@@ -9,6 +9,19 @@ owned identifier semantics and invariants. This document describes how the
 Codex adapter satisfies them, including the scope and lifetime of Codex-native
 identifiers.
 
+## Runtime ownership
+
+`CodexHarness` is the cloneable public API handle. Each project app-server process has exactly one
+non-cloneable `CodexInstance`, owned by exactly one Tokio task, that owns its transport, mapper,
+active turns, pending compactions and context restores, workspace configuration, command/control
+receivers, and worker lifecycle. It serves every native thread on that process and is unrelated to
+the Primary/sub-agent hierarchy. Helper futures borrow its protocol state through `&mut self`; no
+independent worker mutates that state.
+
+`CodexTransport` remains the mockable request/read abstraction. `SenderMap` remains shared only
+because synchronous `AgentHarness::subscribe` must read it; `CodexInstance` is its sole runtime
+lifecycle mutator.
+
 ## Identifier model
 
 Giskard-owned identifiers are durable application identities. Codex-native
@@ -75,12 +88,9 @@ first. Pre-registration removes the second identity rather than reconciling it.
 
 **On claim or open.** `claim_native_thread` binds a provider-owned child without
 issuing `thread/resume`, starting work, or fabricating model metadata. `open_thread`
-binds the native id it explicitly started or resumed. An explicit
-`OpenThreadOptions::thread` wins, because the caller knows the thread's durable
-identity. Otherwise the adapter reuses an existing binding for the native id
-being resumed if it has one, and only mints a fresh `ThreadId` when the native
-thread is genuinely unknown: passing `None` says the caller has no opinion about
-the id, not that this is a new thread.
+binds the native id it explicitly started or resumed to the authoritative
+`OpenThreadOptions::thread` supplied by Giskard. Live opens never discover or mint a Giskard
+identity from a native id.
 
 **Never inferred from traffic.** A non-empty native thread id that resolves to
 nothing is a routing failure, reported as such. It is only attributed to the
@@ -475,7 +485,7 @@ configured `codex_path`, and reports through the `log` crate, which Giskard does
 notifications and requests — but it is the first thing to check when Codex behavior looks
 truncated.
 
-## Resume does not name a model
+## Resume model verification
 
 `thread/resume` treats `model`/`modelProvider` as *overrides*: Codex's
 `merge_persisted_resume_metadata` returns early once either is present, so the
@@ -483,14 +493,13 @@ thread's own persisted model stops being applied. Supplying one therefore moves
 an existing conversation onto a different model rather than expressing a
 preference.
 
-`OpenThreadOptions::initial_model` remains optional. When the adapter issues a native open:
+`OpenThreadOptions::initial_model` is authoritative for every Primary open. When the adapter issues
+a native open:
 
 - **Reopening** a thread Giskard already tracks passes its persisted model — that override is also
   the mechanism for switching a thread's provider.
-- **Starting** a fresh thread requires one (`fresh_model`); there is no existing
-  thread whose model Codex could report. The resume-failed recovery path that
-  starts a replacement therefore returns the resume error instead when no model
-  was named.
+- **Starting** a fresh thread uses the required model directly. Missing-rollout recovery starts its
+  replacement with that same model and Giskard identity.
 
 `thread/resume` also reports `reasoningEffort`, and a reported effort wins over a
 requested one. `thread/start` reports none, so there the request is the only source. When Codex
@@ -576,8 +585,10 @@ target.
 
 - [`src/mapping.rs`](src/mapping.rs) owns native-to-Giskard identity translation and command
   lifecycle tracking.
-- [`src/lib.rs`](src/lib.rs) owns the Codex worker, JSON-RPC routing, timeouts, and process
-  termination calls.
+- [`src/instance.rs`](src/instance.rs) defines the single-task app-server runtime that owns protocol
+  state and reduction for all native threads on that process.
+- [`src/lib.rs`](src/lib.rs) owns the public harness handle, low-level JSON-RPC helpers, timeouts,
+  and process termination calls.
 - Mapper tests assert same-lifecycle stability, cross-turn and cross-thread
   separation, and independent running commands when Codex reuses an item ID.
 - Worker tests assert background-terminal and `command/exec` termination routing

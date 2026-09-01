@@ -90,6 +90,10 @@ Cargo workspace with 8 crates under `crates/`:
   `rust-toolchain.toml`, so it will not catch a newer API sneaking past this line — raising it is
   always a deliberate act.
 - All Codex-specific types confined to `giskard-harness-codex`.
+- One `CodexInstance` is the single-task state authority for each Codex app-server process. Its
+  transport, mapper, active turns, pending compactions, and pending context restores must remain
+  task-owned. Do not share them through `Arc<Mutex<_>>`, `Arc<RwLock<_>>`, or independent
+  state-mutating workers; helper futures may borrow this state only through `&mut self`.
 - Atomic writes for all persistence (temp file + fsync + rename).
 - The store's per-thread locks are in-process `Mutex`es and order nothing between binaries. Anything
   that rewrites or deletes store files from outside `giskard-server` must hold the advisory

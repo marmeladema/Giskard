@@ -7,6 +7,7 @@
 //! See the crate README for Codex-native identifier scopes, item and process
 //! lifecycles, background-command ownership, and termination routing.
 
+mod instance;
 mod log_fields;
 mod mapping;
 mod native_ids;
@@ -14,6 +15,7 @@ mod native_routes;
 
 use crate::log_fields::display_opt;
 use crate::native_ids::NativeThreadId;
+use instance::CodexInstance;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -299,6 +301,7 @@ struct WorkerReceivers {
     commands: mpsc::Receiver<QueuedHarnessCommand>,
     controls: mpsc::Receiver<QueuedControlCommand>,
     shutdown: watch::Receiver<bool>,
+    done: watch::Sender<bool>,
 }
 
 type SenderMap = Arc<StdMutex<HashMap<ThreadId, broadcast::Sender<AgentEvent>>>>;
@@ -943,23 +946,21 @@ impl CodexHarness {
         });
 
         tokio::spawn(run_worker_queue_watchdog(Arc::downgrade(&worker_queue)));
-        tokio::spawn(async move {
-            background_task(
-                client,
-                WorkerReceivers {
-                    commands: cmd_rx,
-                    controls: control_rx,
-                    shutdown: shutdown_rx,
-                },
-                senders,
-                worker_queue,
-                workspace_root,
-                writable_roots,
-                mapper,
-            )
-            .await;
-            worker_done_tx.send_replace(true);
-        });
+        let instance = CodexInstance::new(
+            client,
+            WorkerReceivers {
+                commands: cmd_rx,
+                controls: control_rx,
+                shutdown: shutdown_rx,
+                done: worker_done_tx,
+            },
+            senders,
+            worker_queue,
+            workspace_root,
+            writable_roots,
+            mapper,
+        );
+        tokio::spawn(instance.run());
         Ok(harness)
     }
 
@@ -1486,237 +1487,6 @@ impl AgentHarness for CodexHarness {
     }
 }
 
-async fn background_task<C>(
-    mut client: C,
-    receivers: WorkerReceivers,
-    senders: SenderMap,
-    worker_queue: Arc<WorkerQueueWatchdog>,
-    workspace_root: PathBuf,
-    writable_roots: Vec<PathBuf>,
-    mut mapper: CodexMapper,
-) where
-    C: CodexTransport,
-{
-    let WorkerReceivers {
-        mut commands,
-        mut controls,
-        mut shutdown,
-    } = receivers;
-    let mut pending_compactions: HashMap<ThreadId, PendingCompaction> = HashMap::new();
-    let mut pending_context_restores: HashMap<NativeThreadId, PendingContextRestore> =
-        HashMap::new();
-    let mut active_turns: ActiveTurns = HashMap::new();
-    let mut first_event_warn_tick = tokio::time::interval(Duration::from_secs(1));
-
-    loop {
-        tokio::select! {
-            biased;
-            _ = wait_for_shutdown_request(&mut shutdown) => {
-                cleanup_all_active_turn_uploads(&mut client, &mut active_turns).await;
-                shutdown_codex_transport(client, &workspace_root).await;
-                break;
-            }
-            msg = client.next_message(), if should_poll_codex_messages(&mapper, &active_turns, &pending_compactions) || !pending_context_restores.is_empty() => {
-                match msg {
-                    Ok(Some(msg)) => {
-                        observe_pending_context_restore(&mut pending_context_restores, &msg);
-                        match handle_background_server_message(
-                                &mut client,
-                                &mut mapper,
-                                &senders,
-                                &mut pending_compactions,
-                                &mut active_turns,
-                                msg,
-                            )
-                            .await
-                        {
-                            StreamOutcome::TurnEnded => {}
-                            StreamOutcome::CompactionCompleted { thread, elapsed_ms } => {
-                                info!(
-                                    %thread,
-                                    elapsed_ms,
-                                    pending_compactions = pending_compactions.len(),
-                                    "Codex context compaction completion observed"
-                                );
-                            }
-                            StreamOutcome::Shutdown => {
-                                cleanup_all_active_turn_uploads(&mut client, &mut active_turns).await;
-                                shutdown_codex_transport(client, &workspace_root).await;
-                                break;
-                            }
-                        }
-                    }
-                    Ok(None) => {
-                        cleanup_all_active_turn_uploads(&mut client, &mut active_turns).await;
-                        emit_incomplete_active_turns(
-                            &senders,
-                            &mut mapper,
-                            &mut active_turns,
-                            "Codex stream ended before turn completion",
-                        )
-                        .await;
-                        if !pending_compactions.is_empty() {
-                            warn!(
-                                action = "read_codex_stream",
-                                workspace_root = %workspace_root.display(),
-                                pending_compactions = pending_compactions.len(),
-                                pending_compaction_states = ?pending_compaction_states(&pending_compactions),
-                                "Codex message stream ended with pending context compactions"
-                            );
-                        }
-                        break;
-                    }
-                    Err(CodexStreamError::NonJsonStdout {
-                        parse_error,
-                        raw_preview,
-                        raw_bytes,
-                    }) => {
-                        warn!(
-                            active_turns = active_turns.len(),
-                            pending_compactions = pending_compactions.len(),
-                            pending_compaction_states = ?pending_compaction_states(&pending_compactions),
-                            workspace_root = %workspace_root.display(),
-                            error = %parse_error,
-                            raw_bytes,
-                            raw_preview = ?raw_preview,
-                            "Ignoring non-JSON line from Codex app-server stdout"
-                        );
-                    }
-                    Err(CodexStreamError::Fatal(e)) => {
-                        let message = e.to_string();
-                        if active_turns.is_empty() {
-                            warn!(
-                                action = "read_codex_stream",
-                                error = %message,
-                                pending_compactions = pending_compactions.len(),
-                                pending_compaction_states = ?pending_compaction_states(&pending_compactions),
-                                workspace_root = %workspace_root.display(),
-                                "Codex idle stream failed while background work was running"
-                            );
-                        } else {
-                            warn!(
-                                action = "read_codex_stream",
-                                error = %message,
-                                active_turns = active_turns.len(),
-                                active_turn_states = ?active_turn_states(&active_turns),
-                                pending_compactions = pending_compactions.len(),
-                                pending_compaction_states = ?pending_compaction_states(&pending_compactions),
-                                workspace_root = %workspace_root.display(),
-                                "Codex stream failed before all active turns completed"
-                            );
-                            cleanup_all_active_turn_uploads(&mut client, &mut active_turns).await;
-                            emit_incomplete_active_turns(
-                                &senders,
-                                &mut mapper,
-                                &mut active_turns,
-                                format!("Codex stream failed before turn completion: {message}"),
-                            )
-                            .await;
-                        }
-                        break;
-                    }
-                }
-            }
-            queued = commands.recv() => {
-                let queued = match queued {
-                    Some(queued) => queued,
-                    None => {
-                        cleanup_all_active_turn_uploads(&mut client, &mut active_turns).await;
-                        break;
-                    }
-                };
-                worker_queue.mark_started(queued.token);
-
-                match queued.command {
-                    HarnessCommand::OpenThread { opts, response } => {
-                        let result =
-                            handle_open_thread(&mut client, &mut mapper, &opts, &senders).await;
-                        match result {
-                            Ok(outcome) => {
-                                let handle = outcome.handle;
-                                if let Some(model) = outcome.resume_replay_model {
-                                    let replaced = pending_context_restores.insert(NativeThreadId::new(handle.harness_thread_id.clone()), PendingContextRestore {
-                                        thread: handle.thread,
-                                        model,
-                                        sink: opts.updates.clone(),
-                                    });
-                                    if let Some(replaced) = replaced {
-                                        warn!(thread_id = %handle.thread,
-                                            replaced_thread_id = %replaced.thread,
-                                            harness_thread_id = %handle.harness_thread_id,
-                                            "replaced an overlapping pending context restore");
-                                    }
-                                }
-                                let _ = response.send(Ok(handle));
-                            }
-                            Err(error) => { let _ = response.send(Err(error)); }
-                        }
-                    }
-                    HarnessCommand::StartTurn {
-                        thread,
-                        input,
-                        overrides,
-                        response,
-                    } => {
-                        match handle_start_turn(
-                            &mut client,
-                            &mut mapper,
-                            &thread,
-                            &input,
-                            &overrides,
-                            &writable_roots,
-                        )
-                        .await
-                        {
-                            Ok(started) => {
-                                let _ = response.send(Ok(started.turn));
-                                active_turns.insert(
-                                    thread.thread,
-                                    ActiveTurn::new(*thread, started.turn)
-                                        .with_upload_dir(started.upload_dir),
-                                );
-                            }
-                            Err(error) => {
-                                let _ = response.send(Err(error));
-                            }
-                        }
-                    }
-                }
-                worker_queue.mark_finished(queued.token);
-            }
-            queued = controls.recv() => {
-                let Some(queued) = queued else {
-                    cleanup_all_active_turn_uploads(&mut client, &mut active_turns).await;
-                    break;
-                };
-                worker_queue.mark_started(queued.token);
-                let token = queued.token;
-                let outcome =
-                    handle_control_command(
-                        &mut client,
-                        &mut mapper,
-                        &senders,
-                        &mut pending_compactions,
-                        &mut pending_context_restores,
-                        &active_turns,
-                        Some(queued.command),
-                    )
-                    .await;
-                worker_queue.mark_finished(token);
-                if matches!(outcome, StreamOutcome::Shutdown) {
-                    cleanup_all_active_turn_uploads(&mut client, &mut active_turns).await;
-                    shutdown_codex_transport(client, &workspace_root).await;
-                    break;
-                }
-            }
-            _ = first_event_warn_tick.tick(), if !active_turns.is_empty() => {
-                warn_slow_first_events(&mut active_turns);
-            }
-        }
-    }
-    worker_queue.close();
-}
-
 async fn wait_for_shutdown_request(shutdown: &mut watch::Receiver<bool>) {
     if *shutdown.borrow_and_update() {
         return;
@@ -1874,345 +1644,6 @@ fn completed_current_active_turn(
     (*turn == active.acknowledged_turn).then_some((*thread, *turn))
 }
 
-async fn handle_background_server_message(
-    client: &mut dyn CodexTransport,
-    mapper: &mut CodexMapper,
-    senders: &SenderMap,
-    pending_compactions: &mut HashMap<ThreadId, PendingCompaction>,
-    active_turns: &mut ActiveTurns,
-    msg: codex_codes::ServerMessage,
-) -> StreamOutcome {
-    let fallback_thread = fallback_thread(mapper, active_turns);
-    match msg {
-        codex_codes::ServerMessage::Notification(notif) => {
-            if let Some(event) = mapper.map_notification(&notif, fallback_thread) {
-                let thread = event_thread(&event);
-                if let Some(active) = active_turns.get_mut(&thread) {
-                    active.mark_server_message();
-                    if let AgentEvent::TurnStarted { turn, .. } = &event
-                        && *turn == active.acknowledged_turn
-                    {
-                        active.active_turn = Some(*turn);
-                    }
-                }
-                let completed_compaction =
-                    observe_pending_compaction(pending_compactions, thread, &event);
-                let completed_active_turn =
-                    completed_current_active_turn(active_turns, &event).map(|(_, turn)| turn);
-                if active_turns.contains_key(&thread)
-                    && matches!(&event, AgentEvent::TurnCompleted { .. })
-                    && completed_active_turn.is_none()
-                {
-                    debug!(
-                        %thread,
-                        acknowledged_turn = display_opt(active_turns.get(&thread).map(|active| active.acknowledged_turn)),
-                        event_turn = display_opt(agent_event_turn(&event)),
-                        "ignoring Codex turn completion for a non-current turn"
-                    );
-                }
-                let fatal_completion = active_turns.get(&thread).and_then(|active| {
-                    active
-                        .event_is_current_turn(&event)
-                        .then(|| {
-                            mapping::fatal_turn_error(&notif)
-                                .map(|message| (active.active_turn, message))
-                        })
-                        .flatten()
-                });
-                let _ = broadcast_event(senders, thread, || event).await;
-                if let Some(turn) = completed_active_turn {
-                    cleanup_active_turn_upload(client, active_turns, thread).await;
-                    active_turns.remove(&thread);
-                    mapper.clear_active_turn(thread);
-                    debug!(
-                        %thread,
-                        %turn,
-                        remaining_active_turns = active_turns.len(),
-                        "Codex turn completion observed"
-                    );
-                } else if let Some((turn, message)) = fatal_completion
-                    && emit_fatal_turn_completion(senders, thread, turn, message).await
-                {
-                    cleanup_active_turn_upload(client, active_turns, thread).await;
-                    active_turns.remove(&thread);
-                    mapper.clear_active_turn(thread);
-                }
-                if let Some(elapsed_ms) = completed_compaction {
-                    return StreamOutcome::CompactionCompleted { thread, elapsed_ms };
-                }
-            } else if let Some(message) = mapping::fatal_turn_error(&notif) {
-                let (harness_thread_id, native_turn_id) = match &notif {
-                    codex_codes::messages::Notification::Error(error) => {
-                        (Some(error.thread_id.as_str()), Some(error.turn_id.as_str()))
-                    }
-                    _ => (None, notif.turn_id()),
-                };
-                warn!(
-                    action = "map_fatal_notification",
-                    method = notif.method(),
-                    harness_thread_id,
-                    native_turn_id,
-                    fallback_thread = %fallback_thread,
-                    error = %message,
-                    "dropping fatal Codex error notification that could not be mapped to a known thread"
-                );
-            }
-            StreamOutcome::TurnEnded
-        }
-        codex_codes::ServerMessage::Request { id, request } => {
-            let Some(event) = mapper.map_server_request(&id, &request, fallback_thread) else {
-                respond_unroutable_server_request(client, &id, &request).await;
-                return StreamOutcome::TurnEnded;
-            };
-            let thread = event_thread(&event);
-            if let Some(active) = active_turns.get_mut(&thread) {
-                active.mark_server_message();
-            }
-            let _ = broadcast_event(senders, thread, || event).await;
-            StreamOutcome::TurnEnded
-        }
-    }
-}
-
-async fn handle_control_command(
-    client: &mut dyn CodexTransport,
-    mapper: &mut CodexMapper,
-    senders: &SenderMap,
-    pending_compactions: &mut HashMap<ThreadId, PendingCompaction>,
-    pending_context_restores: &mut HashMap<NativeThreadId, PendingContextRestore>,
-    active_turns: &ActiveTurns,
-    control: Option<ControlCommand>,
-) -> StreamOutcome {
-    match control {
-        Some(ControlCommand::ClaimNativeThread {
-            thread,
-            harness_thread_id,
-            workspace_root,
-            response,
-        }) => {
-            let result = mapper
-                .claim_thread(harness_thread_id.clone(), thread)
-                .map(|_| {
-                    let (sender, _) = broadcast::channel(BROADCAST_CAPACITY);
-                    ensure_thread_sender(senders, thread, sender);
-                    // A claim answers with the identity facts this harness lifetime already
-                    // attested through its own events. It must not resume the thread to learn
-                    // more: the native model stays unreported until an event names it.
-                    let parent_harness_thread_id = mapper.native_parent(&harness_thread_id);
-                    ThreadHandle {
-                        parent_harness_thread_id,
-                        ..ThreadHandle::opened(thread, harness_thread_id, workspace_root)
-                    }
-                });
-            let _ = response.send(result);
-            StreamOutcome::TurnEnded
-        }
-        Some(ControlCommand::RespondApproval {
-            id,
-            decision,
-            response,
-        }) => {
-            let result = handle_respond_approval(client, mapper, &id, &decision).await;
-            let _ = response.send(result);
-            StreamOutcome::TurnEnded
-        }
-        Some(ControlCommand::RespondServerRequest {
-            id,
-            response_payload,
-            response,
-        }) => {
-            let result =
-                handle_respond_server_request(client, mapper, senders, &id, response_payload).await;
-            let _ = response.send(result);
-            StreamOutcome::TurnEnded
-        }
-        Some(ControlCommand::Interrupt { thread, response }) => {
-            let native_turn_id = mapper
-                .active_native_turn_for_thread(thread.thread)
-                .map(str::to_owned);
-            let result = timeout_codex_control(
-                "interrupt",
-                Some(&thread),
-                None,
-                native_turn_id.as_deref(),
-                handle_interrupt(client, mapper, &thread),
-            )
-            .await;
-            if result.is_ok() {
-                reject_pending_requests_for_interrupted_thread(
-                    client,
-                    mapper,
-                    senders,
-                    thread.thread,
-                )
-                .await;
-            }
-            let _ = response.send(result);
-            StreamOutcome::TurnEnded
-        }
-        Some(ControlCommand::TerminateCommand {
-            thread,
-            process_id,
-            response,
-        }) => {
-            let native_turn_id = mapper
-                .native_turn_for_process(thread.thread, &process_id)
-                .or_else(|| mapper.active_native_turn_for_thread(thread.thread))
-                .map(str::to_owned);
-            let result = timeout_codex_control(
-                "terminate_command",
-                Some(&thread),
-                Some(&process_id),
-                native_turn_id.as_deref(),
-                handle_terminate_command(client, &thread, &process_id),
-            )
-            .await;
-            let _ = response.send(result);
-            StreamOutcome::TurnEnded
-        }
-        Some(ControlCommand::CompactThread { thread, response }) => {
-            if active_turns.contains_key(&thread.thread) {
-                let _ = response.send(Err(HarnessError::Unsupported(
-                    "context compaction is not available during an active turn".into(),
-                )));
-                return StreamOutcome::TurnEnded;
-            }
-            let started = Instant::now();
-            info!(
-                thread = %thread.thread,
-                harness_thread_id = %thread.harness_thread_id,
-                pending_compactions = pending_compactions.len(),
-                "requesting Codex context compaction"
-            );
-            let result = handle_compact_thread(client, &thread).await;
-            match &result {
-                Ok(()) => {
-                    pending_compactions.insert(thread.thread, PendingCompaction::new(started));
-                    info!(
-                        thread = %thread.thread,
-                        harness_thread_id = %thread.harness_thread_id,
-                        ack_elapsed_ms = started.elapsed().as_millis(),
-                        pending_compactions = pending_compactions.len(),
-                        "Codex accepted context compaction request"
-                    );
-                }
-                Err(error) => {
-                    warn!(
-                        action = "compact_thread",
-                        thread_id = %thread.thread,
-                        harness_thread_id = %thread.harness_thread_id,
-                        error = %error,
-                        elapsed_ms = started.elapsed().as_millis(),
-                        "Codex context compaction request failed"
-                    );
-                }
-            }
-            let _ = response.send(result);
-            StreamOutcome::TurnEnded
-        }
-        Some(ControlCommand::SetThreadName {
-            thread,
-            name,
-            response,
-        }) => {
-            let result = handle_set_thread_name(client, &thread, &name).await;
-            let _ = response.send(result);
-            StreamOutcome::TurnEnded
-        }
-        Some(ControlCommand::SetThreadArchived {
-            thread,
-            archived,
-            response,
-        }) => {
-            let result = if active_turns.contains_key(&thread.thread) {
-                Err(HarnessError::Unsupported(
-                    "thread archiving is not available during an active turn".into(),
-                ))
-            } else {
-                handle_set_thread_archived(client, &thread, archived).await
-            };
-            let _ = response.send(result);
-            StreamOutcome::TurnEnded
-        }
-        Some(ControlCommand::DeleteThread { thread, response }) => {
-            let result = if active_turns.contains_key(&thread.thread) {
-                Err(HarnessError::Unsupported(
-                    "thread deletion is not available during an active turn".into(),
-                ))
-            } else {
-                handle_delete_thread(client, &thread).await
-            };
-            if result.is_ok() {
-                lock_senders(senders).remove(&thread.thread);
-                pending_context_restores.remove(thread.harness_thread_id.as_str());
-            }
-            let _ = response.send(result);
-            StreamOutcome::TurnEnded
-        }
-        Some(ControlCommand::ListMcpServers { response }) => {
-            let result = timeout_codex_control(
-                "list_mcp_servers",
-                None,
-                None,
-                None,
-                handle_list_mcp_servers(client),
-            )
-            .await;
-            let _ = response.send(result);
-            StreamOutcome::TurnEnded
-        }
-        Some(ControlCommand::ReloadMcpServers { response }) => {
-            let result = timeout_codex_control(
-                "reload_mcp_servers",
-                None,
-                None,
-                None,
-                handle_reload_mcp_servers(client),
-            )
-            .await;
-            let _ = response.send(result);
-            StreamOutcome::TurnEnded
-        }
-        Some(ControlCommand::StartMcpOauthLogin { name, response }) => {
-            let result = timeout_codex_control(
-                "start_mcp_oauth_login",
-                None,
-                Some(&name),
-                None,
-                handle_start_mcp_oauth_login(client, &name),
-            )
-            .await;
-            let _ = response.send(result);
-            StreamOutcome::TurnEnded
-        }
-        Some(ControlCommand::ListProviders { cwd, response }) => {
-            let result = timeout_codex_control(
-                "list_providers",
-                None,
-                None,
-                None,
-                handle_list_providers(client, cwd),
-            )
-            .await;
-            let _ = response.send(result);
-            StreamOutcome::TurnEnded
-        }
-        Some(ControlCommand::ListModels { cwd, response }) => {
-            let result = timeout_codex_control(
-                "list_models",
-                None,
-                None,
-                None,
-                handle_list_models(client, cwd),
-            )
-            .await;
-            let _ = response.send(result);
-            StreamOutcome::TurnEnded
-        }
-        None => StreamOutcome::Shutdown,
-    }
-}
-
 async fn timeout_codex_control<T>(
     action: &'static str,
     thread: Option<&ThreadHandle>,
@@ -2238,10 +1669,9 @@ async fn timeout_codex_control<T>(
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum StreamOutcome {
-    TurnEnded,
+enum MessageOutcome {
+    Handled,
     CompactionCompleted { thread: ThreadId, elapsed_ms: u128 },
-    Shutdown,
 }
 
 #[derive(Debug)]
