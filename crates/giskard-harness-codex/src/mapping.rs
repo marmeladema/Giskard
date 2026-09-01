@@ -1310,43 +1310,56 @@ impl CodexMapper {
         })
     }
 
-    pub fn map_approval_response(
-        &mut self,
+    pub fn prepare_approval_response(
+        &self,
         id: &ApprovalId,
         decision: &ApprovalDecision,
-    ) -> Result<ApprovalResponse, String> {
-        match self.pending_approval_responses.remove(id) {
-            Some(PendingApprovalResponse {
+    ) -> Result<PreparedApprovalResponse, String> {
+        let pending = self
+            .pending_approval_responses
+            .get(id)
+            .ok_or_else(|| format!("no pending approval for id {id}"))?;
+        let response = match pending {
+            PendingApprovalResponse {
                 request_id,
                 thread,
                 turn,
                 kind: PendingApprovalResponseKind::Permissions { permissions },
-            }) => Ok(ApprovalResponse::from_parts(
-                request_id,
-                ApprovalResponseOwner { thread, turn },
-                map_permissions_approval_decision(decision, permissions),
-            )),
-            Some(PendingApprovalResponse {
+            } => ApprovalResponse::from_parts(
+                request_id.clone(),
+                ApprovalResponseOwner {
+                    thread: *thread,
+                    turn: *turn,
+                },
+                map_permissions_approval_decision(decision, permissions.clone()),
+            ),
+            PendingApprovalResponse {
                 request_id,
                 thread,
                 turn,
                 kind: PendingApprovalResponseKind::LegacyReviewDecision,
-            }) => Ok(ApprovalResponse::from_parts(
-                request_id,
-                ApprovalResponseOwner { thread, turn },
+            } => ApprovalResponse::from_parts(
+                request_id.clone(),
+                ApprovalResponseOwner {
+                    thread: *thread,
+                    turn: *turn,
+                },
                 map_legacy_review_decision(decision),
-            )),
-            Some(PendingApprovalResponse {
+            ),
+            PendingApprovalResponse {
                 request_id,
                 thread,
                 turn,
                 kind: PendingApprovalResponseKind::Decision,
-            }) => Ok(ApprovalResponse::from_parts(
-                request_id,
-                ApprovalResponseOwner { thread, turn },
+            } => ApprovalResponse::from_parts(
+                request_id.clone(),
+                ApprovalResponseOwner {
+                    thread: *thread,
+                    turn: *turn,
+                },
                 ApprovalResponseBody::Result(map_approval_decision(decision)),
-            )),
-            Some(PendingApprovalResponse {
+            ),
+            PendingApprovalResponse {
                 request_id,
                 thread,
                 turn,
@@ -1355,13 +1368,39 @@ impl CodexMapper {
                         transport,
                         question_id,
                     },
-            }) => Ok(ApprovalResponse::from_parts(
-                request_id,
-                ApprovalResponseOwner { thread, turn },
-                map_mcp_tool_approval_decision(decision, &transport, question_id.as_deref()),
-            )),
-            None => Err(format!("no pending approval for id {id}")),
+            } => ApprovalResponse::from_parts(
+                request_id.clone(),
+                ApprovalResponseOwner {
+                    thread: *thread,
+                    turn: *turn,
+                },
+                map_mcp_tool_approval_decision(decision, transport, question_id.as_deref()),
+            ),
+        };
+        Ok(PreparedApprovalResponse {
+            approval_id: id.clone(),
+            response,
+        })
+    }
+
+    pub fn commit_approval_response(&mut self, prepared: &PreparedApprovalResponse) -> bool {
+        self.remove_exact_approval_response(prepared)
+    }
+
+    pub fn discard_approval_response(&mut self, prepared: &PreparedApprovalResponse) -> bool {
+        self.remove_exact_approval_response(prepared)
+    }
+
+    fn remove_exact_approval_response(&mut self, prepared: &PreparedApprovalResponse) -> bool {
+        let matches = self
+            .pending_approval_responses
+            .get(&prepared.approval_id)
+            .is_some_and(|pending| pending.request_id == *prepared.request_id());
+        if matches {
+            self.pending_approval_responses
+                .remove(&prepared.approval_id);
         }
+        matches
     }
 
     pub fn pending_server_request(
@@ -1388,8 +1427,15 @@ impl CodexMapper {
             .collect()
     }
 
-    pub fn resolve_server_request(&mut self, id: &ServerRequestId) {
-        self.pending_server_requests.remove(id);
+    pub fn resolve_server_request(&mut self, id: &ServerRequestId, request_id: &RequestId) -> bool {
+        let matches = self
+            .pending_server_requests
+            .get(id)
+            .is_some_and(|pending| pending.request_id == *request_id);
+        if matches {
+            self.pending_server_requests.remove(id);
+        }
+        matches
     }
 
     /// Build a first-class MCP tool-call approval event from a detected
@@ -1535,6 +1581,21 @@ pub struct PendingServerRequest {
 pub struct ApprovalResponseOwner {
     pub thread: ThreadId,
     pub turn: TurnId,
+}
+
+#[derive(Debug)]
+pub struct PreparedApprovalResponse {
+    pub approval_id: ApprovalId,
+    pub response: ApprovalResponse,
+}
+
+impl PreparedApprovalResponse {
+    pub fn request_id(&self) -> &RequestId {
+        match &self.response {
+            ApprovalResponse::Result { request_id, .. }
+            | ApprovalResponse::Error { request_id, .. } => request_id,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -4207,11 +4268,12 @@ mod tests {
         };
 
         match mapper
-            .map_approval_response(
+            .prepare_approval_response(
                 &ApprovalId("perm_req".into()),
                 &ApprovalDecision::AcceptForSession,
             )
             .unwrap()
+            .response
         {
             ApprovalResponse::Result {
                 request_id,
@@ -4248,8 +4310,9 @@ mod tests {
         let _ = mapper.map_server_request(&request_id, &request, ThreadId::new());
 
         match mapper
-            .map_approval_response(&ApprovalId("perm_req".into()), &ApprovalDecision::Decline)
+            .prepare_approval_response(&ApprovalId("perm_req".into()), &ApprovalDecision::Decline)
             .unwrap()
+            .response
         {
             ApprovalResponse::Error {
                 request_id,
@@ -4444,13 +4507,14 @@ mod tests {
 
         let value = approval_result_value(
             mapper
-                .map_approval_response(
+                .prepare_approval_response(
                     &ApprovalId("cmd_req".into()),
                     &ApprovalDecision::AcceptWithExecPolicyAmendment {
                         amendment: vec!["cargo test".into()],
                     },
                 )
-                .unwrap(),
+                .unwrap()
+                .response,
         );
         let decoded: codex_codes::protocol::CommandExecutionRequestApprovalResponse =
             assert_response_schema(value);
@@ -4502,11 +4566,12 @@ mod tests {
 
         let value = approval_result_value(
             mapper
-                .map_approval_response(
+                .prepare_approval_response(
                     &ApprovalId("file_req".into()),
                     &ApprovalDecision::AcceptForSession,
                 )
-                .unwrap(),
+                .unwrap()
+                .response,
         );
         let decoded: codex_codes::protocol::FileChangeRequestApprovalResponse =
             assert_response_schema(value);
@@ -4755,13 +4820,14 @@ mod tests {
 
         let value = approval_result_value(
             mapper
-                .map_approval_response(
+                .prepare_approval_response(
                     &ApprovalId("patch_req".into()),
                     &ApprovalDecision::AcceptWithExecPolicyAmendment {
                         amendment: vec!["apply patch".into()],
                     },
                 )
-                .unwrap(),
+                .unwrap()
+                .response,
         );
         let decoded: codex_codes::protocol::ApplyPatchApprovalResponse =
             assert_response_schema(value);
@@ -4775,11 +4841,87 @@ mod tests {
 
     #[test]
     fn unknown_approval_response_id_is_an_error() {
-        let mut mapper = CodexMapper::new(PathBuf::from("/tmp"));
+        let mapper = CodexMapper::new(PathBuf::from("/tmp"));
         let err = mapper
-            .map_approval_response(&ApprovalId("missing".into()), &ApprovalDecision::Accept)
+            .prepare_approval_response(&ApprovalId("missing".into()), &ApprovalDecision::Accept)
             .unwrap_err();
         assert!(err.contains("missing"));
+    }
+
+    #[test]
+    fn approval_response_is_removed_only_after_commit() {
+        let mut mapper = CodexMapper::new(PathBuf::from("/tmp"));
+        let request = CodexServerRequest::CmdExecApproval(
+            serde_json::from_value(serde_json::json!({
+                "commandActions": [],
+                "cwd": "/tmp/project",
+                "itemId": "cmd1",
+                "threadId": "thread1",
+                "turnId": "turn1",
+                "startedAtMs": 123
+            }))
+            .unwrap(),
+        );
+        let request_id = RequestId::String("approval".into());
+        mapper
+            .map_server_request(&request_id, &request, ThreadId::new())
+            .unwrap();
+
+        let first = mapper
+            .prepare_approval_response(&ApprovalId("approval".into()), &ApprovalDecision::Accept)
+            .unwrap();
+        let second = mapper
+            .prepare_approval_response(&ApprovalId("approval".into()), &ApprovalDecision::Accept)
+            .unwrap();
+        assert_eq!(first.request_id(), second.request_id());
+        assert_eq!(
+            approval_result_value(first.response),
+            approval_result_value(second.response)
+        );
+        let prepared = mapper
+            .prepare_approval_response(&ApprovalId("approval".into()), &ApprovalDecision::Accept)
+            .unwrap();
+        assert!(mapper.commit_approval_response(&prepared));
+        assert!(
+            mapper
+                .prepare_approval_response(
+                    &ApprovalId("approval".into()),
+                    &ApprovalDecision::Accept
+                )
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn stale_approval_completion_cannot_remove_a_colliding_request() {
+        let mut mapper = CodexMapper::new(PathBuf::from("/tmp"));
+        let request = CodexServerRequest::CmdExecApproval(
+            serde_json::from_value(serde_json::json!({
+                "commandActions": [],
+                "cwd": "/tmp/project",
+                "itemId": "cmd1",
+                "threadId": "thread1",
+                "turnId": "turn1",
+                "startedAtMs": 123
+            }))
+            .unwrap(),
+        );
+        mapper
+            .map_server_request(&RequestId::Integer(42), &request, ThreadId::new())
+            .unwrap();
+        let stale = mapper
+            .prepare_approval_response(&ApprovalId("42".into()), &ApprovalDecision::Accept)
+            .unwrap();
+        mapper
+            .map_server_request(&RequestId::String("42".into()), &request, ThreadId::new())
+            .unwrap();
+
+        assert!(!mapper.commit_approval_response(&stale));
+        assert!(!mapper.discard_approval_response(&stale));
+        let current = mapper
+            .prepare_approval_response(&ApprovalId("42".into()), &ApprovalDecision::Accept)
+            .unwrap();
+        assert_eq!(current.request_id(), &RequestId::String("42".into()));
     }
 
     #[test]
@@ -4824,7 +4966,13 @@ mod tests {
         assert_eq!(pending.request_id, RequestId::Integer(42));
         assert_eq!(pending.thread, fallback);
         assert!(pending.turn.is_some());
-        mapper.resolve_server_request(&ServerRequestId("42".into()));
+        assert!(!mapper.resolve_server_request(
+            &ServerRequestId("42".into()),
+            &RequestId::String("42".into())
+        ));
+        assert!(
+            mapper.resolve_server_request(&ServerRequestId("42".into()), &RequestId::Integer(42))
+        );
         assert!(
             mapper
                 .pending_server_request(&ServerRequestId("42".into()))
@@ -5192,8 +5340,9 @@ mod tests {
         }
 
         match mapper
-            .map_approval_response(&ApprovalId("legacy_cmd".into()), &ApprovalDecision::Decline)
+            .prepare_approval_response(&ApprovalId("legacy_cmd".into()), &ApprovalDecision::Decline)
             .unwrap()
+            .response
         {
             ApprovalResponse::Result { value, .. } => {
                 assert_eq!(value["decision"], "denied");
@@ -6781,9 +6930,9 @@ mod tests {
 
         // Accept (once)
         let resp = mapper
-            .map_approval_response(&ApprovalId("mcp3".into()), &ApprovalDecision::Accept)
+            .prepare_approval_response(&ApprovalId("mcp3".into()), &ApprovalDecision::Accept)
             .unwrap();
-        match resp {
+        match resp.response {
             ApprovalResponse::Result { value, .. } => {
                 let answers = value.get("answers").unwrap();
                 let q = answers.get("mcp_tool_call_approval_call_5").unwrap();
@@ -6797,12 +6946,12 @@ mod tests {
             .map_server_request(&RequestId::String("mcp4".into()), &request, fallback)
             .unwrap();
         let resp = mapper
-            .map_approval_response(
+            .prepare_approval_response(
                 &ApprovalId("mcp4".into()),
                 &ApprovalDecision::AcceptForSession,
             )
             .unwrap();
-        match resp {
+        match resp.response {
             ApprovalResponse::Result { value, .. } => {
                 let q = value
                     .get("answers")
@@ -6839,12 +6988,12 @@ mod tests {
             .unwrap();
 
         let resp = mapper
-            .map_approval_response(
+            .prepare_approval_response(
                 &ApprovalId("mcp5".into()),
                 &ApprovalDecision::AcceptForSession,
             )
             .unwrap();
-        match resp {
+        match resp.response {
             ApprovalResponse::Result { value, .. } => {
                 assert_eq!(value["action"], "accept");
                 assert_eq!(value["_meta"]["persist"], "session");
@@ -6857,9 +7006,9 @@ mod tests {
             .map_server_request(&RequestId::String("mcp6".into()), &request, fallback)
             .unwrap();
         let resp = mapper
-            .map_approval_response(&ApprovalId("mcp6".into()), &ApprovalDecision::Decline)
+            .prepare_approval_response(&ApprovalId("mcp6".into()), &ApprovalDecision::Decline)
             .unwrap();
-        match resp {
+        match resp.response {
             ApprovalResponse::Result { value, .. } => {
                 assert_eq!(value["action"], "decline");
             }
