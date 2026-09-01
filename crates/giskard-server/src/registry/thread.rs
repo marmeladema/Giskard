@@ -4,12 +4,14 @@ use std::sync::{Arc, Mutex, Weak};
 use giskard_core::error::HarnessError;
 use giskard_core::ids::{ProjectId, ThreadId, TurnId};
 use giskard_core::thread::ThreadKind;
+use giskard_core::turn::{TurnMode, TurnModel};
+use giskard_core::user_input::UserInput;
 use giskard_harness::ThreadHandle;
 use tokio::sync::{Mutex as AsyncMutex, Notify, OwnedMutexGuard, watch};
 
 use super::{
     LoadedThreadBinding, RegistryTaskPermit, RegistryTaskTracker, SubagentMaterializationJob,
-    TurnContext,
+    TurnContext, TurnContextKind,
 };
 use crate::thread_runtime::{ThreadRuntimeEntry, ThreadRuntimeSlot, ThreadTurnLease};
 
@@ -84,6 +86,13 @@ pub(super) struct ClaimedNativeTurn {
     pub(super) external: bool,
 }
 
+/// Persisted model and mode sampled outside the coordinator lock for one external claim.
+#[derive(Clone)]
+pub(super) struct ExternalTurnDefaults {
+    pub(super) model: TurnModel,
+    pub(super) mode: TurnMode,
+}
+
 struct ThreadCoordinatorState {
     generation: u64,
     next_sequence: u64,
@@ -134,10 +143,6 @@ impl ThreadCoordinator {
 
     pub(super) async fn binding(&self) -> LoadedThreadBinding {
         self.state.lock().await.binding.clone()
-    }
-
-    pub(super) async fn classification(&self) -> ClassificationPhase {
-        self.state.lock().await.classification
     }
 
     pub(super) async fn classify_orphan_as_subagent(&self) -> Result<(), HarnessError> {
@@ -301,7 +306,7 @@ impl ThreadCoordinator {
     pub(super) async fn claim_native_turn(
         &self,
         turn_id: TurnId,
-        external_context: TurnContext,
+        external_defaults: ExternalTurnDefaults,
     ) -> Result<ClaimedNativeTurn, HarnessError> {
         let mut state = self.state.lock().await;
         if let Some(native_turn) = state.native_turn.as_ref() {
@@ -327,7 +332,17 @@ impl ThreadCoordinator {
             )
         } else {
             let token = state.token();
-            (token, external_context, None, NativeTurnOrigin::External)
+            let context = TurnContext {
+                user_input: external_turn_input_label(state.classification),
+                model: external_defaults.model,
+                mode: external_defaults.mode,
+                kind: match state.classification {
+                    ClassificationPhase::Primary => TurnContextKind::User,
+                    ClassificationPhase::Subagent => TurnContextKind::ExternalSubagent,
+                    ClassificationPhase::Orphan => TurnContextKind::ExternalOrphan,
+                },
+            };
+            (token, context, None, NativeTurnOrigin::External)
         };
         let external = origin == NativeTurnOrigin::External;
         state.native_turn = Some(OwnedNativeTurn {
@@ -466,6 +481,25 @@ impl ThreadCoordinator {
             .native_turn
             .as_ref()
             .is_some_and(|native_turn| native_turn.turn_id == turn_id)
+    }
+}
+
+/// The visible input label for a native turn Giskard did not start.
+///
+/// A promptless external turn still gets one row of presentation metadata, and it may only name
+/// what Giskard has actually established. A classified child is a sub-agent turn; an unclassified
+/// native thread has no proven relationship yet, so its turns must not claim one. A `Primary`
+/// thread never reaches this path with an empty label unless Giskard missed the start, so it keeps
+/// the empty input it has always had.
+///
+/// A turn claimed while the thread was unclassified keeps this label after classification, for the
+/// same reason its mode is not rewritten: the label records what was known when the turn was
+/// claimed, not what is known now.
+fn external_turn_input_label(classification: ClassificationPhase) -> UserInput {
+    match classification {
+        ClassificationPhase::Primary => UserInput::text(""),
+        ClassificationPhase::Subagent => UserInput::text("Sub-agent turn"),
+        ClassificationPhase::Orphan => UserInput::text("Unclassified native turn"),
     }
 }
 
@@ -684,6 +718,7 @@ mod tests {
     use std::sync::Arc;
 
     use giskard_core::ids::{ProjectId, ThreadId, TurnId};
+    use giskard_core::turn::Mode;
     use giskard_harness::ThreadHandle;
     use giskard_persist::PersistStore;
 
@@ -705,6 +740,14 @@ mod tests {
             },
             ClassificationPhase::Primary,
         ))
+    }
+
+    fn test_external_defaults() -> ExternalTurnDefaults {
+        let context = test_turn_context();
+        ExternalTurnDefaults {
+            model: context.model,
+            mode: context.mode,
+        }
     }
 
     #[test]
@@ -829,6 +872,71 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn external_claim_rederives_context_after_classification() {
+        let coordinator = test_coordinator(ClassificationPhase::Orphan);
+        let first_turn = TurnId::new();
+        let defaults_a = test_external_defaults();
+        let first = coordinator
+            .claim_native_turn(first_turn, defaults_a.clone())
+            .await
+            .unwrap();
+        coordinator.classify_orphan_as_subagent().await.unwrap();
+        let mut defaults_b = test_external_defaults();
+        if let TurnModel::Known(model) = &mut defaults_b.model {
+            model.model = "second-model".into();
+        }
+        defaults_b.mode = TurnMode::Known(Mode::Plan);
+        let still_first = coordinator
+            .claim_native_turn(first_turn, defaults_b.clone())
+            .await
+            .unwrap();
+        assert_eq!(still_first.context.kind, TurnContextKind::ExternalOrphan);
+        assert_eq!(still_first.context.model, defaults_a.model);
+        assert_eq!(still_first.context.mode, defaults_a.mode);
+        coordinator
+            .finish_native_turn(first.token, first_turn)
+            .await;
+
+        let second_turn = TurnId::new();
+        let second = coordinator
+            .claim_native_turn(second_turn, defaults_b.clone())
+            .await
+            .unwrap();
+
+        assert_eq!(first.context.kind, TurnContextKind::ExternalOrphan);
+        assert_eq!(
+            first.context.user_input,
+            UserInput::text("Unclassified native turn")
+        );
+        assert_eq!(first.context.model, defaults_a.model);
+        assert_eq!(first.context.mode, defaults_a.mode);
+        assert_eq!(second.context.kind, TurnContextKind::ExternalSubagent);
+        assert_eq!(second.context.user_input, UserInput::text("Sub-agent turn"));
+        assert_eq!(second.context.model, defaults_b.model);
+        assert_eq!(second.context.mode, defaults_b.mode);
+
+        let prepared = test_coordinator(ClassificationPhase::Primary);
+        let (cancel, _) = watch::channel(false);
+        let (_, completed) = watch::channel(false);
+        prepared
+            .activate_owner(EventOwnerControl { cancel, completed })
+            .await
+            .unwrap();
+        let runtime = ThreadRuntimeSupport::new();
+        let prepared_context = test_turn_context();
+        let _token = prepare_test_operation(&prepared, &runtime, prepared_context.clone()).await;
+        let claimed = prepared
+            .claim_native_turn(TurnId::new(), defaults_b)
+            .await
+            .unwrap();
+        assert!(!claimed.external);
+        assert_eq!(claimed.context.user_input, prepared_context.user_input);
+        assert_eq!(claimed.context.model, prepared_context.model);
+        assert_eq!(claimed.context.mode, prepared_context.mode);
+        assert_eq!(claimed.context.kind, prepared_context.kind);
+    }
+
+    #[tokio::test]
     async fn stale_operation_acknowledgement_cannot_acknowledge_a_later_lease() {
         let coordinator = test_coordinator(ClassificationPhase::Primary);
         let binding = coordinator.binding().await;
@@ -894,7 +1002,7 @@ mod tests {
         let coordinator = test_coordinator(ClassificationPhase::Subagent);
         let first_turn = TurnId::new();
         let first = coordinator
-            .claim_native_turn(first_turn, test_turn_context())
+            .claim_native_turn(first_turn, test_external_defaults())
             .await
             .unwrap();
         coordinator
@@ -903,7 +1011,7 @@ mod tests {
 
         let second_turn = TurnId::new();
         let second = coordinator
-            .claim_native_turn(second_turn, test_turn_context())
+            .claim_native_turn(second_turn, test_external_defaults())
             .await
             .unwrap();
         coordinator
@@ -925,13 +1033,13 @@ mod tests {
         let coordinator = test_coordinator(ClassificationPhase::Subagent);
         let active_turn = TurnId::new();
         let active = coordinator
-            .claim_native_turn(active_turn, test_turn_context())
+            .claim_native_turn(active_turn, test_external_defaults())
             .await
             .unwrap();
 
         let other_turn = TurnId::new();
         let error = match coordinator
-            .claim_native_turn(other_turn, test_turn_context())
+            .claim_native_turn(other_turn, test_external_defaults())
             .await
         {
             Ok(_) => panic!("a second native turn must not replace the active turn"),
