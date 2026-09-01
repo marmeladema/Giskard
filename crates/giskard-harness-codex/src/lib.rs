@@ -27,7 +27,7 @@ use rand::RngCore;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use giskard_core::approval::ApprovalDecision;
 use giskard_core::error::HarnessError;
@@ -2510,10 +2510,35 @@ async fn handle_respond_approval(
     id: &ApprovalId,
     decision: &ApprovalDecision,
 ) -> Result<(), HarnessError> {
-    match mapper
-        .map_approval_response(id, decision)
-        .map_err(HarnessError::Protocol)?
-    {
+    let prepared = mapper
+        .prepare_approval_response(id, decision)
+        .map_err(HarnessError::Protocol)?;
+    write_prepared_approval(client, &prepared).await?;
+    if !mapper.commit_approval_response(&prepared) {
+        let (owner, request_id) = match &prepared.response {
+            mapping::ApprovalResponse::Result {
+                request_id, owner, ..
+            }
+            | mapping::ApprovalResponse::Error {
+                request_id, owner, ..
+            } => (*owner, request_id),
+        };
+        error!(
+            approval_id = %prepared.approval_id,
+            native_request_id = %request_id,
+            thread_id = %owner.thread,
+            turn_id = %owner.turn,
+            "approval response was written but its exact pending correlation was missing"
+        );
+    }
+    Ok(())
+}
+
+async fn write_prepared_approval(
+    client: &mut dyn CodexTransport,
+    prepared: &mapping::PreparedApprovalResponse,
+) -> Result<(), HarnessError> {
+    match &prepared.response {
         mapping::ApprovalResponse::Result {
             request_id,
             owner,
@@ -2524,9 +2549,9 @@ async fn handle_respond_approval(
                 CodexOperationContext::new("respond_approval")
                     .with_thread_id(owner.thread)
                     .with_giskard_turn_id(owner.turn)
-                    .with_request_id(&request_id),
+                    .with_request_id(request_id),
                 request_id.clone(),
-                value,
+                value.clone(),
             )
             .await
         }
@@ -2541,10 +2566,10 @@ async fn handle_respond_approval(
                 CodexOperationContext::new("respond_approval")
                     .with_thread_id(owner.thread)
                     .with_giskard_turn_id(owner.turn)
-                    .with_request_id(&request_id),
+                    .with_request_id(request_id),
                 request_id.clone(),
-                code,
-                &message,
+                *code,
+                message,
             )
             .await
         }
@@ -2573,7 +2598,14 @@ async fn handle_respond_server_request(
             codex_respond_error_json(client, context, request_id.clone(), code, &message).await?
         }
     }
-    mapper.resolve_server_request(id);
+    if !mapper.resolve_server_request(id, &request_id) {
+        error!(
+            request_id = %id,
+            native_request_id = %request_id,
+            thread_id = %pending.thread,
+            "server response was written but its exact pending correlation was missing"
+        );
+    }
     let thread = pending.thread;
     let turn = pending.turn;
     let request_id = id.clone();
@@ -2604,14 +2636,31 @@ async fn reject_pending_requests_for_interrupted_thread(
     }
 
     for approval_id in approval_ids {
-        if let Err(error) =
-            handle_respond_approval(client, mapper, &approval_id, &ApprovalDecision::Cancel).await
+        let prepared = match mapper
+            .prepare_approval_response(&approval_id, &ApprovalDecision::Cancel)
         {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                warn!(%thread, request_id = %approval_id, %error, "failed to prepare pending approval cancellation after interrupt");
+                continue;
+            }
+        };
+        if let Err(error) = write_prepared_approval(client, &prepared).await {
+            let discarded = mapper.discard_approval_response(&prepared);
             warn!(
                 %thread,
                 request_id = %approval_id,
+                native_request_id = %prepared.request_id(),
+                discarded,
                 %error,
                 "failed to cancel pending approval after interrupt"
+            );
+        } else if !mapper.commit_approval_response(&prepared) {
+            error!(
+                %thread,
+                request_id = %approval_id,
+                native_request_id = %prepared.request_id(),
+                "approval cancellation was written but its exact pending correlation was missing"
             );
         }
     }
@@ -3274,6 +3323,8 @@ mod tests {
         /// never set it does.
         config_model_provider: Option<String>,
         hang_response_json: bool,
+        respond_json_error: Option<String>,
+        respond_error_json_error: Option<String>,
         hang_shutdown: bool,
         block_shutdown: bool,
         shutdown_release: Arc<tokio::sync::Notify>,
@@ -3371,6 +3422,14 @@ mod tests {
 
         async fn hang_json_responses(&self) {
             self.state.lock().await.hang_response_json = true;
+        }
+
+        async fn fail_next_respond_json(&self, message: &str) {
+            self.state.lock().await.respond_json_error = Some(message.into());
+        }
+
+        async fn fail_next_respond_error_json(&self, message: &str) {
+            self.state.lock().await.respond_error_json_error = Some(message.into());
         }
 
         async fn hang_shutdown(&self) {
@@ -3615,6 +3674,9 @@ mod tests {
             value: Value,
         ) -> Result<(), HarnessError> {
             let mut state = self.state.lock().await;
+            if let Some(error) = state.respond_json_error.take() {
+                return Err(HarnessError::Transport(error));
+            }
             if state.hang_response_json {
                 drop(state);
                 std::future::pending().await
@@ -3630,15 +3692,15 @@ mod tests {
             code: i64,
             message: &str,
         ) -> Result<(), HarnessError> {
-            self.state
-                .lock()
-                .await
-                .response_errors
-                .push(FakeResponseError {
-                    id,
-                    code,
-                    message: message.to_owned(),
-                });
+            let mut state = self.state.lock().await;
+            if let Some(error) = state.respond_error_json_error.take() {
+                return Err(HarnessError::Transport(error));
+            }
+            state.response_errors.push(FakeResponseError {
+                id,
+                code,
+                message: message.to_owned(),
+            });
             Ok(())
         }
 
@@ -3886,6 +3948,27 @@ mod tests {
                     "startedAtMs": 123
                 }))
                 .expect("test approval request should deserialize"),
+            ),
+        }
+    }
+
+    fn permissions_approval_request(
+        id: &str,
+        native_thread_id: &str,
+        native_turn_id: &str,
+    ) -> codex_codes::ServerMessage {
+        codex_codes::ServerMessage::Request {
+            id: codex_codes::jsonrpc::RequestId::String(id.to_owned()),
+            request: codex_codes::messages::ServerRequest::PermissionsRequestApproval(
+                serde_json::from_value(json!({
+                    "cwd": "/tmp",
+                    "itemId": format!("permissions-{id}"),
+                    "permissions": { "network": { "enabled": true } },
+                    "threadId": native_thread_id,
+                    "turnId": native_turn_id,
+                    "startedAtMs": 123
+                }))
+                .expect("test permissions approval request should deserialize"),
             ),
         }
     }
@@ -4979,6 +5062,236 @@ mod tests {
             codex_codes::jsonrpc::RequestId::String("approval_req".into())
         );
         assert_eq!(responses[0].value, json!({"decision": "accept"}));
+    }
+
+    #[tokio::test]
+    async fn approval_result_response_can_retry_after_write_failure() {
+        let (harness, controller) = spawn_fake_harness();
+        let thread = harness
+            .open_thread(open_opts(ThreadId::new(), None))
+            .await
+            .unwrap();
+        harness
+            .start_turn(&thread, UserInput::text("approve"), build_turn_overrides())
+            .await
+            .unwrap();
+        let native_turn = controller.started_turns().await[0].native_turn_id.clone();
+        let mut stream = harness.subscribe(&thread);
+        controller
+            .send_server_message(command_approval_request(
+                "retry_approval",
+                &thread.harness_thread_id,
+                &native_turn,
+            ))
+            .await;
+        recv_matching_event(&mut stream, "approval request", |event| {
+            matches!(event, AgentEvent::ApprovalRequested { request, .. }
+                if request.id == ApprovalId("retry_approval".into()))
+        })
+        .await;
+
+        controller.fail_next_respond_json("injected failure").await;
+        let first = harness
+            .respond_approval(
+                ApprovalId("retry_approval".into()),
+                ApprovalDecision::Accept,
+            )
+            .await;
+        assert!(
+            matches!(first, Err(HarnessError::Transport(message)) if message == "injected failure")
+        );
+        assert!(controller.responses().await.is_empty());
+
+        harness
+            .respond_approval(
+                ApprovalId("retry_approval".into()),
+                ApprovalDecision::Accept,
+            )
+            .await
+            .unwrap();
+        let responses = controller.responses().await;
+        assert_eq!(responses.len(), 1);
+        assert_eq!(
+            responses[0].id,
+            codex_codes::jsonrpc::RequestId::String("retry_approval".into())
+        );
+        assert_eq!(responses[0].value, json!({"decision": "accept"}));
+        assert!(
+            harness
+                .respond_approval(
+                    ApprovalId("retry_approval".into()),
+                    ApprovalDecision::Accept,
+                )
+                .await
+                .is_err()
+        );
+        assert_eq!(controller.responses().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn approval_error_response_can_retry_after_write_failure() {
+        let (harness, controller) = spawn_fake_harness();
+        let thread = harness
+            .open_thread(open_opts(ThreadId::new(), None))
+            .await
+            .unwrap();
+        harness
+            .start_turn(&thread, UserInput::text("approve"), build_turn_overrides())
+            .await
+            .unwrap();
+        let native_turn = controller.started_turns().await[0].native_turn_id.clone();
+        let mut stream = harness.subscribe(&thread);
+        controller
+            .send_server_message(permissions_approval_request(
+                "retry_permissions",
+                &thread.harness_thread_id,
+                &native_turn,
+            ))
+            .await;
+        recv_matching_event(&mut stream, "permissions approval", |event| {
+            matches!(event, AgentEvent::ApprovalRequested { request, .. }
+                if request.id == ApprovalId("retry_permissions".into()))
+        })
+        .await;
+
+        controller
+            .fail_next_respond_error_json("injected failure")
+            .await;
+        let first = harness
+            .respond_approval(
+                ApprovalId("retry_permissions".into()),
+                ApprovalDecision::Decline,
+            )
+            .await;
+        assert!(
+            matches!(first, Err(HarnessError::Transport(message)) if message == "injected failure")
+        );
+        assert!(controller.response_errors().await.is_empty());
+
+        harness
+            .respond_approval(
+                ApprovalId("retry_permissions".into()),
+                ApprovalDecision::Decline,
+            )
+            .await
+            .unwrap();
+        let errors = controller.response_errors().await;
+        assert_eq!(errors.len(), 1);
+        assert_eq!(
+            errors[0].id,
+            codex_codes::jsonrpc::RequestId::String("retry_permissions".into())
+        );
+        assert_eq!(errors[0].code, -32000);
+        assert!(errors[0].message.contains("declined"));
+        assert!(
+            harness
+                .respond_approval(
+                    ApprovalId("retry_permissions".into()),
+                    ApprovalDecision::Decline,
+                )
+                .await
+                .is_err()
+        );
+        assert_eq!(controller.response_errors().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn generic_server_response_remains_retryable_after_write_failure() {
+        let (harness, controller) = spawn_fake_harness();
+        let thread = harness
+            .open_thread(open_opts(ThreadId::new(), None))
+            .await
+            .unwrap();
+        harness
+            .start_turn(&thread, UserInput::text("answer"), build_turn_overrides())
+            .await
+            .unwrap();
+        let native_turn = controller.started_turns().await[0].native_turn_id.clone();
+        let mut stream = harness.subscribe(&thread);
+        controller
+            .send_server_message(generic_user_input_request(
+                "retry_server",
+                &thread.harness_thread_id,
+                &native_turn,
+            ))
+            .await;
+        recv_matching_event(&mut stream, "server request", |event| {
+            matches!(event, AgentEvent::ServerRequestReceived { request, .. }
+                if request.id == ServerRequestId("retry_server".into()))
+        })
+        .await;
+
+        controller.fail_next_respond_json("injected failure").await;
+        let response = ServerRequestResponse::result(json!({"answer": true}));
+        let first = harness
+            .respond_server_request(ServerRequestId("retry_server".into()), response.clone())
+            .await;
+        assert!(
+            matches!(first, Err(HarnessError::Transport(message)) if message == "injected failure")
+        );
+        assert!(controller.responses().await.is_empty());
+
+        harness
+            .respond_server_request(ServerRequestId("retry_server".into()), response)
+            .await
+            .unwrap();
+        assert_eq!(controller.responses().await.len(), 1);
+        recv_matching_event(&mut stream, "server request resolution", |event| {
+            matches!(event, AgentEvent::ServerRequestResolved { request_id, .. }
+                if *request_id == ServerRequestId("retry_server".into()))
+        })
+        .await;
+        assert!(
+            harness
+                .respond_server_request(
+                    ServerRequestId("retry_server".into()),
+                    ServerRequestResponse::result(json!({"answer": false})),
+                )
+                .await
+                .is_err()
+        );
+        assert_eq!(controller.responses().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn failed_interrupt_approval_cancellation_is_abandoned() {
+        let (harness, controller) = spawn_fake_harness();
+        let thread = harness
+            .open_thread(open_opts(ThreadId::new(), None))
+            .await
+            .unwrap();
+        harness
+            .start_turn(&thread, UserInput::text("approve"), build_turn_overrides())
+            .await
+            .unwrap();
+        let native_turn = controller.started_turns().await[0].native_turn_id.clone();
+        let mut stream = harness.subscribe(&thread);
+        controller
+            .send_server_message(command_approval_request(
+                "interrupted_approval",
+                &thread.harness_thread_id,
+                &native_turn,
+            ))
+            .await;
+        recv_matching_event(&mut stream, "approval request", |event| {
+            matches!(event, AgentEvent::ApprovalRequested { request, .. }
+                if request.id == ApprovalId("interrupted_approval".into()))
+        })
+        .await;
+        controller.fail_next_respond_json("injected failure").await;
+
+        harness.interrupt(&thread).await.unwrap();
+        assert!(controller.responses().await.is_empty());
+        assert!(
+            harness
+                .respond_approval(
+                    ApprovalId("interrupted_approval".into()),
+                    ApprovalDecision::Accept,
+                )
+                .await
+                .is_err()
+        );
+        assert!(controller.responses().await.is_empty());
     }
 
     #[tokio::test]

@@ -574,9 +574,19 @@ Codex server requests use their JSON-RPC request ID for protocol responses. The
 adapter creates a Giskard `ApprovalId` or `ServerRequestId` for browser routing
 and retains the original request ID in an in-memory pending-request registry.
 
-The browser-facing ID is not a thread, turn, item, or process ID. Resolving a
-request removes the pending registry entry so duplicate or stale responses fail
-instead of being routed to another request.
+The browser-facing ID is not a thread, turn, item, or process ID. For ordinary
+browser responses, the adapter prepares the native response without mutation
+and removes the exact pending correlation only after the transport reports a
+successful write. A reported write failure therefore retains correlation for a
+browser retry. After an accepted interrupt, failed best-effort approval
+cancellation explicitly abandons that correlation because the stopped turn may
+no longer be answered. Exact native request-ID checks prevent stale completion
+from removing a replacement entry with the same browser-facing ID.
+
+This is adapter-state retry safety, not proof that retrying is wire-safe after a
+timeout. The current transport cannot distinguish no write from a partial frame
+or a completed frame whose flush reported failure; that requires the planned
+non-cancelling writer boundary.
 
 Current Codex file-change approval requests identify the associated item but do
 not carry its changed paths. With current Codex app-server ordering, the adapter
