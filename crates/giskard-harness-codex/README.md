@@ -20,7 +20,9 @@ independent worker mutates that state.
 
 `CodexTransport` remains the mockable request/read abstraction. `SenderMap` remains shared only
 because synchronous `AgentHarness::subscribe` must read it; `CodexInstance` is its sole runtime
-lifecycle mutator.
+lifecycle mutator. It also owns route establishment: durable bootstrap, explicit open/resume, and
+provider-owned child claims all use the same primitive. That operation claims identity before
+publishing the broadcast sender, and an idempotent claim preserves the existing sender.
 
 ## Identifier model
 
@@ -101,10 +103,12 @@ created.
 Every first binding receives a monotonically allocated route epoch for that
 adapter lifetime. Repeating the same native/local pair is idempotent; binding
 either side to a different identity is a protocol error and never rekeys state.
-These registries belong to one adapter worker and are rebuilt from durable
+These registries belong to one `CodexInstance` and are rebuilt from durable
 bootstrap when its Codex app-server process is respawned. Durable Giskard IDs
 and completed transcript items remain in Giskard persistence; native
-live-process state does not.
+live-process state does not. Deleting a thread removes its delivery sender but preserves its native
+identity claim for the lifetime of that Codex process; an identical later claim recreates the
+sender, while a conflicting identity remains an error.
 
 The turn key includes the Giskard thread because Codex does not expose a
 protocol contract making turn IDs globally unique across threads. The item key

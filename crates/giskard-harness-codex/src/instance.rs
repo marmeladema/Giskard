@@ -30,9 +30,10 @@ impl<C> CodexInstance<C> {
         worker_queue: Arc<WorkerQueueWatchdog>,
         workspace_root: PathBuf,
         writable_roots: Vec<PathBuf>,
-        mapper: CodexMapper,
-    ) -> Self {
-        Self {
+        bootstrap: HarnessBootstrap,
+    ) -> Result<Self, HarnessError> {
+        let mapper = CodexMapper::new(workspace_root.clone());
+        let mut instance = Self {
             client,
             receivers,
             senders,
@@ -43,7 +44,26 @@ impl<C> CodexInstance<C> {
             active_turns: HashMap::new(),
             pending_compactions: HashMap::new(),
             pending_context_restores: HashMap::new(),
+        };
+        for binding in bootstrap.known_threads {
+            instance.claim_thread_route(binding.harness_thread_id, binding.thread_id)?;
         }
+        Ok(instance)
+    }
+
+    fn claim_thread_route(
+        &mut self,
+        harness_thread_id: String,
+        thread_id: ThreadId,
+    ) -> Result<(), HarnessError> {
+        self.mapper.claim_thread(harness_thread_id, thread_id)?;
+        lock_senders(&self.senders)
+            .entry(thread_id)
+            .or_insert_with(|| {
+                let (sender, _) = broadcast::channel(BROADCAST_CAPACITY);
+                sender
+            });
+        Ok(())
     }
 }
 
@@ -186,9 +206,7 @@ where
     async fn handle_harness_command(&mut self, queued: QueuedHarnessCommand) {
         match queued.command {
             HarnessCommand::OpenThread { opts, response } => {
-                let result =
-                    handle_open_thread(&mut self.client, &mut self.mapper, &opts, &self.senders)
-                        .await;
+                let result = self.handle_open_thread(&opts).await;
                 match result {
                     Ok(outcome) => {
                         let handle = outcome.handle;
@@ -247,6 +265,91 @@ where
                 }
             }
         }
+    }
+
+    async fn handle_open_thread(
+        &mut self,
+        opts: &OpenThreadOptions,
+    ) -> Result<OpenThreadOutcome, HarnessError> {
+        let cwd = opts.workspace_root.to_string_lossy().to_string();
+        let thread_id = opts.thread;
+
+        // Track whether resume-by-id failed and we fell back to a fresh native thread (C5), so we
+        // can warn the caller that agent context was lost while keeping the Giskard-side history.
+        let mut resume_warning = None;
+
+        let opened = if let Some(ref resume_id) = opts.resume {
+            let context = CodexOperationContext::for_project("thread_resume", opts.project)
+                .with_thread_id(thread_id)
+                .with_harness_thread_id(resume_id);
+            match resume_thread(
+                &mut self.client,
+                context,
+                resume_id,
+                &cwd,
+                &opts.initial_model,
+            )
+            .await
+            {
+                Ok(opened) => opened,
+                Err(e) => {
+                    // C5: Codex thread store purged/rotated. Start fresh instead of hard-failing.
+                    resume_warning = Some(HarnessNotice {
+                        code: "codex_resume_failed".into(),
+                        message: "Agent context was lost; started a fresh Codex session. History is intact."
+                            .into(),
+                        detail: Some(e.to_string()),
+                    });
+                    let context = CodexOperationContext::for_project(
+                        "thread_start_after_resume_failed",
+                        opts.project,
+                    )
+                    .with_thread_id(thread_id);
+                    start_thread(&mut self.client, context, &cwd, &opts.initial_model).await?
+                }
+            }
+        } else {
+            let context = CodexOperationContext::for_project("thread_start", opts.project)
+                .with_thread_id(thread_id);
+            start_thread(&mut self.client, context, &cwd, &opts.initial_model).await?
+        };
+
+        // B4: bind the (possibly re-established) native id to the durable ThreadId.
+        self.claim_thread_route(opened.harness_thread_id.clone(), thread_id)?;
+
+        let _ = broadcast_event(&self.senders, thread_id, || AgentEvent::ThreadOpened {
+            thread: thread_id,
+            harness_thread_id: opened.harness_thread_id.clone(),
+        })
+        .await;
+
+        if let Some(warning) = &resume_warning {
+            let message = warning.message.clone();
+            let _ = broadcast_event(&self.senders, thread_id, || AgentEvent::Error {
+                thread: thread_id,
+                turn: None,
+                error: HarnessError::Transport(message),
+            })
+            .await;
+        }
+
+        let resume_replay_model = (opts.resume.is_some() && resume_warning.is_none())
+            .then(|| opened.model.clone())
+            .flatten();
+        Ok(OpenThreadOutcome {
+            handle: ThreadHandle {
+                warning: resume_warning,
+                resumed_model: opened.model,
+                agent_name: opened.agent_name,
+                parent_harness_thread_id: opened.parent_harness_thread_id,
+                ..ThreadHandle::opened(
+                    thread_id,
+                    opened.harness_thread_id,
+                    opts.workspace_root.clone(),
+                )
+            },
+            resume_replay_model,
+        })
     }
 }
 
@@ -378,11 +481,8 @@ where
                 response,
             } => {
                 let result = self
-                    .mapper
-                    .claim_thread(harness_thread_id.clone(), thread)
-                    .map(|_| {
-                        let (sender, _) = broadcast::channel(BROADCAST_CAPACITY);
-                        ensure_thread_sender(&self.senders, thread, sender);
+                    .claim_thread_route(harness_thread_id.clone(), thread)
+                    .map(|()| {
                         // A claim answers with the identity facts this harness lifetime already
                         // attested through its own events. It must not resume the thread to learn
                         // more: the native model stays unreported until an event names it.
