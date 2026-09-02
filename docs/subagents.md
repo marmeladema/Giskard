@@ -91,12 +91,10 @@ owner commits the real native turn, clears only the matching coordinator token, 
 turn's prompt context, and continues reading the same stream. Parent lifecycle labels establish or
 refresh links only: they never synthesize a child turn or terminal result.
 
-The current broadcast transport can report that a receiver lagged after dropping events. If that
-happens during a turn, Giskard persists the received prefix as `Interrupted` and keeps the owner
-usable. Later events for that native turn, including its real completion, are treated as belonging
-to the already-persisted turn and do not amend its transcript. This deliberate truncation is removed
-by the M3 bounded, backpressured transport, which prevents receiver lag instead of reconstructing
-missing events.
+The harness retains a thread's events until its owner consumes them, so owner installation or
+replacement cannot lose events. The retention cap (`EVENT_LOG_RETAIN_LIMIT`) is the only loss
+boundary and is reported to the owner as a gap. The owner persists the received prefix as an
+`Interrupted` turn with an explicit overflow message and then continues with retained events.
 
 ## Approvals raised inside a child
 

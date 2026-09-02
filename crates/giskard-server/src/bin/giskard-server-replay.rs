@@ -24,7 +24,6 @@ use std::sync::Arc;
 
 use argon2::PasswordHasher;
 use async_trait::async_trait;
-use tokio::sync::broadcast;
 use tracing::{error, info, warn};
 
 use giskard_core::approval::{ApprovalDecision, ApprovalKind, ApprovalMetadata, ApprovalRequest};
@@ -39,8 +38,8 @@ use giskard_core::token::TokenUsage;
 use giskard_core::turn::{TurnOverrides, TurnStatus, TurnStatusKind};
 use giskard_core::user_input::UserInput;
 use giskard_harness::{
-    AgentEventStream, AgentHarness, HarnessBootstrap, HarnessCapabilities, OpenThreadOptions,
-    ThreadHandle,
+    AgentEventStream, AgentHarness, EventLog, HarnessBootstrap, HarnessCapabilities,
+    OpenThreadOptions, ThreadHandle,
 };
 use giskard_persist::store::ProjectConfig;
 use giskard_server::{AppState, HarnessFactory, build_app};
@@ -108,10 +107,6 @@ const SCRIPTED_SERVER_REQUEST_THEN_ERROR_MESSAGE: &str = "Scripted non-fatal har
 const SCRIPTED_REASONING_TRIGGER: &str = "Think out loud before replying.";
 const SCRIPTED_REASONING_SUMMARY: &str = "Weighing the scripted options";
 const SCRIPTED_REASONING_DETAIL: &str = "Then answering with the deterministic scripted reply.";
-/// How long a scripted turn waits for the server's event forwarder to subscribe before giving up.
-const RECEIVER_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
-const RECEIVER_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(10);
-
 /// A harness that speaks the neutral protocol but has no backend: every turn streams the same
 /// canned agent message, so the browser-visible transcript is fully deterministic.
 struct ScriptedHarness {
@@ -122,7 +117,7 @@ struct ScriptedHarness {
     // Structural reason: This non-test-gated replay adapter cannot use server authorities.
     // Synchronization: The mutex protects linear lookup, insertion, and removal.
     // Invalidation/removal: Thread close removes state; dropping the harness removes all entries.
-    threads: tokio::sync::Mutex<Vec<(ThreadId, broadcast::Sender<AgentEvent>)>>,
+    threads: tokio::sync::Mutex<Vec<(ThreadId, Arc<EventLog>)>>,
     // ENTITY-AUTHORITY-EXCEPTION:
     // Role: Translate scripted native thread identifiers to Giskard thread identifiers.
     // Source of truth: Bootstrap and import claims establish the bijective bindings.
@@ -204,17 +199,7 @@ impl ScriptedHarness {
         Ok(())
     }
 
-    /// Wait for the server's event forwarder to attach before scripting a turn. A `broadcast` sender
-    /// drops anything sent with no receivers, so every scripted turn must gate on this.
-    async fn wait_for_receiver(sender: &broadcast::Sender<AgentEvent>) -> bool {
-        let deadline = tokio::time::Instant::now() + RECEIVER_WAIT_TIMEOUT;
-        while sender.receiver_count() == 0 && tokio::time::Instant::now() < deadline {
-            tokio::time::sleep(RECEIVER_POLL_INTERVAL).await;
-        }
-        sender.receiver_count() > 0
-    }
-
-    async fn sender_for(&self, thread: ThreadId) -> Option<broadcast::Sender<AgentEvent>> {
+    async fn sender_for(&self, thread: ThreadId) -> Option<Arc<EventLog>> {
         let threads = self.threads.lock().await;
         threads
             .iter()
@@ -239,7 +224,7 @@ impl ScriptedHarness {
         thread: ThreadId,
         harness_thread_id: &str,
     ) -> (Option<String>, bool) {
-        let (new_sender, _) = broadcast::channel(256);
+        let new_sender = Arc::new(EventLog::new());
         let mut threads = self.threads.lock().await;
         let (sender, is_new) =
             if let Some((_, existing)) = threads.iter().find(|(id, _)| *id == thread) {
@@ -269,15 +254,11 @@ impl ScriptedHarness {
     /// no sidebar row — the exact state the ancestor badge, the sub-agents button, and the approval
     /// notification have to surface.
     fn spawn_approval_subagent_turn(
-        sender: broadcast::Sender<AgentEvent>,
+        sender: Arc<EventLog>,
         thread_id: ThreadId,
         active_approvals: ActiveApprovals,
     ) {
         tokio::spawn(async move {
-            if !Self::wait_for_receiver(&sender).await {
-                return;
-            }
-
             // The forwarder is listening, but the browser opens its WebSocket a few milliseconds
             // after the HTTP call that started the parent turn. Thread activity is broadcast live
             // and never replayed on connect, so firing immediately would race the client and the
@@ -289,12 +270,12 @@ impl ScriptedHarness {
                 ApprovalId(SCRIPTED_SUBAGENT_APPROVAL_ID.into()),
                 (thread_id, turn),
             );
-            let _ = sender.send(AgentEvent::TurnStarted {
+            let _ = sender.append(AgentEvent::TurnStarted {
                 thread: thread_id,
                 turn,
             });
             tokio::task::yield_now().await;
-            let _ = sender.send(AgentEvent::ApprovalRequested {
+            let _ = sender.append(AgentEvent::ApprovalRequested {
                 thread: thread_id,
                 turn,
                 request: ApprovalRequest {
@@ -312,20 +293,16 @@ impl ScriptedHarness {
     }
 
     fn spawn_nested_subagent_turn(
-        sender: broadcast::Sender<AgentEvent>,
+        sender: Arc<EventLog>,
         thread_id: ThreadId,
         parent_harness_thread_id: String,
     ) {
         tokio::spawn(async move {
-            if !Self::wait_for_receiver(&sender).await {
-                return;
-            }
-
             let turn = TurnId::new();
             // Mirror the collaboration-v2 race seen from Codex: a turn-scoped sub-agent activity
             // can arrive before the corresponding TurnStarted notification.
             tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
-            let _ = sender.send(AgentEvent::ItemCompleted {
+            let _ = sender.append(AgentEvent::ItemCompleted {
                 thread: thread_id,
                 turn,
                 item: Item {
@@ -350,13 +327,13 @@ impl ScriptedHarness {
                 },
             });
             tokio::time::sleep(tokio::time::Duration::from_secs(3)).await;
-            let _ = sender.send(AgentEvent::TurnStarted {
+            let _ = sender.append(AgentEvent::TurnStarted {
                 thread: thread_id,
                 turn,
             });
             tokio::task::yield_now().await;
             let wait_item_id = ItemId::new();
-            let _ = sender.send(AgentEvent::ItemStarted {
+            let _ = sender.append(AgentEvent::ItemStarted {
                 thread: thread_id,
                 turn,
                 item: ItemStart {
@@ -376,7 +353,7 @@ impl ScriptedHarness {
                 },
             });
             tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
-            let _ = sender.send(AgentEvent::TurnCompleted {
+            let _ = sender.append(AgentEvent::TurnCompleted {
                 thread: thread_id,
                 turn,
                 usage: TokenUsage::new(30, 6),
@@ -389,22 +366,18 @@ impl ScriptedHarness {
     }
 
     fn spawn_subagent_turn(
-        sender: broadcast::Sender<AgentEvent>,
+        sender: Arc<EventLog>,
         thread_id: ThreadId,
         parent_harness_thread_id: String,
     ) {
         tokio::spawn(async move {
-            if !Self::wait_for_receiver(&sender).await {
-                return;
-            }
-
             let turn = TurnId::new();
-            let _ = sender.send(AgentEvent::TurnStarted {
+            let _ = sender.append(AgentEvent::TurnStarted {
                 thread: thread_id,
                 turn,
             });
             tokio::task::yield_now().await;
-            let _ = sender.send(AgentEvent::ItemCompleted {
+            let _ = sender.append(AgentEvent::ItemCompleted {
                 thread: thread_id,
                 turn,
                 item: Item {
@@ -417,7 +390,7 @@ impl ScriptedHarness {
                 },
             });
             tokio::task::yield_now().await;
-            let _ = sender.send(AgentEvent::ItemCompleted {
+            let _ = sender.append(AgentEvent::ItemCompleted {
                 thread: thread_id,
                 turn,
                 item: Item {
@@ -440,7 +413,7 @@ impl ScriptedHarness {
                 },
             });
             tokio::task::yield_now().await;
-            let _ = sender.send(AgentEvent::TurnCompleted {
+            let _ = sender.append(AgentEvent::TurnCompleted {
                 thread: thread_id,
                 turn,
                 usage: TokenUsage::new(40, 12),
@@ -605,23 +578,23 @@ impl AgentHarness for ScriptedHarness {
                     },
                     created_at: chrono::Utc::now(),
                 };
-                let _ = sender.send(AgentEvent::TurnStarted {
+                let _ = sender.append(AgentEvent::TurnStarted {
                     thread: thread_id,
                     turn,
                 });
                 tokio::task::yield_now().await;
-                let _ = sender.send(AgentEvent::ItemCompleted {
+                let _ = sender.append(AgentEvent::ItemCompleted {
                     thread: thread_id,
                     turn,
                     item: file_change("@@ -1 +1 @@\n-before\n+first version", "in_progress"),
                 });
                 tokio::time::sleep(SCRIPTED_DIFF_REPLACEMENT_DELAY).await;
-                let _ = sender.send(AgentEvent::ItemCompleted {
+                let _ = sender.append(AgentEvent::ItemCompleted {
                     thread: thread_id,
                     turn,
                     item: file_change("@@ -1 +1 @@\n-before\n+second version", "completed"),
                 });
-                let _ = sender.send(AgentEvent::DiffUpdated {
+                let _ = sender.append(AgentEvent::DiffUpdated {
                     thread: thread_id,
                     turn,
                     diff: giskard_core::FileDiff {
@@ -637,7 +610,7 @@ impl AgentHarness for ScriptedHarness {
                 // Keep the replacement live long enough for browser tests to exercise the
                 // superseded-id conflict before turn persistence releases runtime diff state.
                 tokio::time::sleep(SCRIPTED_DIFF_COMPLETION_DELAY).await;
-                let _ = sender.send(AgentEvent::TurnCompleted {
+                let _ = sender.append(AgentEvent::TurnCompleted {
                     thread: thread_id,
                     turn,
                     usage: TokenUsage::new(20, 8),
@@ -654,12 +627,12 @@ impl AgentHarness for ScriptedHarness {
                 // response to `respond_server_request`, which deliberately stays silent: a browser
                 // reload must still render the card resolved, from the server's recorded answer
                 // rather than from a harness resolved event that never comes.
-                let _ = sender.send(AgentEvent::TurnStarted {
+                let _ = sender.append(AgentEvent::TurnStarted {
                     thread: thread_id,
                     turn,
                 });
                 tokio::task::yield_now().await;
-                let _ = sender.send(AgentEvent::ServerRequestReceived {
+                let _ = sender.append(AgentEvent::ServerRequestReceived {
                     thread: thread_id,
                     turn: Some(turn),
                     request: giskard_core::server_request::ServerRequest {
@@ -681,7 +654,7 @@ impl AgentHarness for ScriptedHarness {
                 });
                 if raise_server_request_then_error {
                     tokio::task::yield_now().await;
-                    let _ = sender.send(AgentEvent::Error {
+                    let _ = sender.append(AgentEvent::Error {
                         thread: thread_id,
                         turn: Some(turn),
                         error: giskard_core::error::HarnessError::Protocol(
@@ -695,12 +668,12 @@ impl AgentHarness for ScriptedHarness {
             if raise_approval {
                 // Raise an approval and deliberately leave the turn in-flight (no TurnCompleted), so
                 // the live buffer keeps the answered state for reconnect assertions.
-                let _ = sender.send(AgentEvent::TurnStarted {
+                let _ = sender.append(AgentEvent::TurnStarted {
                     thread: thread_id,
                     turn,
                 });
                 tokio::task::yield_now().await;
-                let _ = sender.send(AgentEvent::ApprovalRequested {
+                let _ = sender.append(AgentEvent::ApprovalRequested {
                     thread: thread_id,
                     turn,
                     request: ApprovalRequest {
@@ -739,7 +712,7 @@ impl AgentHarness for ScriptedHarness {
                 });
                 if raise_approval_then_error {
                     tokio::task::yield_now().await;
-                    let _ = sender.send(AgentEvent::Error {
+                    let _ = sender.append(AgentEvent::Error {
                         thread: thread_id,
                         turn: Some(turn),
                         error: giskard_core::error::HarnessError::Protocol(
@@ -757,12 +730,12 @@ impl AgentHarness for ScriptedHarness {
                 } else {
                     SCRIPTED_SUBAGENT_AGENT_NAME
                 };
-                let _ = sender.send(AgentEvent::TurnStarted {
+                let _ = sender.append(AgentEvent::TurnStarted {
                     thread: thread_id,
                     turn,
                 });
                 tokio::task::yield_now().await;
-                let _ = sender.send(AgentEvent::ItemCompleted {
+                let _ = sender.append(AgentEvent::ItemCompleted {
                     thread: thread_id,
                     turn,
                     item: Item {
@@ -785,7 +758,7 @@ impl AgentHarness for ScriptedHarness {
                     },
                 });
                 tokio::task::yield_now().await;
-                let _ = sender.send(AgentEvent::TurnCompleted {
+                let _ = sender.append(AgentEvent::TurnCompleted {
                     thread: thread_id,
                     turn,
                     usage: TokenUsage::new(25, 5),
@@ -798,7 +771,7 @@ impl AgentHarness for ScriptedHarness {
             }
 
             let item_id = ItemId::new();
-            let _ = sender.send(AgentEvent::TurnStarted {
+            let _ = sender.append(AgentEvent::TurnStarted {
                 thread: thread_id,
                 turn,
             });
@@ -809,7 +782,7 @@ impl AgentHarness for ScriptedHarness {
                 let reasoning_id = ItemId::new();
                 let reasoning_text =
                     format!("**{SCRIPTED_REASONING_SUMMARY}**\n\n{SCRIPTED_REASONING_DETAIL}");
-                let _ = sender.send(AgentEvent::ItemStarted {
+                let _ = sender.append(AgentEvent::ItemStarted {
                     thread: thread_id,
                     turn,
                     item: ItemStart {
@@ -822,7 +795,7 @@ impl AgentHarness for ScriptedHarness {
                 });
                 tokio::task::yield_now().await;
                 for chunk in reasoning_text.split_inclusive(' ') {
-                    let _ = sender.send(AgentEvent::ItemDelta {
+                    let _ = sender.append(AgentEvent::ItemDelta {
                         thread: thread_id,
                         turn,
                         item_id: reasoning_id,
@@ -830,7 +803,7 @@ impl AgentHarness for ScriptedHarness {
                     });
                     tokio::task::yield_now().await;
                 }
-                let _ = sender.send(AgentEvent::ItemCompleted {
+                let _ = sender.append(AgentEvent::ItemCompleted {
                     thread: thread_id,
                     turn,
                     item: Item {
@@ -844,7 +817,7 @@ impl AgentHarness for ScriptedHarness {
                 });
                 tokio::task::yield_now().await;
             }
-            let _ = sender.send(AgentEvent::ItemStarted {
+            let _ = sender.append(AgentEvent::ItemStarted {
                 thread: thread_id,
                 turn,
                 item: ItemStart {
@@ -857,7 +830,7 @@ impl AgentHarness for ScriptedHarness {
             });
             tokio::task::yield_now().await;
             for word in SCRIPTED_REPLY.split_inclusive(' ') {
-                let _ = sender.send(AgentEvent::ItemDelta {
+                let _ = sender.append(AgentEvent::ItemDelta {
                     thread: thread_id,
                     turn,
                     item_id,
@@ -865,7 +838,7 @@ impl AgentHarness for ScriptedHarness {
                 });
                 tokio::task::yield_now().await;
             }
-            let _ = sender.send(AgentEvent::ItemCompleted {
+            let _ = sender.append(AgentEvent::ItemCompleted {
                 thread: thread_id,
                 turn,
                 item: Item {
@@ -878,7 +851,7 @@ impl AgentHarness for ScriptedHarness {
                 },
             });
             tokio::task::yield_now().await;
-            let _ = sender.send(AgentEvent::TurnCompleted {
+            let _ = sender.append(AgentEvent::TurnCompleted {
                 thread: thread_id,
                 turn,
                 usage: TokenUsage::new(120, 34),
@@ -896,10 +869,9 @@ impl AgentHarness for ScriptedHarness {
         if let Ok(threads) = self.threads.try_lock()
             && let Some((_, tx)) = threads.iter().find(|(id, _)| *id == thread.thread)
         {
-            return AgentEventStream::new(tx.subscribe());
+            return AgentEventStream::new(tx.reader());
         }
-        let (_, rx) = broadcast::channel(1);
-        AgentEventStream::new(rx)
+        AgentEventStream::closed()
     }
 
     async fn respond_approval(
@@ -922,7 +894,7 @@ impl AgentHarness for ScriptedHarness {
                 ApprovalDecision::Cancel => "cancel",
                 ApprovalDecision::AcceptWithExecPolicyAmendment { .. } => "accept_amended",
             };
-            let _ = sender.send(AgentEvent::ItemCompleted {
+            let _ = sender.append(AgentEvent::ItemCompleted {
                 thread: thread_id,
                 turn,
                 item: Item {

@@ -22,7 +22,7 @@ use giskard_core::token::TokenUsage;
 use giskard_core::turn::{Mode, PermissionPreset, TurnOverrides, TurnStatus, TurnStatusKind};
 use giskard_core::user_input::UserInput;
 use giskard_harness::{
-    AgentEventStream, AgentHarness, HarnessCapabilities, OpenThreadOptions, ThreadHandle,
+    AgentEventStream, AgentHarness, EventLog, HarnessCapabilities, OpenThreadOptions, ThreadHandle,
 };
 use giskard_harness_replay::{ReplayFixture, ReplayHarness};
 use giskard_persist::store::ProjectConfig;
@@ -237,19 +237,19 @@ struct NoMcpHarness;
 
 #[derive(Default)]
 struct UnsupportedCompactionHarness {
-    threads: tokio::sync::Mutex<HashMap<ThreadId, tokio::sync::broadcast::Sender<AgentEvent>>>,
+    threads: tokio::sync::Mutex<HashMap<ThreadId, Arc<EventLog>>>,
 }
 
 #[derive(Default)]
 struct SlowCompactionHarness {
-    threads: tokio::sync::Mutex<HashMap<ThreadId, tokio::sync::broadcast::Sender<AgentEvent>>>,
+    threads: tokio::sync::Mutex<HashMap<ThreadId, Arc<EventLog>>>,
     compact_calls: AtomicUsize,
     hold_compaction: AtomicBool,
     release_compaction: AtomicBool,
 }
 
 struct SlowStartHarness {
-    threads: tokio::sync::Mutex<HashMap<ThreadId, tokio::sync::broadcast::Sender<AgentEvent>>>,
+    threads: tokio::sync::Mutex<HashMap<ThreadId, Arc<EventLog>>>,
     start_calls: AtomicUsize,
     hold_first_start: AtomicBool,
     release_first_start: AtomicBool,
@@ -257,7 +257,7 @@ struct SlowStartHarness {
 
 #[derive(Default)]
 struct ActivityHarness {
-    threads: tokio::sync::Mutex<HashMap<ThreadId, tokio::sync::broadcast::Sender<AgentEvent>>>,
+    threads: tokio::sync::Mutex<HashMap<ThreadId, Arc<EventLog>>>,
     resumed_native_ids: tokio::sync::Mutex<Vec<String>>,
     claims: tokio::sync::Mutex<Vec<(String, ThreadId)>>,
     hold_native_child_open: AtomicBool,
@@ -272,7 +272,7 @@ struct ActivityHarness {
 
 #[derive(Default)]
 struct CountingOpenHarness {
-    threads: tokio::sync::Mutex<HashMap<ThreadId, tokio::sync::broadcast::Sender<AgentEvent>>>,
+    threads: tokio::sync::Mutex<HashMap<ThreadId, Arc<EventLog>>>,
     open_calls: AtomicUsize,
     claim_calls: AtomicUsize,
     start_calls: AtomicUsize,
@@ -414,7 +414,7 @@ impl ActivityHarness {
         let Some(sender) = self.threads.lock().await.get(&thread).cloned() else {
             return Err(HarnessError::ThreadNotFound(thread));
         };
-        let _ = sender.send(AgentEvent::TurnCompleted {
+        let _ = sender.append(AgentEvent::TurnCompleted {
             thread,
             turn,
             usage: TokenUsage::default(),
@@ -430,7 +430,7 @@ impl ActivityHarness {
         let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
         loop {
             if let Some(sender) = self.threads.lock().await.get(&thread)
-                && sender.receiver_count() >= expected
+                && sender.reader_count() >= expected
             {
                 return;
             }
@@ -449,7 +449,7 @@ impl ActivityHarness {
                 .lock()
                 .await
                 .get(&thread)
-                .map(tokio::sync::broadcast::Sender::receiver_count)
+                .map(|log| log.reader_count())
                 .unwrap_or_default();
             if count == expected {
                 return;
@@ -480,11 +480,11 @@ impl ActivityHarness {
             },
             created_at: chrono::Utc::now(),
         };
-        let _ = sender.send(AgentEvent::TurnStarted { thread, turn });
+        let _ = sender.append(AgentEvent::TurnStarted { thread, turn });
         tokio::task::yield_now().await;
-        let _ = sender.send(AgentEvent::ItemCompleted { thread, turn, item });
+        let _ = sender.append(AgentEvent::ItemCompleted { thread, turn, item });
         tokio::task::yield_now().await;
-        let _ = sender.send(AgentEvent::TurnCompleted {
+        let _ = sender.append(AgentEvent::TurnCompleted {
             thread,
             turn,
             usage: TokenUsage::default(),
@@ -526,11 +526,11 @@ impl ActivityHarness {
             },
             created_at: chrono::Utc::now(),
         };
-        let _ = sender.send(AgentEvent::TurnStarted { thread, turn });
+        let _ = sender.append(AgentEvent::TurnStarted { thread, turn });
         tokio::task::yield_now().await;
-        let _ = sender.send(AgentEvent::ItemCompleted { thread, turn, item });
+        let _ = sender.append(AgentEvent::ItemCompleted { thread, turn, item });
         tokio::task::yield_now().await;
-        let _ = sender.send(AgentEvent::TurnCompleted {
+        let _ = sender.append(AgentEvent::TurnCompleted {
             thread,
             turn,
             usage: TokenUsage::default(),
@@ -559,9 +559,9 @@ impl ActivityHarness {
             },
             created_at: chrono::Utc::now(),
         };
-        let _ = sender.send(AgentEvent::TurnStarted { thread, turn });
+        let _ = sender.append(AgentEvent::TurnStarted { thread, turn });
         tokio::task::yield_now().await;
-        let _ = sender.send(AgentEvent::ItemCompleted { thread, turn, item });
+        let _ = sender.append(AgentEvent::ItemCompleted { thread, turn, item });
         Ok(turn)
     }
 
@@ -575,9 +575,9 @@ impl ActivityHarness {
         };
         let turn = TurnId::new();
         let item_id = ItemId::new();
-        let _ = sender.send(AgentEvent::TurnStarted { thread, turn });
+        let _ = sender.append(AgentEvent::TurnStarted { thread, turn });
         tokio::task::yield_now().await;
-        let _ = sender.send(AgentEvent::ItemStarted {
+        let _ = sender.append(AgentEvent::ItemStarted {
             thread,
             turn,
             item: ItemStart {
@@ -607,7 +607,7 @@ impl ActivityHarness {
         let Some(sender) = self.threads.lock().await.get(&thread).cloned() else {
             return Err(HarnessError::ThreadNotFound(thread));
         };
-        let _ = sender.send(AgentEvent::ItemCompleted {
+        let _ = sender.append(AgentEvent::ItemCompleted {
             thread,
             turn,
             item: Item {
@@ -696,7 +696,7 @@ impl AgentHarness for UnsupportedCompactionHarness {
 
     async fn open_thread(&self, opts: OpenThreadOptions) -> Result<ThreadHandle, HarnessError> {
         let thread = opts.thread;
-        let (tx, _) = tokio::sync::broadcast::channel(16);
+        let tx = Arc::new(EventLog::new());
         self.threads.lock().await.insert(thread, tx);
         Ok(ThreadHandle {
             resumed_model: Some(opts.initial_model.clone()),
@@ -723,10 +723,9 @@ impl AgentHarness for UnsupportedCompactionHarness {
         if let Ok(threads) = self.threads.try_lock()
             && let Some(sender) = threads.get(&thread.thread)
         {
-            return AgentEventStream::new(sender.subscribe());
+            return AgentEventStream::new(sender.reader());
         }
-        let (_, rx) = tokio::sync::broadcast::channel(1);
-        AgentEventStream::new(rx)
+        AgentEventStream::closed()
     }
 
     async fn respond_approval(
@@ -786,7 +785,7 @@ impl AgentHarness for SlowCompactionHarness {
 
     async fn open_thread(&self, opts: OpenThreadOptions) -> Result<ThreadHandle, HarnessError> {
         let thread = opts.thread;
-        let (tx, _) = tokio::sync::broadcast::channel(32);
+        let tx = Arc::new(EventLog::new());
         self.threads.lock().await.insert(thread, tx);
         Ok(ThreadHandle {
             resumed_model: Some(opts.initial_model.clone()),
@@ -818,18 +817,18 @@ impl AgentHarness for SlowCompactionHarness {
                 },
                 created_at: chrono::Utc::now(),
             };
-            let _ = sender.send(AgentEvent::TurnStarted {
+            let _ = sender.append(AgentEvent::TurnStarted {
                 thread: thread_id,
                 turn,
             });
             tokio::task::yield_now().await;
-            let _ = sender.send(AgentEvent::ItemCompleted {
+            let _ = sender.append(AgentEvent::ItemCompleted {
                 thread: thread_id,
                 turn,
                 item,
             });
             tokio::task::yield_now().await;
-            let _ = sender.send(AgentEvent::TurnCompleted {
+            let _ = sender.append(AgentEvent::TurnCompleted {
                 thread: thread_id,
                 turn,
                 usage: TokenUsage::default(),
@@ -846,10 +845,9 @@ impl AgentHarness for SlowCompactionHarness {
         if let Ok(threads) = self.threads.try_lock()
             && let Some(sender) = threads.get(&thread.thread)
         {
-            return AgentEventStream::new(sender.subscribe());
+            return AgentEventStream::new(sender.reader());
         }
-        let (_, rx) = tokio::sync::broadcast::channel(1);
-        AgentEventStream::new(rx)
+        AgentEventStream::closed()
     }
 
     async fn respond_approval(
@@ -885,12 +883,12 @@ impl AgentHarness for SlowCompactionHarness {
         let thread_id = thread.thread;
         tokio::spawn(async move {
             let turn = TurnId::new();
-            let _ = sender.send(AgentEvent::TurnStarted {
+            let _ = sender.append(AgentEvent::TurnStarted {
                 thread: thread_id,
                 turn,
             });
             tokio::task::yield_now().await;
-            let _ = sender.send(AgentEvent::ItemCompleted {
+            let _ = sender.append(AgentEvent::ItemCompleted {
                 thread: thread_id,
                 turn,
                 item: Item {
@@ -906,7 +904,7 @@ impl AgentHarness for SlowCompactionHarness {
                 },
             });
             tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
-            let _ = sender.send(AgentEvent::TurnCompleted {
+            let _ = sender.append(AgentEvent::TurnCompleted {
                 thread: thread_id,
                 turn,
                 usage: TokenUsage::default(),
@@ -966,7 +964,7 @@ impl AgentHarness for ActivityHarness {
             }
         }
         let thread = opts.thread;
-        let (tx, _) = tokio::sync::broadcast::channel(32);
+        let tx = Arc::new(EventLog::new());
         self.threads.lock().await.insert(thread, tx);
         let harness_thread_id = opts.resume.unwrap_or_else(|| format!("test_{thread}"));
         let agent_name = (harness_thread_id == "native-collab-child").then(|| "James".to_string());
@@ -1000,10 +998,9 @@ impl AgentHarness for ActivityHarness {
             .await
             .push((harness_thread_id.clone(), thread));
         let mut threads = self.threads.lock().await;
-        threads.entry(thread).or_insert_with(|| {
-            let (sender, _) = tokio::sync::broadcast::channel(32);
-            sender
-        });
+        threads
+            .entry(thread)
+            .or_insert_with(|| Arc::new(EventLog::new()));
         // Mirrors the Codex adapter: a claim reports the parentage this harness lifetime already
         // attested through its own events, and nothing a resume would have to ask for.
         let parent_harness_thread_id = attested_native_parent(&harness_thread_id);
@@ -1025,7 +1022,7 @@ impl AgentHarness for ActivityHarness {
         let thread_id = thread.thread;
         let turn = TurnId::new();
         let text = input.as_text().unwrap_or_default().to_string();
-        let _ = sender.send(AgentEvent::TurnStarted {
+        let _ = sender.append(AgentEvent::TurnStarted {
             thread: thread_id,
             turn,
         });
@@ -1036,7 +1033,7 @@ impl AgentHarness for ActivityHarness {
                 .lock()
                 .await
                 .insert(approval_id.clone(), (thread_id, turn));
-            let _ = sender.send(AgentEvent::ApprovalRequested {
+            let _ = sender.append(AgentEvent::ApprovalRequested {
                 thread: thread_id,
                 turn,
                 request: ApprovalRequest {
@@ -1056,7 +1053,7 @@ impl AgentHarness for ActivityHarness {
                 .lock()
                 .await
                 .insert(request_id.clone(), (thread_id, turn));
-            let _ = sender.send(AgentEvent::ServerRequestReceived {
+            let _ = sender.append(AgentEvent::ServerRequestReceived {
                 thread: thread_id,
                 turn: Some(turn),
                 request: ServerRequest {
@@ -1076,7 +1073,7 @@ impl AgentHarness for ActivityHarness {
         } else if text.contains("subagent terminal fallback") {
             let item_id = ItemId::new();
             let harness_item_id = format!("subagent_terminal_{turn}");
-            let _ = sender.send(AgentEvent::ItemStarted {
+            let _ = sender.append(AgentEvent::ItemStarted {
                 thread: thread_id,
                 turn,
                 item: ItemStart {
@@ -1124,7 +1121,7 @@ impl AgentHarness for ActivityHarness {
                 },
                 created_at: chrono::Utc::now(),
             };
-            let _ = sender.send(AgentEvent::ItemCompleted {
+            let _ = sender.append(AgentEvent::ItemCompleted {
                 thread: thread_id,
                 turn,
                 item,
@@ -1149,7 +1146,7 @@ impl AgentHarness for ActivityHarness {
                 },
                 created_at: chrono::Utc::now(),
             };
-            let _ = sender.send(AgentEvent::ItemCompleted {
+            let _ = sender.append(AgentEvent::ItemCompleted {
                 thread: thread_id,
                 turn,
                 item,
@@ -1167,7 +1164,7 @@ impl AgentHarness for ActivityHarness {
                 },
                 created_at: chrono::Utc::now(),
             };
-            let _ = sender.send(AgentEvent::ItemCompleted {
+            let _ = sender.append(AgentEvent::ItemCompleted {
                 thread: thread_id,
                 turn,
                 item,
@@ -1191,7 +1188,7 @@ impl AgentHarness for ActivityHarness {
                 },
                 created_at: chrono::Utc::now(),
             };
-            let _ = sender.send(AgentEvent::ItemCompleted {
+            let _ = sender.append(AgentEvent::ItemCompleted {
                 thread: thread_id,
                 turn,
                 item,
@@ -1215,7 +1212,7 @@ impl AgentHarness for ActivityHarness {
                 },
                 created_at: chrono::Utc::now(),
             };
-            let _ = sender.send(AgentEvent::ItemCompleted {
+            let _ = sender.append(AgentEvent::ItemCompleted {
                 thread: thread_id,
                 turn,
                 item,
@@ -1239,14 +1236,14 @@ impl AgentHarness for ActivityHarness {
                 },
                 created_at: chrono::Utc::now(),
             };
-            let _ = sender.send(AgentEvent::ItemCompleted {
+            let _ = sender.append(AgentEvent::ItemCompleted {
                 thread: thread_id,
                 turn,
                 item,
             });
             tokio::spawn(async move {
                 tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
-                let _ = sender.send(AgentEvent::ItemStarted {
+                let _ = sender.append(AgentEvent::ItemStarted {
                     thread: thread_id,
                     turn,
                     item: ItemStart {
@@ -1274,7 +1271,7 @@ impl AgentHarness for ActivityHarness {
                 });
             });
         } else if text.contains("collab spawn input fallback") {
-            let _ = sender.send(AgentEvent::ItemStarted {
+            let _ = sender.append(AgentEvent::ItemStarted {
                 thread: thread_id,
                 turn,
                 item: ItemStart {
@@ -1301,7 +1298,7 @@ impl AgentHarness for ActivityHarness {
                 },
             });
         } else if text.contains("nested collab spawn") {
-            let _ = sender.send(AgentEvent::ItemStarted {
+            let _ = sender.append(AgentEvent::ItemStarted {
                 thread: thread_id,
                 turn,
                 item: ItemStart {
@@ -1328,7 +1325,7 @@ impl AgentHarness for ActivityHarness {
                 },
             });
         } else if text.contains("collab spawn") {
-            let _ = sender.send(AgentEvent::ItemStarted {
+            let _ = sender.append(AgentEvent::ItemStarted {
                 thread: thread_id,
                 turn,
                 item: ItemStart {
@@ -1373,7 +1370,7 @@ impl AgentHarness for ActivityHarness {
                 },
                 created_at: chrono::Utc::now(),
             };
-            let _ = sender.send(AgentEvent::ItemCompleted {
+            let _ = sender.append(AgentEvent::ItemCompleted {
                 thread: thread_id,
                 turn,
                 item,
@@ -1390,10 +1387,9 @@ impl AgentHarness for ActivityHarness {
         if let Ok(threads) = self.threads.try_lock()
             && let Some(sender) = threads.get(&thread.thread)
         {
-            return AgentEventStream::new(sender.subscribe());
+            return AgentEventStream::new(sender.reader());
         }
-        let (_, rx) = tokio::sync::broadcast::channel(1);
-        AgentEventStream::new(rx)
+        AgentEventStream::closed()
     }
 
     async fn respond_approval(
@@ -1474,7 +1470,7 @@ impl AgentHarness for SlowStartHarness {
 
     async fn open_thread(&self, opts: OpenThreadOptions) -> Result<ThreadHandle, HarnessError> {
         let thread = opts.thread;
-        let (tx, _) = tokio::sync::broadcast::channel(32);
+        let tx = Arc::new(EventLog::new());
         self.threads.lock().await.insert(thread, tx);
         Ok(ThreadHandle {
             resumed_model: Some(opts.initial_model.clone()),
@@ -1513,18 +1509,18 @@ impl AgentHarness for SlowStartHarness {
             },
             created_at: chrono::Utc::now(),
         };
-        let _ = sender.send(AgentEvent::TurnStarted {
+        let _ = sender.append(AgentEvent::TurnStarted {
             thread: thread_id,
             turn,
         });
         tokio::task::yield_now().await;
-        let _ = sender.send(AgentEvent::ItemCompleted {
+        let _ = sender.append(AgentEvent::ItemCompleted {
             thread: thread_id,
             turn,
             item,
         });
         tokio::task::yield_now().await;
-        let _ = sender.send(AgentEvent::TurnCompleted {
+        let _ = sender.append(AgentEvent::TurnCompleted {
             thread: thread_id,
             turn,
             usage: TokenUsage::default(),
@@ -1540,10 +1536,9 @@ impl AgentHarness for SlowStartHarness {
         if let Ok(threads) = self.threads.try_lock()
             && let Some(sender) = threads.get(&thread.thread)
         {
-            return AgentEventStream::new(sender.subscribe());
+            return AgentEventStream::new(sender.reader());
         }
-        let (_, rx) = tokio::sync::broadcast::channel(1);
-        AgentEventStream::new(rx)
+        AgentEventStream::closed()
     }
 
     async fn respond_approval(
@@ -1606,7 +1601,7 @@ impl AgentHarness for CountingOpenHarness {
             .lock()
             .await
             .push(opts.initial_model.clone());
-        let (tx, _) = tokio::sync::broadcast::channel(16);
+        let tx = Arc::new(EventLog::new());
         self.threads.lock().await.insert(thread, tx);
         Ok(ThreadHandle {
             resumed_model: Some(opts.initial_model.clone()),
@@ -1626,7 +1621,7 @@ impl AgentHarness for CountingOpenHarness {
         workspace_root: PathBuf,
     ) -> Result<ThreadHandle, HarnessError> {
         self.claim_calls.fetch_add(1, Ordering::SeqCst);
-        let (tx, _) = tokio::sync::broadcast::channel(16);
+        let tx = Arc::new(EventLog::new());
         self.threads.lock().await.insert(thread, tx);
         Ok(ThreadHandle::opened(
             thread,
@@ -1658,7 +1653,7 @@ impl AgentHarness for CountingOpenHarness {
             threads.get(&thread.thread).cloned()
         }
         .ok_or(HarnessError::ThreadNotFound(thread.thread))?;
-        let _ = sender.send(AgentEvent::TurnStarted {
+        let _ = sender.append(AgentEvent::TurnStarted {
             thread: thread.thread,
             turn,
         });
@@ -1669,10 +1664,9 @@ impl AgentHarness for CountingOpenHarness {
         if let Ok(threads) = self.threads.try_lock()
             && let Some(sender) = threads.get(&thread.thread)
         {
-            return AgentEventStream::new(sender.subscribe());
+            return AgentEventStream::new(sender.reader());
         }
-        let (_, rx) = tokio::sync::broadcast::channel(1);
-        AgentEventStream::new(rx)
+        AgentEventStream::closed()
     }
 
     async fn respond_approval(
@@ -1749,8 +1743,7 @@ impl AgentHarness for NoMcpHarness {
     }
 
     fn subscribe(&self, _thread: &ThreadHandle) -> AgentEventStream {
-        let (_tx, rx) = tokio::sync::broadcast::channel(1);
-        AgentEventStream::new(rx)
+        AgentEventStream::closed()
     }
 
     async fn respond_approval(

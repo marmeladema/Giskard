@@ -18,12 +18,12 @@ use giskard_core::server_request::ServerRequestResponse;
 use giskard_core::turn::{TurnOverrides, TurnStatus, TurnStatusKind};
 use giskard_core::user_input::UserInput;
 use giskard_harness::{
-    AgentEventStream, AgentHarness, HarnessCapabilities, OpenThreadOptions, ThreadHandle,
+    AgentEventStream, AgentHarness, EventLog, HarnessCapabilities, OpenThreadOptions, ThreadHandle,
 };
 use giskard_persist::store::ProjectConfig;
 use giskard_proto::{ClientMessage, ServerMessage, TaskKind};
 use giskard_server::{AppState, HarnessFactory, build_app};
-use tokio::sync::{Mutex, broadcast};
+use tokio::sync::Mutex;
 use tokio::time::{Duration, Instant};
 
 use common::fake_native_model;
@@ -32,13 +32,13 @@ use thread_fixture::persist_primary_thread;
 /// Harness that, on `start_turn`, emits `TurnStarted` + an in-progress tool `ItemStarted` and
 /// leaves the turn open (the tool blocks the turn), so the server keeps a running tool task.
 struct ToolHarness {
-    tx: broadcast::Sender<AgentEvent>,
+    tx: Arc<EventLog>,
     active_turn: Mutex<Option<TurnId>>,
 }
 
 impl ToolHarness {
     fn new() -> Self {
-        let (tx, _) = broadcast::channel(64);
+        let tx = Arc::new(EventLog::new());
         Self {
             tx,
             active_turn: Mutex::new(None),
@@ -91,8 +91,10 @@ impl AgentHarness for ToolHarness {
         let turn = TurnId::new();
         let tid = thread.thread;
         *self.active_turn.lock().await = Some(turn);
-        let _ = self.tx.send(AgentEvent::TurnStarted { thread: tid, turn });
-        let _ = self.tx.send(AgentEvent::ItemStarted {
+        let _ = self
+            .tx
+            .append(AgentEvent::TurnStarted { thread: tid, turn });
+        let _ = self.tx.append(AgentEvent::ItemStarted {
             thread: tid,
             turn,
             item: ItemStart {
@@ -115,7 +117,7 @@ impl AgentHarness for ToolHarness {
     }
 
     fn subscribe(&self, _thread: &ThreadHandle) -> AgentEventStream {
-        AgentEventStream::new(self.tx.subscribe())
+        AgentEventStream::new(self.tx.reader())
     }
 
     async fn respond_approval(
@@ -142,7 +144,7 @@ impl AgentHarness for ToolHarness {
             .await
             .take()
             .unwrap_or_else(TurnId::new);
-        let _ = self.tx.send(AgentEvent::TurnCompleted {
+        let _ = self.tx.append(AgentEvent::TurnCompleted {
             thread: thread.thread,
             turn,
             usage: giskard_core::token::TokenUsage::default(),

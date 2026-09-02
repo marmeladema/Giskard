@@ -95,7 +95,7 @@ Cargo workspace with 8 crates under `crates/`:
   task-owned. Do not share them through `Arc<Mutex<_>>`, `Arc<RwLock<_>>`, or independent
   state-mutating workers; helper futures may borrow this state only through `&mut self`.
 - Every production Codex thread route must be established through the `CodexInstance` route
-  methods; do not claim or replace mapper identity and publish its event sender as separate
+  methods; do not claim or replace mapper identity and publish its event log as separate
   operations. Resume-fallback replacement must require the exact prior native/Giskard binding.
 - Atomic writes for all persistence (temp file + fsync + rename).
 - The store's per-thread locks are in-process `Mutex`es and order nothing between binaries. Anything

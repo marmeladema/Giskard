@@ -917,12 +917,12 @@ impl ThreadEventForwarder {
         exit_reason
     }
 
-    async fn handle_stream_error(&mut self, e: broadcast::error::RecvError) -> ForwarderControl {
+    async fn handle_stream_error(&mut self, e: EventStreamError) -> ForwarderControl {
         let thread_id = self.thread_id();
         let project_id = self.binding.project_id;
         let hub = self.shared.hub.clone();
         let runtime = self.shared.runtime.clone();
-        let lagged = matches!(e, broadcast::error::RecvError::Lagged(_));
+        let gap = matches!(&e, EventStreamError::Gap { .. });
         self.stream_error = Some(e.to_string());
         if self.turn.lease.is_none()
             && let (Some(token), Some(turn)) = (self.turn.owned_token, self.turn.owned_turn)
@@ -956,8 +956,8 @@ impl ThreadEventForwarder {
                 .is_some_and(|lease| !lease.is_released());
             let status = TurnStatus {
                 kind: TurnStatusKind::Interrupted,
-                message: Some(if lagged {
-                    "Harness event stream lagged before turn completion".into()
+                message: Some(if gap {
+                    "Harness event log overflowed before turn completion".into()
                 } else {
                     "Harness event stream ended before turn completion".into()
                 }),
@@ -1001,18 +1001,18 @@ impl ThreadEventForwarder {
                     .finish_native_turn(token, incomplete_turn)
                     .await;
             }
-            if lagged {
+            if gap {
                 self.turn.reset(&self.idle_context);
                 self.stream_error = None;
                 return ForwarderControl::Continue;
             }
             ForwarderControl::Exit(ForwarderExitReason::StreamEndedRecovered)
-        } else if lagged {
+        } else if let EventStreamError::Gap { dropped } = e {
             error!(
                 %project_id,
                 %thread_id,
-                ?e,
-                "event owner lagged while idle; continuing with retained events"
+                dropped,
+                "event log overflowed while idle; N events dropped"
             );
             self.stream_error = None;
             ForwarderControl::Continue
@@ -1761,11 +1761,11 @@ mod tests {
     use giskard_core::token::{TokenLedger, TokenUsage};
     use giskard_core::turn::{Mode, PermissionPreset, TurnMode, TurnModel, TurnStatusKind};
     use giskard_core::user_input::UserInput;
-    use giskard_harness::{AgentEventStream, ThreadHandle};
+    use giskard_harness::{AgentEventStream, EventLog, ThreadHandle};
     use giskard_persist::PersistStore;
     use giskard_persist::store::ThreadFile;
     use giskard_proto::{ServerMessage, WireAgentEvent};
-    use tokio::sync::{broadcast, mpsc};
+    use tokio::sync::mpsc;
     use tokio::task::JoinHandle;
 
     use super::*;
@@ -2341,7 +2341,7 @@ mod tests {
             .await
             .unwrap();
 
-        let (tx, _) = broadcast::channel(16);
+        let log = Arc::new(EventLog::new());
         let hub = Arc::new(Hub::new());
         let (client_tx, _client_rx) = mpsc::channel(16);
         let replacements = hub.register_client(1, client_tx.clone()).await;
@@ -2350,7 +2350,7 @@ mod tests {
         let handle = spawn_forwarder_handle(
             thread_id,
             project_id,
-            AgentEventStream::new(tx.subscribe()),
+            AgentEventStream::new(log.reader()),
             hub,
             store.clone(),
             ledger,
@@ -2358,12 +2358,11 @@ mod tests {
             "context window mismatch",
         );
 
-        tx.send(AgentEvent::TurnStarted {
+        assert!(log.append(AgentEvent::TurnStarted {
             thread: thread_id,
             turn: turn_id,
-        })
-        .unwrap();
-        tx.send(AgentEvent::ContextWindowUpdated {
+        }));
+        assert!(log.append(AgentEvent::ContextWindowUpdated {
             thread: thread_id,
             turn: turn_id,
             model: ModelRef {
@@ -2372,9 +2371,8 @@ mod tests {
                 reasoning_effort: None,
             },
             context_window: 400_000,
-        })
-        .unwrap();
-        tx.send(AgentEvent::TurnCompleted {
+        }));
+        assert!(log.append(AgentEvent::TurnCompleted {
             thread: thread_id,
             turn: turn_id,
             usage: TokenUsage::default(),
@@ -2382,9 +2380,8 @@ mod tests {
                 kind: TurnStatusKind::Completed,
                 message: None,
             },
-        })
-        .unwrap();
-        drop(tx);
+        }));
+        log.close();
 
         tokio::time::timeout(tokio::time::Duration::from_secs(2), handle)
             .await
@@ -2454,7 +2451,7 @@ mod tests {
             .await
             .unwrap();
 
-        let (tx, _) = broadcast::channel(16);
+        let log = Arc::new(EventLog::new());
         let hub = Arc::new(Hub::new());
         let (client_tx, _client_rx) = mpsc::channel(16);
         let replacements = hub.register_client(1, client_tx.clone()).await;
@@ -2463,7 +2460,7 @@ mod tests {
         let handle = spawn_forwarder_handle(
             thread_id,
             project_id,
-            AgentEventStream::new(tx.subscribe()),
+            AgentEventStream::new(log.reader()),
             hub,
             store.clone(),
             ledger,
@@ -2471,19 +2468,17 @@ mod tests {
             "context window match",
         );
 
-        tx.send(AgentEvent::TurnStarted {
+        assert!(log.append(AgentEvent::TurnStarted {
             thread: thread_id,
             turn: turn_id,
-        })
-        .unwrap();
-        tx.send(AgentEvent::ContextWindowUpdated {
+        }));
+        assert!(log.append(AgentEvent::ContextWindowUpdated {
             thread: thread_id,
             turn: turn_id,
             model: model.clone(),
             context_window: 258_400,
-        })
-        .unwrap();
-        tx.send(AgentEvent::TurnCompleted {
+        }));
+        assert!(log.append(AgentEvent::TurnCompleted {
             thread: thread_id,
             turn: turn_id,
             usage: TokenUsage::default(),
@@ -2491,9 +2486,8 @@ mod tests {
                 kind: TurnStatusKind::Completed,
                 message: None,
             },
-        })
-        .unwrap();
-        drop(tx);
+        }));
+        log.close();
 
         tokio::time::timeout(tokio::time::Duration::from_secs(2), handle)
             .await
@@ -2582,14 +2576,14 @@ mod tests {
             .await
             .unwrap();
 
-        let (tx, _) = broadcast::channel(64);
+        let log = Arc::new(EventLog::new());
         let hub = Arc::new(Hub::new());
         let ledger = ledger::spawn(store.clone());
 
         let (runtime, authority) = spawn_forwarder(
             thread_id,
             project_id,
-            AgentEventStream::new(tx.subscribe()),
+            AgentEventStream::new(log.reader()),
             hub.clone(),
             store.clone(),
             ledger.clone(),
@@ -2605,7 +2599,7 @@ mod tests {
             "one",
             TokenUsage::new(10, 1),
         );
-        tx.send(first_events.remove(0)).unwrap();
+        assert!(log.append(first_events.remove(0)));
         let rejected_diff = giskard_core::FileDiff {
             path: "src/rejected.rs".into(),
             change: giskard_core::FileChangeKind::Modified,
@@ -2618,14 +2612,13 @@ mod tests {
         let rejected_id = giskard_core::capture_structured_diff(rejected_diff.clone())
             .1
             .id;
-        tx.send(AgentEvent::DiffUpdated {
+        assert!(log.append(AgentEvent::DiffUpdated {
             thread: thread_id,
             turn: second_turn,
             diff: rejected_diff,
-        })
-        .unwrap();
+        }));
         for event in first_events {
-            tx.send(event).unwrap();
+            assert!(log.append(event));
         }
         wait_for_turn_count(&store, project_id, thread_id, 1).await;
         assert!(matches!(
@@ -2640,7 +2633,7 @@ mod tests {
             "two",
             TokenUsage::new(20, 2),
         ) {
-            tx.send(event).unwrap();
+            assert!(log.append(event));
         }
         wait_for_turn_count(&store, project_id, thread_id, 2).await;
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
@@ -2718,7 +2711,7 @@ mod tests {
             .await
             .unwrap();
 
-        let (tx, rx) = broadcast::channel(32);
+        let log = Arc::new(EventLog::new());
         let shared = Arc::new(super::RegistryShared::new(
             Arc::new(Hub::new()),
             store.clone(),
@@ -2747,13 +2740,13 @@ mod tests {
                 shared.clone(),
                 authority,
                 coordinator.clone(),
-                AgentEventStream::new(rx),
+                AgentEventStream::new(log.reader()),
                 cancel_rx,
             )
             .await
             .run(),
         );
-        assert_eq!(tx.receiver_count(), 1);
+        assert_eq!(log.reader_count(), 1);
 
         let first_turn = TurnId::new();
         for event in turn_events(
@@ -2763,7 +2756,7 @@ mod tests {
             "first",
             TokenUsage::new(1, 1),
         ) {
-            tx.send(event).unwrap();
+            assert!(log.append(event));
         }
         wait_for_turn_count(&store, project_id, thread_id, 1).await;
 
@@ -2798,11 +2791,11 @@ mod tests {
             "second",
             TokenUsage::new(2, 2),
         ) {
-            tx.send(event).unwrap();
+            assert!(log.append(event));
         }
         wait_for_turn_count(&store, project_id, thread_id, 2).await;
-        assert_eq!(tx.receiver_count(), 1);
-        drop(tx);
+        assert_eq!(log.reader_count(), 1);
+        log.close();
         forwarder.await.unwrap();
 
         let turns = store.load_all_turns(project_id, thread_id).await.unwrap();
@@ -2863,13 +2856,13 @@ mod tests {
             .await
             .unwrap();
 
-        let (tx, _) = broadcast::channel(64);
+        let log = Arc::new(EventLog::new());
         let hub = Arc::new(Hub::new());
         let ledger = ledger::spawn(store.clone());
         let (handle, runtime, _coordinator, authority) = spawn_forwarder_handle_with_runtime(
             thread_id,
             project_id,
-            AgentEventStream::new(tx.subscribe()),
+            AgentEventStream::new(log.reader()),
             hub,
             store.clone(),
             ledger,
@@ -2879,12 +2872,11 @@ mod tests {
 
         let turn = TurnId::new();
         let command_item = ItemId::new();
-        tx.send(AgentEvent::TurnStarted {
+        assert!(log.append(AgentEvent::TurnStarted {
             thread: thread_id,
             turn,
-        })
-        .unwrap();
-        tx.send(AgentEvent::ItemStarted {
+        }));
+        assert!(log.append(AgentEvent::ItemStarted {
             thread: thread_id,
             turn,
             item: ItemStart {
@@ -2900,9 +2892,8 @@ mod tests {
                 }),
                 tool: None,
             },
-        })
-        .unwrap();
-        tx.send(AgentEvent::ItemCompleted {
+        }));
+        assert!(log.append(AgentEvent::ItemCompleted {
             thread: thread_id,
             turn,
             item: Item {
@@ -2922,9 +2913,8 @@ mod tests {
                 },
                 created_at: Utc::now(),
             },
-        })
-        .unwrap();
-        tx.send(AgentEvent::TurnCompleted {
+        }));
+        assert!(log.append(AgentEvent::TurnCompleted {
             thread: thread_id,
             turn,
             usage: TokenUsage::default(),
@@ -2932,11 +2922,21 @@ mod tests {
                 kind: TurnStatusKind::Completed,
                 message: None,
             },
-        })
-        .unwrap();
+        }));
 
         wait_for_turn_count(&store, project_id, thread_id, 1).await;
-        let tasks = runtime.tasks_snapshot(&authority).1;
+        let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(2);
+        let tasks = loop {
+            let tasks = runtime.tasks_snapshot(&authority).1;
+            if tasks.first().is_some_and(|task| task.after_turn) {
+                break tasks;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "persisted command was not marked after-turn"
+            );
+            tokio::task::yield_now().await;
+        };
         assert_eq!(tasks.len(), 1);
         assert!(tasks[0].after_turn);
         assert!(tasks[0].process_id.is_none());
@@ -2945,13 +2945,12 @@ mod tests {
         // old process's terminal replacement must update running-task state without being mistaken
         // for an event belonging to the new turn.
         let next_turn = TurnId::new();
-        tx.send(AgentEvent::TurnStarted {
+        assert!(log.append(AgentEvent::TurnStarted {
             thread: thread_id,
             turn: next_turn,
-        })
-        .unwrap();
+        }));
 
-        tx.send(AgentEvent::ItemCompleted {
+        assert!(log.append(AgentEvent::ItemCompleted {
             thread: thread_id,
             turn,
             item: Item {
@@ -2971,8 +2970,7 @@ mod tests {
                 },
                 created_at: Utc::now(),
             },
-        })
-        .unwrap();
+        }));
 
         let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(2);
         while !runtime.tasks_snapshot(&authority).1.is_empty() {
@@ -2984,7 +2982,7 @@ mod tests {
         }
         assert!(runtime.has_active_turn(&authority));
 
-        tx.send(AgentEvent::TurnCompleted {
+        assert!(log.append(AgentEvent::TurnCompleted {
             thread: thread_id,
             turn: next_turn,
             usage: TokenUsage::default(),
@@ -2992,15 +2990,14 @@ mod tests {
                 kind: TurnStatusKind::Completed,
                 message: None,
             },
-        })
-        .unwrap();
+        }));
         wait_for_turn_count(&store, project_id, thread_id, 2).await;
         let turns = store.load_all_turns(project_id, thread_id).await.unwrap();
         assert_eq!(turns.len(), 2);
         assert_eq!(turns[0].id, turn);
         assert_eq!(turns[1].id, next_turn);
         assert!(turns[1].items.is_empty());
-        drop(tx);
+        log.close();
 
         tokio::time::timeout(tokio::time::Duration::from_secs(2), handle)
             .await
@@ -3056,13 +3053,13 @@ mod tests {
             .await
             .unwrap();
 
-        let (tx, _) = broadcast::channel(64);
+        let log = Arc::new(EventLog::new());
         let hub = Arc::new(Hub::new());
         let ledger = ledger::spawn(store.clone());
         let (handle, runtime, _coordinator, authority) = spawn_forwarder_handle_with_runtime(
             thread_id,
             project_id,
-            AgentEventStream::new(tx.subscribe()),
+            AgentEventStream::new(log.reader()),
             hub,
             store.clone(),
             ledger,
@@ -3071,12 +3068,11 @@ mod tests {
         );
 
         let turn = TurnId::new();
-        tx.send(AgentEvent::TurnStarted {
+        assert!(log.append(AgentEvent::TurnStarted {
             thread: thread_id,
             turn,
-        })
-        .unwrap();
-        tx.send(AgentEvent::ItemCompleted {
+        }));
+        assert!(log.append(AgentEvent::ItemCompleted {
             thread: thread_id,
             turn,
             item: Item {
@@ -3087,9 +3083,8 @@ mod tests {
                 },
                 created_at: Utc::now(),
             },
-        })
-        .unwrap();
-        tx.send(AgentEvent::ItemStarted {
+        }));
+        assert!(log.append(AgentEvent::ItemStarted {
             thread: thread_id,
             turn,
             item: ItemStart {
@@ -3105,9 +3100,8 @@ mod tests {
                 }),
                 tool: None,
             },
-        })
-        .unwrap();
-        drop(tx);
+        }));
+        log.close();
 
         tokio::time::timeout(tokio::time::Duration::from_secs(2), handle)
             .await
@@ -3145,20 +3139,20 @@ mod tests {
             .await
             .unwrap();
 
-        let (tx, _) = broadcast::channel(8);
+        let log = Arc::new(EventLog::new());
         let hub = Arc::new(Hub::new());
         let ledger = ledger::spawn(store.clone());
         let (handle, runtime, coordinator, authority) = spawn_forwarder_handle_with_runtime(
             thread_id,
             project_id,
-            AgentEventStream::new(tx.subscribe()),
+            AgentEventStream::new(log.reader()),
             hub,
             store,
             ledger,
             model.clone(),
             "never started",
         );
-        drop(tx);
+        log.close();
 
         tokio::time::timeout(tokio::time::Duration::from_secs(2), handle)
             .await
@@ -3263,14 +3257,14 @@ mod tests {
             .await
             .unwrap();
 
-        let (tx, _) = broadcast::channel(16);
+        let log = Arc::new(EventLog::new());
         let hub = Arc::new(Hub::new());
         let ledger = ledger::spawn(store.clone());
 
         let (runtime, authority) = spawn_forwarder(
             thread_id,
             project_id,
-            AgentEventStream::new(tx.subscribe()),
+            AgentEventStream::new(log.reader()),
             hub,
             store,
             ledger,
@@ -3278,7 +3272,7 @@ mod tests {
             "next",
         );
 
-        tx.send(AgentEvent::ItemStarted {
+        assert!(log.append(AgentEvent::ItemStarted {
             thread: thread_id,
             turn,
             item: ItemStart {
@@ -3294,8 +3288,7 @@ mod tests {
                 }),
                 tool: None,
             },
-        })
-        .unwrap();
+        }));
 
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
         assert!(
@@ -3391,7 +3384,7 @@ mod tests {
             .await
             .unwrap();
 
-        let (tx, _) = broadcast::channel(16);
+        let log = Arc::new(EventLog::new());
         let hub = Arc::new(Hub::new());
         let (client_tx, mut client_rx) = mpsc::channel(16);
         let _replacements = hub.register_client(1, client_tx).await;
@@ -3401,7 +3394,7 @@ mod tests {
         let (runtime, authority) = spawn_forwarder(
             thread_id,
             project_id,
-            AgentEventStream::new(tx.subscribe()),
+            AgentEventStream::new(log.reader()),
             hub,
             store,
             ledger,
@@ -3410,7 +3403,7 @@ mod tests {
         );
 
         assert!(runtime.tasks_snapshot(&authority).1.is_empty());
-        tx.send(AgentEvent::ItemCompleted {
+        assert!(log.append(AgentEvent::ItemCompleted {
             thread: thread_id,
             turn,
             item: Item {
@@ -3430,8 +3423,7 @@ mod tests {
                 },
                 created_at: now,
             },
-        })
-        .unwrap();
+        }));
 
         let message = tokio::time::timeout(tokio::time::Duration::from_secs(1), async {
             loop {
@@ -3505,7 +3497,7 @@ mod tests {
             .await
             .unwrap();
 
-        let (tx, _) = broadcast::channel(64);
+        let log = Arc::new(EventLog::new());
         let hub = Arc::new(Hub::new());
         let ledger = ledger::spawn(store.clone());
         let (client_tx, mut client_rx) = mpsc::channel(16);
@@ -3515,7 +3507,7 @@ mod tests {
         let (runtime, authority) = spawn_forwarder(
             thread_id,
             project_id,
-            AgentEventStream::new(tx.subscribe()),
+            AgentEventStream::new(log.reader()),
             hub,
             store.clone(),
             ledger,
@@ -3530,7 +3522,7 @@ mod tests {
             "wrong",
             TokenUsage::new(99, 1),
         ) {
-            tx.send(event).unwrap();
+            assert!(log.append(event));
         }
 
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
@@ -3598,7 +3590,7 @@ mod tests {
             .await
             .unwrap();
 
-        let (tx, _) = broadcast::channel(64);
+        let log = Arc::new(EventLog::new());
         let hub = Arc::new(Hub::new());
         let ledger = ledger::spawn(store.clone());
         let (client_tx, mut client_rx) = mpsc::channel(16);
@@ -3608,7 +3600,7 @@ mod tests {
         let (runtime, authority) = spawn_forwarder(
             thread_id,
             project_id,
-            AgentEventStream::new(tx.subscribe()),
+            AgentEventStream::new(log.reader()),
             hub,
             store.clone(),
             ledger,
@@ -3675,7 +3667,7 @@ mod tests {
         ];
 
         for event in foreign_events {
-            tx.send(event).unwrap();
+            assert!(log.append(event));
         }
 
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
@@ -3749,7 +3741,7 @@ mod tests {
             .await
             .unwrap();
 
-        let (tx, _) = broadcast::channel(64);
+        let log = Arc::new(EventLog::new());
         let hub = Arc::new(Hub::new());
         let ledger = ledger::spawn(store.clone());
         let (client_tx, mut client_rx) = mpsc::channel(16);
@@ -3759,7 +3751,7 @@ mod tests {
         let (runtime, authority) = spawn_forwarder(
             thread_id,
             project_id,
-            AgentEventStream::new(tx.subscribe()),
+            AgentEventStream::new(log.reader()),
             hub,
             store.clone(),
             ledger,
@@ -3768,7 +3760,7 @@ mod tests {
         );
 
         let request_id = ServerRequestId("turnless_request".into());
-        tx.send(AgentEvent::ServerRequestReceived {
+        assert!(log.append(AgentEvent::ServerRequestReceived {
             thread: thread_id,
             turn: None,
             request: ServerRequest {
@@ -3779,8 +3771,7 @@ mod tests {
                 }),
                 received_at: Utc::now(),
             },
-        })
-        .unwrap();
+        }));
 
         tokio::time::timeout(tokio::time::Duration::from_secs(2), async {
             loop {
@@ -3865,7 +3856,7 @@ mod tests {
             .await
             .unwrap();
 
-        let (tx, _) = broadcast::channel(64);
+        let log = Arc::new(EventLog::new());
         let hub = Arc::new(Hub::new());
         let (client_tx, mut client_rx) = mpsc::channel(16);
         let _replacements = hub.register_client(1, client_tx).await;
@@ -3875,7 +3866,7 @@ mod tests {
         spawn_forwarder(
             thread_id,
             project_id,
-            AgentEventStream::new(tx.subscribe()),
+            AgentEventStream::new(log.reader()),
             hub,
             store,
             ledger,
@@ -3884,20 +3875,18 @@ mod tests {
         );
 
         let turn = TurnId::new();
-        tx.send(AgentEvent::TurnStarted {
+        assert!(log.append(AgentEvent::TurnStarted {
             thread: thread_id,
             turn,
-        })
-        .unwrap();
+        }));
         for _ in 0..2 {
-            tx.send(AgentEvent::Notice {
+            assert!(log.append(AgentEvent::Notice {
                 thread: thread_id,
                 turn: Some(turn),
                 message: "Heads up: Long threads and multiple compactions can cause drift.".into(),
-            })
-            .unwrap();
+            }));
         }
-        tx.send(AgentEvent::TurnCompleted {
+        assert!(log.append(AgentEvent::TurnCompleted {
             thread: thread_id,
             turn,
             usage: TokenUsage::default(),
@@ -3905,8 +3894,7 @@ mod tests {
                 kind: TurnStatusKind::Completed,
                 message: None,
             },
-        })
-        .unwrap();
+        }));
 
         let mut notice_count = 0;
         let mut completed = false;
@@ -3928,18 +3916,16 @@ mod tests {
         assert_eq!(notice_count, 1);
 
         let next_turn = TurnId::new();
-        tx.send(AgentEvent::TurnStarted {
+        assert!(log.append(AgentEvent::TurnStarted {
             thread: thread_id,
             turn: next_turn,
-        })
-        .unwrap();
-        tx.send(AgentEvent::Notice {
+        }));
+        assert!(log.append(AgentEvent::Notice {
             thread: thread_id,
             turn: Some(next_turn),
             message: "Heads up: Long threads and multiple compactions can cause drift.".into(),
-        })
-        .unwrap();
-        tx.send(AgentEvent::TurnCompleted {
+        }));
+        assert!(log.append(AgentEvent::TurnCompleted {
             thread: thread_id,
             turn: next_turn,
             usage: TokenUsage::default(),
@@ -3947,8 +3933,7 @@ mod tests {
                 kind: TurnStatusKind::Completed,
                 message: None,
             },
-        })
-        .unwrap();
+        }));
 
         let mut second_notice_count = 0;
         loop {
@@ -3969,7 +3954,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn forwarder_lag_recovers_but_truncates_the_interrupted_native_turn() {
+    async fn forwarder_gap_recovers_but_truncates_the_interrupted_native_turn() {
         let tmp = tempfile::TempDir::new().unwrap();
         let store = Arc::new(PersistStore::new(tmp.path().to_path_buf()));
         let project_id = ProjectId::new();
@@ -4013,15 +3998,14 @@ mod tests {
             .await
             .unwrap();
 
-        let (tx, _) = broadcast::channel(2);
-        let stream = AgentEventStream::new(tx.subscribe());
+        let log = Arc::new(EventLog::with_limit(2));
+        let stream = AgentEventStream::new(log.reader());
         for sequence in 0..3 {
-            tx.send(AgentEvent::Notice {
+            assert!(log.append(AgentEvent::Notice {
                 thread: thread_id,
                 turn: None,
                 message: format!("queued notice {sequence}"),
-            })
-            .unwrap();
+            }));
         }
         let hub = Arc::new(Hub::new());
         let (client_tx, mut client_rx) = mpsc::channel(16);
@@ -4055,12 +4039,11 @@ mod tests {
         .expect("the forwarder should continue after reporting lag");
 
         let turn = TurnId::new();
-        tx.send(AgentEvent::TurnStarted {
+        assert!(log.append(AgentEvent::TurnStarted {
             thread: thread_id,
             turn,
-        })
-        .unwrap();
-        tx.send(AgentEvent::TurnCompleted {
+        }));
+        assert!(log.append(AgentEvent::TurnCompleted {
             thread: thread_id,
             turn,
             usage: TokenUsage::default(),
@@ -4068,8 +4051,7 @@ mod tests {
                 kind: TurnStatusKind::Completed,
                 message: None,
             },
-        })
-        .unwrap();
+        }));
 
         tokio::time::timeout(tokio::time::Duration::from_secs(5), async {
             loop {
@@ -4089,11 +4071,10 @@ mod tests {
         .expect("a turn after lag should be persisted normally");
 
         let lagged_turn = TurnId::new();
-        tx.send(AgentEvent::TurnStarted {
+        assert!(log.append(AgentEvent::TurnStarted {
             thread: thread_id,
             turn: lagged_turn,
-        })
-        .unwrap();
+        }));
         tokio::time::timeout(tokio::time::Duration::from_secs(5), async {
             loop {
                 if coordinator.owns_native_turn_for_test(lagged_turn).await {
@@ -4106,12 +4087,11 @@ mod tests {
         .expect("the native turn should become active before forcing lag");
 
         for sequence in 0..3 {
-            tx.send(AgentEvent::Notice {
+            assert!(log.append(AgentEvent::Notice {
                 thread: thread_id,
                 turn: Some(lagged_turn),
                 message: format!("lagging active turn {sequence}"),
-            })
-            .unwrap();
+            }));
         }
         tokio::time::timeout(tokio::time::Duration::from_secs(5), async {
             loop {
@@ -4132,7 +4112,7 @@ mod tests {
         .await
         .expect("lag should persist the active native turn as interrupted");
 
-        tx.send(AgentEvent::TurnCompleted {
+        assert!(log.append(AgentEvent::TurnCompleted {
             thread: thread_id,
             turn: lagged_turn,
             usage: TokenUsage::default(),
@@ -4140,14 +4120,12 @@ mod tests {
                 kind: TurnStatusKind::Completed,
                 message: None,
             },
-        })
-        .unwrap();
-        tx.send(AgentEvent::Notice {
+        }));
+        assert!(log.append(AgentEvent::Notice {
             thread: thread_id,
             turn: None,
             message: "completion fence after lag".into(),
-        })
-        .unwrap();
+        }));
         tokio::time::timeout(tokio::time::Duration::from_secs(5), async {
             loop {
                 if matches!(
@@ -4162,12 +4140,11 @@ mod tests {
         .await
         .expect("the owner should consume the real completion after lag");
         let following_turn = TurnId::new();
-        tx.send(AgentEvent::TurnStarted {
+        assert!(log.append(AgentEvent::TurnStarted {
             thread: thread_id,
             turn: following_turn,
-        })
-        .unwrap();
-        tx.send(AgentEvent::TurnCompleted {
+        }));
+        assert!(log.append(AgentEvent::TurnCompleted {
             thread: thread_id,
             turn: following_turn,
             usage: TokenUsage::default(),
@@ -4175,8 +4152,7 @@ mod tests {
                 kind: TurnStatusKind::Completed,
                 message: None,
             },
-        })
-        .unwrap();
+        }));
         tokio::time::timeout(tokio::time::Duration::from_secs(5), async {
             loop {
                 let turns = store.load_all_turns(project_id, thread_id).await.unwrap();
@@ -4340,13 +4316,13 @@ mod tests {
             })
             .await
             .unwrap();
-        let (tx, rx) = broadcast::channel(16);
+        let log = Arc::new(EventLog::new());
         let forwarder = tokio::spawn(
             ThreadEventForwarder::new(
                 shared,
                 authority,
                 coordinator,
-                AgentEventStream::new(rx),
+                AgentEventStream::new(log.reader()),
                 cancel_rx,
             )
             .await
@@ -4359,9 +4335,9 @@ mod tests {
             "external output",
             TokenUsage::new(1, 1),
         ) {
-            tx.send(event).unwrap();
+            assert!(log.append(event));
         }
-        drop(tx);
+        log.close();
         forwarder.await.unwrap();
 
         let turns = store.load_all_turns(project_id, thread_id).await.unwrap();
@@ -4505,7 +4481,7 @@ mod tests {
             .await
             .unwrap();
 
-        let (tx, _) = broadcast::channel(64);
+        let log = Arc::new(EventLog::new());
         let hub = Arc::new(Hub::new());
         let (client_tx, mut client_rx) = mpsc::channel(64);
         let _replacements = hub.register_client(1, client_tx).await;
@@ -4515,7 +4491,7 @@ mod tests {
         spawn_forwarder(
             thread_id,
             project_id,
-            AgentEventStream::new(tx.subscribe()),
+            AgentEventStream::new(log.reader()),
             hub,
             store.clone(),
             ledger,
@@ -4524,15 +4500,14 @@ mod tests {
         );
 
         let second_turn = TurnId::new();
-        tx.send(AgentEvent::TurnStarted {
+        assert!(log.append(AgentEvent::TurnStarted {
             thread: thread_id,
             turn: second_turn,
-        })
-        .unwrap();
+        }));
         // Two ItemCompleted events for the same harness id within the new turn: this should
         // upsert to a single persisted item carrying the latest payload, while the earlier
         // persisted turn keeps its own distinct item.
-        tx.send(AgentEvent::ItemCompleted {
+        assert!(log.append(AgentEvent::ItemCompleted {
             thread: thread_id,
             turn: second_turn,
             item: Item {
@@ -4543,9 +4518,8 @@ mod tests {
                 },
                 created_at: now,
             },
-        })
-        .unwrap();
-        tx.send(AgentEvent::ItemCompleted {
+        }));
+        assert!(log.append(AgentEvent::ItemCompleted {
             thread: thread_id,
             turn: second_turn,
             item: Item {
@@ -4556,9 +4530,8 @@ mod tests {
                 },
                 created_at: now,
             },
-        })
-        .unwrap();
-        tx.send(AgentEvent::ItemCompleted {
+        }));
+        assert!(log.append(AgentEvent::ItemCompleted {
             thread: thread_id,
             turn: second_turn,
             item: Item {
@@ -4569,9 +4542,8 @@ mod tests {
                 },
                 created_at: now,
             },
-        })
-        .unwrap();
-        tx.send(AgentEvent::TurnCompleted {
+        }));
+        assert!(log.append(AgentEvent::TurnCompleted {
             thread: thread_id,
             turn: second_turn,
             usage: TokenUsage::new(2, 2),
@@ -4579,8 +4551,7 @@ mod tests {
                 kind: TurnStatusKind::Completed,
                 message: None,
             },
-        })
-        .unwrap();
+        }));
 
         wait_for_turn_count(&store, project_id, thread_id, 2).await;
         let saved = store.load_all_turns(project_id, thread_id).await.unwrap();
@@ -4696,7 +4667,7 @@ mod tests {
             .await
             .unwrap();
 
-        let (tx, _) = broadcast::channel(64);
+        let log = Arc::new(EventLog::new());
         let hub = Arc::new(Hub::new());
         let (client_tx, mut client_rx) = mpsc::channel(64);
         let _replacements = hub.register_client(1, client_tx).await;
@@ -4706,7 +4677,7 @@ mod tests {
         spawn_forwarder(
             thread_id,
             project_id,
-            AgentEventStream::new(tx.subscribe()),
+            AgentEventStream::new(log.reader()),
             hub,
             store.clone(),
             ledger,
@@ -4716,12 +4687,11 @@ mod tests {
 
         let second_turn = TurnId::new();
         let second_item_id = ItemId::new();
-        tx.send(AgentEvent::TurnStarted {
+        assert!(log.append(AgentEvent::TurnStarted {
             thread: thread_id,
             turn: second_turn,
-        })
-        .unwrap();
-        tx.send(AgentEvent::ItemStarted {
+        }));
+        assert!(log.append(AgentEvent::ItemStarted {
             thread: thread_id,
             turn: second_turn,
             item: ItemStart {
@@ -4731,18 +4701,16 @@ mod tests {
                 command: None,
                 tool: None,
             },
-        })
-        .unwrap();
-        tx.send(AgentEvent::ItemDelta {
+        }));
+        assert!(log.append(AgentEvent::ItemDelta {
             thread: thread_id,
             turn: second_turn,
             item_id: second_item_id,
             delta: giskard_core::item::ItemDelta::Text {
                 text: "streaming".into(),
             },
-        })
-        .unwrap();
-        tx.send(AgentEvent::ItemCompleted {
+        }));
+        assert!(log.append(AgentEvent::ItemCompleted {
             thread: thread_id,
             turn: second_turn,
             item: Item {
@@ -4753,9 +4721,8 @@ mod tests {
                 },
                 created_at: now,
             },
-        })
-        .unwrap();
-        tx.send(AgentEvent::TurnCompleted {
+        }));
+        assert!(log.append(AgentEvent::TurnCompleted {
             thread: thread_id,
             turn: second_turn,
             usage: TokenUsage::new(2, 2),
@@ -4763,8 +4730,7 @@ mod tests {
                 kind: TurnStatusKind::Completed,
                 message: None,
             },
-        })
-        .unwrap();
+        }));
 
         wait_for_turn_count(&store, project_id, thread_id, 2).await;
 
@@ -4865,7 +4831,7 @@ mod tests {
             .await
             .unwrap();
 
-        let (tx, _) = broadcast::channel(64);
+        let log = Arc::new(EventLog::new());
         let hub = Arc::new(Hub::new());
         let (client_tx, mut client_rx) = mpsc::channel(64);
         let _replacements = hub.register_client(1, client_tx).await;
@@ -4875,7 +4841,7 @@ mod tests {
         spawn_forwarder(
             thread_id,
             project_id,
-            AgentEventStream::new(tx.subscribe()),
+            AgentEventStream::new(log.reader()),
             hub,
             store.clone(),
             ledger,
@@ -4886,12 +4852,11 @@ mod tests {
         let turn = TurnId::new();
         let item_id = ItemId::new();
         let harness = "agent_text";
-        tx.send(AgentEvent::TurnStarted {
+        assert!(log.append(AgentEvent::TurnStarted {
             thread: thread_id,
             turn,
-        })
-        .unwrap();
-        tx.send(AgentEvent::ItemStarted {
+        }));
+        assert!(log.append(AgentEvent::ItemStarted {
             thread: thread_id,
             turn,
             item: ItemStart {
@@ -4901,27 +4866,24 @@ mod tests {
                 command: None,
                 tool: None,
             },
-        })
-        .unwrap();
-        tx.send(AgentEvent::ItemDelta {
+        }));
+        assert!(log.append(AgentEvent::ItemDelta {
             thread: thread_id,
             turn,
             item_id,
             delta: giskard_core::item::ItemDelta::Text {
                 text: "first".into(),
             },
-        })
-        .unwrap();
-        tx.send(AgentEvent::ItemDelta {
+        }));
+        assert!(log.append(AgentEvent::ItemDelta {
             thread: thread_id,
             turn,
             item_id,
             delta: giskard_core::item::ItemDelta::Text {
                 text: " second".into(),
             },
-        })
-        .unwrap();
-        tx.send(AgentEvent::ItemCompleted {
+        }));
+        assert!(log.append(AgentEvent::ItemCompleted {
             thread: thread_id,
             turn,
             item: Item {
@@ -4932,9 +4894,8 @@ mod tests {
                 },
                 created_at: now,
             },
-        })
-        .unwrap();
-        tx.send(AgentEvent::TurnCompleted {
+        }));
+        assert!(log.append(AgentEvent::TurnCompleted {
             thread: thread_id,
             turn,
             usage: TokenUsage::new(3, 3),
@@ -4942,8 +4903,7 @@ mod tests {
                 kind: TurnStatusKind::Completed,
                 message: None,
             },
-        })
-        .unwrap();
+        }));
 
         wait_for_turn_count(&store, project_id, thread_id, 1).await;
 
@@ -4977,7 +4937,6 @@ mod tests {
     }
 
     #[tokio::test]
-    #[ignore = "M1: retained event log"]
     async fn replacement_forwarder_persists_events_sent_while_no_forwarder_ran() {
         let tmp = tempfile::TempDir::new().unwrap();
         let store = Arc::new(PersistStore::new(tmp.path().to_path_buf()));
@@ -5022,7 +4981,7 @@ mod tests {
             .await
             .unwrap();
 
-        let (tx, _) = broadcast::channel(256);
+        let log = Arc::new(EventLog::new());
         let hub = Arc::new(Hub::new());
         let (client_tx, mut client_rx) = mpsc::channel(64);
         let _replacements = hub.register_client(1, client_tx).await;
@@ -5032,7 +4991,7 @@ mod tests {
             spawn_forwarder_handle_with_runtime(
                 thread_id,
                 project_id,
-                AgentEventStream::new(tx.subscribe()),
+                AgentEventStream::new(log.reader()),
                 hub.clone(),
                 store.clone(),
                 ledger.clone(),
@@ -5053,12 +5012,11 @@ mod tests {
                 created_at: Utc::now(),
             },
         };
-        tx.send(AgentEvent::TurnStarted {
+        assert!(log.append(AgentEvent::TurnStarted {
             thread: thread_id,
             turn,
-        })
-        .unwrap();
-        tx.send(completed_item("before")).unwrap();
+        }));
+        assert!(log.append(completed_item("before")));
         tokio::time::timeout(tokio::time::Duration::from_secs(5), async {
             loop {
                 if matches!(
@@ -5082,23 +5040,20 @@ mod tests {
         first_forwarder.await.unwrap();
         coordinator.finish_retirement().await;
 
-        // With no receiver, `broadcast::Sender::send` returns `Err(SendError)` and discards the
-        // event. Production ignores that result (`giskard-harness-codex/src/lib.rs`,
-        // `broadcast_event`), so the test does too; the assertion below is the observable loss.
-        let _ = tx.send(completed_item("during-gap"));
+        assert!(log.append(completed_item("during-gap")));
 
         let (_second_forwarder, _runtime, _coordinator, _authority) =
             spawn_forwarder_handle_with_runtime(
                 thread_id,
                 project_id,
-                AgentEventStream::new(tx.subscribe()),
+                AgentEventStream::new(log.reader()),
                 hub,
                 store.clone(),
                 ledger,
                 model,
                 "second",
             );
-        tx.send(AgentEvent::TurnCompleted {
+        assert!(log.append(AgentEvent::TurnCompleted {
             thread: thread_id,
             turn,
             usage: TokenUsage::default(),
@@ -5106,8 +5061,7 @@ mod tests {
                 kind: TurnStatusKind::Completed,
                 message: None,
             },
-        })
-        .unwrap();
+        }));
 
         wait_for_turn_count(&store, project_id, thread_id, 1).await;
         let saved = store.load_all_turns(project_id, thread_id).await.unwrap();

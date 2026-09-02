@@ -79,10 +79,7 @@ impl<C> CodexInstance<C> {
     fn ensure_thread_route_sender(&self, thread_id: ThreadId) {
         lock_senders(&self.senders)
             .entry(thread_id)
-            .or_insert_with(|| {
-                let (sender, _) = broadcast::channel(BROADCAST_CAPACITY);
-                sender
-            });
+            .or_insert_with(|| Arc::new(EventLog::new()));
     }
 }
 
@@ -663,7 +660,9 @@ where
                     handle_delete_thread(&mut self.client, &thread).await
                 };
                 if result.is_ok() {
-                    lock_senders(&self.senders).remove(&thread.thread);
+                    if let Some(log) = lock_senders(&self.senders).remove(&thread.thread) {
+                        log.close();
+                    }
                     self.pending_context_restores
                         .remove(thread.harness_thread_id.as_str());
                 }

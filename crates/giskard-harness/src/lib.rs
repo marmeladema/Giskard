@@ -1,11 +1,13 @@
 //! The `AgentHarness` abstraction — the keystone of the harness-agnostic design (spec §4).
 
+mod event_log;
+pub use event_log::{EVENT_LOG_RETAIN_LIMIT, EventLog, EventLogReader, EventStreamError};
+
 use std::path::PathBuf;
 use std::time::Duration;
 
 use async_trait::async_trait;
-use futures::stream::BoxStream;
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::mpsc;
 use tracing::{debug, warn};
 
 use giskard_core::approval::ApprovalDecision;
@@ -413,37 +415,22 @@ pub struct HarnessNotice {
     pub detail: Option<String>,
 }
 
-/// A typed wrapper around a `broadcast::Receiver<AgentEvent>`.
-pub struct AgentEventStream {
-    rx: broadcast::Receiver<AgentEvent>,
-}
+/// A typed wrapper around a retained event-log reader.
+pub struct AgentEventStream(EventLogReader);
 
 impl AgentEventStream {
-    pub fn new(rx: broadcast::Receiver<AgentEvent>) -> Self {
-        Self { rx }
+    pub fn new(reader: EventLogReader) -> Self {
+        Self(reader)
     }
 
-    /// Returns the underlying receiver.
-    pub fn into_inner(self) -> broadcast::Receiver<AgentEvent> {
-        self.rx
+    /// A stream that is already closed and contains no events.
+    pub fn closed() -> Self {
+        Self(EventLog::closed_reader())
     }
 
     /// Recv next event (awaits).
-    pub async fn recv(&mut self) -> Result<AgentEvent, broadcast::error::RecvError> {
-        self.rx.recv().await
-    }
-
-    /// Convert to a `BoxStream` for ergonomic use with `futures`.
-    pub fn into_stream(self) -> BoxStream<'static, AgentEvent> {
-        use futures::StreamExt;
-        let rx = self.rx;
-        futures::stream::unfold(rx, |mut rx| async move {
-            match rx.recv().await {
-                Ok(event) => Some((event, rx)),
-                Err(_) => None,
-            }
-        })
-        .boxed()
+    pub async fn recv(&mut self) -> Result<AgentEvent, EventStreamError> {
+        self.0.recv().await
     }
 }
 

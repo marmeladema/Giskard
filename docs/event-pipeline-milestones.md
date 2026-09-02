@@ -72,6 +72,8 @@ failures.
 
 ## M1 — Retained event log in place of broadcast
 
+**Status.** Implemented by the retained-event-log change.
+
 **Goal.** Close windows B, C and D. Delete `Lagged` and the "persist prefix as Interrupted" fallback.
 
 **Seam.** `AgentEventStream` plus its producers. Server changes limited to the one error arm.
@@ -243,4 +245,3 @@ milestone is a PR that stands alone on `main`; none needs a long-lived branch.
 - The diff passes 1000 non-test lines.
 
 Any of these means stop, keep what is additive, and re-cut.
-

@@ -23,12 +23,12 @@ use giskard_core::token::TokenUsage;
 use giskard_core::turn::{TurnOverrides, TurnStatus, TurnStatusKind};
 use giskard_core::user_input::UserInput;
 use giskard_harness::{
-    AgentEventStream, AgentHarness, HarnessCapabilities, OpenThreadOptions, ThreadHandle,
+    AgentEventStream, AgentHarness, EventLog, HarnessCapabilities, OpenThreadOptions, ThreadHandle,
 };
 use giskard_persist::store::ProjectConfig;
 use giskard_proto::{ClientMessage, ErrorInfo, RunningTask, ServerMessage, WireAgentEvent};
 use giskard_server::{AppState, HarnessFactory, build_app};
-use tokio::sync::{Mutex, broadcast};
+use tokio::sync::Mutex;
 use tokio::time::{Duration, Instant};
 
 use common::fake_native_model;
@@ -47,7 +47,7 @@ enum TerminateBehavior {
 }
 
 struct InterruptHarness {
-    tx: broadcast::Sender<AgentEvent>,
+    tx: Arc<EventLog>,
     active: Mutex<Option<(ThreadId, TurnId)>>,
     command: Mutex<Option<(ThreadId, TurnId, ItemId)>>,
     interrupted: Mutex<Vec<ThreadId>>,
@@ -58,7 +58,7 @@ struct InterruptHarness {
 
 impl InterruptHarness {
     fn new() -> Self {
-        let (tx, _) = broadcast::channel(64);
+        let tx = Arc::new(EventLog::new());
         Self {
             tx,
             active: Mutex::new(None),
@@ -116,7 +116,7 @@ impl InterruptHarness {
         let Some((thread, turn, item_id)) = *self.command.lock().await else {
             panic!("command did not start");
         };
-        let _ = self.tx.send(AgentEvent::ItemCompleted {
+        let _ = self.tx.append(AgentEvent::ItemCompleted {
             thread,
             turn,
             item: Item {
@@ -184,13 +184,13 @@ impl AgentHarness for InterruptHarness {
     ) -> Result<TurnId, HarnessError> {
         let turn = TurnId::new();
         *self.active.lock().await = Some((thread.thread, turn));
-        let _ = self.tx.send(AgentEvent::TurnStarted {
+        let _ = self.tx.append(AgentEvent::TurnStarted {
             thread: thread.thread,
             turn,
         });
         let command_item = ItemId::new();
         *self.command.lock().await = Some((thread.thread, turn, command_item));
-        let _ = self.tx.send(AgentEvent::ItemStarted {
+        let _ = self.tx.append(AgentEvent::ItemStarted {
             thread: thread.thread,
             turn,
             item: ItemStart {
@@ -207,7 +207,7 @@ impl AgentHarness for InterruptHarness {
                 tool: None,
             },
         });
-        let _ = self.tx.send(AgentEvent::ItemDelta {
+        let _ = self.tx.append(AgentEvent::ItemDelta {
             thread: thread.thread,
             turn,
             item_id: command_item,
@@ -219,7 +219,7 @@ impl AgentHarness for InterruptHarness {
     }
 
     fn subscribe(&self, _thread: &ThreadHandle) -> AgentEventStream {
-        AgentEventStream::new(self.tx.subscribe())
+        AgentEventStream::new(self.tx.reader())
     }
 
     async fn respond_approval(
@@ -250,7 +250,7 @@ impl AgentHarness for InterruptHarness {
             .take()
             .map(|(_, turn)| turn)
             .unwrap_or_default();
-        let _ = self.tx.send(AgentEvent::TurnCompleted {
+        let _ = self.tx.append(AgentEvent::TurnCompleted {
             thread: thread.thread,
             turn,
             usage: TokenUsage::default(),

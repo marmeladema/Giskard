@@ -9,7 +9,13 @@
 
 **Document status:** Implementation-ready specification.
 **Audience:** An AI coding agent (and its human reviewer) implementing the system.
-**Version:** 1.77
+**Version:** 1.78
+
+> **Amendment — retained harness event log (1.78).** Harness events are retained per thread until
+> the event owner consumes them, so a reader created after an event was appended still receives it
+> and replacing an owner does not discard unconsumed events. The explicit per-log retention cap is
+> the only event-loss boundary; crossing it reports a typed gap with the dropped count. Broadcast
+> receiver `Lagged` errors no longer exist in the harness-to-server event path.
 
 > **Amendment — durable native identity foundation (1.77).** Harness construction receives a
 > complete, validated `HarnessBootstrap` before the adapter launches ordinary event dispatch; a failed scan,
@@ -1510,8 +1516,8 @@ A single Cargo workspace with focused crates. Names are prefixed `giskard-`.
     is somehow unsuitable.
 
   **Decision: use `codex-codes` with the `async-client` feature.** Its API maps directly onto the
-  `AgentHarness` trait; Giskard wraps `next_message()` into a `broadcast::Sender<AgentEvent>` for
-  multi-subscriber support and maps `codex-codes` types to `giskard-core` types at the boundary.
+  `AgentHarness` trait; Giskard appends `next_message()` results to a retained per-thread event log
+  and maps `codex-codes` types to `giskard-core` types at the boundary.
   If a future Codex CLI version diverges beyond what `codex-codes` tracks, fall back to a minimal
   hand-rolled JSON-RPC client inside `giskard-harness-codex`. **Either way, all Codex/app-server
   types must be confined to `giskard-harness-codex`** (nothing Codex-specific leaks upward) and the
@@ -1671,7 +1677,7 @@ pub trait AgentHarness: Send + Sync {
     ) -> Result<TurnId, HarnessError>;
 
     /// Subscribe to the stream of neutral events for a thread.
-    /// Implemented as a broadcast/mpsc receiver of `AgentEvent`.
+    /// Implemented as a cursor over a retained log of `AgentEvent` values.
     fn subscribe(&self, thread: &ThreadHandle) -> AgentEventStream;
 
     /// Respond to a pending approval request (no-op error if unsupported).
@@ -1725,8 +1731,8 @@ pub trait AgentHarness: Send + Sync {
 > `Arc<dyn AgentHarness>`, so this is a hard requirement, not a stylistic one. `#[async_trait]`
 > is used to keep `async fn` in the trait object-safe.
 
-`AgentEventStream` is an `impl Stream<Item = AgentEvent>` (or a typed wrapper around a
-`tokio::sync::broadcast::Receiver`). The registry installs exactly one consuming event owner per
+`AgentEventStream` is a typed wrapper around a retained event-log reader. The registry installs
+exactly one consuming event owner per
 loaded native thread. Browser tabs subscribe to the registry's projections, not to harness streams.
 
 ### 4.4 The neutral event model (`AgentEvent`)
@@ -2102,8 +2108,8 @@ including while `PersistenceBlocked`; persisted lookup targets the selected turn
 post-persistence late tool completion remains ignored and is logged until durable late-item
 amendments are implemented.
 
-> `AgentEventStream` is `impl Stream<Item = AgentEvent> + Send` (concretely a wrapper over a
-> `tokio::sync::broadcast::Receiver<AgentEvent>`), supporting multiple subscribers per thread.
+> `AgentEventStream` is a typed reader over a per-thread retained event log, supporting multiple
+> subscribers per thread without dropping events when a subscriber is installed or replaced.
 
 ### 4.6 Codex mapping (informative)
 

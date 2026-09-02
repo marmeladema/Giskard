@@ -18,7 +18,7 @@ use giskard_core::token::TokenUsage;
 use giskard_core::turn::{TurnOverrides, TurnStatus, TurnStatusKind};
 use giskard_core::user_input::UserInput;
 use giskard_harness::{
-    AgentEventStream, AgentHarness, HarnessCapabilities, OpenThreadOptions, ThreadHandle,
+    AgentEventStream, AgentHarness, EventLog, HarnessCapabilities, OpenThreadOptions, ThreadHandle,
 };
 use giskard_persist::store::{ProjectConfig, ThreadGitWorkspace};
 use giskard_server::{AppState, HarnessFactory, build_app};
@@ -235,7 +235,7 @@ struct RecordingHarness {
     /// async mutex it could only `try_lock` — handing back a stream over a dropped sender whenever
     /// the map happened to be held. Every event for that thread would then vanish and the test would
     /// fail on an unexplained timeout. Nothing holds this guard across an await.
-    threads: std::sync::Mutex<Vec<(ThreadId, tokio::sync::broadcast::Sender<AgentEvent>)>>,
+    threads: std::sync::Mutex<Vec<(ThreadId, Arc<EventLog>)>>,
     /// When set, the next turn reports having spawned a sub-agent with this native id, which is what
     /// drives the registry to materialize a linked thread the way Codex does.
     spawns_subagent: Mutex<Option<String>>,
@@ -263,7 +263,7 @@ impl AgentHarness for RecordingHarness {
             .await
             .push(opts.workspace_root.to_string_lossy().into_owned());
         let thread = opts.thread;
-        let (tx, _) = tokio::sync::broadcast::channel(16);
+        let tx = Arc::new(EventLog::new());
         self.threads.lock().unwrap().push((thread, tx));
         Ok(ThreadHandle {
             resumed_model: Some(opts.initial_model.clone()),
@@ -287,7 +287,7 @@ impl AgentHarness for RecordingHarness {
             .lock()
             .await
             .push(workspace_root.to_string_lossy().into_owned());
-        let (tx, _) = tokio::sync::broadcast::channel(16);
+        let tx = Arc::new(EventLog::new());
         self.threads.lock().unwrap().push((thread, tx));
         Ok(ThreadHandle::opened(
             thread,
@@ -315,12 +315,12 @@ impl AgentHarness for RecordingHarness {
             .find(|(id, _)| *id == thread.thread)
             .map(|(_, tx)| tx.clone());
         if let Some(tx) = sender {
-            let _ = tx.send(AgentEvent::TurnStarted {
+            let _ = tx.append(AgentEvent::TurnStarted {
                 thread: thread.thread,
                 turn,
             });
             if let Some(text) = self.agent_says.lock().await.clone() {
-                let _ = tx.send(AgentEvent::ItemCompleted {
+                let _ = tx.append(AgentEvent::ItemCompleted {
                     thread: thread.thread,
                     turn,
                     item: Item {
@@ -332,7 +332,7 @@ impl AgentHarness for RecordingHarness {
                 });
             }
             if let Some(child) = self.spawns_subagent.lock().await.take() {
-                let _ = tx.send(AgentEvent::ItemCompleted {
+                let _ = tx.append(AgentEvent::ItemCompleted {
                     thread: thread.thread,
                     turn,
                     item: Item {
@@ -361,7 +361,7 @@ impl AgentHarness for RecordingHarness {
                     },
                 });
             }
-            let _ = tx.send(AgentEvent::TurnCompleted {
+            let _ = tx.append(AgentEvent::TurnCompleted {
                 thread: thread.thread,
                 turn,
                 usage: TokenUsage::new(0, 0),
@@ -382,10 +382,9 @@ impl AgentHarness for RecordingHarness {
             .iter()
             .find(|(id, _)| *id == thread.thread)
         {
-            return AgentEventStream::new(tx.subscribe());
+            return AgentEventStream::new(tx.reader());
         }
-        let (_, rx) = tokio::sync::broadcast::channel(1);
-        AgentEventStream::new(rx)
+        AgentEventStream::closed()
     }
 
     async fn respond_approval(
