@@ -9,7 +9,15 @@
 
 **Document status:** Implementation-ready specification.
 **Audience:** An AI coding agent (and its human reviewer) implementing the system.
-**Version:** 1.78
+**Version:** 1.79
+
+> **Amendment — identity minted at ingest (1.79).** On the first frame carrying an unknown,
+> non-empty native thread ID, the harness binds it to a fresh final Giskard `ThreadId`, creates its
+> retained event log, and announces the binding on a retained per-harness discovery stream before
+> publishing that frame. The server persists an unclassified discovery as a hidden, read-only
+> `ThreadKind::Orphan` and installs its ordinary event owner. A later parent link classifies that
+> same identity as a sub-agent. Live native-thread claims adopt an identity already minted for the
+> native ID; exact durable bootstrap and open claims still reject conflicts.
 
 > **Amendment — retained harness event log (1.78).** Harness events are retained per thread until
 > the event owner consumes them, so a reader created after an event was appended still receives it
@@ -21,8 +29,9 @@
 > complete, validated `HarnessBootstrap` before the adapter launches ordinary event dispatch; a failed scan,
 > empty native ID, or non-bijective native/local mapping prevents publication. Every first binding
 > is an authoritative, idempotent route claim with one harness-lifetime epoch. Provider-owned child
-> discovery claims a final Giskard ID without `thread/resume` or other native work; conflicting
-> claims fail instead of rekeying. A relationship not yet known is represented durably as hidden,
+> discovery claims a final Giskard ID without `thread/resume` or other native work. Live claims
+> adopt a traffic-minted identity, while conflicting durable claims fail instead of rekeying. A
+> relationship not yet known is represented durably as hidden,
 > read-only `ThreadKind::Orphan`, whose only transition is a revision-checked
 > `Orphan -> Subagent`. Native model/mode metadata that has not been reported is persisted and sent
 > on the wire as `TurnModel::Unknown` / `TurnMode::Unknown` (`"unknown"`), never as a fabricated
@@ -1680,6 +1689,12 @@ pub trait AgentHarness: Send + Sync {
     /// Implemented as a cursor over a retained log of `AgentEvent` values.
     fn subscribe(&self, thread: &ThreadHandle) -> AgentEventStream;
 
+    /// Native threads this harness bound from traffic, retained until consumed.
+    /// Harnesses that do not discover native threads return a closed stream.
+    fn discoveries(&self) -> DiscoveryStream {
+        DiscoveryStream::closed()
+    }
+
     /// Respond to a pending approval request (no-op error if unsupported).
     async fn respond_approval(
         &self,
@@ -1731,9 +1746,10 @@ pub trait AgentHarness: Send + Sync {
 > `Arc<dyn AgentHarness>`, so this is a hard requirement, not a stylistic one. `#[async_trait]`
 > is used to keep `async fn` in the trait object-safe.
 
-`AgentEventStream` is a typed wrapper around a retained event-log reader. The registry installs
-exactly one consuming event owner per
-loaded native thread. Browser tabs subscribe to the registry's projections, not to harness streams.
+`AgentEventStream` and `DiscoveryStream` are typed wrappers around retained event-log readers. The
+registry installs exactly one discovery consumer per harness and exactly one consuming event owner
+per loaded native thread. Browser tabs subscribe to the registry's projections, not to harness
+streams.
 
 ### 4.4 The neutral event model (`AgentEvent`)
 

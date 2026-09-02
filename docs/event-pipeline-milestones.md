@@ -106,17 +106,19 @@ M0 tests B, C, D pass; `docs/subagents.md` paragraph on lag truncation deleted.
 
 ## M2 — Identity minted at ingest, discoveries announced
 
+**Status.** Implemented by the M2 identity-at-ingest change, which supersedes and closes #219.
+
 **Goal.** Close window A. Make `ThreadKind::Orphan` reachable. Retire #219.
 
 **Seam.** Adapter, plus one additive trait method and one additive server consumer.
 
-**Design.** In `NativeThreadRoutes::resolve`, an unknown non-empty native id is claimed with a fresh
-final `ThreadId` and its event log is created on the spot, so the frame that revealed the thread is
-the first entry in its log. The adapter appends `ThreadDiscovered { thread, harness_thread_id,
-parent_harness_thread_id }` to a per-harness discoveries log built on the same `EventLog` type, and
-`AgentHarness::discoveries()` returns a replaying reader for it. Because the child's log retains
-from its first event, the order in which the server consumes discoveries versus events is
-irrelevant.
+**Design.** When instance-level mapping reports an unknown non-empty native id, the adapter claims
+it with a fresh final `ThreadId` and creates its event log on the spot, then retries mapping so the
+frame that revealed the thread is the first entry in its log. The adapter appends
+`ThreadDiscovered { thread, harness_thread_id, parent_harness_thread_id }` to a per-harness
+discoveries log built on the same `EventLog` type before appending that event, and
+`AgentHarness::discoveries()` returns a replaying reader for it. The mapper's lower-level unknown
+route rejection remains unchanged.
 
 `claim_native_thread` keeps its signature. Its meaning changes in one respect: the proposed
 `ThreadId` is used only if the native id is unbound; if traffic already bound it, the returned

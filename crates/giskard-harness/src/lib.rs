@@ -434,6 +434,34 @@ impl AgentEventStream {
     }
 }
 
+/// A native thread the harness bound on first sight of its traffic.
+///
+/// The `ThreadId` is final: later live claims for the same native id adopt it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ThreadDiscovered {
+    pub thread: ThreadId,
+    pub harness_thread_id: String,
+    /// The native parent already attested by a sub-agent link, if known at discovery time.
+    pub parent_harness_thread_id: Option<String>,
+}
+
+/// Retained discoveries for one harness. Intended to have one consumer.
+pub struct DiscoveryStream(EventLogReader<ThreadDiscovered>);
+
+impl DiscoveryStream {
+    pub fn new(reader: EventLogReader<ThreadDiscovered>) -> Self {
+        Self(reader)
+    }
+
+    pub fn closed() -> Self {
+        Self(EventLog::closed_reader())
+    }
+
+    pub async fn recv(&mut self) -> Result<ThreadDiscovered, EventStreamError> {
+        self.0.recv().await
+    }
+}
+
 /// The neutral harness contract (spec §4.3).
 ///
 /// Every method is dyn-compatible: `&self` receivers, no generic method params, no `Self`-by-value.
@@ -491,8 +519,8 @@ pub trait AgentHarness: Send + Sync {
     ///
     /// This is used when an already-running agent reports a child thread. The returned handle is
     /// immediately subscribable, but the operation must not issue a provider RPC or make the
-    /// read-only child user-operable. Repeating the same pair is idempotent; either side already
-    /// bound to a different identity is a protocol error.
+    /// read-only child user-operable. If traffic already bound the native id, the returned handle
+    /// adopts that final `ThreadId`; a proposed `ThreadId` bound to another native id is an error.
     async fn claim_native_thread(
         &self,
         thread: ThreadId,
@@ -515,6 +543,11 @@ pub trait AgentHarness: Send + Sync {
 
     /// Subscribe to the stream of neutral events for a thread.
     fn subscribe(&self, thread: &ThreadHandle) -> AgentEventStream;
+
+    /// Native threads this harness bound from traffic, retained until consumed.
+    fn discoveries(&self) -> DiscoveryStream {
+        DiscoveryStream::closed()
+    }
 
     /// Respond to a pending approval request.
     async fn respond_approval(

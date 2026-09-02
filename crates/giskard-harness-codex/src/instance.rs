@@ -1,4 +1,5 @@
 use super::*;
+use crate::native_routes::UnknownNativeThread;
 
 /// One task-owned runtime for one Codex app-server process.
 ///
@@ -13,6 +14,7 @@ pub(super) struct CodexInstance<C> {
     client: C,
     receivers: WorkerReceivers,
     senders: SenderMap,
+    discoveries: Arc<EventLog<ThreadDiscovered>>,
     worker_queue: Arc<WorkerQueueWatchdog>,
     workspace_root: PathBuf,
     writable_roots: Vec<PathBuf>,
@@ -23,10 +25,12 @@ pub(super) struct CodexInstance<C> {
 }
 
 impl<C> CodexInstance<C> {
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn new(
         client: C,
         receivers: WorkerReceivers,
         senders: SenderMap,
+        discoveries: Arc<EventLog<ThreadDiscovered>>,
         worker_queue: Arc<WorkerQueueWatchdog>,
         workspace_root: PathBuf,
         writable_roots: Vec<PathBuf>,
@@ -37,6 +41,7 @@ impl<C> CodexInstance<C> {
             client,
             receivers,
             senders,
+            discoveries,
             worker_queue,
             workspace_root,
             writable_roots,
@@ -59,6 +64,18 @@ impl<C> CodexInstance<C> {
         self.mapper.claim_thread(harness_thread_id, thread_id)?;
         self.ensure_thread_route_sender(thread_id);
         Ok(())
+    }
+
+    fn claim_or_adopt_thread_route(
+        &mut self,
+        harness_thread_id: String,
+        proposed_thread_id: ThreadId,
+    ) -> Result<ThreadId, HarnessError> {
+        let thread_id = self
+            .mapper
+            .claim_or_adopt_thread(harness_thread_id, proposed_thread_id)?;
+        self.ensure_thread_route_sender(thread_id);
+        Ok(thread_id)
     }
 
     fn replace_thread_route(
@@ -97,6 +114,7 @@ where
                     cleanup_all_active_turn_uploads(&mut self.client, &mut self.active_turns).await;
                     shutdown_codex_transport(self.client, &self.workspace_root).await;
                     self.worker_queue.close();
+                    self.discoveries.close();
                     self.receivers.done.send_replace(true);
                     return;
                 }
@@ -216,6 +234,7 @@ where
             }
         }
         self.worker_queue.close();
+        self.discoveries.close();
         self.receivers.done.send_replace(true);
     }
 
@@ -382,6 +401,53 @@ impl<C> CodexInstance<C>
 where
     C: CodexTransport,
 {
+    fn map_or_discover<T>(
+        &mut self,
+        map: impl Fn(&mut CodexMapper) -> Result<T, UnknownNativeThread>,
+        frame: &'static str,
+    ) -> Option<T> {
+        match map(&mut self.mapper) {
+            Ok(mapped) => Some(mapped),
+            Err(UnknownNativeThread { native_thread_id }) => {
+                let thread = ThreadId::new();
+                if let Err(error) = self.claim_thread_route(native_thread_id.to_string(), thread) {
+                    warn!(
+                        native_thread_id = %native_thread_id,
+                        %thread,
+                        %error,
+                        frame,
+                        "could not bind a native thread discovered from traffic; dropping frame"
+                    );
+                    return None;
+                }
+                let parent = self.mapper.native_parent(native_thread_id.as_str());
+                info!(
+                    native_thread_id = %native_thread_id,
+                    %thread,
+                    parent_harness_thread_id = parent.as_deref(),
+                    frame,
+                    "bound a native thread discovered from traffic"
+                );
+                self.discoveries.append(ThreadDiscovered {
+                    thread,
+                    harness_thread_id: native_thread_id.to_string(),
+                    parent_harness_thread_id: parent,
+                });
+                match map(&mut self.mapper) {
+                    Ok(mapped) => Some(mapped),
+                    Err(error) => {
+                        error!(
+                            native_thread_id = %error.native_thread_id,
+                            frame,
+                            "native thread still unknown after binding; dropping frame"
+                        );
+                        None
+                    }
+                }
+            }
+        }
+    }
+
     async fn handle_server_message(
         &mut self,
         message: codex_codes::ServerMessage,
@@ -389,7 +455,13 @@ where
         let fallback_thread = fallback_thread(&self.mapper, &self.active_turns);
         match message {
             codex_codes::ServerMessage::Notification(notif) => {
-                if let Some(event) = self.mapper.map_notification(&notif, fallback_thread) {
+                if let Some(event) = self
+                    .map_or_discover(
+                        |mapper| mapper.try_map_notification(&notif, fallback_thread),
+                        "notification",
+                    )
+                    .flatten()
+                {
                     let thread = event_thread(&event);
                     if let Some(active) = self.active_turns.get_mut(&thread) {
                         active.mark_server_message();
@@ -476,8 +548,11 @@ where
             }
             codex_codes::ServerMessage::Request { id, request } => {
                 let Some(event) = self
-                    .mapper
-                    .map_server_request(&id, &request, fallback_thread)
+                    .map_or_discover(
+                        |mapper| mapper.try_map_server_request(&id, &request, fallback_thread),
+                        "server_request",
+                    )
+                    .flatten()
                 else {
                     respond_unroutable_server_request(&mut self.client, &id, &request).await;
                     return MessageOutcome::Handled;
@@ -506,8 +581,8 @@ where
                 response,
             } => {
                 let result = self
-                    .claim_thread_route(harness_thread_id.clone(), thread)
-                    .map(|()| {
+                    .claim_or_adopt_thread_route(harness_thread_id.clone(), thread)
+                    .map(|accepted_thread| {
                         // A claim answers with the identity facts this harness lifetime already
                         // attested through its own events. It must not resume the thread to learn
                         // more: the native model stays unreported until an event names it.
@@ -515,7 +590,11 @@ where
                             self.mapper.native_parent(&harness_thread_id);
                         ThreadHandle {
                             parent_harness_thread_id,
-                            ..ThreadHandle::opened(thread, harness_thread_id, workspace_root)
+                            ..ThreadHandle::opened(
+                                accepted_thread,
+                                harness_thread_id,
+                                workspace_root,
+                            )
                         }
                     });
                 let _ = response.send(result);

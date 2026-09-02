@@ -79,6 +79,24 @@ impl NativeThreadRoutes {
         Ok(route)
     }
 
+    /// Claims a new route, or adopts the final identity already bound to the native thread.
+    pub(super) fn claim_or_adopt(
+        &mut self,
+        native_thread_id: String,
+        proposed_thread_id: ThreadId,
+    ) -> Result<NativeRoute, HarnessError> {
+        let native_thread_id = NativeThreadId::new(native_thread_id.trim().to_owned());
+        if native_thread_id.as_str().is_empty() {
+            return Err(HarnessError::Protocol(
+                "cannot claim an empty native thread id".into(),
+            ));
+        }
+        if let Some(existing) = self.by_native.get(&native_thread_id) {
+            return Ok(*existing);
+        }
+        self.claim(native_thread_id.to_string(), proposed_thread_id)
+    }
+
     /// Atomically replaces one exact native/Giskard route with a new native identity.
     pub(super) fn replace(
         &mut self,
@@ -183,6 +201,23 @@ mod tests {
 
         let second_route = routes.claim("native-b".into(), second).unwrap();
         assert!(second_route.epoch > route.epoch);
+    }
+
+    #[test]
+    fn claim_or_adopt_returns_existing_route_and_rejects_rebound_thread() {
+        let mut routes = NativeThreadRoutes::default();
+        let accepted = ThreadId::new();
+        let ignored = ThreadId::new();
+        let existing = routes.claim("native-a".into(), accepted).unwrap();
+
+        assert_eq!(
+            routes.claim_or_adopt("native-a".into(), ignored).unwrap(),
+            existing
+        );
+        assert!(routes.claim_or_adopt("native-b".into(), accepted).is_err());
+
+        let new_route = routes.claim_or_adopt("native-b".into(), ignored).unwrap();
+        assert_eq!(new_route.thread_id, ignored);
     }
 
     #[test]

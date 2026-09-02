@@ -93,21 +93,23 @@ has never seen and has to invent a `ThreadId` for a thread that already has one 
 two identities for one thread, and every registry above keyed by whichever came
 first. Pre-registration removes the second identity rather than reconciling it.
 
-**On claim or open.** `claim_native_thread` binds a provider-owned child without
-issuing `thread/resume`, starting work, or fabricating model metadata. `open_thread`
-binds the native id it explicitly started or resumed to the authoritative
-`OpenThreadOptions::thread` supplied by Giskard. Live opens never discover or mint a Giskard
-identity from a native id.
+**On claim or open.** `claim_native_thread` binds a provider-owned child without issuing
+`thread/resume`, starting work, or fabricating model metadata. If traffic already bound that
+native id, the claim adopts the adapter-minted `ThreadId`; otherwise it binds the proposed id.
+`open_thread` binds the native id it explicitly started or resumed to the authoritative
+`OpenThreadOptions::thread` supplied by Giskard. Durable bootstrap and open claims remain exact,
+and conflicting durable identities prevent harness publication.
 
-**Never inferred from traffic.** A non-empty native thread id that resolves to
-nothing is a routing failure, reported as such. It is only attributed to the
-caller's fallback thread while the adapter knows of no threads at all — which,
-for a project with persisted threads, stops being true the moment its harness is
-created.
+**Minted from traffic, never rekeyed.** On first sight of an unknown, non-empty native thread id,
+the adapter binds it to a fresh final `ThreadId`, creates its retained event log, and announces the
+binding on the harness discoveries stream before appending the event that revealed it. The server
+can therefore persist and own the thread from its first frame. A later live claim for that native
+id adopts the minted identity instead of replacing it.
 
 Every first binding receives a monotonically allocated route epoch for that
-adapter lifetime. Repeating the same native/local pair is idempotent; binding
-either side to a different identity is a protocol error and never rekeys state.
+adapter lifetime. Repeating the same native/local pair is idempotent. A live claim adopts an
+existing route for its native id, but proposing a Giskard id already bound to another native id is
+a protocol error; exact durable claims reject either-side conflicts. No path rekeys state.
 These registries belong to one `CodexInstance` and are rebuilt from durable
 bootstrap when its Codex app-server process is respawned. Durable Giskard IDs
 and completed transcript items remain in Giskard persistence; native

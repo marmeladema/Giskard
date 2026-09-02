@@ -31,8 +31,15 @@ thread summaries or sub-agent item payloads sent to the browser.
 
 Giskard claims the child's advertised native identity directly. Materializing or reattaching a
 provider-owned child never sends `thread/resume` or starts replacement work. The claim is
-idempotent for the same native/local pair and rejects either identity being bound differently.
+idempotent for the same native/local pair, adopts the identity the adapter already minted for that
+native id, and rejects a proposed Giskard id already bound to another native id.
 Reopening a primary thread keeps its separate lost-context recovery.
+
+If child frames arrive before the parent's relationship link, the adapter mints the child's final
+Giskard identity from the first frame and announces it on a retained discovery stream. The server
+persists a hidden orphan and installs its event owner before consuming the child's retained events.
+When the parent link arrives, it classifies that same record as a sub-agent; it does not create or
+rekey another thread.
 
 ## Ownership model
 

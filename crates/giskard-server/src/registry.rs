@@ -25,12 +25,13 @@ use giskard_core::server_request::ServerRequestResponse;
 use giskard_core::text::trimmed_non_empty;
 use giskard_core::thread::ThreadKind;
 use giskard_core::turn::{
-    Mode, Turn, TurnMode, TurnModel, TurnOverrides, TurnStatus, TurnStatusKind,
+    Mode, PermissionPreset, Turn, TurnMode, TurnModel, TurnOverrides, TurnStatus, TurnStatusKind,
 };
 use giskard_core::user_input::UserInput;
 use giskard_harness::{
     AgentHarness, EventStreamError, HarnessBootstrap, HarnessCapabilities, HarnessProvider,
-    KnownThreadBinding, OpenThreadOptions, ThreadHandle, ThreadUpdate, thread_update_channel,
+    KnownThreadBinding, OpenThreadOptions, ThreadDiscovered, ThreadHandle, ThreadUpdate,
+    thread_update_channel,
 };
 use giskard_persist::PersistStore;
 use giskard_persist::store::{ProjectConfig, ThreadFile, ThreadMutation, TurnCommitOutcome};
@@ -278,6 +279,8 @@ struct RegistryShared {
     harness_transitions: Arc<HarnessTransitions>,
     threads: Arc<Mutex<ThreadIndex>>,
     background_tasks: Arc<RegistryTaskTracker>,
+    #[cfg(test)]
+    discovery_records_processed: AtomicUsize,
     hub: Arc<Hub>,
     runtime: Arc<ThreadRuntimeSupport>,
     store: Arc<PersistStore>,
@@ -448,6 +451,8 @@ impl RegistryShared {
             harness_transitions: Arc::new(HarnessTransitions::new()),
             threads: Arc::new(Mutex::new(ThreadIndex::default())),
             background_tasks: Arc::new(RegistryTaskTracker::default()),
+            #[cfg(test)]
+            discovery_records_processed: AtomicUsize::new(0),
             hub,
             runtime: Arc::new(ThreadRuntimeSupport::with_max_command_output_bytes(
                 max_command_output_bytes,
@@ -526,6 +531,168 @@ fn spawn_thread_update_forwarder(
                 "failed to persist resumed context window"),
         }
     }))
+}
+
+fn spawn_discovery_consumer(
+    shared: Arc<RegistryShared>,
+    project_id: ProjectId,
+    harness: Arc<dyn AgentHarness>,
+) {
+    let Some(task_permit) = shared.background_tasks.register() else {
+        warn!(
+            %project_id,
+            action = "consume_thread_discoveries",
+            reason = "registry_shutting_down",
+            "not starting harness discovery consumer"
+        );
+        return;
+    };
+    let mut discoveries = harness.discoveries();
+    tokio::spawn(async move {
+        let _task_permit = task_permit;
+        loop {
+            match discoveries.recv().await {
+                Ok(record) => {
+                    let result =
+                        admit_discovered_thread(&shared, project_id, &harness, &record).await;
+                    #[cfg(test)]
+                    shared
+                        .discovery_records_processed
+                        .fetch_add(1, Ordering::SeqCst);
+                    if let Err(error) = result {
+                        error!(
+                            %project_id,
+                            thread_id = %record.thread,
+                            harness_thread_id = %record.harness_thread_id,
+                            %error,
+                            "failed to admit a native thread discovered from traffic"
+                        );
+                    }
+                }
+                Err(EventStreamError::Closed) => return,
+                Err(EventStreamError::Gap { dropped }) => {
+                    error!(%project_id, dropped, "harness discovery stream overflowed");
+                }
+            }
+        }
+    });
+}
+
+async fn admit_discovered_thread(
+    shared: &Arc<RegistryShared>,
+    project_id: ProjectId,
+    harness: &Arc<dyn AgentHarness>,
+    record: &ThreadDiscovered,
+) -> Result<(), HarnessError> {
+    let _lifecycle_guard = lock_project_lifecycle(&shared.projects, project_id).await;
+    let Some(project_config) = shared
+        .store
+        .load_project(project_id)
+        .await
+        .map_err(|error| HarnessError::Protocol(error.to_string()))?
+    else {
+        warn!(
+            %project_id,
+            thread_id = %record.thread,
+            harness_thread_id = %record.harness_thread_id,
+            "project disappeared before a discovered native thread could be admitted"
+        );
+        return Ok(());
+    };
+
+    let live_bindings = shared.coordinator_snapshot().await;
+    let mut existing_id = None;
+    for (thread_id, coordinator) in live_bindings {
+        let binding = coordinator.binding().await;
+        if binding.project_id == project_id
+            && binding.handle.harness_thread_id == record.harness_thread_id
+        {
+            existing_id = Some(thread_id);
+            break;
+        }
+    }
+    let existing = if let Some(thread_id) = existing_id {
+        shared
+            .store
+            .load_thread(project_id, thread_id)
+            .await
+            .map_err(|error| HarnessError::Protocol(error.to_string()))?
+    } else {
+        load_thread_graph(&shared.store, project_id)
+            .await
+            .map_err(|error| HarnessError::Protocol(error.to_string()))?
+            .into_values()
+            .find(|thread| thread.harness_thread_id == record.harness_thread_id)
+    };
+
+    if let Some(thread_file) = existing {
+        if thread_file.kind == ThreadKind::Primary {
+            warn!(
+                %project_id,
+                thread_id = %record.thread,
+                existing_thread_id = %thread_file.id,
+                harness_thread_id = %record.harness_thread_id,
+                "ignoring traffic discovery for an already persisted primary thread"
+            );
+            return Ok(());
+        }
+        let classification = ClassificationPhase::from(thread_file.kind);
+        ensure_subagent_thread_open(&project_config, &thread_file, shared, classification).await?;
+        return Ok(());
+    }
+
+    let now = Utc::now();
+    let thread_file = ThreadFile {
+        revision: 0,
+        version: giskard_persist::store::THREAD_METADATA_VERSION,
+        id: record.thread,
+        project_id,
+        title: "Unclassified native thread".into(),
+        harness_thread_id: record.harness_thread_id.clone(),
+        parent_thread_id: None,
+        spawned_by_turn_id: None,
+        kind: ThreadKind::Orphan,
+        mode: TurnMode::Unknown,
+        current_model: TurnModel::Unknown,
+        context_window: 0,
+        model_context_windows: HashMap::new(),
+        permission_preset: PermissionPreset::AskFirst,
+        model_efforts: HashMap::new(),
+        tokens: giskard_core::token::TokenLedger::default(),
+        created_at: now,
+        updated_at: now,
+        archived: false,
+        git_workspace: None,
+    };
+    let workspace_root =
+        effective_thread_workspace_root(&shared.store, &project_config, &thread_file)
+            .await
+            .map_err(|error| HarnessError::Protocol(error.to_string()))?;
+    let thread_file = shared
+        .thread_metadata
+        .create(project_id, thread_file)
+        .await
+        .map_err(|error| HarnessError::Protocol(error.to_string()))?;
+    let handle = ThreadHandle {
+        parent_harness_thread_id: record.parent_harness_thread_id.clone(),
+        ..ThreadHandle::opened(
+            thread_file.id,
+            thread_file.harness_thread_id.clone(),
+            workspace_root.into(),
+        )
+    };
+    install_event_owner(
+        shared,
+        harness,
+        LoadedThreadBinding {
+            project_id,
+            handle,
+            native_model: None,
+        },
+        ClassificationPhase::Orphan,
+    )
+    .await?;
+    Ok(())
 }
 
 impl HarnessRegistry {
@@ -712,6 +879,7 @@ impl HarnessRegistry {
             "created harness with durable thread bindings installed");
 
         slot.publish_active(h.clone());
+        spawn_discovery_consumer(self.shared.clone(), project, h.clone());
         Ok(h)
     }
 
@@ -787,7 +955,13 @@ impl HarnessRegistry {
             )));
         }
         self.get_or_create_harness(config.id, config).await?;
-        ensure_subagent_thread_open(config, thread, &self.shared).await?;
+        ensure_subagent_thread_open(
+            config,
+            thread,
+            &self.shared,
+            ClassificationPhase::from(thread.kind),
+        )
+        .await?;
         self.loaded_thread_binding(thread.id)
             .await
             .map(|binding| binding.handle)
@@ -2116,8 +2290,13 @@ async fn materialize_subagent_thread(
                 .publish_created(project_id, &existing)
                 .await;
         }
-        let opened_agent_name =
-            ensure_subagent_thread_open(&project_config, &existing, &shared).await?;
+        let opened_agent_name = ensure_subagent_thread_open(
+            &project_config,
+            &existing,
+            &shared,
+            ClassificationPhase::Subagent,
+        )
+        .await?;
         let refreshed_info = subagent_info_with_agent_name(info.clone(), opened_agent_name);
         let desired_title = subagent_thread_title(&refreshed_info);
         if should_refresh_subagent_title(&existing.title, &desired_title) {
@@ -2380,6 +2559,7 @@ async fn ensure_subagent_thread_open(
     project_config: &ProjectConfig,
     thread_file: &ThreadFile,
     shared: &Arc<RegistryShared>,
+    classification: ClassificationPhase,
 ) -> Result<Option<String>, HarnessError> {
     let harness = shared
         .active_harness(project_config.id)
@@ -2398,7 +2578,7 @@ async fn ensure_subagent_thread_open(
                 project_config.id,
                 thread_file.id,
                 Some(&thread_file.harness_thread_id),
-                ClassificationPhase::Subagent,
+                classification,
             )
             .await?;
         return Ok(handle.agent_name);
@@ -2429,7 +2609,7 @@ async fn ensure_subagent_thread_open(
             handle,
             native_model,
         },
-        ClassificationPhase::Subagent,
+        classification,
     )
     .await?;
     Ok(agent_name)
@@ -2607,6 +2787,8 @@ impl HarnessThreadId {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+    use std::path::PathBuf;
     use std::sync::Mutex as StdMutex;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Weak};
@@ -2614,14 +2796,18 @@ mod tests {
     use chrono::Utc;
     use giskard_core::approval::ApprovalDecision;
     use giskard_core::error::HarnessError;
+    use giskard_core::event::AgentEvent;
     use giskard_core::ids::{ApprovalId, ItemId, ProjectId, ServerRequestId, ThreadId, TurnId};
+    use giskard_core::item::{Item, ItemPayload};
     use giskard_core::model::{ModelDescriptor, ModelRef};
-    use giskard_core::token::TokenLedger;
-    use giskard_core::turn::{Mode, PermissionPreset, TurnMode, TurnModel};
+    use giskard_core::token::{TokenLedger, TokenUsage};
+    use giskard_core::turn::{
+        Mode, PermissionPreset, TurnMode, TurnModel, TurnStatus, TurnStatusKind,
+    };
     use giskard_core::user_input::UserInput;
     use giskard_harness::{
-        AgentEventStream, AgentHarness, EventLog, HarnessCapabilities, OpenThreadOptions,
-        ThreadHandle,
+        AgentEventStream, AgentHarness, DiscoveryStream, EventLog, HarnessBootstrap,
+        HarnessCapabilities, OpenThreadOptions, ThreadDiscovered, ThreadHandle,
     };
     use giskard_persist::PersistStore;
     use giskard_persist::store::{ProjectConfig, ThreadFile};
@@ -2630,9 +2816,170 @@ mod tests {
     use super::{TurnContext, TurnContextKind, turn_reservation};
     use crate::hub::Hub;
     use crate::ledger;
+    use crate::test_logs::CapturedLogWriter;
     use crate::thread_runtime::ThreadRuntimeSupport;
 
     struct UnusedHarnessFactory;
+
+    struct DiscoveryHarness {
+        discoveries: Arc<EventLog<ThreadDiscovered>>,
+        routes: StdMutex<HashMap<String, ThreadHandle>>,
+        logs: StdMutex<HashMap<ThreadId, Arc<EventLog>>>,
+    }
+
+    impl DiscoveryHarness {
+        fn new(bootstrap: HarnessBootstrap) -> Self {
+            let mut routes = HashMap::new();
+            let mut logs = HashMap::new();
+            for binding in bootstrap.known_threads {
+                let handle = ThreadHandle::opened(
+                    binding.thread_id,
+                    binding.harness_thread_id.clone(),
+                    PathBuf::from("/tmp/test"),
+                );
+                routes.insert(binding.harness_thread_id, handle);
+                logs.insert(binding.thread_id, Arc::new(EventLog::new()));
+            }
+            Self {
+                discoveries: Arc::new(EventLog::new()),
+                routes: StdMutex::new(routes),
+                logs: StdMutex::new(logs),
+            }
+        }
+
+        fn announce(&self, record: ThreadDiscovered) {
+            self.routes
+                .lock()
+                .unwrap()
+                .entry(record.harness_thread_id.clone())
+                .or_insert_with(|| ThreadHandle {
+                    parent_harness_thread_id: record.parent_harness_thread_id.clone(),
+                    ..ThreadHandle::opened(
+                        record.thread,
+                        record.harness_thread_id.clone(),
+                        PathBuf::from("/tmp/test"),
+                    )
+                });
+            self.logs
+                .lock()
+                .unwrap()
+                .entry(record.thread)
+                .or_insert_with(|| Arc::new(EventLog::new()));
+            assert!(self.discoveries.append(record));
+        }
+
+        fn append_event(&self, thread: ThreadId, event: AgentEvent) {
+            let log = self.logs.lock().unwrap().get(&thread).cloned().unwrap();
+            assert!(log.append(event));
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl AgentHarness for DiscoveryHarness {
+        fn capabilities(&self) -> HarnessCapabilities {
+            HarnessCapabilities::default()
+        }
+
+        async fn list_models(&self) -> Result<Vec<ModelDescriptor>, HarnessError> {
+            Ok(Vec::new())
+        }
+
+        async fn open_thread(
+            &self,
+            _opts: OpenThreadOptions,
+        ) -> Result<ThreadHandle, HarnessError> {
+            Err(HarnessError::Unsupported("unused".into()))
+        }
+
+        async fn claim_native_thread(
+            &self,
+            thread: ThreadId,
+            harness_thread_id: String,
+            workspace_root: PathBuf,
+        ) -> Result<ThreadHandle, HarnessError> {
+            let mut routes = self.routes.lock().unwrap();
+            if let Some(existing) = routes.get(&harness_thread_id) {
+                return Ok(existing.clone());
+            }
+            let handle = ThreadHandle::opened(thread, harness_thread_id.clone(), workspace_root);
+            routes.insert(harness_thread_id, handle.clone());
+            self.logs
+                .lock()
+                .unwrap()
+                .entry(thread)
+                .or_insert_with(|| Arc::new(EventLog::new()));
+            Ok(handle)
+        }
+
+        async fn start_turn(
+            &self,
+            _thread: &ThreadHandle,
+            _input: UserInput,
+            _overrides: giskard_core::turn::TurnOverrides,
+        ) -> Result<TurnId, HarnessError> {
+            Err(HarnessError::Unsupported("unused".into()))
+        }
+
+        fn subscribe(&self, thread: &ThreadHandle) -> AgentEventStream {
+            let log = self
+                .logs
+                .lock()
+                .unwrap()
+                .get(&thread.thread)
+                .cloned()
+                .unwrap_or_else(|| Arc::new(EventLog::new()));
+            AgentEventStream::new(log.reader())
+        }
+
+        fn discoveries(&self) -> DiscoveryStream {
+            DiscoveryStream::new(self.discoveries.reader())
+        }
+
+        async fn respond_approval(
+            &self,
+            _req: ApprovalId,
+            _decision: ApprovalDecision,
+        ) -> Result<(), HarnessError> {
+            Err(HarnessError::Unsupported("unused".into()))
+        }
+
+        async fn respond_server_request(
+            &self,
+            _req: ServerRequestId,
+            _response: giskard_core::server_request::ServerRequestResponse,
+        ) -> Result<(), HarnessError> {
+            Err(HarnessError::Unsupported("unused".into()))
+        }
+
+        async fn interrupt(&self, _thread: &ThreadHandle) -> Result<(), HarnessError> {
+            Err(HarnessError::Unsupported("unused".into()))
+        }
+
+        async fn shutdown(&self) -> Result<(), HarnessError> {
+            self.discoveries.close();
+            for log in self.logs.lock().unwrap().values() {
+                log.close();
+            }
+            Ok(())
+        }
+    }
+
+    struct DiscoveryFactory {
+        harness: StdMutex<Option<Arc<DiscoveryHarness>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl super::HarnessFactory for DiscoveryFactory {
+        async fn create(
+            &self,
+            _config: &ProjectConfig,
+            bootstrap: HarnessBootstrap,
+        ) -> Result<Arc<dyn AgentHarness>, HarnessError> {
+            let harness = Arc::new(DiscoveryHarness::new(bootstrap));
+            *self.harness.lock().unwrap() = Some(harness.clone());
+            Ok(harness)
+        }
+    }
 
     struct ShutdownHarness {
         calls: Arc<AtomicUsize>,
@@ -2867,6 +3214,436 @@ mod tests {
             .unwrap()
             .expect("the project was just created");
         (project_id, config)
+    }
+
+    fn test_thread_file(
+        project_id: ProjectId,
+        id: ThreadId,
+        native: &str,
+        kind: giskard_core::ThreadKind,
+    ) -> ThreadFile {
+        let now = Utc::now();
+        ThreadFile {
+            revision: 0,
+            version: giskard_persist::store::THREAD_METADATA_VERSION,
+            id,
+            project_id,
+            title: "test thread".into(),
+            harness_thread_id: native.into(),
+            parent_thread_id: None,
+            spawned_by_turn_id: None,
+            kind,
+            mode: TurnMode::Known(Mode::Build),
+            current_model: TurnModel::Known(ModelRef {
+                provider: "openai".into(),
+                model: "test".into(),
+                reasoning_effort: None,
+            }),
+            context_window: 128_000,
+            model_context_windows: Default::default(),
+            permission_preset: PermissionPreset::AskFirst,
+            model_efforts: Default::default(),
+            tokens: TokenLedger::default(),
+            created_at: now,
+            updated_at: now,
+            archived: false,
+            git_workspace: None,
+        }
+    }
+
+    async fn discovery_registry(
+        store: Arc<PersistStore>,
+    ) -> (Arc<super::HarnessRegistry>, Arc<DiscoveryFactory>) {
+        let factory = Arc::new(DiscoveryFactory {
+            harness: StdMutex::new(None),
+        });
+        let registry = Arc::new(super::HarnessRegistry::new(
+            factory.clone(),
+            Arc::new(Hub::new()),
+            store.clone(),
+            ledger::spawn(store),
+        ));
+        (registry, factory)
+    }
+
+    async fn wait_for_thread(
+        store: &PersistStore,
+        project: ProjectId,
+        thread: ThreadId,
+    ) -> ThreadFile {
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if let Some(file) = store.load_thread(project, thread).await.unwrap() {
+                    return file;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("discovered thread was not persisted")
+    }
+
+    async fn wait_for_coordinator(
+        registry: &super::HarnessRegistry,
+        thread: ThreadId,
+    ) -> Arc<super::ThreadCoordinator> {
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if let Some(coordinator) = registry.shared.coordinator(thread).await {
+                    return coordinator;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("discovered thread owner was not installed")
+    }
+
+    async fn wait_for_discovery_records(registry: &super::HarnessRegistry, expected: usize) {
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while registry
+                .shared
+                .discovery_records_processed
+                .load(Ordering::SeqCst)
+                < expected
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("discovery consumer did not process the expected records");
+    }
+
+    #[tokio::test]
+    async fn discovered_native_thread_becomes_a_hidden_orphan_with_an_owner() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(PersistStore::new(tmp.path().to_path_buf()));
+        let (project, config) = create_test_project(&store, "discovered-orphan").await;
+        let (registry, factory) = discovery_registry(store.clone()).await;
+        registry
+            .get_or_create_harness(project, &config)
+            .await
+            .unwrap();
+        let harness = factory.harness.lock().unwrap().clone().unwrap();
+        let thread = ThreadId::new();
+        harness.announce(ThreadDiscovered {
+            thread,
+            harness_thread_id: "native-child".into(),
+            parent_harness_thread_id: None,
+        });
+
+        let file = wait_for_thread(&store, project, thread).await;
+        assert_eq!(file.kind, giskard_core::ThreadKind::Orphan);
+        assert_eq!(file.current_model, TurnModel::Unknown);
+        assert_eq!(file.mode, TurnMode::Unknown);
+        assert_eq!(file.harness_thread_id, "native-child");
+        assert_eq!(file.parent_thread_id, None);
+        assert_eq!(file.spawned_by_turn_id, None);
+        // PersistStore reserves revision zero for legacy files and promotes every new record.
+        assert_eq!(file.revision, 1);
+        assert_eq!(
+            file.version,
+            giskard_persist::store::THREAD_METADATA_VERSION
+        );
+        assert_eq!(file.context_window, 0);
+        assert!(file.model_context_windows.is_empty());
+        assert_eq!(file.permission_preset, PermissionPreset::AskFirst);
+        assert!(file.model_efforts.is_empty());
+        assert_eq!(file.tokens, TokenLedger::default());
+        assert_eq!(file.created_at, file.updated_at);
+        assert!(!file.archived);
+        assert!(file.git_workspace.is_none());
+        wait_for_coordinator(&registry, thread).await;
+
+        let turn = TurnId::new();
+        harness.append_event(thread, AgentEvent::TurnStarted { thread, turn });
+        harness.append_event(
+            thread,
+            AgentEvent::ItemCompleted {
+                thread,
+                turn,
+                item: Item {
+                    id: ItemId::new(),
+                    harness_item_id: "native-agent-message".into(),
+                    payload: ItemPayload::AgentMessage {
+                        text: "hello".into(),
+                    },
+                    created_at: Utc::now(),
+                },
+            },
+        );
+        harness.append_event(
+            thread,
+            AgentEvent::TurnCompleted {
+                thread,
+                turn,
+                usage: TokenUsage::default(),
+                status: TurnStatus {
+                    kind: TurnStatusKind::Completed,
+                    message: None,
+                },
+            },
+        );
+        let turns = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let turns = store.load_all_turns(project, thread).await.unwrap();
+                if turns.len() == 1 {
+                    return turns;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("discovered thread turn was not persisted");
+        assert_eq!(turns[0].id, turn);
+        assert_eq!(
+            turns[0].user_input,
+            UserInput::text("Unclassified native turn")
+        );
+        registry.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn link_after_discovery_classifies_the_same_thread() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(PersistStore::new(tmp.path().to_path_buf()));
+        let (project, config) = create_test_project(&store, "link-after-discovery").await;
+        let parent = ThreadId::new();
+        store
+            .save_thread(
+                project,
+                &test_thread_file(
+                    project,
+                    parent,
+                    "native-parent",
+                    giskard_core::ThreadKind::Primary,
+                ),
+            )
+            .await
+            .unwrap();
+        let (registry, factory) = discovery_registry(store.clone()).await;
+        registry
+            .get_or_create_harness(project, &config)
+            .await
+            .unwrap();
+        let harness = factory.harness.lock().unwrap().clone().unwrap();
+        let child = ThreadId::new();
+        harness.announce(ThreadDiscovered {
+            thread: child,
+            harness_thread_id: "native-child".into(),
+            parent_harness_thread_id: None,
+        });
+        wait_for_thread(&store, project, child).await;
+        let before = wait_for_coordinator(&registry, child).await;
+        let spawned_by = TurnId::new();
+        let result = super::materialize_subagent_thread(
+            parent,
+            project,
+            spawned_by,
+            super::SubagentActivityInfo {
+                native_thread_id: "native-child".into(),
+                agent_name: None,
+                agent_path: None,
+                title: None,
+            },
+            registry.shared.clone(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(result, Some(child));
+        let file = store.load_thread(project, child).await.unwrap().unwrap();
+        assert_eq!(file.kind, giskard_core::ThreadKind::Subagent);
+        assert_eq!(file.parent_thread_id, Some(parent));
+        assert!(Arc::ptr_eq(
+            &before,
+            &registry.shared.coordinator(child).await.unwrap()
+        ));
+        registry.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn discovery_after_link_reuses_the_existing_thread() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(PersistStore::new(tmp.path().to_path_buf()));
+        let (project, config) = create_test_project(&store, "discovery-after-link").await;
+        let parent = ThreadId::new();
+        store
+            .save_thread(
+                project,
+                &test_thread_file(
+                    project,
+                    parent,
+                    "native-parent",
+                    giskard_core::ThreadKind::Primary,
+                ),
+            )
+            .await
+            .unwrap();
+        let (registry, factory) = discovery_registry(store.clone()).await;
+        registry
+            .get_or_create_harness(project, &config)
+            .await
+            .unwrap();
+        let child = super::materialize_subagent_thread(
+            parent,
+            project,
+            TurnId::new(),
+            super::SubagentActivityInfo {
+                native_thread_id: "native-child".into(),
+                agent_name: None,
+                agent_path: None,
+                title: None,
+            },
+            registry.shared.clone(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let harness = factory.harness.lock().unwrap().clone().unwrap();
+        let rejected = ThreadId::new();
+        harness.announce(ThreadDiscovered {
+            thread: rejected,
+            harness_thread_id: "native-child".into(),
+            parent_harness_thread_id: Some("native-parent".into()),
+        });
+        wait_for_discovery_records(&registry, 1).await;
+        assert!(
+            store
+                .load_thread(project, rejected)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            super::load_thread_graph(&store, project)
+                .await
+                .unwrap()
+                .len(),
+            2
+        );
+        assert!(registry.shared.coordinator(child).await.is_some());
+        registry.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn discovery_for_a_primary_is_ignored() {
+        let output = Arc::new(StdMutex::new(Vec::new()));
+        let writer_output = output.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::WARN)
+            .with_writer(move || CapturedLogWriter(writer_output.clone()))
+            .finish();
+        let _subscriber = tracing::subscriber::set_default(subscriber);
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(PersistStore::new(tmp.path().to_path_buf()));
+        let (project, config) = create_test_project(&store, "primary-discovery").await;
+        let primary = ThreadId::new();
+        store
+            .save_thread(
+                project,
+                &test_thread_file(
+                    project,
+                    primary,
+                    "native-primary",
+                    giskard_core::ThreadKind::Primary,
+                ),
+            )
+            .await
+            .unwrap();
+        let (registry, factory) = discovery_registry(store.clone()).await;
+        registry
+            .get_or_create_harness(project, &config)
+            .await
+            .unwrap();
+        let harness = factory.harness.lock().unwrap().clone().unwrap();
+        let minted = ThreadId::new();
+        harness.announce(ThreadDiscovered {
+            thread: minted,
+            harness_thread_id: "native-primary".into(),
+            parent_harness_thread_id: None,
+        });
+        wait_for_discovery_records(&registry, 1).await;
+        assert!(store.load_thread(project, minted).await.unwrap().is_none());
+        assert!(registry.shared.coordinator(minted).await.is_none());
+        let logs = String::from_utf8(output.lock().unwrap().clone()).unwrap();
+        assert!(
+            logs.contains("ignoring traffic discovery for an already persisted primary thread")
+        );
+        registry.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn discovery_consumer_survives_a_failed_record() {
+        let output = Arc::new(StdMutex::new(Vec::new()));
+        let writer_output = output.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::WARN)
+            .with_writer(move || CapturedLogWriter(writer_output.clone()))
+            .finish();
+        let _subscriber = tracing::subscriber::set_default(subscriber);
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(PersistStore::new(tmp.path().to_path_buf()));
+        let (project, config) = create_test_project(&store, "discovery-recovery").await;
+        let (registry, factory) = discovery_registry(store.clone()).await;
+        registry
+            .get_or_create_harness(project, &config)
+            .await
+            .unwrap();
+        let harness = factory.harness.lock().unwrap().clone().unwrap();
+
+        store.delete_project(project).await.unwrap();
+        let dropped = ThreadId::new();
+        harness.announce(ThreadDiscovered {
+            thread: dropped,
+            harness_thread_id: "native-dropped".into(),
+            parent_harness_thread_id: None,
+        });
+        wait_for_discovery_records(&registry, 1).await;
+        assert!(store.load_thread(project, dropped).await.unwrap().is_none());
+        assert!(
+            String::from_utf8(output.lock().unwrap().clone())
+                .unwrap()
+                .contains(
+                    "project disappeared before a discovered native thread could be admitted"
+                )
+        );
+
+        store
+            .create_project(project, "discovery-recovery", "/tmp/test")
+            .await
+            .unwrap();
+        let admitted = ThreadId::new();
+        harness.announce(ThreadDiscovered {
+            thread: admitted,
+            harness_thread_id: "native-admitted".into(),
+            parent_harness_thread_id: None,
+        });
+        wait_for_discovery_records(&registry, 2).await;
+        let file = wait_for_thread(&store, project, admitted).await;
+        assert_eq!(file.kind, giskard_core::ThreadKind::Orphan);
+        wait_for_coordinator(&registry, admitted).await;
+        assert!(store.load_thread(project, dropped).await.unwrap().is_none());
+        registry.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn discovery_consumer_stops_on_registry_shutdown() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(PersistStore::new(tmp.path().to_path_buf()));
+        let (project, config) = create_test_project(&store, "discovery-shutdown").await;
+        let (registry, _) = discovery_registry(store).await;
+        registry
+            .get_or_create_harness(project, &config)
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), registry.shutdown())
+            .await
+            .expect("registry shutdown timed out")
+            .unwrap();
     }
 
     /// The bindings only prevent a second identity if they are in place before anything can open a
