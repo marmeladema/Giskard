@@ -18,7 +18,20 @@ receivers, and worker lifecycle. It serves every native thread on that process a
 the Primary/sub-agent hierarchy. Helper futures borrow its protocol state through `&mut self`; no
 independent worker mutates that state.
 
-`CodexTransport` remains the mockable request/read abstraction. `SenderMap` remains shared only
+The transport may own internal reader and writer tasks for stdio and request correlation; they
+never access mapper, route, turn, compaction, or context-restore state.
+
+## Transport
+
+`CodexTransport` remains the mockable request/read abstraction. Production uses `StdioTransport`:
+one always-running task reads stdout, correlates responses by monotonically allocated request ID,
+and appends notifications and requests to a retained inbox. Responses never enter that inbox. The
+inbox is capped at 65,536 frames; a gap is fatal because a dropped lifecycle event or server
+request cannot be recovered safely. One bounded-queue writer owns stdin, writes one newline-free
+JSON object plus its delimiter, flushes it, and acknowledges response frames only after success.
+Shutdown closes delivery, fails pending waiters, kills the child, and stops the transport tasks.
+
+`SenderMap` remains shared only
 because synchronous `AgentHarness::subscribe` must read it; it holds one retained event log per
 route, and `CodexInstance` is its sole runtime lifecycle mutator. It also owns route establishment:
 durable bootstrap, explicit open/resume, and provider-owned child claims all use the same primitive.
@@ -547,8 +560,8 @@ time-based deadline.
 
 An invalid or out-of-range `modelContextWindow` suppresses only the context-window
 update. It never suppresses the turn's token usage, which is still attached on
-`turn/completed`. While unresolved, a pending restore keeps the Codex message loop
-awake so an arbitrarily late update can still be observed.
+`turn/completed`. The transport reader remains active regardless of turn or restore state, so an
+arbitrarily late update can still be observed.
 
 ## Restart and unload behavior
 
@@ -592,10 +605,10 @@ cancellation explicitly abandons that correlation because the stopped turn may
 no longer be answered. Exact native request-ID checks prevent stale completion
 from removing a replacement entry with the same browser-facing ID.
 
-This is adapter-state retry safety, not proof that retrying is wire-safe after a
-timeout. The current transport cannot distinguish no write from a partial frame
-or a completed frame whose flush reported failure; that requires the planned
-non-cancelling writer boundary.
+The writer never exposes partial or interleaved frames: it owns stdin and completes each write and
+flush before starting the next. If a request times out, diagnostics distinguish whether its frame
+was queued or written. Caller-visible timeout behavior and retry policy are unchanged. Adapter
+correlation remains available for retry only after a reported response-write failure.
 
 Current Codex file-change approval requests identify the associated item but do
 not carry its changed paths. With current Codex app-server ordering, the adapter

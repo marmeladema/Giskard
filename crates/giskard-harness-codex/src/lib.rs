@@ -1,6 +1,6 @@
 //! Codex CLI harness adapter (spec §4.6).
 //!
-//! Wraps `codex-codes::AsyncClient` and implements the `AgentHarness` trait.
+//! Uses `codex-codes` protocol types and implements the `AgentHarness` trait.
 //! All Codex-specific types are confined to this crate and mapped to
 //! `giskard-core` types at the boundary.
 //!
@@ -12,10 +12,12 @@ mod log_fields;
 mod mapping;
 mod native_ids;
 mod native_routes;
+mod transport;
 
 use crate::log_fields::display_opt;
 use crate::native_ids::NativeThreadId;
 use instance::CodexInstance;
+use transport::StdioTransport;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -661,85 +663,6 @@ fn bounded_utf8_preview(value: &str, max_bytes: usize) -> String {
     value[..end].to_owned()
 }
 
-fn classify_codex_stream_error(error: codex_codes::Error) -> CodexStreamError {
-    match error {
-        codex_codes::Error::Deserialization(parse_error)
-            if parse_error.method.is_none()
-                && parse_error.raw_json.is_none()
-                && !parse_error.raw_line.trim_start().starts_with('{') =>
-        {
-            CodexStreamError::NonJsonStdout {
-                raw_preview: bounded_utf8_preview(
-                    &parse_error.raw_line,
-                    NON_JSON_STDOUT_PREVIEW_BYTES,
-                ),
-                raw_bytes: parse_error.raw_line.len(),
-                parse_error: parse_error.error_message,
-            }
-        }
-        codex_codes::Error::Deserialization(parse_error) => {
-            let raw_preview =
-                bounded_utf8_preview(&parse_error.raw_line, NON_JSON_STDOUT_PREVIEW_BYTES);
-            let method = parse_error.method.as_deref().unwrap_or("unknown");
-            CodexStreamError::Fatal(HarnessError::Transport(format!(
-                "Codex JSON-RPC deserialization error for method {method}: {} \
-                 (raw_bytes: {}, raw_preview: {raw_preview:?})",
-                parse_error.error_message,
-                parse_error.raw_line.len(),
-            )))
-        }
-        error => CodexStreamError::Fatal(HarnessError::Transport(error.to_string())),
-    }
-}
-
-#[async_trait]
-impl CodexTransport for codex_codes::AsyncClient {
-    async fn request_json(
-        &mut self,
-        method: &str,
-        params: serde_json::Value,
-    ) -> Result<serde_json::Value, HarnessError> {
-        self.request(method, &params)
-            .await
-            .map_err(|e| HarnessError::Transport(e.to_string()))
-    }
-
-    async fn next_message(
-        &mut self,
-    ) -> Result<Option<codex_codes::ServerMessage>, CodexStreamError> {
-        self.next_message()
-            .await
-            .map_err(classify_codex_stream_error)
-    }
-
-    async fn respond_json(
-        &mut self,
-        id: codex_codes::jsonrpc::RequestId,
-        value: serde_json::Value,
-    ) -> Result<(), HarnessError> {
-        self.respond(id, &value)
-            .await
-            .map_err(|e| HarnessError::Transport(e.to_string()))
-    }
-
-    async fn respond_error_json(
-        &mut self,
-        id: codex_codes::jsonrpc::RequestId,
-        code: i64,
-        message: &str,
-    ) -> Result<(), HarnessError> {
-        self.respond_error(id, code, message)
-            .await
-            .map_err(|e| HarnessError::Transport(e.to_string()))
-    }
-
-    async fn shutdown_transport(self) -> Result<(), HarnessError> {
-        self.shutdown()
-            .await
-            .map_err(|e| HarnessError::Transport(e.to_string()))
-    }
-}
-
 async fn codex_request<P, R>(
     client: &mut dyn CodexTransport,
     context: CodexOperationContext<'_>,
@@ -1006,12 +929,18 @@ fn normalize_workspace_root(workspace_root: PathBuf) -> Result<PathBuf, HarnessE
 
 async fn start_codex_client(
     builder: codex_codes::AppServerBuilder,
-) -> Result<(codex_codes::AsyncClient, Option<String>), HarnessError> {
-    let mut client = codex_codes::AsyncClient::spawn(builder)
-        .await
-        .map_err(|e| HarnessError::Spawn(e.to_string()))?;
-    let response = client
-        .initialize(&build_initialize_params())
+) -> Result<(StdioTransport, Option<String>), HarnessError> {
+    let mut client = StdioTransport::spawn(builder).await?;
+    let response: codex_codes::InitializeResponse = codex_request(
+        &mut client,
+        CodexOperationContext::new("initialize"),
+        codex_codes::protocol::methods::INITIALIZE,
+        &build_initialize_params(),
+    )
+    .await
+    .map_err(|e| HarnessError::Spawn(e.to_string()))?;
+    client
+        .send_notification(codex_codes::protocol::methods::INITIALIZED)
         .await
         .map_err(|e| HarnessError::Spawn(e.to_string()))?;
     let version = codex_version_from_user_agent(&response.user_agent);
@@ -1650,17 +1579,6 @@ fn active_turn_states(active_turns: &ActiveTurns) -> Vec<String> {
 struct StartedTurn {
     turn: TurnId,
     upload_dir: Option<PathBuf>,
-}
-
-fn should_poll_codex_messages(
-    mapper: &CodexMapper,
-    active_turns: &ActiveTurns,
-    pending_compactions: &HashMap<ThreadId, PendingCompaction>,
-) -> bool {
-    !active_turns.is_empty()
-        || mapper.has_active_turns()
-        || mapper.has_running_commands()
-        || !pending_compactions.is_empty()
 }
 
 fn fallback_thread(mapper: &CodexMapper, active_turns: &ActiveTurns) -> ThreadId {
@@ -4106,74 +4024,6 @@ mod tests {
     }
 
     #[test]
-    fn bare_non_json_stream_error_is_recoverable() {
-        let serde_error = serde_json::from_str::<Value>("not JSON").unwrap_err();
-        let parse_error = codex_codes::ParseError::from_line("not JSON", serde_error);
-
-        assert!(matches!(
-            classify_codex_stream_error(codex_codes::Error::Deserialization(parse_error)),
-            CodexStreamError::NonJsonStdout { .. }
-        ));
-    }
-
-    #[test]
-    fn non_json_stdout_preview_is_bounded_on_a_utf8_boundary() {
-        let raw = format!("{}é", "x".repeat(NON_JSON_STDOUT_PREVIEW_BYTES - 1));
-        let serde_error = serde_json::from_str::<Value>(&raw).unwrap_err();
-        let parse_error = codex_codes::ParseError::from_line(&raw, serde_error);
-
-        let CodexStreamError::NonJsonStdout {
-            raw_preview,
-            raw_bytes,
-            ..
-        } = classify_codex_stream_error(codex_codes::Error::Deserialization(parse_error))
-        else {
-            panic!("expected recoverable non-JSON stdout");
-        };
-        assert_eq!(raw_preview.len(), NON_JSON_STDOUT_PREVIEW_BYTES - 1);
-        assert_eq!(raw_bytes, raw.len());
-    }
-
-    #[test]
-    fn parseable_json_stream_error_remains_fatal() {
-        let raw = r#"{"unexpected":true}"#;
-        let serde_error = serde_json::from_str::<i32>(raw).unwrap_err();
-        let parse_error = codex_codes::ParseError::from_line(raw, serde_error);
-
-        assert!(matches!(
-            classify_codex_stream_error(codex_codes::Error::Deserialization(parse_error)),
-            CodexStreamError::Fatal(HarnessError::Transport(_))
-        ));
-    }
-
-    #[test]
-    fn truncated_json_rpc_object_remains_fatal() {
-        let raw = r#"{"method":"turn/completed""#;
-        let serde_error = serde_json::from_str::<Value>(raw).unwrap_err();
-        let parse_error = codex_codes::ParseError::from_line(raw, serde_error);
-
-        assert!(matches!(
-            classify_codex_stream_error(codex_codes::Error::Deserialization(parse_error)),
-            CodexStreamError::Fatal(HarnessError::Transport(_))
-        ));
-    }
-
-    #[test]
-    fn typed_json_rpc_decode_error_remains_fatal() {
-        let serde_error = serde_json::from_value::<i32>(json!({"unexpected": true})).unwrap_err();
-        let parse_error = codex_codes::ParseError::from_envelope(
-            "turn/completed",
-            Some(json!({"unexpected": true})),
-            serde_error,
-        );
-
-        assert!(matches!(
-            classify_codex_stream_error(codex_codes::Error::Deserialization(parse_error)),
-            CodexStreamError::Fatal(HarnessError::Transport(_))
-        ));
-    }
-
-    #[test]
     fn foreign_turn_completion_does_not_end_live_stream() {
         let stream_thread = ThreadId::new();
         let foreign_thread = ThreadId::new();
@@ -4275,20 +4125,6 @@ mod tests {
             ),
             None
         );
-    }
-
-    #[test]
-    fn codex_messages_are_polled_while_any_turn_is_active() {
-        let mapper = CodexMapper::new(PathBuf::from("/tmp"));
-        let mut active_turns = ActiveTurns::new();
-        let thread = test_thread();
-        active_turns.insert(thread.thread, ActiveTurn::new(thread, TurnId::new()));
-
-        assert!(should_poll_codex_messages(
-            &mapper,
-            &active_turns,
-            &HashMap::new()
-        ));
     }
 
     #[tokio::test]
@@ -4396,13 +4232,17 @@ mod tests {
             .open_thread(open_opts(ThreadId::new(), None))
             .await
             .unwrap();
+        let compact_harness = harness.clone();
+        let compact_thread = thread.clone();
+        let compact =
+            tokio::spawn(async move { compact_harness.compact_thread(&compact_thread).await });
+        tokio::task::yield_now().await;
         controller
             .send_stream_error(CodexStreamError::Fatal(HarnessError::Transport(
                 "connection lost".into(),
             )))
             .await;
-
-        harness.compact_thread(&thread).await.unwrap();
+        compact.await.unwrap().unwrap();
         timeout(Duration::from_secs(1), async {
             while !harness.worker_queue.is_closed() {
                 tokio::task::yield_now().await;
@@ -6879,7 +6719,6 @@ mod tests {
         }
 
         #[tokio::test]
-        #[ignore = "M5: polling gate removed"]
         async fn child_events_are_read_while_no_turn_is_active() {
             let (harness, controller) = spawn_fake_harness();
             let _parent = harness

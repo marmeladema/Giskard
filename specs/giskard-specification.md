@@ -9,7 +9,15 @@
 
 **Document status:** Implementation-ready specification.
 **Audience:** An AI coding agent (and its human reviewer) implementing the system.
-**Version:** 1.79
+**Version:** 1.80
+
+> **Amendment — single stdout reader (1.80).** Giskard owns the Codex stdio transport. Exactly one
+> transport-internal task continuously reads stdout, correlating responses while appending
+> notifications and requests to the transport-owned retained 65,536-frame inbox. Overflow is an
+> explicit fatal gap.
+> Exactly one writer owns stdin and writes and flushes whole JSONL frames. Caller-visible request
+> timeout and retry semantics are unchanged. The adapter polling gate is removed, so child traffic
+> is consumed even while no turn is active.
 
 > **Amendment — identity minted at ingest (1.79).** On the first frame carrying an unknown,
 > non-empty native thread ID, the harness binds it to a fresh final Giskard `ThreadId`, creates its
@@ -1163,12 +1171,12 @@ authoritative replacement runtime overview.
   `codex-codes`, `codex-app-server-protocol` (§3.3, App. A, App. D).
 
 **Changelog (1.1 → 1.2), from D2 investigation against installed Codex CLI 0.142.5:**
-- **D2 resolved: `codex-codes` v0.143.0 is the chosen client crate** (async-client feature).
-  Verified on crates.io: its `AsyncClient` API maps 1:1 to `AgentHarness`, it tracks Codex CLI
-  0.143.0 (≈ installed 0.142.5), includes a schema-drift scorecard for CI (§14.4), and ships real
-  JSONL test captures. Reordered §3.3 + App. A to put `codex-codes` first; updated App. D item 2
-  from "open" to "resolved". Fallback (`codex-app-server-sdk` v0.5.1 or hand-rolled) only if a
-  future CLI version diverges.
+- **Historical D2 resolution:** `codex-codes` v0.143.0 was chosen with its `async-client` feature.
+  At that version, its `AsyncClient` API was judged to map 1:1 to `AgentHarness`; it tracked Codex
+  CLI 0.143.0 (approximately installed 0.142.5), included a schema-drift scorecard for CI (§14.4),
+  and shipped real JSONL test captures. Version 1.80 supersedes the client ownership part of that
+  decision: Giskard now owns stdio and request correlation while continuing to use `codex-codes`
+  protocol types and process construction.
 
 **Changelog (1.2 → 1.3), from review (integration pass over v1.2):**
 - **B1:** Added the normative `Turn` type sketch (§4.5); `Thread.turns` persists `Vec<Turn>` (§5.3).
@@ -1505,12 +1513,10 @@ A single Cargo workspace with focused crates. Names are prefixed `giskard-`.
   today:
   - **`codex-codes`** (v0.151.2) — **recommended first choice.** Typed Rust SDK for the Codex
     CLI app-server JSON-RPC protocol, tested against Codex CLI 0.151.0.
-    Provides `AsyncClient` (Tokio) with `start()` (process spawn), `thread_start`, `turn_start`
-    (accepting `model`, `reasoning_effort`, `sandbox_policy` — mapping onto `TurnOverrides`
-    + `ModelRef.reasoning_effort`, P1),
-    `next_message()` (streaming `ServerMessage::Notification/Request`), `respond()` (approval
-    decisions), and `shutdown()`. Feature flags: `async-client` (Tokio), `types` (WASM-compatible
-    serde models only). Includes a **schema coverage scorecard** that validates typed structs
+    Giskard uses its typed protocol envelopes and messages, app-server process builder, and
+    generated request/response types while owning stdout, stdin, request correlation, and retained
+    delivery in `StdioTransport`. Feature flags include `async-client` (Tokio) and `types`
+    (WASM-compatible serde models only). Includes a **schema coverage scorecard** that validates typed structs
     against `codex app-server generate-json-schema` output — directly usable for the CI
     protocol-drift check (§14.4). Ships real JSONL test captures (useful as `ReplayHarness`
     fixtures, §14.2). Raw `JsonRpcMessage`/`ServerMessage` access preserved for unknown/drifted
@@ -1524,9 +1530,10 @@ A single Cargo workspace with focused crates. Names are prefixed `giskard-`.
     Codex 0.142.x. Not recommended unless only types are needed and `codex-codes`' `types` feature
     is somehow unsuitable.
 
-  **Decision: use `codex-codes` with the `async-client` feature.** Its API maps directly onto the
-  `AgentHarness` trait; Giskard appends `next_message()` results to a retained per-thread event log
-  and maps `codex-codes` types to `giskard-core` types at the boundary.
+  **Decision: use `codex-codes` with the `async-client` feature for protocol types and process
+  construction.** Giskard's `StdioTransport` owns request correlation, stdout reading, stdin
+  writing, and its retained inbox; `CodexInstance` maps delivered messages to retained per-thread
+  event logs and converts `codex-codes` types to `giskard-core` types at the boundary.
   If a future Codex CLI version diverges beyond what `codex-codes` tracks, fall back to a minimal
   hand-rolled JSON-RPC client inside `giskard-harness-codex`. **Either way, all Codex/app-server
   types must be confined to `giskard-harness-codex`** (nothing Codex-specific leaks upward) and the
@@ -4000,9 +4007,10 @@ Artifacts are version-pinned to the Codex binary that produced them; regenerate 
 > `TurnOverrides.permission_preset` is the thread preset snapshot (P3/AP1: not a per-turn override).
 
 **Client library:** use `codex-codes` (v0.151.2, tested against Codex CLI 0.151.0) with the
-`async-client` feature — its `AsyncClient` API (`spawn`, `initialize`, `thread_start`, generic
-`request`, `next_message`, `respond`, `shutdown`) maps onto the `AgentHarness` trait. The Codex
-`turn/start` call uses the generic `request` path while `codex-codes`' typed `TurnStartParams`
+`async-client` feature for protocol types and process construction. Giskard owns request
+correlation, a single continuous stdout reader, a single whole-frame stdin writer, and the retained
+transport-owned inbox. The Codex `turn/start` call uses the generic `request` path while
+`codex-codes`' typed `TurnStartParams`
 lags newer fields such as `collaborationMode`. Its built-in schema coverage scorecard validates
 typed structs against `codex app-server generate-json-schema` output and can be wired into the CI
 drift check (§14.4). Fall back to `codex-app-server-sdk` (v0.5.1) or a hand-rolled client only if a
@@ -4123,11 +4131,11 @@ default already stated in-line:
    (explicit context-used field → last turn's input tokens → cumulative total). Remaining task:
    confirm the exact field name in the pinned Codex JSON schema and record the pick in code +
    README.
-2. **Codex client crate choice** — **resolved: `codex-codes` v0.143.0** with the `async-client`
-   feature (§3.3, App. A). Verified on crates.io against installed Codex CLI 0.142.5; its
-   `AsyncClient` API maps 1:1 to `AgentHarness`, it includes a schema-drift scorecard for CI, and
-   it ships real JSONL test captures. Fallback (`codex-app-server-sdk` v0.5.1 or hand-rolled) only
-   if a future CLI version diverges.
+2. **Codex client crate choice** — **resolved: `codex-codes`** (§3.3, App. A). Giskard uses its
+   protocol types and process builder, schema-drift scorecard, and JSONL test captures. As amended
+   in version 1.80, Giskard's `StdioTransport` owns stdio, request correlation, and retained frame
+   delivery; the crate's `AsyncClient` is not the `AgentHarness` transport. Fall back to
+   `codex-app-server-sdk` or a hand-rolled protocol layer only if a future CLI version diverges.
 3. **Dioxus fullstack single-crate vs split `giskard-ui`/`giskard-server`** — keep split
    unless tooling friction dictates otherwise; non-WASM crates stay separate regardless (§3.2).
    **Resolved (C1/C2):** `giskard-proto` is the sole crate `giskard-ui` links; it owns `Wire*`
