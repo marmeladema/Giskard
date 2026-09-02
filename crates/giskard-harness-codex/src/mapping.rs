@@ -6070,6 +6070,43 @@ mod tests {
         }
     }
 
+    /// Codex can report terminal collaboration activity in an `item/started` frame. Keep the
+    /// raw JSON-RPC boundary covered because an SDK enum drift here terminates the whole stream
+    /// before the mapper sees the notification.
+    #[test]
+    fn started_subagent_completion_deserializes() {
+        #[derive(serde::Deserialize)]
+        struct ItemStartedEnvelope {
+            method: String,
+            params: ItemStartedNotification,
+        }
+
+        let raw = r#"{
+            "method": "item/started",
+            "params": {
+                "item": {
+                    "agentPath": "/root/codex_semantics",
+                    "agentThreadId": "child-native",
+                    "id": "subagent-completed-child-native",
+                    "kind": "completed",
+                    "type": "subAgentActivity"
+                },
+                "startedAtMs": 1788336000388,
+                "threadId": "parent-native",
+                "turnId": "parent-turn"
+            }
+        }"#;
+        let envelope: ItemStartedEnvelope = serde_json::from_str(raw).unwrap();
+        assert_eq!(envelope.method, "item/started");
+        match envelope.params.item {
+            codex_codes::ThreadItem::SubAgentActivity { id, kind, .. } => {
+                assert_eq!(id, "subagent-completed-child-native");
+                assert_eq!(kind, codex_codes::SubAgentActivityKind::Completed);
+            }
+            other => panic!("expected sub-agent activity, got {other:?}"),
+        }
+    }
+
     #[test]
     fn legacy_wait_with_multiple_receivers_has_no_ambiguous_link() {
         let mut mapper = CodexMapper::new(PathBuf::from("/tmp"));
