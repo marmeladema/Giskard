@@ -6,10 +6,11 @@
 use std::borrow::Borrow;
 use std::collections::HashMap;
 use std::path::Path;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use async_trait::async_trait;
-use tokio::sync::{Mutex, broadcast};
+use tokio::sync::Mutex;
 
 use giskard_core::approval::ApprovalDecision;
 use giskard_core::error::HarnessError;
@@ -24,8 +25,8 @@ use giskard_core::turn::TurnOverrides;
 use giskard_core::turn::{TurnStatus, TurnStatusKind};
 use giskard_core::user_input::UserInput;
 use giskard_harness::{
-    AgentEventStream, AgentHarness, HarnessCapabilities, HarnessProvider, OpenThreadOptions,
-    ThreadHandle,
+    AgentEventStream, AgentHarness, EventLog, HarnessCapabilities, HarnessProvider,
+    OpenThreadOptions, ThreadHandle,
 };
 
 /// A recorded fixture: an ordered list of `AgentEvent`s to replay.
@@ -72,7 +73,7 @@ impl ReplayFixture {
 }
 
 struct ThreadState {
-    sender: broadcast::Sender<AgentEvent>,
+    log: Arc<EventLog>,
     pending: Vec<AgentEvent>,
 }
 
@@ -281,15 +282,9 @@ impl AgentHarness for ReplayHarness {
             remap_event_thread(event, thread_id);
         }
 
-        let (tx, _) = broadcast::channel(256);
+        let log = Arc::new(EventLog::new());
         let mut threads = self.threads.lock().await;
-        threads.push((
-            thread_id,
-            ThreadState {
-                sender: tx,
-                pending,
-            },
-        ));
+        threads.push((thread_id, ThreadState { log, pending }));
 
         Ok(ThreadHandle {
             // A deterministic replay applies exactly the requested model, so echo it as
@@ -307,17 +302,17 @@ impl AgentHarness for ReplayHarness {
     ) -> Result<TurnId, HarnessError> {
         let turn_id = TurnId::new();
 
-        // Emit all pending events for this thread into the broadcast channel.
+        // Emit all pending events for this thread into the retained event log.
         let mut threads = self.threads.lock().await;
         if let Some((_, state)) = threads.iter_mut().find(|(id, _)| *id == thread.thread) {
-            let sender = state.sender.clone();
+            let log = state.log.clone();
             let events = std::mem::take(&mut state.pending);
             drop(threads);
 
             // Send events asynchronously.
             tokio::spawn(async move {
                 for event in events {
-                    let _ = sender.send(event);
+                    log.append(event);
                     tokio::task::yield_now().await;
                 }
             });
@@ -327,16 +322,14 @@ impl AgentHarness for ReplayHarness {
     }
 
     fn subscribe(&self, thread: &ThreadHandle) -> AgentEventStream {
-        // We need to get the sender synchronously. Use try_lock.
+        // We need to get the log synchronously. Use try_lock.
         let threads = self.threads.try_lock();
         if let Ok(threads) = threads
             && let Some((_, state)) = threads.iter().find(|(id, _)| *id == thread.thread)
         {
-            return AgentEventStream::new(state.sender.subscribe());
+            return AgentEventStream::new(state.log.reader());
         }
-        // Fallback: create a dummy channel.
-        let (_, rx) = broadcast::channel(1);
-        AgentEventStream::new(rx)
+        AgentEventStream::closed()
     }
 
     async fn respond_approval(
@@ -364,19 +357,19 @@ impl AgentHarness for ReplayHarness {
         let Some((_, state)) = threads.iter_mut().find(|(id, _)| *id == thread.thread) else {
             return Err(HarnessError::ThreadNotFound(thread.thread));
         };
-        let sender = state.sender.clone();
+        let sender = state.log.clone();
         let thread_id = thread.thread;
         drop(threads);
 
         tokio::spawn(async move {
             let turn = TurnId::new();
             let item_id = ItemId::new();
-            let _ = sender.send(AgentEvent::TurnStarted {
+            let _ = sender.append(AgentEvent::TurnStarted {
                 thread: thread_id,
                 turn,
             });
             tokio::task::yield_now().await;
-            let _ = sender.send(AgentEvent::ItemCompleted {
+            let _ = sender.append(AgentEvent::ItemCompleted {
                 thread: thread_id,
                 turn,
                 item: Item {
@@ -392,7 +385,7 @@ impl AgentHarness for ReplayHarness {
                 },
             });
             tokio::task::yield_now().await;
-            let _ = sender.send(AgentEvent::TurnCompleted {
+            let _ = sender.append(AgentEvent::TurnCompleted {
                 thread: thread_id,
                 turn,
                 usage: TokenUsage::default(),

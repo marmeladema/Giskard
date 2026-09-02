@@ -12,7 +12,7 @@ use giskard_core::model::ModelRef;
 use giskard_core::token::TokenUsage;
 use giskard_core::turn::{Mode, PermissionPreset, TurnStatus, TurnStatusKind};
 use giskard_core::user_input::UserInput;
-use giskard_harness::{AgentHarness, OpenThreadOptions};
+use giskard_harness::{AgentHarness, EventStreamError, OpenThreadOptions};
 use giskard_harness_replay::{ReplayFixture, ReplayHarness};
 
 fn make_fixture() -> (ReplayFixture, ThreadId, TurnId) {
@@ -163,8 +163,8 @@ async fn open_thread_one_turn_assert_state() {
                     break;
                 }
             }
-            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-            Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            Err(EventStreamError::Gap { .. }) => continue,
+            Err(EventStreamError::Closed) => break,
         }
     }
 

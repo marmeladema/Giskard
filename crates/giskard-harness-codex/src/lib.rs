@@ -27,7 +27,7 @@ use rand::RngCore;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tokio::sync::{broadcast, mpsc, oneshot, watch};
+use tokio::sync::{mpsc, oneshot, watch};
 use tracing::{debug, error, info, warn};
 
 use giskard_core::approval::ApprovalDecision;
@@ -45,14 +45,13 @@ use giskard_core::token::TokenUsage;
 use giskard_core::turn::{PermissionPreset, TurnOverrides, TurnStatus, TurnStatusKind};
 use giskard_core::{AttachmentKind, UserAttachment, UserInput};
 use giskard_harness::{
-    AgentEventStream, AgentHarness, HarnessBootstrap, HarnessCapabilities, HarnessNotice,
+    AgentEventStream, AgentHarness, EventLog, HarnessBootstrap, HarnessCapabilities, HarnessNotice,
     HarnessProvider, OpenThreadOptions, ProviderAuth, ProviderAuthCommand, ThreadHandle,
     ThreadUpdate,
 };
 
 use mapping::CodexMapper;
 
-const BROADCAST_CAPACITY: usize = 256;
 const TURN_FIRST_EVENT_WARN_AFTER: Duration = Duration::from_secs(15);
 #[cfg(not(test))]
 const CODEX_JSON_RPC_TIMEOUT: Duration = Duration::from_secs(10);
@@ -269,7 +268,22 @@ struct WorkerReceivers {
     done: watch::Sender<bool>,
 }
 
-type SenderMap = Arc<StdMutex<HashMap<ThreadId, broadcast::Sender<AgentEvent>>>>;
+#[derive(Default)]
+struct EventLogs(StdMutex<HashMap<ThreadId, Arc<EventLog>>>);
+
+impl Drop for EventLogs {
+    fn drop(&mut self) {
+        let logs = match self.0.get_mut() {
+            Ok(logs) => logs,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        for log in logs.values() {
+            log.close();
+        }
+    }
+}
+
+type SenderMap = Arc<EventLogs>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WorkerQueueKind {
@@ -811,10 +825,10 @@ pub struct CodexHarness {
     control_tx: mpsc::Sender<QueuedControlCommand>,
     // ENTITY-AUTHORITY-EXCEPTION:
     // Role: Route mapped Codex events to each Giskard thread's harness subscriber.
-    // Source of truth: Harness open/resume establishes the sender used by the adapter.
+    // Source of truth: Harness open/resume establishes the retained log used by the adapter.
     // Structural reason: Provider delivery routing belongs in the lower harness crate.
-    // Synchronization: The standard mutex protects sender lookup, insertion, and removal.
-    // Invalidation/removal: Thread close removes a sender; harness shutdown drops the map.
+    // Synchronization: The standard mutex protects log lookup, insertion, and removal.
+    // Invalidation/removal: Thread close removes and closes a log; harness drop closes the map.
     senders: SenderMap,
     worker_queue: Arc<WorkerQueueWatchdog>,
     shutdown_tx: watch::Sender<bool>,
@@ -873,7 +887,7 @@ impl CodexHarness {
     {
         let (cmd_tx, cmd_rx) = mpsc::channel(64);
         let (control_tx, control_rx) = mpsc::channel(64);
-        let senders: SenderMap = Arc::new(StdMutex::new(HashMap::new()));
+        let senders: SenderMap = Arc::new(EventLogs::default());
         let worker_queue = Arc::new(WorkerQueueWatchdog::new());
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let (worker_done_tx, worker_done) = watch::channel(false);
@@ -1372,11 +1386,10 @@ impl AgentHarness for CodexHarness {
     }
 
     fn subscribe(&self, thread: &ThreadHandle) -> AgentEventStream {
-        if let Some(sender) = sender_for_thread(&self.senders, thread.thread) {
-            return AgentEventStream::new(sender.subscribe());
+        if let Some(log) = sender_for_thread(&self.senders, thread.thread) {
+            return AgentEventStream::new(log.reader());
         }
-        let (_, rx) = broadcast::channel(1);
-        AgentEventStream::new(rx)
+        AgentEventStream::closed()
     }
 
     async fn respond_approval(
@@ -2327,16 +2340,36 @@ fn runtime_workspace_roots(
 }
 
 async fn broadcast_event<F: FnOnce() -> AgentEvent>(senders: &SenderMap, thread: ThreadId, f: F) {
-    let sender = sender_for_thread(senders, thread);
-    if let Some(sender) = sender {
-        let _ = sender.send(f());
+    let log = sender_for_thread(senders, thread);
+    if let Some(log) = log {
+        let event = f();
+        let event_kind = agent_event_kind(&event);
+        if !log.append(event) {
+            debug!(%thread, event_kind, "Codex event log was closed; dropping event");
+        }
     }
 }
 
-fn lock_senders(
-    senders: &SenderMap,
-) -> StdMutexGuard<'_, HashMap<ThreadId, broadcast::Sender<AgentEvent>>> {
-    match senders.lock() {
+fn agent_event_kind(event: &AgentEvent) -> &'static str {
+    match event {
+        AgentEvent::ThreadOpened { .. } => "thread_opened",
+        AgentEvent::TurnStarted { .. } => "turn_started",
+        AgentEvent::ContextWindowUpdated { .. } => "context_window_updated",
+        AgentEvent::ItemStarted { .. } => "item_started",
+        AgentEvent::ItemDelta { .. } => "item_delta",
+        AgentEvent::ItemCompleted { .. } => "item_completed",
+        AgentEvent::DiffUpdated { .. } => "diff_updated",
+        AgentEvent::ApprovalRequested { .. } => "approval_requested",
+        AgentEvent::ServerRequestReceived { .. } => "server_request_received",
+        AgentEvent::ServerRequestResolved { .. } => "server_request_resolved",
+        AgentEvent::TurnCompleted { .. } => "turn_completed",
+        AgentEvent::Error { .. } => "error",
+        AgentEvent::Notice { .. } => "notice",
+    }
+}
+
+fn lock_senders(senders: &SenderMap) -> StdMutexGuard<'_, HashMap<ThreadId, Arc<EventLog>>> {
+    match senders.0.lock() {
         Ok(guard) => guard,
         Err(poisoned) => {
             warn!("Codex sender map lock was poisoned; recovering sender state");
@@ -2345,10 +2378,7 @@ fn lock_senders(
     }
 }
 
-fn sender_for_thread(
-    senders: &SenderMap,
-    thread: ThreadId,
-) -> Option<broadcast::Sender<AgentEvent>> {
+fn sender_for_thread(senders: &SenderMap, thread: ThreadId) -> Option<Arc<EventLog>> {
     lock_senders(senders).get(&thread).cloned()
 }
 
@@ -4447,7 +4477,8 @@ mod tests {
 
         assert_eq!(opened.thread, thread);
         assert_eq!(opened.harness_thread_id, "native-thread-1");
-        assert!(original_sender.same_channel(
+        assert!(Arc::ptr_eq(
+            &original_sender,
             &sender_for_thread(&harness.senders, thread).expect("replacement sender exists")
         ));
         assert_eq!(
@@ -5726,6 +5757,13 @@ mod tests {
             .await
             .unwrap();
         let mut first_rx = harness.subscribe(&opened);
+        assert!(matches!(
+            first_rx.recv().await,
+            Ok(AgentEvent::ThreadOpened {
+                thread: got_thread,
+                ..
+            }) if got_thread == thread
+        ));
 
         harness
             .claim_native_thread(thread, "native-existing".into(), PathBuf::from("/tmp"))
@@ -5735,8 +5773,7 @@ mod tests {
         let turn = TurnId::new();
         sender_for_thread(&harness.senders, thread)
             .expect("sender exists")
-            .send(AgentEvent::TurnStarted { thread, turn })
-            .unwrap();
+            .append(AgentEvent::TurnStarted { thread, turn });
         assert!(matches!(
             first_rx.recv().await,
             Ok(AgentEvent::TurnStarted { thread: got_thread, turn: got_turn })
@@ -5785,7 +5822,7 @@ mod tests {
             .unwrap();
         let repeated =
             sender_for_thread(&harness.senders, thread).expect("sender survives repeated claim");
-        assert!(first.same_channel(&repeated));
+        assert!(Arc::ptr_eq(&first, &repeated));
     }
 
     #[tokio::test]
@@ -5860,9 +5897,10 @@ mod tests {
     #[tokio::test]
     async fn incomplete_stream_without_turn_emits_error_event() {
         let thread = ThreadId::new();
-        let senders: SenderMap = Arc::new(StdMutex::new(HashMap::new()));
-        let (tx, mut rx) = broadcast::channel(BROADCAST_CAPACITY);
-        lock_senders(&senders).insert(thread, tx);
+        let senders: SenderMap = Arc::new(EventLogs::default());
+        let log = Arc::new(EventLog::new());
+        let mut rx = log.reader();
+        lock_senders(&senders).insert(thread, log);
 
         emit_incomplete_turn(&senders, thread, None, "stream ended").await;
 
@@ -5884,9 +5922,10 @@ mod tests {
     async fn incomplete_stream_with_turn_emits_failed_completion() {
         let thread = ThreadId::new();
         let turn = TurnId::new();
-        let senders: SenderMap = Arc::new(StdMutex::new(HashMap::new()));
-        let (tx, mut rx) = broadcast::channel(BROADCAST_CAPACITY);
-        lock_senders(&senders).insert(thread, tx);
+        let senders: SenderMap = Arc::new(EventLogs::default());
+        let log = Arc::new(EventLog::new());
+        let mut rx = log.reader();
+        lock_senders(&senders).insert(thread, log);
 
         emit_incomplete_turn(&senders, thread, Some(turn), "stream failed").await;
 
@@ -5911,9 +5950,10 @@ mod tests {
     async fn fatal_error_with_turn_emits_failed_completion() {
         let thread = ThreadId::new();
         let turn = TurnId::new();
-        let senders: SenderMap = Arc::new(StdMutex::new(HashMap::new()));
-        let (tx, mut rx) = broadcast::channel(BROADCAST_CAPACITY);
-        lock_senders(&senders).insert(thread, tx);
+        let senders: SenderMap = Arc::new(EventLogs::default());
+        let log = Arc::new(EventLog::new());
+        let mut rx = log.reader();
+        lock_senders(&senders).insert(thread, log);
 
         assert!(emit_fatal_turn_completion(&senders, thread, Some(turn), "quota exceeded").await);
 
@@ -5937,16 +5977,14 @@ mod tests {
     #[tokio::test]
     async fn fatal_error_without_turn_does_not_synthesize_completion() {
         let thread = ThreadId::new();
-        let senders: SenderMap = Arc::new(StdMutex::new(HashMap::new()));
-        let (tx, mut rx) = broadcast::channel(BROADCAST_CAPACITY);
-        lock_senders(&senders).insert(thread, tx);
+        let senders: SenderMap = Arc::new(EventLogs::default());
+        let log = Arc::new(EventLog::new());
+        let mut rx = log.reader();
+        lock_senders(&senders).insert(thread, log);
 
         assert!(!emit_fatal_turn_completion(&senders, thread, None, "quota exceeded").await);
 
-        assert!(matches!(
-            rx.try_recv(),
-            Err(broadcast::error::TryRecvError::Empty)
-        ));
+        assert!(timeout(Duration::from_millis(10), rx.recv()).await.is_err());
     }
 
     #[test]
@@ -6515,7 +6553,6 @@ mod tests {
         }
 
         #[tokio::test]
-        #[ignore = "M1: retained event log"]
         async fn events_after_claim_and_before_subscribe_are_retained() {
             let (harness, controller) = spawn_fake_harness();
             let (parent, parent_turn, mut parent_stream) =
@@ -6557,7 +6594,6 @@ mod tests {
         }
 
         #[tokio::test]
-        #[ignore = "M1: retained event log"]
         async fn slow_subscriber_receives_every_event_in_order() {
             let (harness, controller) = spawn_fake_harness();
             let (parent, parent_turn, mut parent_stream) =
@@ -6612,7 +6648,6 @@ mod tests {
         }
 
         #[tokio::test]
-        #[ignore = "M1: retained event log"]
         async fn resubscribing_after_dropping_the_stream_yields_unconsumed_events() {
             let (harness, controller) = spawn_fake_harness();
             let (parent, parent_turn, mut parent_stream) =

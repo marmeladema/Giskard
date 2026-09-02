@@ -22,13 +22,12 @@ use giskard_core::token::TokenUsage;
 use giskard_core::turn::{Mode, PermissionPreset, TurnOverrides, TurnStatus, TurnStatusKind};
 use giskard_core::user_input::UserInput;
 use giskard_harness::{
-    AgentEventStream, AgentHarness, HarnessCapabilities, OpenThreadOptions, ThreadHandle,
+    AgentEventStream, AgentHarness, EventLog, HarnessCapabilities, OpenThreadOptions, ThreadHandle,
 };
 use giskard_persist::store::ProjectConfig;
 use giskard_proto::ClientMessage;
 use giskard_server::{AppState, HarnessFactory, build_app};
 use tokio::sync::Mutex as TokioMutex;
-use tokio::sync::broadcast;
 
 use common::fake_native_model;
 use thread_fixture::persist_primary_thread;
@@ -36,7 +35,7 @@ use thread_fixture::persist_primary_thread;
 /// Harness that records the overrides passed to `start_turn` and emits a trivial completed turn.
 struct CapturingHarness {
     captured: Arc<TokioMutex<Vec<TurnOverrides>>>,
-    tx: broadcast::Sender<AgentEvent>,
+    tx: Arc<EventLog>,
     thread_id: StdMutex<Option<ThreadId>>,
     /// What each `open_thread` asked for.
     requested_models: Arc<StdMutex<Vec<ModelRef>>>,
@@ -47,7 +46,7 @@ impl CapturingHarness {
         captured: Arc<TokioMutex<Vec<TurnOverrides>>>,
         requested_models: Arc<StdMutex<Vec<ModelRef>>>,
     ) -> Self {
-        let (tx, _) = broadcast::channel(64);
+        let tx = Arc::new(EventLog::new());
         Self {
             captured,
             tx,
@@ -108,8 +107,10 @@ impl AgentHarness for CapturingHarness {
         let tid = thread.thread;
         let turn = TurnId::new();
         // Drive a minimal turn so the server-side forwarder completes and persists.
-        let _ = self.tx.send(AgentEvent::TurnStarted { thread: tid, turn });
-        let _ = self.tx.send(AgentEvent::TurnCompleted {
+        let _ = self
+            .tx
+            .append(AgentEvent::TurnStarted { thread: tid, turn });
+        let _ = self.tx.append(AgentEvent::TurnCompleted {
             thread: tid,
             turn,
             usage: TokenUsage::default(),
@@ -122,7 +123,7 @@ impl AgentHarness for CapturingHarness {
     }
 
     fn subscribe(&self, _thread: &ThreadHandle) -> AgentEventStream {
-        AgentEventStream::new(self.tx.subscribe())
+        AgentEventStream::new(self.tx.reader())
     }
 
     async fn respond_approval(

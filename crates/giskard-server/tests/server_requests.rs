@@ -19,12 +19,12 @@ use giskard_core::token::TokenUsage;
 use giskard_core::turn::{TurnOverrides, TurnStatus, TurnStatusKind};
 use giskard_core::user_input::UserInput;
 use giskard_harness::{
-    AgentEventStream, AgentHarness, HarnessCapabilities, OpenThreadOptions, ThreadHandle,
+    AgentEventStream, AgentHarness, EventLog, HarnessCapabilities, OpenThreadOptions, ThreadHandle,
 };
 use giskard_persist::store::ProjectConfig;
 use giskard_proto::{ClientMessage, LiveTurnSnapshot, ServerMessage, WireAgentEvent};
 use giskard_server::{AppState, HarnessFactory, build_app};
-use tokio::sync::{Mutex, broadcast};
+use tokio::sync::Mutex;
 use tokio::time::{Duration, Instant};
 
 use common::fake_native_model;
@@ -34,7 +34,7 @@ type TestWs =
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
 struct ServerRequestHarness {
-    tx: broadcast::Sender<AgentEvent>,
+    tx: Arc<EventLog>,
     active: Mutex<Option<(ThreadId, TurnId)>>,
     responses: Mutex<Vec<(ServerRequestId, ServerRequestResponse)>>,
     fail_next_response: Mutex<Option<HarnessError>>,
@@ -47,7 +47,7 @@ struct ServerRequestHarness {
 
 impl ServerRequestHarness {
     fn new() -> Self {
-        let (tx, _) = broadcast::channel(64);
+        let tx = Arc::new(EventLog::new());
         Self {
             tx,
             active: Mutex::new(None),
@@ -129,11 +129,11 @@ impl AgentHarness for ServerRequestHarness {
     ) -> Result<TurnId, HarnessError> {
         let turn = TurnId::new();
         *self.active.lock().await = Some((thread.thread, turn));
-        let _ = self.tx.send(AgentEvent::TurnStarted {
+        let _ = self.tx.append(AgentEvent::TurnStarted {
             thread: thread.thread,
             turn,
         });
-        let _ = self.tx.send(AgentEvent::ServerRequestReceived {
+        let _ = self.tx.append(AgentEvent::ServerRequestReceived {
             thread: thread.thread,
             turn: Some(turn),
             request: ServerRequest {
@@ -154,7 +154,7 @@ impl AgentHarness for ServerRequestHarness {
     }
 
     fn subscribe(&self, _thread: &ThreadHandle) -> AgentEventStream {
-        AgentEventStream::new(self.tx.subscribe())
+        AgentEventStream::new(self.tx.reader())
     }
 
     async fn respond_approval(
@@ -184,12 +184,12 @@ impl AgentHarness for ServerRequestHarness {
             return Ok(());
         }
         let (thread, turn) = self.active.lock().await.take().unwrap_or_default();
-        let _ = self.tx.send(AgentEvent::ServerRequestResolved {
+        let _ = self.tx.append(AgentEvent::ServerRequestResolved {
             thread,
             turn: Some(turn),
             request_id: req,
         });
-        let _ = self.tx.send(AgentEvent::TurnCompleted {
+        let _ = self.tx.append(AgentEvent::TurnCompleted {
             thread,
             turn,
             usage: TokenUsage::default(),

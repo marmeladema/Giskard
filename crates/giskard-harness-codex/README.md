@@ -19,13 +19,15 @@ the Primary/sub-agent hierarchy. Helper futures borrow its protocol state throug
 independent worker mutates that state.
 
 `CodexTransport` remains the mockable request/read abstraction. `SenderMap` remains shared only
-because synchronous `AgentHarness::subscribe` must read it; `CodexInstance` is its sole runtime
-lifecycle mutator. It also owns route establishment: durable bootstrap, explicit open/resume, and
-provider-owned child claims all use the same primitive. That operation claims identity before
-publishing the broadcast sender, and an idempotent claim preserves the existing sender.
+because synchronous `AgentHarness::subscribe` must read it; it holds one retained event log per
+route, and `CodexInstance` is its sole runtime lifecycle mutator. It also owns route establishment:
+durable bootstrap, explicit open/resume, and provider-owned child claims all use the same primitive.
+That operation claims identity before publishing the event log, and an idempotent claim preserves
+the existing log and all of its retained events. Deleting a thread closes its log so attached
+readers drain retained events and then terminate.
 When a bootstrapped native resume fails because its rollout disappeared, the instance atomically
 replaces that exact native/Giskard binding with the fresh session identity, advances its route
-epoch, and preserves the delivery sender.
+epoch, and preserves the retained delivery log.
 
 ## Identifier model
 
@@ -80,7 +82,7 @@ matters because Codex can talk about a thread before Giskard opens it.
 complete `HarnessBootstrap` containing every `(harness_thread_id, ThreadId)` pair
 the project has already persisted. The registry rejects an incomplete scan,
 empty IDs, and duplicate mappings. The Codex adapter installs every route and
-event sender before launching its worker and ordinary event dispatch;
+event log before launching its worker and ordinary event dispatch;
 initialization traffic already buffered by the current client cannot be mapped
 first. This is construction input, not a command sent to an already-running harness.
 
@@ -109,9 +111,9 @@ either side to a different identity is a protocol error and never rekeys state.
 These registries belong to one `CodexInstance` and are rebuilt from durable
 bootstrap when its Codex app-server process is respawned. Durable Giskard IDs
 and completed transcript items remain in Giskard persistence; native
-live-process state does not. Deleting a thread removes its delivery sender but preserves its native
+live-process state does not. Deleting a thread removes and closes its delivery log but preserves its native
 identity claim for the lifetime of that Codex process; an identical later claim recreates the
-sender, while a conflicting identity remains an error.
+log, while a conflicting identity remains an error.
 
 The turn key includes the Giskard thread because Codex does not expose a
 protocol contract making turn IDs globally unique across threads. The item key

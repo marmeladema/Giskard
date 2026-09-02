@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use chrono::Utc;
 use futures::future::join_all;
-use tokio::sync::{Mutex, Notify, OwnedMutexGuard, broadcast, oneshot, watch};
+use tokio::sync::{Mutex, Notify, OwnedMutexGuard, oneshot, watch};
 use tokio::time::timeout;
 use tracing::{debug, error, info, warn};
 
@@ -29,8 +29,8 @@ use giskard_core::turn::{
 };
 use giskard_core::user_input::UserInput;
 use giskard_harness::{
-    AgentHarness, HarnessBootstrap, HarnessCapabilities, HarnessProvider, KnownThreadBinding,
-    OpenThreadOptions, ThreadHandle, ThreadUpdate, thread_update_channel,
+    AgentHarness, EventStreamError, HarnessBootstrap, HarnessCapabilities, HarnessProvider,
+    KnownThreadBinding, OpenThreadOptions, ThreadHandle, ThreadUpdate, thread_update_channel,
 };
 use giskard_persist::PersistStore;
 use giskard_persist::store::{ProjectConfig, ThreadFile, ThreadMutation, TurnCommitOutcome};
@@ -2620,11 +2620,12 @@ mod tests {
     use giskard_core::turn::{Mode, PermissionPreset, TurnMode, TurnModel};
     use giskard_core::user_input::UserInput;
     use giskard_harness::{
-        AgentEventStream, AgentHarness, HarnessCapabilities, OpenThreadOptions, ThreadHandle,
+        AgentEventStream, AgentHarness, EventLog, HarnessCapabilities, OpenThreadOptions,
+        ThreadHandle,
     };
     use giskard_persist::PersistStore;
     use giskard_persist::store::{ProjectConfig, ThreadFile};
-    use tokio::sync::{Notify, broadcast};
+    use tokio::sync::Notify;
 
     use super::{TurnContext, TurnContextKind, turn_reservation};
     use crate::hub::Hub;
@@ -2665,8 +2666,7 @@ mod tests {
         }
 
         fn subscribe(&self, _thread: &ThreadHandle) -> AgentEventStream {
-            let (_, receiver) = broadcast::channel(1);
-            AgentEventStream::new(receiver)
+            AgentEventStream::closed()
         }
 
         async fn respond_approval(
@@ -2760,8 +2760,7 @@ mod tests {
         }
 
         fn subscribe(&self, _thread: &ThreadHandle) -> giskard_harness::AgentEventStream {
-            let (_, rx) = tokio::sync::broadcast::channel(1);
-            giskard_harness::AgentEventStream::new(rx)
+            giskard_harness::AgentEventStream::closed()
         }
 
         async fn respond_approval(
@@ -3704,12 +3703,12 @@ mod tests {
             .unwrap();
         let authority = install_test_coordinator(&registry.shared, coordinator.clone()).await;
         let permit = registry.shared.background_tasks.register().unwrap();
-        let (events, _) = broadcast::channel(2);
+        let events = Arc::new(EventLog::new());
         super::launch_event_forwarder(
             registry.shared.clone(),
             authority,
             coordinator,
-            AgentEventStream::new(events.subscribe()),
+            AgentEventStream::new(events.reader()),
             cancel_rx,
             completed_tx,
             permit,
@@ -3721,7 +3720,7 @@ mod tests {
             registry_forget.forget_thread(thread_id).await;
         });
         tokio::task::yield_now().await;
-        drop(events);
+        events.close();
         tokio::task::yield_now().await;
         drop(owner_guard);
 
@@ -3849,17 +3848,17 @@ mod tests {
                 .is_ok()
         );
         let permit = shared.background_tasks.register().unwrap();
-        let (events, _) = broadcast::channel(2);
+        let events = Arc::new(EventLog::new());
         super::launch_event_forwarder(
             shared,
             authority.clone(),
             coordinator,
-            AgentEventStream::new(events.subscribe()),
+            AgentEventStream::new(events.reader()),
             cancel_rx,
             completed_tx,
             permit,
         );
-        drop(events);
+        events.close();
         while !*completed_rx.borrow() {
             completed_rx.changed().await.unwrap();
         }

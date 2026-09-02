@@ -15,12 +15,12 @@ use giskard_core::model::{ModelDescriptor, ModelRef};
 use giskard_core::token::{TokenLedger, TokenUsage};
 use giskard_core::turn::{Mode, PermissionPreset, Turn, TurnStatus, TurnStatusKind};
 use giskard_harness::{
-    AgentEventStream, AgentHarness, HarnessCapabilities, OpenThreadOptions, ThreadHandle,
+    AgentEventStream, AgentHarness, EventLog, HarnessCapabilities, OpenThreadOptions, ThreadHandle,
 };
 use giskard_persist::store::{ProjectConfig, ThreadFile, ThreadGitWorkspace, ThreadWorktree};
 use giskard_proto::ClientMessage;
 use giskard_server::{AppState, HarnessFactory, build_app};
-use tokio::sync::{Mutex, broadcast};
+use tokio::sync::Mutex;
 
 const DEAD_PROVIDER: &str = "cloudflare-litellm";
 const NEW_PROVIDER: &str = "opencodex";
@@ -31,7 +31,7 @@ const NEW_PROVIDER: &str = "opencodex";
 struct SwitchHarness {
     report_provider: Option<String>,
     opened_workspace_roots: Arc<Mutex<Vec<String>>>,
-    events: broadcast::Sender<giskard_core::event::AgentEvent>,
+    events: Arc<EventLog>,
 }
 
 #[async_trait::async_trait]
@@ -82,7 +82,7 @@ impl AgentHarness for SwitchHarness {
     }
 
     fn subscribe(&self, _thread: &ThreadHandle) -> AgentEventStream {
-        AgentEventStream::new(self.events.subscribe())
+        AgentEventStream::new(self.events.reader())
     }
 
     async fn respond_approval(
@@ -115,7 +115,7 @@ impl AgentHarness for SwitchHarness {
 struct SwitchFactory {
     report_provider: Option<String>,
     opened_workspace_roots: Arc<Mutex<Vec<String>>>,
-    events: broadcast::Sender<giskard_core::event::AgentEvent>,
+    events: Arc<EventLog>,
 }
 
 #[async_trait::async_trait]
@@ -305,7 +305,7 @@ model_listing = false
         .unwrap();
 
     let opened_workspace_roots = Arc::new(Mutex::new(Vec::new()));
-    let (events, _) = broadcast::channel(8);
+    let events = Arc::new(EventLog::new());
     let state = AppState::new(
         store,
         Arc::new(SwitchFactory {
