@@ -86,11 +86,10 @@ native thread. The same owner processes every native turn until the binding is e
 parent activity does not start a second subscriber, hand ownership between tasks, or stop the owner
 after a timeout.
 
-Owner retirement changes the slot from `Live` to `Draining` while holding the per-thread owner
-lock, requests cancellation, then releases the lock before waiting for task completion. Cold opens
-that encounter `Draining` also release the lock and wait before retrying. Consequently no task ever
-waits for another task while holding the owner lock, and a replacement subscriber cannot overlap
-the draining generation.
+One project event driver owns all of the harness's forwarders and serializes their ownership
+transitions. Retirement is a `Detach` message to that driver. An attach that arrives while the same
+thread is detaching is queued until the old forwarder exits, so a replacement subscriber cannot
+overlap it and no task waits on another task's owner lifecycle.
 
 The first event carrying a previously unseen native turn ID atomically claims that turn before any
 live-buffer, browser, or persistence mutation. `TurnStarted` may arrive later. On completion the

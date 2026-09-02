@@ -6,6 +6,8 @@ use giskard_core::model::ModelDescriptor;
 use giskard_harness::AgentHarness;
 use tokio::sync::{Mutex, MutexGuard, OwnedMutexGuard, RwLock};
 
+use super::driver::DriverHandle;
+
 /// Role-specific handle for serializing one project's lifecycle operations.
 #[derive(Clone)]
 pub(super) struct LifecycleLock(Arc<Mutex<()>>);
@@ -111,9 +113,11 @@ struct ProjectHarnessSlot {
 
 /// Whether the installed harness accepts normal use or is being deleted.
 enum ProjectHarnessState {
-    Active(Arc<dyn AgentHarness>),
-    Deleting(Arc<dyn AgentHarness>),
+    Active(Arc<dyn AgentHarness>, DriverHandle),
+    Deleting(Arc<dyn AgentHarness>, DriverHandle),
 }
+
+type HarnessAndDriver = (Arc<dyn AgentHarness>, DriverHandle);
 
 /// Root serialization point for harness creation, deletion, and shutdown.
 pub(super) struct HarnessTransitions {
@@ -181,8 +185,8 @@ impl ProjectHarnessGuard<'_, '_, '_> {
     /// Clones an active harness; empty and deleting slots are not reachable.
     pub(super) fn active(&self) -> Option<Arc<dyn AgentHarness>> {
         match self.slot.as_ref() {
-            Some(ProjectHarnessState::Active(harness)) => Some(harness.clone()),
-            Some(ProjectHarnessState::Deleting(_)) | None => None,
+            Some(ProjectHarnessState::Active(harness, _)) => Some(harness.clone()),
+            Some(ProjectHarnessState::Deleting(_, _)) | None => None,
         }
     }
 
@@ -196,8 +200,8 @@ impl ProjectHarnessGuard<'_, '_, '_> {
             ));
         }
         match self.slot.as_ref() {
-            Some(ProjectHarnessState::Active(harness)) => Ok(Some(harness.clone())),
-            Some(ProjectHarnessState::Deleting(_)) => Err(HarnessError::Protocol(format!(
+            Some(ProjectHarnessState::Active(harness, _)) => Ok(Some(harness.clone())),
+            Some(ProjectHarnessState::Deleting(_, _)) => Err(HarnessError::Protocol(format!(
                 "project {} harness is being deleted",
                 self.project_id
             ))),
@@ -206,19 +210,31 @@ impl ProjectHarnessGuard<'_, '_, '_> {
     }
 
     /// Publishes a newly created harness into the same slot checked for creation.
-    pub(super) fn publish_active(&mut self, harness: Arc<dyn AgentHarness>) {
-        *self.slot = Some(ProjectHarnessState::Active(harness));
+    pub(super) fn publish_active(&mut self, harness: Arc<dyn AgentHarness>, driver: DriverHandle) {
+        *self.slot = Some(ProjectHarnessState::Active(harness, driver));
+    }
+
+    pub(super) fn driver(&self) -> Option<DriverHandle> {
+        match self.slot.as_ref() {
+            Some(ProjectHarnessState::Active(_, driver))
+            | Some(ProjectHarnessState::Deleting(_, driver)) => Some(driver.clone()),
+            None => None,
+        }
     }
 
     /// Marks an active harness deleting and returns it for shutdown outside the guards.
-    pub(super) fn begin_delete(&mut self) -> Result<Option<Arc<dyn AgentHarness>>, HarnessError> {
+    pub(super) fn begin_delete(&mut self) -> Result<Option<HarnessAndDriver>, HarnessError> {
         match self.slot.as_ref() {
-            Some(ProjectHarnessState::Active(harness)) => {
+            Some(ProjectHarnessState::Active(harness, driver)) => {
                 let harness = harness.clone();
-                *self.slot = Some(ProjectHarnessState::Deleting(harness.clone()));
-                Ok(Some(harness))
+                let driver = driver.clone();
+                *self.slot = Some(ProjectHarnessState::Deleting(
+                    harness.clone(),
+                    driver.clone(),
+                ));
+                Ok(Some((harness, driver)))
             }
-            Some(ProjectHarnessState::Deleting(_)) => Err(HarnessError::Protocol(format!(
+            Some(ProjectHarnessState::Deleting(_, _)) => Err(HarnessError::Protocol(format!(
                 "project {} harness deletion is already in progress",
                 self.project_id
             ))),
@@ -231,10 +247,13 @@ impl ProjectHarnessGuard<'_, '_, '_> {
         if !self.transitions.state.shutting_down
             && matches!(
                 self.slot.as_ref(),
-                Some(ProjectHarnessState::Deleting(current)) if Arc::ptr_eq(current, &harness)
+                Some(ProjectHarnessState::Deleting(current, _)) if Arc::ptr_eq(current, &harness)
             )
         {
-            *self.slot = Some(ProjectHarnessState::Active(harness));
+            let Some(ProjectHarnessState::Deleting(_, driver)) = self.slot.take() else {
+                return;
+            };
+            *self.slot = Some(ProjectHarnessState::Active(harness, driver));
         }
     }
 
@@ -242,7 +261,7 @@ impl ProjectHarnessGuard<'_, '_, '_> {
     pub(super) fn finish_delete(&mut self, harness: &Arc<dyn AgentHarness>) {
         if matches!(
             self.slot.as_ref(),
-            Some(ProjectHarnessState::Deleting(current)) if Arc::ptr_eq(current, harness)
+            Some(ProjectHarnessState::Deleting(current, _)) if Arc::ptr_eq(current, harness)
         ) {
             *self.slot = None;
         }
@@ -251,7 +270,7 @@ impl ProjectHarnessGuard<'_, '_, '_> {
     /// Drains either harness state while the global shutdown fence is held.
     pub(super) fn take_for_shutdown(&mut self) -> Option<Arc<dyn AgentHarness>> {
         self.slot.take().map(|state| match state {
-            ProjectHarnessState::Active(harness) | ProjectHarnessState::Deleting(harness) => {
+            ProjectHarnessState::Active(harness, _) | ProjectHarnessState::Deleting(harness, _) => {
                 harness
             }
         })

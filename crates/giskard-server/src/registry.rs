@@ -50,19 +50,21 @@ use crate::thread_runtime::{
     RestorePermit, RuntimeRequestId, ThreadRuntimeSupport, ThreadTurnLease, TurnReservation,
 };
 
+mod driver;
 mod event_forwarder;
 mod project;
 mod thread;
 
+use driver::{AttachOutcome, DriverHandle, spawn_project_event_driver};
 use event_forwarder::{
-    ForwarderExitReason, ThreadEventForwarder, event_item_id, event_kind, event_turn_id,
-    forwarder_exit_reason_label, log_metadata_only_event_rejection,
+    ForwarderExitReason, event_item_id, event_kind, event_turn_id, forwarder_exit_reason_label,
+    log_metadata_only_event_rejection,
 };
 use project::{HarnessTransitions, LifecycleLock, ProjectAuthority, WeakLifecycleLock};
 pub(crate) use thread::ThreadAuthority;
 use thread::{
-    ClassificationPhase, CoordinatorToken, EventOwnerControl, ExternalTurnDefaults, OwnerLock,
-    ThreadBinding, ThreadCoordinator, WeakOwnerLock,
+    ClassificationPhase, CoordinatorToken, ExternalTurnDefaults, OwnerLock, ThreadBinding,
+    ThreadCoordinator, WeakOwnerLock,
 };
 
 #[async_trait]
@@ -293,6 +295,12 @@ impl RegistryShared {
         let authority = self.project_authority(project_id).await?;
         let mut transitions = self.harness_transitions.lock().await;
         transitions.project(&authority).await.active()
+    }
+
+    async fn event_driver(&self, project_id: ProjectId) -> Option<DriverHandle> {
+        let authority = self.project_authority(project_id).await?;
+        let mut transitions = self.harness_transitions.lock().await;
+        transitions.project(&authority).await.driver()
     }
 
     async fn project_authority(&self, project_id: ProjectId) -> Option<Arc<ProjectAuthority>> {
@@ -878,7 +886,14 @@ impl HarnessRegistry {
         debug!(project_id = %project, bindings = binding_count,
             "created harness with durable thread bindings installed");
 
-        slot.publish_active(h.clone());
+        let Some(driver_permit) = self.shared.background_tasks.register() else {
+            let _ = h.shutdown().await;
+            return Err(HarnessError::Protocol(
+                "server is shutting down; refusing to start a project event driver".into(),
+            ));
+        };
+        let driver = spawn_project_event_driver(project, self.shared.clone(), &h, driver_permit);
+        slot.publish_active(h.clone(), driver);
         spawn_discovery_consumer(self.shared.clone(), project, h.clone());
         Ok(h)
     }
@@ -985,7 +1000,7 @@ impl HarnessRegistry {
         // Serialize the cold check and native open for an already-known thread. Locking only when
         // publishing the owner is too late: two callers could both open the native thread and the
         // losing open may invalidate the stream already owned by the winner.
-        let _owner_guard = lock_thread_owner_after_drain(&self.shared, thread).await;
+        let _owner_guard = lock_thread_owner(&self.shared.threads, thread).await;
         if let Some(existing) = self.shared.coordinator(thread).await {
             return existing
                 .reusable_handle(
@@ -1034,7 +1049,7 @@ impl HarnessRegistry {
             handle: handle.clone(),
             native_model: Some(native_model),
         };
-        let owner_installed = install_event_owner_locked(
+        let owner_installed = install_event_owner(
             &self.shared,
             &harness,
             binding,
@@ -1677,29 +1692,15 @@ impl HarnessRegistry {
     }
 
     pub async fn forget_thread(&self, thread_id: ThreadId) {
-        let owner_guard = lock_thread_owner(&self.shared.threads, thread_id).await;
-        let authority = self.shared.thread_authority(thread_id).await;
-        let coordinator = match authority.as_ref() {
-            Some(authority) => authority.coordinator().await,
-            None => None,
+        let Some(authority) = self.shared.thread_authority(thread_id).await else {
+            return;
         };
-        let control = match coordinator.as_ref() {
-            Some(coordinator) => coordinator.begin_retirement().await,
-            None => None,
-        };
-        if let Some(control) = control.as_ref() {
-            let _ = control.cancel.send(true);
-        }
-        drop(owner_guard);
-
-        if let Some(mut control) = control {
-            wait_for_owner_completion(&mut control).await;
-        }
-
-        let _owner_guard = lock_thread_owner(&self.shared.threads, thread_id).await;
-        if let (Some(authority), Some(coordinator)) = (authority.as_ref(), coordinator) {
+        if let Some(driver) = self.shared.event_driver(authority.project_id()).await {
+            driver.detach(thread_id).await;
+        } else if let Some(coordinator) = authority.coordinator().await
+            && coordinator.is_failed().await
+        {
             authority.clear_coordinator_if(&coordinator).await;
-            coordinator.finish_retirement().await;
         }
     }
 
@@ -1826,13 +1827,15 @@ impl HarnessRegistry {
             }
         }
         let authority = self.shared.project_authority(project_id).await;
-        let harness = if let Some(authority) = authority.as_ref() {
+        let harness_and_driver = if let Some(authority) = authority.as_ref() {
             let mut transitions = self.shared.harness_transitions.lock().await;
             transitions.project(authority).await.begin_delete()?
         } else {
             None
         };
-        if let Some(harness) = harness {
+        let mut retained_driver = None;
+        if let Some((harness, driver)) = harness_and_driver {
+            retained_driver = Some(driver);
             if let Err(error) = harness.shutdown().await {
                 let mut transitions = self.shared.harness_transitions.lock().await;
                 if let Some(authority) = authority.as_ref() {
@@ -1854,8 +1857,13 @@ impl HarnessRegistry {
             if let Some(authority) = self.shared.thread_authority(*thread_id).await {
                 thread_authorities.push(authority);
             }
-            self.forget_thread(*thread_id).await;
+            if let Some(driver) = retained_driver.as_ref() {
+                driver.detach(*thread_id).await;
+            } else {
+                self.forget_thread(*thread_id).await;
+            }
         }
+        drop(retained_driver);
         self.shared.runtime.forget_threads(&thread_authorities);
         publish_runtime_overview(&self.shared).await;
 
@@ -1919,51 +1927,6 @@ async fn lock_thread_owner(
         }
     };
     lock.lock_owned().await
-}
-
-async fn wait_for_owner_completion(control: &mut EventOwnerControl) {
-    while !*control.completed.borrow() {
-        if control.completed.changed().await.is_err() {
-            break;
-        }
-    }
-}
-
-/// Lock an owner slot only after its previous generation has finished draining. Waiting happens
-/// without the slot lock, so retirement and owner-task completion can always make progress.
-async fn lock_thread_owner_after_drain(
-    shared: &RegistryShared,
-    thread_id: ThreadId,
-) -> OwnedMutexGuard<()> {
-    loop {
-        let owner_guard = lock_thread_owner(&shared.threads, thread_id).await;
-        let Some(authority) = shared.thread_authority(thread_id).await else {
-            return owner_guard;
-        };
-        let coordinator = authority.coordinator().await;
-        let Some(coordinator) = coordinator else {
-            return owner_guard;
-        };
-        if coordinator.is_retired().await {
-            authority.clear_coordinator_if(&coordinator).await;
-            return owner_guard;
-        }
-        let Some(mut control) = coordinator.draining_control().await else {
-            return owner_guard;
-        };
-        if *control.completed.borrow() {
-            drop(owner_guard);
-            tokio::task::yield_now().await;
-            continue;
-        }
-        if control.completed.has_changed().is_err() {
-            authority.clear_coordinator_if(&coordinator).await;
-            coordinator.finish_retirement().await;
-            return owner_guard;
-        }
-        drop(owner_guard);
-        wait_for_owner_completion(&mut control).await;
-    }
 }
 
 async fn publish_runtime_overview(shared: &RegistryShared) {
@@ -2571,7 +2534,6 @@ async fn ensure_subagent_thread_open(
         effective_thread_workspace_root(&shared.store, project_config, thread_file)
             .await
             .map_err(|error| HarnessError::Protocol(error.to_string()))?;
-    let _owner_guard = lock_thread_owner_after_drain(shared, thread_file.id).await;
     if let Some(coordinator) = shared.coordinator(thread_file.id).await {
         let handle = coordinator
             .reusable_handle(
@@ -2601,7 +2563,7 @@ async fn ensure_subagent_thread_open(
         .clone()
         .or_else(|| thread_file.current_model.as_known().cloned());
     let agent_name = handle.agent_name.clone();
-    install_event_owner_locked(
+    install_event_owner(
         shared,
         &harness,
         LoadedThreadBinding {
@@ -2662,117 +2624,25 @@ async fn broadcast_event_with_user_input(
     .await;
 }
 
-fn launch_event_forwarder(
-    shared: Arc<RegistryShared>,
-    authority: Arc<ThreadAuthority>,
-    coordinator: Arc<ThreadCoordinator>,
-    stream: giskard_harness::AgentEventStream,
-    cancel: watch::Receiver<bool>,
-    completed: watch::Sender<bool>,
-    permit: RegistryTaskPermit,
-) {
-    tokio::spawn(async move {
-        let _permit = permit;
-        let cancellation_probe = cancel.clone();
-        let forwarder = ThreadEventForwarder::new(
-            shared.clone(),
-            authority.clone(),
-            coordinator.clone(),
-            stream,
-            cancel,
-        )
-        .await;
-        let thread_id = forwarder.thread_id();
-        let exit_reason = forwarder.run().await;
-        let cancelled = *cancellation_probe.borrow();
-        if !cancelled && exit_reason != ForwarderExitReason::PersistenceBlocked {
-            coordinator.owner_finished(false).await;
-            if authority.clear_coordinator_if(&coordinator).await {
-                warn!(
-                    %thread_id,
-                    exit_reason = forwarder_exit_reason_label(exit_reason),
-                    "removed failed event owner so the thread can be reopened"
-                );
-            }
-        } else {
-            coordinator.owner_finished(cancelled).await;
-        }
-        let _ = completed.send(true);
-    });
-}
-
 async fn install_event_owner(
     shared: &Arc<RegistryShared>,
-    harness: &Arc<dyn AgentHarness>,
-    binding: LoadedThreadBinding,
-    classification: ClassificationPhase,
-) -> Result<bool, HarnessError> {
-    let thread_id = binding.handle.thread;
-    let _owner_guard = lock_thread_owner_after_drain(shared, thread_id).await;
-    install_event_owner_locked(shared, harness, binding, classification).await
-}
-
-async fn install_event_owner_locked(
-    shared: &Arc<RegistryShared>,
-    harness: &Arc<dyn AgentHarness>,
+    _harness: &Arc<dyn AgentHarness>,
     binding: LoadedThreadBinding,
     classification: ClassificationPhase,
 ) -> Result<bool, HarnessError> {
     let thread_id = binding.handle.thread;
     let project_id = binding.project_id;
-    let authority = shared
-        .intern_thread_authority(thread_id, project_id)
-        .await
-        .map_err(|error| HarnessError::Protocol(error.to_string()))?;
-    let existing = authority.coordinator().await;
-    if let Some(existing) = existing {
-        existing
-            .reusable_handle(
-                project_id,
-                thread_id,
-                Some(&binding.handle.harness_thread_id),
-                classification,
-            )
-            .await?;
-        debug!(%project_id, %thread_id, "reused existing long-lived native event owner");
-        return Ok(false);
+    let driver = shared.event_driver(project_id).await.ok_or_else(|| {
+        HarnessError::Protocol(format!("project {project_id} has no event driver"))
+    })?;
+    match driver.attach(binding, classification).await? {
+        AttachOutcome::Installed => Ok(true),
+        AttachOutcome::Reused(handle) => {
+            drop(handle);
+            debug!(%project_id, %thread_id, "reused existing long-lived native event owner");
+            Ok(false)
+        }
     }
-
-    let stream = harness.subscribe(&binding.handle);
-    let Some(permit) = shared.background_tasks.register() else {
-        return Err(HarnessError::Protocol(
-            "server is shutting down; refusing to install event owner".into(),
-        ));
-    };
-    let coordinator = Arc::new(ThreadCoordinator::new(binding, classification));
-    let (cancel_tx, cancel_rx) = watch::channel(false);
-    let (completed_tx, completed_rx) = watch::channel(false);
-    coordinator
-        .activate_owner(EventOwnerControl {
-            cancel: cancel_tx,
-            completed: completed_rx,
-        })
-        .await?;
-    if authority
-        .install_coordinator_if_empty(coordinator.clone())
-        .await
-        .is_err()
-    {
-        return Err(HarnessError::Protocol(format!(
-            "thread {thread_id} event owner installation conflicted with an existing coordinator"
-        )));
-    }
-    launch_event_forwarder(
-        shared.clone(),
-        authority,
-        coordinator.clone(),
-        stream,
-        cancel_rx,
-        completed_tx,
-        permit,
-    );
-    debug!(%project_id, %thread_id, "installed long-lived native event owner");
-    Ok(true)
 }
 
 /// Harness-neutral native thread identity used only for bootstrap uniqueness checks.
@@ -3955,13 +3825,13 @@ mod tests {
             .await;
         {
             let mut transitions = registry.shared.harness_transitions.lock().await;
-            transitions
-                .project(&successful)
-                .await
-                .publish_active(Arc::new(ShutdownHarness {
+            transitions.project(&successful).await.publish_active(
+                Arc::new(ShutdownHarness {
                     calls: successful_calls.clone(),
                     fail: false,
-                }));
+                }),
+                super::DriverHandle::disconnected(),
+            );
         }
         let failing = registry
             .shared
@@ -3969,13 +3839,13 @@ mod tests {
             .await;
         {
             let mut transitions = registry.shared.harness_transitions.lock().await;
-            transitions
-                .project(&failing)
-                .await
-                .publish_active(Arc::new(ShutdownHarness {
+            transitions.project(&failing).await.publish_active(
+                Arc::new(ShutdownHarness {
                     calls: failing_calls.clone(),
                     fail: true,
-                }));
+                }),
+                super::DriverHandle::disconnected(),
+            );
         }
 
         let error = registry.shutdown().await.unwrap_err();
@@ -4228,7 +4098,7 @@ mod tests {
         {
             let mut transitions = registry.shared.harness_transitions.lock().await;
             let mut slot = transitions.project(&authority).await;
-            slot.publish_active(harness);
+            slot.publish_active(harness, super::DriverHandle::disconnected());
             slot.begin_delete().unwrap();
         }
         let config: ProjectConfig = serde_json::from_value(serde_json::json!({
@@ -4269,7 +4139,7 @@ mod tests {
             transitions
                 .project(&authority)
                 .await
-                .publish_active(harness.clone());
+                .publish_active(harness.clone(), super::DriverHandle::disconnected());
         }
 
         let error = registry.delete_project(project_id).await.unwrap_err();
@@ -4458,197 +4328,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn closing_owner_cannot_deadlock_forget_thread_behind_owner_lock() {
-        let tmp = tempfile::tempdir().unwrap();
-        let store = Arc::new(PersistStore::new(tmp.path().to_path_buf()));
-        let registry = Arc::new(super::HarnessRegistry::new(
-            Arc::new(UnusedHarnessFactory),
-            Arc::new(Hub::new()),
-            store.clone(),
-            ledger::spawn(store),
-        ));
-        let coordinator = Arc::new(test_coordinator(super::ClassificationPhase::Primary));
-        let thread_id = coordinator.binding().await.handle.thread;
-        let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
-        let (completed_tx, completed_rx) = tokio::sync::watch::channel(false);
-        coordinator
-            .activate_owner(super::EventOwnerControl {
-                cancel: cancel_tx,
-                completed: completed_rx,
-            })
-            .await
-            .unwrap();
-        let authority = install_test_coordinator(&registry.shared, coordinator.clone()).await;
-        let permit = registry.shared.background_tasks.register().unwrap();
-        let events = Arc::new(EventLog::new());
-        super::launch_event_forwarder(
-            registry.shared.clone(),
-            authority,
-            coordinator,
-            AgentEventStream::new(events.reader()),
-            cancel_rx,
-            completed_tx,
-            permit,
-        );
-
-        let owner_guard = super::lock_thread_owner(&registry.shared.threads, thread_id).await;
-        let registry_forget = registry.clone();
-        let forget = tokio::spawn(async move {
-            registry_forget.forget_thread(thread_id).await;
-        });
-        tokio::task::yield_now().await;
-        events.close();
-        tokio::task::yield_now().await;
-        drop(owner_guard);
-
-        tokio::time::timeout(std::time::Duration::from_secs(2), forget)
-            .await
-            .expect("forget_thread must not deadlock with a self-exiting owner")
-            .unwrap();
-    }
-
-    #[tokio::test]
-    async fn installer_waits_for_draining_owner_without_holding_owner_lock() {
-        let tmp = tempfile::tempdir().unwrap();
-        let store = Arc::new(PersistStore::new(tmp.path().to_path_buf()));
-        let shared = Arc::new(super::RegistryShared::new(
-            Arc::new(Hub::new()),
-            store.clone(),
-            ledger::spawn(store),
-        ));
-        let coordinator = Arc::new(test_coordinator(super::ClassificationPhase::Primary));
-        let thread_id = coordinator.binding().await.handle.thread;
-        let (cancel_tx, _) = tokio::sync::watch::channel(false);
-        let (completed_tx, completed_rx) = tokio::sync::watch::channel(false);
-        coordinator
-            .activate_owner(super::EventOwnerControl {
-                cancel: cancel_tx,
-                completed: completed_rx,
-            })
-            .await
-            .unwrap();
-        coordinator.begin_retirement().await.unwrap();
-        let authority = install_test_coordinator(&shared, coordinator.clone()).await;
-
-        let waiter_shared = shared.clone();
-        let waiter = tokio::spawn(async move {
-            super::lock_thread_owner_after_drain(&waiter_shared, thread_id).await
-        });
-        tokio::task::yield_now().await;
-
-        let independent_guard = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            super::lock_thread_owner(&shared.threads, thread_id),
-        )
-        .await
-        .expect("an installer waiting for completion must release the owner lock");
-        drop(independent_guard);
-        coordinator.owner_finished(true).await;
-        completed_tx.send(true).unwrap();
-        let owner_guard = tokio::time::timeout(std::time::Duration::from_secs(2), waiter)
-            .await
-            .expect("the installer should resume after the draining owner completes")
-            .unwrap();
-
-        assert!(authority.coordinator().await.is_none());
-        assert!(coordinator.is_retired().await);
-        drop(owner_guard);
-    }
-
-    #[tokio::test]
-    async fn installer_retires_a_draining_owner_whose_completion_sender_closed() {
-        let tmp = tempfile::tempdir().unwrap();
-        let store = Arc::new(PersistStore::new(tmp.path().to_path_buf()));
-        let shared = Arc::new(super::RegistryShared::new(
-            Arc::new(Hub::new()),
-            store.clone(),
-            ledger::spawn(store),
-        ));
-        let coordinator = Arc::new(test_coordinator(super::ClassificationPhase::Primary));
-        let thread_id = coordinator.binding().await.handle.thread;
-        let (cancel_tx, _) = tokio::sync::watch::channel(false);
-        let (completed_tx, completed_rx) = tokio::sync::watch::channel(false);
-        coordinator
-            .activate_owner(super::EventOwnerControl {
-                cancel: cancel_tx,
-                completed: completed_rx,
-            })
-            .await
-            .unwrap();
-        coordinator.begin_retirement().await.unwrap();
-        let authority = install_test_coordinator(&shared, coordinator.clone()).await;
-        drop(completed_tx);
-
-        let owner_guard = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            super::lock_thread_owner_after_drain(&shared, thread_id),
-        )
-        .await
-        .expect("a closed completion channel must terminate draining");
-
-        assert!(authority.coordinator().await.is_none());
-        assert!(coordinator.is_retired().await);
-        drop(owner_guard);
-    }
-
-    #[tokio::test]
-    async fn failed_forwarder_does_not_clear_a_replacement_coordinator() {
-        let tmp = tempfile::tempdir().unwrap();
-        let store = Arc::new(PersistStore::new(tmp.path().to_path_buf()));
-        let shared = Arc::new(super::RegistryShared::new(
-            Arc::new(Hub::new()),
-            store.clone(),
-            ledger::spawn(store),
-        ));
-        let coordinator = Arc::new(test_coordinator(super::ClassificationPhase::Primary));
-        let binding = coordinator.binding().await;
-        let thread_id = binding.handle.thread;
-        let authority = install_test_coordinator(&shared, coordinator.clone()).await;
-        let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
-        let (completed_tx, mut completed_rx) = tokio::sync::watch::channel(false);
-        coordinator
-            .activate_owner(super::EventOwnerControl {
-                cancel: cancel_tx,
-                completed: completed_rx.clone(),
-            })
-            .await
-            .unwrap();
-        let replacement = Arc::new(super::ThreadCoordinator::new(
-            binding,
-            super::ClassificationPhase::Primary,
-        ));
-        assert!(authority.clear_coordinator_if(&coordinator).await);
-        assert!(
-            authority
-                .install_coordinator_if_empty(replacement.clone())
-                .await
-                .is_ok()
-        );
-        let permit = shared.background_tasks.register().unwrap();
-        let events = Arc::new(EventLog::new());
-        super::launch_event_forwarder(
-            shared,
-            authority.clone(),
-            coordinator,
-            AgentEventStream::new(events.reader()),
-            cancel_rx,
-            completed_tx,
-            permit,
-        );
-        events.close();
-        while !*completed_rx.borrow() {
-            completed_rx.changed().await.unwrap();
-        }
-
-        let installed = authority
-            .coordinator()
-            .await
-            .expect("replacement coordinator remains installed");
-        assert!(Arc::ptr_eq(&installed, &replacement));
-        assert_eq!(authority.thread_id(), thread_id);
-    }
-
-    #[tokio::test]
     async fn forgetting_and_reopening_reuses_the_same_thread_authority() {
         let tmp = tempfile::tempdir().unwrap();
         let store = Arc::new(PersistStore::new(tmp.path().to_path_buf()));
@@ -4661,7 +4340,11 @@ mod tests {
         let first = Arc::new(test_coordinator(super::ClassificationPhase::Primary));
         let binding = first.binding().await;
         let thread_id = binding.handle.thread;
-        let authority = install_test_coordinator(&registry.shared, first).await;
+        let authority = install_test_coordinator(&registry.shared, first.clone()).await;
+
+        let _ = first
+            .owner_exited(super::ForwarderExitReason::StreamEndedWithoutTurn)
+            .await;
 
         registry.forget_thread(thread_id).await;
         assert!(authority.coordinator().await.is_none());

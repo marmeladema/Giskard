@@ -9,7 +9,13 @@
 
 **Document status:** Implementation-ready specification.
 **Audience:** An AI coding agent (and its human reviewer) implementing the system.
-**Version:** 1.80
+**Version:** 1.81
+
+> **Amendment — one event driver per project (1.81).** Each active project harness has one event
+> driver task. It owns every native-thread event forwarder for that harness and serializes attach,
+> detach, and owner-exit transitions. Reattaching during detach is queued until the prior forwarder
+> exits. The driver holds only a weak harness reference, allowing harness shutdown to close retained
+> logs and drain all forwarders without a cross-task owner lifecycle protocol.
 
 > **Amendment — single stdout reader (1.80).** Giskard owns the Codex stdio transport. Exactly one
 > transport-internal task continuously reads stdout, correlating responses while appending
@@ -1754,9 +1760,9 @@ pub trait AgentHarness: Send + Sync {
 > is used to keep `async fn` in the trait object-safe.
 
 `AgentEventStream` and `DiscoveryStream` are typed wrappers around retained event-log readers. The
-registry installs exactly one discovery consumer per harness and exactly one consuming event owner
-per loaded native thread. Browser tabs subscribe to the registry's projections, not to harness
-streams.
+registry installs exactly one discovery consumer per harness. The project event driver installs and
+owns exactly one consuming event owner per loaded native thread. Browser tabs subscribe to the
+registry's projections, not to harness streams.
 
 ### 4.4 The neutral event model (`AgentEvent`)
 

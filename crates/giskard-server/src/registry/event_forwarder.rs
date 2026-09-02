@@ -2717,24 +2717,17 @@ mod tests {
             store.clone(),
             ledger::spawn(store.clone()),
         ));
-        let coordinator = Arc::new(super::ThreadCoordinator::new(
+        let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+        let coordinator = Arc::new(super::ThreadCoordinator::new_live(
             super::LoadedThreadBinding {
                 project_id,
                 handle: ThreadHandle::detached(thread_id, "native-orphan".into()),
                 native_model: Some(initial_model),
             },
             super::ClassificationPhase::Orphan,
+            cancel_tx,
         ));
         let authority = Arc::new(super::ThreadAuthority::new_for_test(thread_id, project_id));
-        let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
-        let (_completed_tx, completed_rx) = tokio::sync::watch::channel(false);
-        coordinator
-            .activate_owner(super::EventOwnerControl {
-                cancel: cancel_tx,
-                completed: completed_rx,
-            })
-            .await
-            .unwrap();
         let forwarder = tokio::spawn(
             ThreadEventForwarder::new(
                 shared.clone(),
@@ -4229,27 +4222,20 @@ mod tests {
         let shared = Arc::new(shared);
         let runtime = shared.runtime.clone();
         let native_handle = ThreadHandle::detached(thread_id, format!("native-{thread_id}"));
-        let coordinator = Arc::new(super::ThreadCoordinator::new(
+        let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+        let coordinator = Arc::new(super::ThreadCoordinator::new_live(
             super::LoadedThreadBinding {
                 project_id,
                 handle: native_handle.clone(),
                 native_model: Some(model),
             },
             super::ClassificationPhase::Primary,
+            cancel_tx,
         ));
         let authority = Arc::new(super::ThreadAuthority::new_for_test(thread_id, project_id));
-        let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
-        let (_completed_tx, completed_rx) = tokio::sync::watch::channel(false);
         let coordinator_for_task = coordinator.clone();
         let task_authority = authority.clone();
         let handle = tokio::spawn(async move {
-            coordinator_for_task
-                .activate_owner(super::EventOwnerControl {
-                    cancel: cancel_tx,
-                    completed: completed_rx,
-                })
-                .await
-                .unwrap();
             let lease = shared
                 .runtime
                 .reserve_turn(
@@ -4294,7 +4280,8 @@ mod tests {
             ledger,
         ));
         let native_handle = ThreadHandle::detached(thread_id, format!("native-{thread_id}"));
-        let coordinator = Arc::new(super::ThreadCoordinator::new(
+        let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+        let coordinator = Arc::new(super::ThreadCoordinator::new_live(
             super::LoadedThreadBinding {
                 project_id,
                 handle: native_handle,
@@ -4305,17 +4292,9 @@ mod tests {
                 }),
             },
             classification,
+            cancel_tx,
         ));
         let authority = Arc::new(super::ThreadAuthority::new_for_test(thread_id, project_id));
-        let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
-        let (_completed_tx, completed_rx) = tokio::sync::watch::channel(false);
-        coordinator
-            .activate_owner(super::EventOwnerControl {
-                cancel: cancel_tx,
-                completed: completed_rx,
-            })
-            .await
-            .unwrap();
         let log = Arc::new(EventLog::new());
         let forwarder = tokio::spawn(
             ThreadEventForwarder::new(
@@ -5032,13 +5011,18 @@ mod tests {
         .await
         .expect("the first forwarder should consume the item before the gap");
 
-        let control = coordinator
-            .begin_retirement()
-            .await
-            .expect("a live owner can be retired");
-        control.cancel.send(true).unwrap();
+        let (reply, response) = tokio::sync::oneshot::channel();
+        let _ = coordinator.request_detach(reply).await;
         first_forwarder.await.unwrap();
-        coordinator.finish_retirement().await;
+        let outcome = coordinator
+            .owner_exited(ForwarderExitReason::StreamEndedWithoutTurn)
+            .await;
+        if let super::thread::OwnerExitOutcome::Detached(waiters) = outcome {
+            for waiter in waiters {
+                let _ = waiter.send(());
+            }
+        }
+        response.await.unwrap();
 
         assert!(log.append(completed_item("during-gap")));
 

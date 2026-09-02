@@ -7,11 +7,11 @@ use giskard_core::thread::ThreadKind;
 use giskard_core::turn::{TurnMode, TurnModel};
 use giskard_core::user_input::UserInput;
 use giskard_harness::ThreadHandle;
-use tokio::sync::{Mutex as AsyncMutex, Notify, OwnedMutexGuard, watch};
+use tokio::sync::{Mutex as AsyncMutex, Notify, OwnedMutexGuard, oneshot, watch};
 
 use super::{
-    LoadedThreadBinding, RegistryTaskPermit, RegistryTaskTracker, SubagentMaterializationJob,
-    TurnContext, TurnContextKind,
+    ForwarderExitReason, LoadedThreadBinding, RegistryTaskPermit, RegistryTaskTracker,
+    SubagentMaterializationJob, TurnContext, TurnContextKind, forwarder_exit_reason_label,
 };
 use crate::thread_runtime::{ThreadRuntimeEntry, ThreadRuntimeSlot, ThreadTurnLease};
 
@@ -38,18 +38,24 @@ impl From<ThreadKind> for ClassificationPhase {
     }
 }
 
-#[derive(Clone)]
-pub(super) struct EventOwnerControl {
-    pub(super) cancel: watch::Sender<bool>,
-    pub(super) completed: watch::Receiver<bool>,
+enum OwnerPhase {
+    Live(watch::Sender<bool>),
+    Detaching {
+        cancel: watch::Sender<bool>,
+        waiters: Vec<oneshot::Sender<()>>,
+    },
+    Failed(String),
 }
 
-enum OwnerPhase {
-    Installing,
-    Live(EventOwnerControl),
-    Draining(EventOwnerControl),
-    Retired,
-    Failed(String),
+pub(super) enum OwnerExitOutcome {
+    Detached(Vec<oneshot::Sender<()>>),
+    RetainFailed,
+    ClearFailed,
+}
+
+pub(super) enum DetachRequestOutcome {
+    Pending,
+    ClearFailed(oneshot::Sender<()>),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -125,17 +131,27 @@ impl ThreadCoordinatorState {
 }
 
 impl ThreadCoordinator {
+    #[cfg(test)]
     pub(super) fn new(binding: LoadedThreadBinding, classification: ClassificationPhase) -> Self {
+        let (cancel, _) = watch::channel(false);
+        Self::new_live(binding, classification, cancel)
+    }
+
+    pub(super) fn new_live(
+        binding: LoadedThreadBinding,
+        classification: ClassificationPhase,
+        cancel: watch::Sender<bool>,
+    ) -> Self {
         Self {
             state: AsyncMutex::new(ThreadCoordinatorState {
                 generation: 1,
                 next_sequence: 0,
                 binding,
                 classification,
-                owner: OwnerPhase::Installing,
+                owner: OwnerPhase::Live(cancel),
                 operation: None,
                 native_turn: None,
-                native_activity: NativeActivity::Unknown,
+                native_activity: NativeActivity::Idle,
             }),
             changed: Notify::new(),
         }
@@ -158,22 +174,6 @@ impl ThreadCoordinator {
                 state.binding.handle.thread
             ))),
         }
-    }
-
-    pub(super) async fn activate_owner(
-        &self,
-        control: EventOwnerControl,
-    ) -> Result<(), HarnessError> {
-        let mut state = self.state.lock().await;
-        if !matches!(state.owner, OwnerPhase::Installing) {
-            return Err(HarnessError::Protocol(format!(
-                "thread {} event owner was installed more than once",
-                state.binding.handle.thread
-            )));
-        }
-        state.owner = OwnerPhase::Live(control);
-        state.native_activity = NativeActivity::Idle;
-        Ok(())
     }
 
     pub(super) async fn prepare_operation(
@@ -275,9 +275,10 @@ impl ThreadCoordinator {
                 "thread {} event owner failed: {reason}",
                 thread_id
             ))),
-            OwnerPhase::Installing | OwnerPhase::Draining(_) | OwnerPhase::Retired => Err(
-                HarnessError::Protocol(format!("thread {} event owner is not reusable", thread_id)),
-            ),
+            OwnerPhase::Detaching { .. } => Err(HarnessError::Protocol(format!(
+                "thread {} event owner is not reusable",
+                thread_id
+            ))),
         }
     }
 
@@ -415,62 +416,60 @@ impl ThreadCoordinator {
         }
     }
 
-    pub(super) async fn owner_finished(&self, cancelled: bool) {
+    pub(super) async fn is_detaching(&self) -> bool {
+        matches!(self.state.lock().await.owner, OwnerPhase::Detaching { .. })
+    }
+
+    pub(super) async fn is_failed(&self) -> bool {
+        matches!(self.state.lock().await.owner, OwnerPhase::Failed(_))
+    }
+
+    pub(super) async fn request_detach(&self, reply: oneshot::Sender<()>) -> DetachRequestOutcome {
         let mut state = self.state.lock().await;
-        let retired = match state.owner {
-            OwnerPhase::Draining(_) if cancelled => {
+        match &mut state.owner {
+            OwnerPhase::Live(cancel) => {
+                let cancel = cancel.clone();
+                state.owner = OwnerPhase::Detaching {
+                    cancel: cancel.clone(),
+                    waiters: vec![reply],
+                };
+                let _ = cancel.send(true);
+                DetachRequestOutcome::Pending
+            }
+            OwnerPhase::Detaching { cancel, waiters } => {
+                let _ = cancel;
+                waiters.push(reply);
+                DetachRequestOutcome::Pending
+            }
+            OwnerPhase::Failed(_) => DetachRequestOutcome::ClearFailed(reply),
+        }
+    }
+
+    pub(super) async fn owner_exited(&self, reason: ForwarderExitReason) -> OwnerExitOutcome {
+        let mut state = self.state.lock().await;
+        let outcome = match &mut state.owner {
+            OwnerPhase::Detaching { waiters, .. } => {
+                let waiters = std::mem::take(waiters);
                 state.generation = state.generation.wrapping_add(1);
-                state.owner = OwnerPhase::Retired;
+                state.owner = OwnerPhase::Failed("detached".into());
                 state.native_activity = NativeActivity::Unloaded;
-                true
+                OwnerExitOutcome::Detached(waiters)
+            }
+            OwnerPhase::Live(_) if reason == ForwarderExitReason::PersistenceBlocked => {
+                state.owner = OwnerPhase::Failed(forwarder_exit_reason_label(reason).into());
+                state.native_activity = NativeActivity::Unknown;
+                OwnerExitOutcome::RetainFailed
             }
             OwnerPhase::Live(_) => {
-                state.owner = OwnerPhase::Failed("native event stream ended".into());
+                state.owner = OwnerPhase::Failed(forwarder_exit_reason_label(reason).into());
                 state.native_activity = NativeActivity::Unknown;
-                false
+                OwnerExitOutcome::ClearFailed
             }
-            _ => false,
+            OwnerPhase::Failed(_) => OwnerExitOutcome::RetainFailed,
         };
         drop(state);
-        if retired {
-            self.changed.notify_waiters();
-        }
-    }
-
-    pub(super) async fn begin_retirement(&self) -> Option<EventOwnerControl> {
-        let mut state = self.state.lock().await;
-        match &state.owner {
-            OwnerPhase::Live(control) | OwnerPhase::Draining(control) => {
-                let control = control.clone();
-                state.owner = OwnerPhase::Draining(control.clone());
-                Some(control)
-            }
-            OwnerPhase::Installing | OwnerPhase::Retired | OwnerPhase::Failed(_) => None,
-        }
-    }
-
-    pub(super) async fn draining_control(&self) -> Option<EventOwnerControl> {
-        let state = self.state.lock().await;
-        match &state.owner {
-            OwnerPhase::Draining(control) => Some(control.clone()),
-            _ => None,
-        }
-    }
-
-    pub(super) async fn is_retired(&self) -> bool {
-        matches!(self.state.lock().await.owner, OwnerPhase::Retired)
-    }
-
-    pub(super) async fn finish_retirement(&self) {
-        let mut state = self.state.lock().await;
-        if matches!(state.owner, OwnerPhase::Retired) {
-            return;
-        }
-        state.generation = state.generation.wrapping_add(1);
-        state.owner = OwnerPhase::Retired;
-        state.native_activity = NativeActivity::Unloaded;
-        drop(state);
         self.changed.notify_waiters();
+        outcome
     }
 
     #[cfg(test)]
@@ -853,12 +852,6 @@ mod tests {
     #[tokio::test]
     async fn stale_operation_token_cannot_abort_a_later_operation() {
         let coordinator = test_coordinator(ClassificationPhase::Primary);
-        let (cancel, _) = tokio::sync::watch::channel(false);
-        let (_, completed) = tokio::sync::watch::channel(false);
-        coordinator
-            .activate_owner(EventOwnerControl { cancel, completed })
-            .await
-            .unwrap();
         let runtime = ThreadRuntimeSupport::new();
         let stale = prepare_test_operation(&coordinator, &runtime, test_turn_context()).await;
         let mut stale_lease = coordinator.abort_operation(stale).await.unwrap();
@@ -916,12 +909,6 @@ mod tests {
         assert_eq!(second.context.mode, defaults_b.mode);
 
         let prepared = test_coordinator(ClassificationPhase::Primary);
-        let (cancel, _) = watch::channel(false);
-        let (_, completed) = watch::channel(false);
-        prepared
-            .activate_owner(EventOwnerControl { cancel, completed })
-            .await
-            .unwrap();
         let runtime = ThreadRuntimeSupport::new();
         let prepared_context = test_turn_context();
         let _token = prepare_test_operation(&prepared, &runtime, prepared_context.clone()).await;
@@ -943,12 +930,6 @@ mod tests {
         let authority = test_authority(&binding);
         let runtime = ThreadRuntimeSupport::new();
         let context = test_turn_context();
-        let (cancel, _) = tokio::sync::watch::channel(false);
-        let (_, completed) = tokio::sync::watch::channel(false);
-        coordinator
-            .activate_owner(EventOwnerControl { cancel, completed })
-            .await
-            .unwrap();
 
         let stale_lease = runtime
             .reserve_turn(
@@ -1059,13 +1040,9 @@ mod tests {
     #[tokio::test]
     async fn failed_owner_rejects_new_preparation_before_io() {
         let coordinator = test_coordinator(ClassificationPhase::Primary);
-        let (cancel, _) = tokio::sync::watch::channel(false);
-        let (_, completed) = tokio::sync::watch::channel(false);
-        coordinator
-            .activate_owner(EventOwnerControl { cancel, completed })
-            .await
-            .unwrap();
-        coordinator.owner_finished(false).await;
+        let _ = coordinator
+            .owner_exited(ForwarderExitReason::StreamEndedWithoutTurn)
+            .await;
         let runtime = ThreadRuntimeSupport::new();
         let binding = coordinator.binding().await;
         let authority = test_authority(&binding);
