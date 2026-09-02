@@ -79,8 +79,8 @@
 - **L8:** The diff view and code overlay title bar shows the workspace-relative path (the same truncation the transcript diff row uses) instead of the raw checkout/worktree-prefixed path. The raw path is still kept for the download/file API.
 
 **Changelog (1.75 → 1.76), refresh Codex protocol SDK:**
-- **CP2:** The Codex harness now builds against `codex-codes` 0.150.1 (tested against Codex CLI
-  0.150.1), up from 0.146.4. Giskard consumes the compatibility-relevant changes only:
+- **CP2:** The Codex harness now builds against `codex-codes` 0.151.2 (tested against Codex CLI
+  0.151.0), up from 0.146.4. Giskard consumes the compatibility-relevant changes only:
   - A `functionCallOutput` thread item — the tool result a client supplies on `turn/start` — maps to
     a `ToolCall` item carrying the tool name, its optional namespace, and the output. The item does
     not contain the call's arguments, so the recorded input is `null` rather than an invented object.
@@ -94,11 +94,15 @@
     warns once per spawned app-server when the running Codex is strictly newer. The bindings' own
     `check_codex_version` is not used: it shells out to `codex --version` on `PATH`, ignoring the
     configured `codex_path`, and reports through `log`, which Giskard does not bridge into `tracing`.
+  - Both Codex spellings of the extended OpenAI MCP elicitation form (`openai/form` and
+    `openaiForm`) preserve request routing and MCP approval promotion.
   Everything else the release adds — paginated `thread/items/list`, `thread/turns/list` and
   `thread/revert`, a typed `turn/steer` helper, `McpServerStatus.runtimeStatus`, the realtime item
   timeline, and the newly typed `project/changed`, `thread/queue/changed`, `thread/reverted`,
-  `mcpServer/event/stream/notification` and auth-recovery notifications — is available but unused;
-  Giskard keeps its own history and ignores notifications it does not map.
+  `mcpServer/event/stream/notification`, auth-recovery notifications, asynchronous agent-message
+  questions, persisted thread model/reasoning metadata, plugin reconciliation and response-usage
+  metadata — is available but unused; Giskard keeps its own history and ignores notifications it
+  does not map.
 
 **Changelog (1.74 → 1.75), collapsible reasoning rows:**
 - **RN1:** A reasoning note is a collapsible transcript row: a one-line summary — the note's first
@@ -1484,8 +1488,8 @@ A single Cargo workspace with focused crates. Names are prefixed `giskard-`.
   design review, whose alternatives were checked against the then-pinned Codex CLI 0.142.5; only
   the selected crate is kept current, and its own line states the Codex CLI it is tested against
   today:
-  - **`codex-codes`** (v0.150.1) — **recommended first choice.** Typed Rust SDK for the Codex
-    CLI app-server JSON-RPC protocol, tested against Codex CLI 0.150.x.
+  - **`codex-codes`** (v0.151.2) — **recommended first choice.** Typed Rust SDK for the Codex
+    CLI app-server JSON-RPC protocol, tested against Codex CLI 0.151.0.
     Provides `AsyncClient` (Tokio) with `start()` (process spawn), `thread_start`, `turn_start`
     (accepting `model`, `reasoning_effort`, `sandbox_policy` — mapping onto `TurnOverrides`
     + `ModelRef.reasoning_effort`, P1),
@@ -3973,7 +3977,7 @@ Artifacts are version-pinned to the Codex binary that produced them; regenerate 
 > inside `ModelRef.reasoning_effort` (P1: no standalone effort field on `TurnOverrides`).
 > `TurnOverrides.permission_preset` is the thread preset snapshot (P3/AP1: not a per-turn override).
 
-**Client library:** use `codex-codes` (v0.146.4, tested against Codex CLI 0.146.x) with the
+**Client library:** use `codex-codes` (v0.151.2, tested against Codex CLI 0.151.0) with the
 `async-client` feature — its `AsyncClient` API (`spawn`, `initialize`, `thread_start`, generic
 `request`, `next_message`, `respond`, `shutdown`) maps onto the `AgentHarness` trait. The Codex
 `turn/start` call uses the generic `request` path while `codex-codes`' typed `TurnStartParams`
