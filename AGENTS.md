@@ -124,6 +124,9 @@ Cargo workspace with 8 crates under `crates/`:
 - `RegistryShared` is the designated process-local entity authority root.
   `RegistryShared::projects` and `RegistryShared::threads` are the only strong process-local owner
   maps for project and thread identity.
+- One `ProjectEventDriver` per harness owns every event forwarder for that project. Attach and
+  detach are driver messages; no code outside the driver installs or clears a coordinator or
+  spawns an event forwarder.
 - Entity-local state belongs on its authority or an authority-owned component. Do not add a peer
   owning map keyed directly or indirectly by project or thread identity.
 - Each root authority owner map must have an adjacent `ENTITY-AUTHORITY-OWNER` comment naming the

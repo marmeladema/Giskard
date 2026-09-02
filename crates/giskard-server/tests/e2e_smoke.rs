@@ -1620,9 +1620,11 @@ impl AgentHarness for CountingOpenHarness {
         harness_thread_id: String,
         workspace_root: PathBuf,
     ) -> Result<ThreadHandle, HarnessError> {
-        self.claim_calls.fetch_add(1, Ordering::SeqCst);
-        let tx = Arc::new(EventLog::new());
-        self.threads.lock().await.insert(thread, tx);
+        let mut threads = self.threads.lock().await;
+        if let std::collections::hash_map::Entry::Vacant(entry) = threads.entry(thread) {
+            self.claim_calls.fetch_add(1, Ordering::SeqCst);
+            entry.insert(Arc::new(EventLog::new()));
+        }
         Ok(ThreadHandle::opened(
             thread,
             harness_thread_id,

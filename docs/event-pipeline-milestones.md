@@ -174,15 +174,17 @@ classification is addressed at the writer.
 
 ## M4 — One driver per project
 
+**Status:** Complete.
+
 **Goal.** Delete per-thread event tasks and the owner lifecycle protocol.
 
 **Seam.** Server registry only. No adapter change: the driver reads the same `AgentEventStream`s.
 
-**Design.** `ProjectEventDriver` is one task per harness that owns
-`HashMap<ThreadId, ThreadEventForwarder>` and a `SelectAll` over their streams plus the discoveries
-reader from M2. Installing an owner becomes "send `Attach { binding }` to the driver"; retirement
-becomes `Detach`. The forwarder keeps `handle_event` unchanged and loses `run()`, `cancel` and
-`stream`. Per-thread state is owned by the driver, so nothing needs a lock to be exclusive.
+**Design.** `ProjectEventDriver` is one task per harness that polls every
+`ThreadEventForwarder::run` future in a `FuturesUnordered`. Installing an owner becomes
+`Attach { binding }`; retirement becomes `Detach`. The forwarder's reduction loop is unchanged.
+Owner transitions are serialized by the driver, and attaches arriving during detach are parked
+until the old owner exits.
 
 **Scope.** `registry.rs` (`install_event_owner*`, `launch_event_forwarder`,
 `lock_thread_owner_after_drain`, `retire_thread`, `forget_thread`), `registry/thread.rs`
@@ -191,8 +193,8 @@ becomes `Detach`. The forwarder keeps `handle_event` unchanged and loses `run()`
 
 **Not in scope.** `start_turn`, intents, materialization, persistence.
 
-**Exit.** No `tokio::spawn` per thread for events; `OwnerPhase`, `OwnerLock`,
-`lock_thread_owner_after_drain`, cancel and completed watches deleted; M0 test D passes in full.
+**Exit.** No `tokio::spawn` per thread for events; the drain protocol and completed watches are
+deleted; one cancellation watch remains per forwarder; M0 test D passes in full.
 
 **Size.** The largest. Bound it by refusing to touch persistence, hub, routes or the adapter. If it
 needs more than the files above, split "driver with old coordinator" from "delete owner protocol".
