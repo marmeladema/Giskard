@@ -45,9 +45,9 @@ use giskard_core::token::TokenUsage;
 use giskard_core::turn::{PermissionPreset, TurnOverrides, TurnStatus, TurnStatusKind};
 use giskard_core::{AttachmentKind, UserAttachment, UserInput};
 use giskard_harness::{
-    AgentEventStream, AgentHarness, EventLog, HarnessBootstrap, HarnessCapabilities, HarnessNotice,
-    HarnessProvider, OpenThreadOptions, ProviderAuth, ProviderAuthCommand, ThreadHandle,
-    ThreadUpdate,
+    AgentEventStream, AgentHarness, DiscoveryStream, EventLog, HarnessBootstrap,
+    HarnessCapabilities, HarnessNotice, HarnessProvider, OpenThreadOptions, ProviderAuth,
+    ProviderAuthCommand, ThreadDiscovered, ThreadHandle, ThreadUpdate,
 };
 
 use mapping::CodexMapper;
@@ -830,6 +830,7 @@ pub struct CodexHarness {
     // Synchronization: The standard mutex protects log lookup, insertion, and removal.
     // Invalidation/removal: Thread close removes and closes a log; harness drop closes the map.
     senders: SenderMap,
+    discoveries: Arc<EventLog<ThreadDiscovered>>,
     worker_queue: Arc<WorkerQueueWatchdog>,
     shutdown_tx: watch::Sender<bool>,
     worker_done: watch::Receiver<bool>,
@@ -888,6 +889,7 @@ impl CodexHarness {
         let (cmd_tx, cmd_rx) = mpsc::channel(64);
         let (control_tx, control_rx) = mpsc::channel(64);
         let senders: SenderMap = Arc::new(EventLogs::default());
+        let discoveries = Arc::new(EventLog::new());
         let worker_queue = Arc::new(WorkerQueueWatchdog::new());
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let (worker_done_tx, worker_done) = watch::channel(false);
@@ -901,6 +903,7 @@ impl CodexHarness {
                 done: worker_done_tx,
             },
             senders.clone(),
+            discoveries.clone(),
             worker_queue.clone(),
             workspace_root.clone(),
             writable_roots,
@@ -912,6 +915,7 @@ impl CodexHarness {
             cmd_tx,
             control_tx,
             senders,
+            discoveries,
             worker_queue: worker_queue.clone(),
             shutdown_tx,
             worker_done,
@@ -1390,6 +1394,10 @@ impl AgentHarness for CodexHarness {
             return AgentEventStream::new(log.reader());
         }
         AgentEventStream::closed()
+    }
+
+    fn discoveries(&self) -> DiscoveryStream {
+        DiscoveryStream::new(self.discoveries.reader())
     }
 
     async fn respond_approval(
@@ -5695,6 +5703,19 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn discoveries_close_with_the_worker() {
+        let (harness, _controller) = spawn_fake_harness();
+        let mut discoveries = harness.discoveries();
+
+        harness.shutdown().await.unwrap();
+
+        assert_eq!(
+            discoveries.recv().await,
+            Err(giskard_harness::EventStreamError::Closed)
+        );
+    }
+
+    #[tokio::test]
     async fn cancelled_shutdown_caller_does_not_cancel_worker_teardown() {
         let (harness, controller) = spawn_fake_harness();
         controller.block_shutdown().await;
@@ -5793,16 +5814,15 @@ mod tests {
         let (harness, _controller) = spawn_fake_harness_with_bootstrap(bootstrap);
 
         assert!(sender_for_thread(&harness.senders, thread).is_some());
-        assert!(
-            harness
-                .claim_native_thread(
-                    ThreadId::new(),
-                    "native-bootstrap".into(),
-                    PathBuf::from("/tmp"),
-                )
-                .await
-                .is_err()
-        );
+        let claimed = harness
+            .claim_native_thread(
+                ThreadId::new(),
+                "native-bootstrap".into(),
+                PathBuf::from("/tmp"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(claimed.thread, thread);
     }
 
     #[tokio::test]
@@ -5839,16 +5859,15 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(
-            harness
-                .claim_native_thread(
-                    rejected_thread,
-                    "native-child".into(),
-                    PathBuf::from("/tmp"),
-                )
-                .await
-                .is_err()
-        );
+        let adopted = harness
+            .claim_native_thread(
+                rejected_thread,
+                "native-child".into(),
+                PathBuf::from("/tmp"),
+            )
+            .await
+            .unwrap();
+        assert_eq!(adopted.thread, accepted_thread);
         assert!(sender_for_thread(&harness.senders, rejected_thread).is_none());
     }
 
@@ -6471,9 +6490,9 @@ mod tests {
         }
 
         #[tokio::test]
-        #[ignore = "M2: identity minted at ingest"]
         async fn child_frames_before_claim_reach_the_child_subscriber() {
             let (harness, controller) = spawn_fake_harness();
+            let mut discoveries = harness.discoveries();
             let (parent, parent_turn, mut parent_stream) =
                 parent_with_active_turn(&harness, &controller).await;
 
@@ -6525,6 +6544,16 @@ mod tests {
             )
             .await;
 
+            let discovery = timeout(Duration::from_secs(1), discoveries.recv())
+                .await
+                .expect("timed out waiting for child discovery")
+                .expect("discovery stream closed");
+            assert_eq!(discovery.harness_thread_id, "native-child");
+            assert_eq!(
+                discovery.parent_harness_thread_id.as_deref(),
+                Some(parent.harness_thread_id.as_str())
+            );
+
             let child = harness
                 .claim_native_thread(
                     ThreadId::new(),
@@ -6533,6 +6562,7 @@ mod tests {
                 )
                 .await
                 .unwrap();
+            assert_eq!(child.thread, discovery.thread);
             let mut child_stream = harness.subscribe(&child);
 
             let started = expect_event(&mut child_stream, "child TurnStarted").await;
@@ -6550,6 +6580,163 @@ mod tests {
                 matches!(completed, AgentEvent::TurnCompleted { thread, status, .. }
                 if thread == child.thread && status.kind == TurnStatusKind::Completed)
             );
+        }
+
+        #[tokio::test]
+        async fn discovery_before_link_has_no_parent_and_claim_adopts_identity() {
+            let (harness, controller) = spawn_fake_harness();
+            let mut discoveries = harness.discoveries();
+            let (parent, parent_turn, mut parent_stream) =
+                parent_with_active_turn(&harness, &controller).await;
+
+            controller
+                .send_server_message(turn_started("native-child", "child-turn-1"))
+                .await;
+            barrier(
+                &controller,
+                &parent,
+                &parent_turn,
+                &mut parent_stream,
+                "discovery before link",
+            )
+            .await;
+            let discovery = expect_discovery(&mut discoveries, "child discovery").await;
+            assert_eq!(discovery.parent_harness_thread_id, None);
+
+            controller
+                .send_server_message(subagent_started(
+                    &parent.harness_thread_id,
+                    &parent_turn,
+                    "native-child",
+                ))
+                .await;
+            barrier(
+                &controller,
+                &parent,
+                &parent_turn,
+                &mut parent_stream,
+                "link after discovery",
+            )
+            .await;
+
+            let proposed = [ThreadId::new(), ThreadId::new()];
+            let sender_count = lock_senders(&harness.senders).len();
+            for proposed_thread in proposed {
+                let claimed = harness
+                    .claim_native_thread(
+                        proposed_thread,
+                        "native-child".into(),
+                        PathBuf::from("/tmp"),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(claimed.thread, discovery.thread);
+                assert_eq!(
+                    claimed.parent_harness_thread_id.as_deref(),
+                    Some(parent.harness_thread_id.as_str())
+                );
+                assert!(sender_for_thread(&harness.senders, proposed_thread).is_none());
+            }
+            assert!(sender_for_thread(&harness.senders, discovery.thread).is_some());
+            assert_eq!(lock_senders(&harness.senders).len(), sender_count);
+        }
+
+        #[tokio::test]
+        async fn discovery_after_link_carries_the_attested_parent() {
+            let (harness, controller) = spawn_fake_harness();
+            let mut discoveries = harness.discoveries();
+            let (parent, parent_turn, mut parent_stream) =
+                parent_with_active_turn(&harness, &controller).await;
+
+            controller
+                .send_server_message(subagent_started(
+                    &parent.harness_thread_id,
+                    &parent_turn,
+                    "native-child",
+                ))
+                .await;
+            controller
+                .send_server_message(turn_started("native-child", "child-turn-1"))
+                .await;
+            barrier(
+                &controller,
+                &parent,
+                &parent_turn,
+                &mut parent_stream,
+                "linked child discovery",
+            )
+            .await;
+
+            let discovery = expect_discovery(&mut discoveries, "linked child discovery").await;
+            assert_eq!(
+                discovery.parent_harness_thread_id.as_deref(),
+                Some(parent.harness_thread_id.as_str())
+            );
+            let child = harness
+                .claim_native_thread(
+                    ThreadId::new(),
+                    "native-child".into(),
+                    PathBuf::from("/tmp"),
+                )
+                .await
+                .unwrap();
+            let mut child_stream = harness.subscribe(&child);
+            let event = expect_event(&mut child_stream, "child turn start").await;
+            assert!(matches!(event, AgentEvent::TurnStarted { thread, .. }
+                    if thread == discovery.thread && thread == child.thread));
+        }
+
+        #[tokio::test]
+        async fn unknown_server_request_discovers_and_routes_the_thread() {
+            let (harness, controller) = spawn_fake_harness();
+            let mut discoveries = harness.discoveries();
+            let (parent, parent_turn, mut parent_stream) =
+                parent_with_active_turn(&harness, &controller).await;
+
+            controller
+                .send_server_message(command_approval_request(
+                    "child-approval",
+                    "native-child",
+                    "child-turn-1",
+                ))
+                .await;
+            barrier(
+                &controller,
+                &parent,
+                &parent_turn,
+                &mut parent_stream,
+                "unknown server request",
+            )
+            .await;
+
+            let discovery = expect_discovery(&mut discoveries, "approval discovery").await;
+            assert_eq!(discovery.harness_thread_id, "native-child");
+            let child = harness
+                .claim_native_thread(
+                    ThreadId::new(),
+                    "native-child".into(),
+                    PathBuf::from("/tmp"),
+                )
+                .await
+                .unwrap();
+            assert_eq!(child.thread, discovery.thread);
+            let mut child_stream = harness.subscribe(&child);
+            let event = expect_event(&mut child_stream, "child approval").await;
+            assert!(matches!(event, AgentEvent::ApprovalRequested { thread, .. }
+                    if thread == discovery.thread));
+            assert!(controller.response_errors().await.is_empty());
+        }
+
+        async fn expect_discovery(
+            discoveries: &mut DiscoveryStream,
+            label: &str,
+        ) -> ThreadDiscovered {
+            timeout(Duration::from_secs(1), discoveries.recv())
+                .await
+                .unwrap_or_else(|_| panic!("timed out waiting for {label}"))
+                .unwrap_or_else(|error| {
+                    panic!("discovery stream closed while waiting for {label}: {error}")
+                })
         }
 
         #[tokio::test]

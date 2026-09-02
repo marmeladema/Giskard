@@ -289,6 +289,16 @@ impl CodexMapper {
             .map(|route| route.epoch.into_inner())
     }
 
+    pub(super) fn claim_or_adopt_thread(
+        &mut self,
+        harness_thread_id: String,
+        proposed_thread: ThreadId,
+    ) -> Result<ThreadId, HarnessError> {
+        self.routes
+            .claim_or_adopt(harness_thread_id, proposed_thread)
+            .map(|route| route.thread_id)
+    }
+
     pub(super) fn replace_thread_route(
         &mut self,
         expected_harness_thread_id: String,
@@ -388,6 +398,7 @@ impl CodexMapper {
             .or_default()
     }
 
+    #[cfg(test)]
     pub fn map_notification(
         &mut self,
         notif: &Notification,
@@ -410,7 +421,7 @@ impl CodexMapper {
         }
     }
 
-    fn try_map_notification(
+    pub(super) fn try_map_notification(
         &mut self,
         notif: &Notification,
         fallback_thread: ThreadId,
@@ -968,6 +979,7 @@ impl CodexMapper {
         }
     }
 
+    #[cfg(test)]
     pub fn map_server_request(
         &mut self,
         id: &RequestId,
@@ -992,7 +1004,7 @@ impl CodexMapper {
         }
     }
 
-    fn try_map_server_request(
+    pub(super) fn try_map_server_request(
         &mut self,
         id: &RequestId,
         request: &CodexServerRequest,
@@ -2529,6 +2541,7 @@ fn thread_item_id_ref(item: &codex_codes::ThreadItem) -> &str {
     }
 }
 
+#[cfg(test)]
 fn notification_item_id(notification: &Notification) -> Option<&str> {
     if let Some(item) = notification.thread_item() {
         return Some(thread_item_id_ref(item));
@@ -2547,6 +2560,7 @@ fn notification_item_id(notification: &Notification) -> Option<&str> {
     }
 }
 
+#[cfg(test)]
 fn notification_request_id(notification: &Notification) -> Option<String> {
     let Notification::ServerRequestResolved(notification) = notification else {
         return None;
@@ -2554,11 +2568,13 @@ fn notification_request_id(notification: &Notification) -> Option<String> {
     Some(protocol_request_id_to_string(&notification.request_id))
 }
 
+#[cfg(test)]
 struct NativeMessageScope<'a> {
     turn_id: Option<&'a str>,
     item_id: Option<&'a str>,
 }
 
+#[cfg(test)]
 fn server_request_native_scope(request: &CodexServerRequest) -> NativeMessageScope<'_> {
     let direct = |turn_id, item_id| NativeMessageScope {
         turn_id: trimmed_non_empty(turn_id),
@@ -2590,10 +2606,12 @@ fn server_request_native_scope(request: &CodexServerRequest) -> NativeMessageSco
     }
 }
 
+#[cfg(test)]
 fn native_scope_from_value(value: Option<&Value>) -> NativeMessageScope<'_> {
     native_scope_from_fields(value.and_then(Value::as_object))
 }
 
+#[cfg(test)]
 fn native_scope_from_fields(
     fields: Option<&serde_json::Map<String, Value>>,
 ) -> NativeMessageScope<'_> {
@@ -4025,6 +4043,27 @@ mod tests {
                 .is_none()
         );
         assert_eq!(mapper.active_native_turn_for_thread(fallback), None);
+    }
+
+    #[test]
+    fn unknown_thread_mapping_leaves_registries_untouched() {
+        let mut mapper = CodexMapper::new(PathBuf::from("/tmp"));
+        let fallback = ThreadId::new();
+        mapper.register_thread("known".into(), fallback);
+        let notification = started_item(serde_json::json!({
+            "type": "agentMessage",
+            "id": "unknown-item",
+            "text": "hello"
+        }));
+
+        assert!(
+            mapper
+                .try_map_notification(&notification, fallback)
+                .is_err()
+        );
+        assert!(mapper.turn_ids.is_empty());
+        assert!(mapper.item_ids.is_empty());
+        assert!(mapper.pending_approval_responses.is_empty());
     }
 
     #[test]

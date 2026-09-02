@@ -12,7 +12,6 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use giskard_core::event::AgentEvent;
 use tokio::sync::Notify;
 use tracing::{error, warn};
 
@@ -34,10 +33,10 @@ pub enum EventStreamError {
     Gap { dropped: u64 },
 }
 
-struct LogState {
+struct LogState<T> {
     /// Sequence number of `entries[0]`.
     base: u64,
-    entries: VecDeque<AgentEvent>,
+    entries: VecDeque<T>,
     /// Next sequence each live reader will consume.
     cursors: HashMap<u64, u64>,
     next_reader: u64,
@@ -47,19 +46,25 @@ struct LogState {
 }
 
 /// One thread's retained event log.
-pub struct EventLog {
-    state: Mutex<LogState>,
+pub struct EventLog<T: Clone + Send + 'static = giskard_core::event::AgentEvent> {
+    state: Mutex<LogState<T>>,
     notify: Notify,
     limit: usize,
 }
 
-impl Default for EventLog {
+impl<T> Default for EventLog<T>
+where
+    T: Clone + Send + 'static,
+{
     fn default() -> Self {
         Self::new()
     }
 }
 
-impl EventLog {
+impl<T> EventLog<T>
+where
+    T: Clone + Send + 'static,
+{
     pub fn new() -> Self {
         Self::with_limit(EVENT_LOG_RETAIN_LIMIT)
     }
@@ -80,7 +85,7 @@ impl EventLog {
         }
     }
 
-    fn lock(&self) -> MutexGuard<'_, LogState> {
+    fn lock(&self) -> MutexGuard<'_, LogState<T>> {
         match self.state.lock() {
             Ok(guard) => guard,
             Err(poisoned) => {
@@ -91,7 +96,7 @@ impl EventLog {
     }
 
     /// Append one event. Returns `false` if the log is closed and the event was discarded.
-    pub fn append(&self, event: AgentEvent) -> bool {
+    pub fn append(&self, event: T) -> bool {
         {
             let mut state = self.lock();
             if state.closed {
@@ -136,7 +141,7 @@ impl EventLog {
     }
 
     /// A reader positioned at the oldest event no reader has consumed.
-    pub fn reader(self: &Arc<Self>) -> EventLogReader {
+    pub fn reader(self: &Arc<Self>) -> EventLogReader<T> {
         let mut state = self.lock();
         let id = state.next_reader;
         state.next_reader += 1;
@@ -149,13 +154,13 @@ impl EventLog {
     }
 
     /// A reader over a closed, empty log: `recv` returns `Closed` immediately.
-    pub fn closed_reader() -> EventLogReader {
+    pub fn closed_reader() -> EventLogReader<T> {
         let log = Arc::new(Self::new());
         log.close();
         log.reader()
     }
 
-    fn trim(state: &mut LogState) {
+    fn trim(state: &mut LogState<T>) {
         let Some(min_cursor) = state.cursors.values().copied().min() else {
             return;
         };
@@ -166,7 +171,7 @@ impl EventLog {
     }
 
     /// Advance one reader. `None` means "nothing available yet, wait".
-    fn poll_reader(state: &mut LogState, id: u64) -> Option<Result<AgentEvent, EventStreamError>> {
+    fn poll_reader(state: &mut LogState<T>, id: u64) -> Option<Result<T, EventStreamError>> {
         let cursor = *state.cursors.get(&id)?;
         if cursor < state.base {
             let dropped = state.base - cursor;
@@ -188,15 +193,18 @@ impl EventLog {
 }
 
 /// A cursor over an [`EventLog`]. Dropping it releases the events only it was holding.
-pub struct EventLogReader {
-    log: Arc<EventLog>,
+pub struct EventLogReader<T: Clone + Send + 'static = giskard_core::event::AgentEvent> {
+    log: Arc<EventLog<T>>,
     id: u64,
 }
 
-impl EventLogReader {
+impl<T> EventLogReader<T>
+where
+    T: Clone + Send + 'static,
+{
     /// The next event, waiting if none is retained yet. Cancel-safe: a cancelled call consumes
     /// nothing.
-    pub async fn recv(&mut self) -> Result<AgentEvent, EventStreamError> {
+    pub async fn recv(&mut self) -> Result<T, EventStreamError> {
         loop {
             let notified = self.log.notify.notified();
             tokio::pin!(notified);
@@ -214,7 +222,10 @@ impl EventLogReader {
     }
 }
 
-impl Drop for EventLogReader {
+impl<T> Drop for EventLogReader<T>
+where
+    T: Clone + Send + 'static,
+{
     fn drop(&mut self) {
         let mut state = self.log.lock();
         state.cursors.remove(&self.id);
@@ -225,6 +236,7 @@ impl Drop for EventLogReader {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use giskard_core::event::AgentEvent;
     use giskard_core::ids::{ThreadId, TurnId};
     use std::time::Duration;
     use tokio::time::timeout;
@@ -329,7 +341,7 @@ mod tests {
         assert!(!log.append(notice(thread, "ignored")));
         assert_eq!(message_of(&reader.recv().await.unwrap()), "last");
         assert_eq!(reader.recv().await.unwrap_err(), EventStreamError::Closed);
-        let mut closed = EventLog::closed_reader();
+        let mut closed: EventLogReader = EventLog::closed_reader();
         assert_eq!(closed.recv().await.unwrap_err(), EventStreamError::Closed);
     }
 
