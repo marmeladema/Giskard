@@ -202,6 +202,10 @@ deleted; one cancellation watch remains per forwarder; M0 test D passes in full.
 **Size.** The largest. Bound it by refusing to touch persistence, hub, routes or the adapter. If it
 needs more than the files above, split "driver with old coordinator" from "delete owner protocol".
 
+**Plan.** [`m4-project-event-driver.md`](m4-project-event-driver.md). Forwarders become futures
+polled by one driver task per harness; attach and detach are driver messages; the drain protocol,
+owner phases and per-owner tasks are deleted while the forwarder's reduction code stays untouched.
+
 ## M5 — Intents replace prepared operations
 
 **Status:** Complete. Implemented by the turn-intent change. See
