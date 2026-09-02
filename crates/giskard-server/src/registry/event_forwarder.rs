@@ -4976,6 +4976,152 @@ mod tests {
         assert_eq!(saved[0].items[0].id, item_id);
     }
 
+    #[tokio::test]
+    #[ignore = "M1: retained event log"]
+    async fn replacement_forwarder_persists_events_sent_while_no_forwarder_ran() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = Arc::new(PersistStore::new(tmp.path().to_path_buf()));
+        let project_id = ProjectId::new();
+        let thread_id = ThreadId::new();
+        let model = ModelRef {
+            provider: "openai".into(),
+            model: "gpt-5.5".into(),
+            reasoning_effort: None,
+        };
+        store
+            .create_project(project_id, "proj", "/tmp/test")
+            .await
+            .unwrap();
+        let now = Utc::now();
+        store
+            .save_thread(
+                project_id,
+                &ThreadFile {
+                    revision: 0,
+                    version: 1,
+                    id: thread_id,
+                    project_id,
+                    title: "gap test".into(),
+                    harness_thread_id: "th-gap".into(),
+                    parent_thread_id: None,
+                    spawned_by_turn_id: None,
+                    kind: giskard_core::ThreadKind::Primary,
+                    mode: TurnMode::Known(Mode::Build),
+                    current_model: TurnModel::Known(model.clone()),
+                    context_window: 128_000,
+                    model_context_windows: Default::default(),
+                    permission_preset: PermissionPreset::AskFirst,
+                    model_efforts: Default::default(),
+                    tokens: TokenLedger::default(),
+                    created_at: now,
+                    updated_at: now,
+                    archived: false,
+                    git_workspace: None,
+                },
+            )
+            .await
+            .unwrap();
+
+        let (tx, _) = broadcast::channel(256);
+        let hub = Arc::new(Hub::new());
+        let (client_tx, mut client_rx) = mpsc::channel(64);
+        let _replacements = hub.register_client(1, client_tx).await;
+        assert!(hub.subscribe(thread_id, 1).await);
+        let ledger = ledger::spawn(store.clone());
+        let (first_forwarder, _runtime, coordinator, _authority) =
+            spawn_forwarder_handle_with_runtime(
+                thread_id,
+                project_id,
+                AgentEventStream::new(tx.subscribe()),
+                hub.clone(),
+                store.clone(),
+                ledger.clone(),
+                model.clone(),
+                "first",
+            );
+
+        let turn = TurnId::new();
+        let completed_item = |harness_item_id: &str| AgentEvent::ItemCompleted {
+            thread: thread_id,
+            turn,
+            item: Item {
+                id: ItemId::new(),
+                harness_item_id: harness_item_id.to_owned(),
+                payload: ItemPayload::AgentMessage {
+                    text: harness_item_id.to_owned(),
+                },
+                created_at: Utc::now(),
+            },
+        };
+        tx.send(AgentEvent::TurnStarted {
+            thread: thread_id,
+            turn,
+        })
+        .unwrap();
+        tx.send(completed_item("before")).unwrap();
+        tokio::time::timeout(tokio::time::Duration::from_secs(5), async {
+            loop {
+                if matches!(
+                    client_rx.recv().await,
+                    Some(ServerMessage::Event { agent_event, .. })
+                        if matches!(&*agent_event, WireAgentEvent::ItemCompleted { item, .. }
+                            if item.harness_item_id == "before")
+                ) {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("the first forwarder should consume the item before the gap");
+
+        let control = coordinator
+            .begin_retirement()
+            .await
+            .expect("a live owner can be retired");
+        control.cancel.send(true).unwrap();
+        first_forwarder.await.unwrap();
+        coordinator.finish_retirement().await;
+
+        // With no receiver, `broadcast::Sender::send` returns `Err(SendError)` and discards the
+        // event. Production ignores that result (`giskard-harness-codex/src/lib.rs`,
+        // `broadcast_event`), so the test does too; the assertion below is the observable loss.
+        let _ = tx.send(completed_item("during-gap"));
+
+        let (_second_forwarder, _runtime, _coordinator, _authority) =
+            spawn_forwarder_handle_with_runtime(
+                thread_id,
+                project_id,
+                AgentEventStream::new(tx.subscribe()),
+                hub,
+                store.clone(),
+                ledger,
+                model,
+                "second",
+            );
+        tx.send(AgentEvent::TurnCompleted {
+            thread: thread_id,
+            turn,
+            usage: TokenUsage::default(),
+            status: TurnStatus {
+                kind: TurnStatusKind::Completed,
+                message: None,
+            },
+        })
+        .unwrap();
+
+        wait_for_turn_count(&store, project_id, thread_id, 1).await;
+        let saved = store.load_all_turns(project_id, thread_id).await.unwrap();
+        let item_ids: Vec<&str> = saved[0]
+            .items
+            .iter()
+            .map(|item| item.harness_item_id.as_str())
+            .collect();
+        assert!(
+            item_ids.contains(&"during-gap"),
+            "an event sent while no forwarder ran must reach the replacement; persisted items: {item_ids:?}"
+        );
+    }
+
     async fn wait_for_turn_count(
         store: &PersistStore,
         project_id: ProjectId,

@@ -6294,4 +6294,392 @@ mod tests {
         assert_eq!(params["approvalPolicy"], "never");
         assert_eq!(params["permissions"], ":danger-full-access");
     }
+    mod loss_scenarios {
+        use super::*;
+
+        fn notification(n: codex_codes::messages::Notification) -> codex_codes::ServerMessage {
+            codex_codes::ServerMessage::Notification(n)
+        }
+
+        fn thread_started(native_thread_id: &str, parent: &str) -> codex_codes::ServerMessage {
+            notification(codex_codes::messages::Notification::ThreadStarted(
+                serde_json::from_value(json!({
+                    "thread": { "id": native_thread_id, "parentThreadId": parent }
+                }))
+                .unwrap(),
+            ))
+        }
+
+        fn turn_started(
+            native_thread_id: &str,
+            native_turn_id: &str,
+        ) -> codex_codes::ServerMessage {
+            notification(codex_codes::messages::Notification::TurnStarted(
+                serde_json::from_value(json!({
+                    "threadId": native_thread_id,
+                    "turn": { "id": native_turn_id, "status": "inProgress" }
+                }))
+                .unwrap(),
+            ))
+        }
+
+        fn turn_completed(
+            native_thread_id: &str,
+            native_turn_id: &str,
+        ) -> codex_codes::ServerMessage {
+            notification(codex_codes::messages::Notification::TurnCompleted(
+                serde_json::from_value(json!({
+                    "threadId": native_thread_id,
+                    "turn": { "id": native_turn_id, "status": "completed" }
+                }))
+                .unwrap(),
+            ))
+        }
+
+        fn agent_message_completed(
+            native_thread_id: &str,
+            native_turn_id: &str,
+            item_id: &str,
+            text: &str,
+        ) -> codex_codes::ServerMessage {
+            notification(codex_codes::messages::Notification::ItemCompleted(
+                serde_json::from_value(json!({
+                    "threadId": native_thread_id,
+                    "turnId": native_turn_id,
+                    "completedAtMs": 1000,
+                    "item": { "type": "agentMessage", "id": item_id, "text": text }
+                }))
+                .unwrap(),
+            ))
+        }
+
+        fn subagent_started(
+            parent_native_thread_id: &str,
+            parent_native_turn_id: &str,
+            child_native_thread_id: &str,
+        ) -> codex_codes::ServerMessage {
+            notification(codex_codes::messages::Notification::ItemCompleted(
+                serde_json::from_value(json!({
+                    "threadId": parent_native_thread_id,
+                    "turnId": parent_native_turn_id,
+                    "completedAtMs": 1000,
+                    "item": {
+                        "type": "subAgentActivity",
+                        "id": "spawn-1",
+                        "kind": "started",
+                        "agentThreadId": child_native_thread_id,
+                        "agentPath": "/root/explorer"
+                    }
+                }))
+                .unwrap(),
+            ))
+        }
+
+        async fn parent_with_active_turn(
+            harness: &Arc<CodexHarness>,
+            controller: &FakeCodexController,
+        ) -> (ThreadHandle, String, AgentEventStream) {
+            let parent = harness
+                .open_thread(open_opts(ThreadId::new(), None))
+                .await
+                .unwrap();
+            let parent_stream = harness.subscribe(&parent);
+            harness
+                .start_turn(
+                    &parent,
+                    UserInput::text("spawn a child"),
+                    build_turn_overrides(),
+                )
+                .await
+                .unwrap();
+            let native_turn = controller.started_turns().await[0].native_turn_id.clone();
+            (parent, native_turn, parent_stream)
+        }
+
+        async fn barrier(
+            controller: &FakeCodexController,
+            parent: &ThreadHandle,
+            native_turn: &str,
+            parent_stream: &mut AgentEventStream,
+            label: &str,
+        ) {
+            let marker = format!("barrier-{label}");
+            controller
+                .send_server_message(agent_message_completed(
+                    &parent.harness_thread_id,
+                    native_turn,
+                    &marker,
+                    &marker,
+                ))
+                .await;
+            recv_matching_event(parent_stream, label, |event| {
+                matches!(event, AgentEvent::ItemCompleted { item, .. } if item.harness_item_id == marker)
+            })
+            .await;
+        }
+
+        async fn expect_event(stream: &mut AgentEventStream, label: &str) -> AgentEvent {
+            timeout(Duration::from_secs(1), stream.recv())
+                .await
+                .unwrap_or_else(|_| panic!("timed out waiting for {label}"))
+                .unwrap_or_else(|error| panic!("stream closed while waiting for {label}: {error}"))
+        }
+
+        fn item_id_of(event: &AgentEvent) -> Option<&str> {
+            match event {
+                AgentEvent::ItemCompleted { item, .. } => Some(item.harness_item_id.as_str()),
+                _ => None,
+            }
+        }
+
+        #[tokio::test]
+        #[ignore = "M2: identity minted at ingest"]
+        async fn child_frames_before_claim_reach_the_child_subscriber() {
+            let (harness, controller) = spawn_fake_harness();
+            let (parent, parent_turn, mut parent_stream) =
+                parent_with_active_turn(&harness, &controller).await;
+
+            controller
+                .send_server_message(subagent_started(
+                    &parent.harness_thread_id,
+                    &parent_turn,
+                    "native-child",
+                ))
+                .await;
+            controller
+                .send_server_message(thread_started("native-child", &parent.harness_thread_id))
+                .await;
+            controller
+                .send_server_message(turn_started("native-child", "child-turn-1"))
+                .await;
+            controller
+                .send_server_message(agent_message_completed(
+                    "native-child",
+                    "child-turn-1",
+                    "child-msg-1",
+                    "hello",
+                ))
+                .await;
+            controller
+                .send_server_message(turn_completed("native-child", "child-turn-1"))
+                .await;
+
+            let link = recv_matching_event(&mut parent_stream, "sub-agent link", |event| {
+                matches!(event, AgentEvent::ItemCompleted { item, .. }
+                    if matches!(&item.payload, ItemPayload::Activity { subagent: Some(_), .. }))
+            })
+            .await;
+            match link {
+                AgentEvent::ItemCompleted { item, .. } => match item.payload {
+                    ItemPayload::Activity { subagent, .. } => {
+                        assert_eq!(subagent.unwrap().harness_thread_id, "native-child");
+                    }
+                    other => panic!("expected activity, got {other:?}"),
+                },
+                other => panic!("expected item completion, got {other:?}"),
+            }
+            barrier(
+                &controller,
+                &parent,
+                &parent_turn,
+                &mut parent_stream,
+                "child frames processed",
+            )
+            .await;
+
+            let child = harness
+                .claim_native_thread(
+                    ThreadId::new(),
+                    "native-child".into(),
+                    PathBuf::from("/tmp"),
+                )
+                .await
+                .unwrap();
+            let mut child_stream = harness.subscribe(&child);
+
+            let started = expect_event(&mut child_stream, "child TurnStarted").await;
+            assert!(
+                matches!(started, AgentEvent::TurnStarted { thread, .. } if thread == child.thread)
+            );
+            let message = expect_event(&mut child_stream, "child message").await;
+            assert!(
+                matches!(&message, AgentEvent::ItemCompleted { thread, item, .. }
+                if *thread == child.thread
+                    && matches!(&item.payload, ItemPayload::AgentMessage { text } if text == "hello"))
+            );
+            let completed = expect_event(&mut child_stream, "child TurnCompleted").await;
+            assert!(
+                matches!(completed, AgentEvent::TurnCompleted { thread, status, .. }
+                if thread == child.thread && status.kind == TurnStatusKind::Completed)
+            );
+        }
+
+        #[tokio::test]
+        #[ignore = "M1: retained event log"]
+        async fn events_after_claim_and_before_subscribe_are_retained() {
+            let (harness, controller) = spawn_fake_harness();
+            let (parent, parent_turn, mut parent_stream) =
+                parent_with_active_turn(&harness, &controller).await;
+            let child = harness
+                .claim_native_thread(
+                    ThreadId::new(),
+                    "native-child".into(),
+                    PathBuf::from("/tmp"),
+                )
+                .await
+                .unwrap();
+
+            controller
+                .send_server_message(turn_started("native-child", "child-turn-1"))
+                .await;
+            controller
+                .send_server_message(agent_message_completed(
+                    "native-child",
+                    "child-turn-1",
+                    "m1",
+                    "early",
+                ))
+                .await;
+            barrier(
+                &controller,
+                &parent,
+                &parent_turn,
+                &mut parent_stream,
+                "child events broadcast without receiver",
+            )
+            .await;
+
+            let mut child_stream = harness.subscribe(&child);
+            let started = expect_event(&mut child_stream, "child TurnStarted").await;
+            assert!(matches!(started, AgentEvent::TurnStarted { .. }));
+            let message = expect_event(&mut child_stream, "child message").await;
+            assert_eq!(item_id_of(&message), Some("m1"));
+        }
+
+        #[tokio::test]
+        #[ignore = "M1: retained event log"]
+        async fn slow_subscriber_receives_every_event_in_order() {
+            let (harness, controller) = spawn_fake_harness();
+            let (parent, parent_turn, mut parent_stream) =
+                parent_with_active_turn(&harness, &controller).await;
+            let child = harness
+                .claim_native_thread(
+                    ThreadId::new(),
+                    "native-child".into(),
+                    PathBuf::from("/tmp"),
+                )
+                .await
+                .unwrap();
+            let mut child_stream = harness.subscribe(&child);
+
+            let burst_controller = controller.clone();
+            let burst = tokio::spawn(async move {
+                burst_controller
+                    .send_server_message(turn_started("native-child", "child-turn-1"))
+                    .await;
+                for i in 0..300 {
+                    burst_controller
+                        .send_server_message(agent_message_completed(
+                            "native-child",
+                            "child-turn-1",
+                            &format!("m{i}"),
+                            "x",
+                        ))
+                        .await;
+                }
+                burst_controller
+                    .send_server_message(turn_completed("native-child", "child-turn-1"))
+                    .await;
+            });
+            burst.await.unwrap();
+            barrier(
+                &controller,
+                &parent,
+                &parent_turn,
+                &mut parent_stream,
+                "burst processed",
+            )
+            .await;
+
+            let started = expect_event(&mut child_stream, "child TurnStarted").await;
+            assert!(matches!(started, AgentEvent::TurnStarted { .. }));
+            for i in 0..300 {
+                let event = expect_event(&mut child_stream, &format!("message m{i}")).await;
+                assert_eq!(item_id_of(&event), Some(format!("m{i}").as_str()));
+            }
+            let completed = expect_event(&mut child_stream, "child TurnCompleted").await;
+            assert!(matches!(completed, AgentEvent::TurnCompleted { .. }));
+        }
+
+        #[tokio::test]
+        #[ignore = "M1: retained event log"]
+        async fn resubscribing_after_dropping_the_stream_yields_unconsumed_events() {
+            let (harness, controller) = spawn_fake_harness();
+            let (parent, parent_turn, mut parent_stream) =
+                parent_with_active_turn(&harness, &controller).await;
+            let child = harness
+                .claim_native_thread(
+                    ThreadId::new(),
+                    "native-child".into(),
+                    PathBuf::from("/tmp"),
+                )
+                .await
+                .unwrap();
+            let mut first = harness.subscribe(&child);
+
+            controller
+                .send_server_message(turn_started("native-child", "child-turn-1"))
+                .await;
+            let started = expect_event(&mut first, "child TurnStarted").await;
+            assert!(matches!(started, AgentEvent::TurnStarted { .. }));
+            drop(first);
+
+            controller
+                .send_server_message(agent_message_completed(
+                    "native-child",
+                    "child-turn-1",
+                    "after-drop",
+                    "tail",
+                ))
+                .await;
+            barrier(
+                &controller,
+                &parent,
+                &parent_turn,
+                &mut parent_stream,
+                "tail processed without receiver",
+            )
+            .await;
+
+            let mut second = harness.subscribe(&child);
+            let event = expect_event(&mut second, "tail after resubscribe").await;
+            assert_eq!(item_id_of(&event), Some("after-drop"));
+        }
+
+        #[tokio::test]
+        #[ignore = "M5: polling gate removed"]
+        async fn child_events_are_read_while_no_turn_is_active() {
+            let (harness, controller) = spawn_fake_harness();
+            let _parent = harness
+                .open_thread(open_opts(ThreadId::new(), None))
+                .await
+                .unwrap();
+            let child = harness
+                .claim_native_thread(
+                    ThreadId::new(),
+                    "native-child".into(),
+                    PathBuf::from("/tmp"),
+                )
+                .await
+                .unwrap();
+            let mut child_stream = harness.subscribe(&child);
+
+            controller
+                .send_server_message(turn_started("native-child", "child-turn-1"))
+                .await;
+
+            let started = expect_event(&mut child_stream, "child TurnStarted while idle").await;
+            assert!(matches!(started, AgentEvent::TurnStarted { .. }));
+        }
+    }
 }
