@@ -430,10 +430,15 @@ a control command on the worker queue (`handle_list_providers`). Codex owns
 provider configuration, so Giskard reads it back instead of asking the user to
 restate it in `config.toml`.
 
-`config/read` returns the whole effective config, and the app-server `Config`
-type forwards every key it does not model itself. `[model_providers]` therefore
-arrives as an unmodeled key, which the adapter's own `CodexConfig` picks up — the
-generated `codex-codes` types omit it, which is why it is deserialized locally.
+`config/read` returns the whole effective config. The adapter uses
+`codex-codes::ConfigReadParams`, `ConfigReadResponse`, and the typed `Config`
+fields directly. That generated `Config` preserves every key it does not model
+in its flattened `additional` map; `[model_providers]` is one such key, so only
+that table is deserialized locally into the provider subset Giskard needs. If a
+new Codex value makes an unrelated modeled field too new for the generated
+`Config`, the adapter logs the typed decode failure and falls back to a narrow
+projection of these required fields. A malformed provider entry is logged and
+skipped without hiding valid providers; a malformed table fails provider listing.
 
 - **Per-directory, but the table is not** — the request carries the project's
   workspace root, as every other `config/read` here does. It does not change the
@@ -597,6 +602,11 @@ changes were supplied, Giskard logs the degraded request and the browser states
 that Codex did not provide the file list. An optional grant root remains
 separately labeled permission-scope metadata and is never presented as a changed
 target.
+
+MCP elicitation approvals accept Codex's standard `form`, slash-form
+`openai/form`, camel-form `openaiForm`, and URL modes. All four retain `_meta`
+for thread/turn routing and approval promotion; the two OpenAI form spellings
+share the same browser-facing generic server-request and MCP approval behavior.
 
 ## Code and tests
 

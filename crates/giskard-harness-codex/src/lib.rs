@@ -26,6 +26,7 @@ use async_trait::async_trait;
 use rand::RngCore;
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 use tracing::{debug, error, info, warn};
 
@@ -79,34 +80,6 @@ struct OpenThreadOutcome {
     resume_replay_model: Option<ModelRef>,
 }
 
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct ConfigReadParams {
-    include_layers: bool,
-    cwd: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct ConfigReadResponse {
-    config: CodexConfig,
-}
-
-#[derive(Debug, Deserialize)]
-struct CodexConfig {
-    sandbox_workspace_write: Option<SandboxWorkspaceWrite>,
-    /// `model_provider` — the routing id Codex uses when nothing overrides it. Absent whenever the
-    /// user never set the key, which is the common case; Codex then routes to its `openai`
-    /// built-in.
-    #[serde(default)]
-    model_provider: Option<String>,
-    /// User-declared `[model_providers.<id>]` entries. Codex's `config/read` serializes its whole
-    /// effective config and the app-server `Config` type forwards every key it does not model
-    /// itself, so this table arrives even though the generated protocol types omit it. Built-in
-    /// providers are *not* included here — see [`CODEX_BUILT_IN_PROVIDER_IDS`].
-    #[serde(default)]
-    model_providers: HashMap<String, CodexModelProvider>,
-}
-
 /// The subset of Codex's `ModelProviderInfo` Giskard needs: a name for the picker and the endpoint
 /// plus key location for `/v1/models` discovery.
 ///
@@ -131,10 +104,8 @@ struct CodexModelProvider {
 ///
 /// Every field is optional even though Codex requires `command`, because this type is only ever
 /// deserialized from *Codex's* output and a required field here would make one unfamiliar provider
-/// entry fail the whole `config/read`. That response is shared: the same call supplies
-/// `sandbox_workspace_write.writable_roots`, so a parse failure would silently narrow the sandbox
-/// as a side effect of a model-discovery field. An `auth` table Giskard cannot make sense of is
-/// treated as no command auth instead.
+/// entry fail the whole provider listing. An `auth` table Giskard cannot make sense of is treated
+/// as no command auth instead.
 #[derive(Debug, Deserialize)]
 struct CodexProviderAuth {
     #[serde(default)]
@@ -188,12 +159,6 @@ const CODEX_BUILT_IN_PROVIDER_IDS: [&str; 5] = [
     "ollama",
     "lmstudio",
 ];
-
-#[derive(Debug, Deserialize)]
-struct SandboxWorkspaceWrite {
-    #[serde(default)]
-    writable_roots: Vec<PathBuf>,
-}
 
 struct QueuedHarnessCommand {
     token: WorkerQueueToken,
@@ -1142,19 +1107,98 @@ async fn read_codex_config(
     client: &mut dyn CodexTransport,
     cwd: String,
     action: &'static str,
-) -> Result<CodexConfig, HarnessError> {
-    let params = ConfigReadParams {
-        include_layers: false,
-        cwd,
+) -> Result<codex_codes::Config, HarnessError> {
+    let params = codex_codes::ConfigReadParams {
+        include_layers: Some(false),
+        cwd: Some(cwd),
     };
-    let response: ConfigReadResponse = codex_request(
+    let response: Value = codex_request(
         client,
         CodexOperationContext::new(action),
         "config/read",
         &params,
     )
     .await?;
-    Ok(response.config)
+    decode_codex_config(response, action)
+}
+
+fn decode_codex_config(
+    response: Value,
+    action: &'static str,
+) -> Result<codex_codes::Config, HarnessError> {
+    match serde_json::from_value::<codex_codes::ConfigReadResponse>(response.clone()) {
+        Ok(response) => Ok(response.config),
+        Err(typed_error) => {
+            #[derive(Deserialize)]
+            struct NarrowResponse {
+                config: NarrowConfig,
+            }
+
+            #[derive(Deserialize)]
+            struct NarrowConfig {
+                #[serde(default)]
+                model_provider: Option<String>,
+                #[serde(default)]
+                model_providers: Option<Value>,
+                #[serde(default)]
+                sandbox_workspace_write: Option<codex_codes::SandboxWorkspaceWrite>,
+            }
+
+            let narrow: NarrowResponse =
+                serde_json::from_value(response).map_err(|narrow_error| {
+                    HarnessError::Protocol(format!(
+                        "invalid Codex config/read response: typed decode failed: {typed_error}; \
+                     compatibility decode failed: {narrow_error}"
+                    ))
+                })?;
+            warn!(
+                action,
+                error = %typed_error,
+                "Codex config/read contained an unsupported modeled field; using the narrow compatibility projection"
+            );
+            let mut config = codex_codes::Config {
+                model_provider: narrow.config.model_provider,
+                sandbox_workspace_write: narrow.config.sandbox_workspace_write,
+                ..Default::default()
+            };
+            if let Some(model_providers) = narrow.config.model_providers {
+                config
+                    .additional
+                    .insert("model_providers".into(), model_providers);
+            }
+            Ok(config)
+        }
+    }
+}
+
+/// Decode the one effective-config table that the generated protocol `Config` deliberately leaves
+/// in its flattened `additional` map. Built-in providers are not included in this user table.
+fn configured_model_providers(
+    config: &codex_codes::Config,
+) -> Result<HashMap<String, CodexModelProvider>, HarnessError> {
+    let Some(value) = config.additional.get("model_providers") else {
+        return Ok(HashMap::new());
+    };
+    let Value::Object(entries) = value else {
+        return Err(HarnessError::Protocol(
+            "invalid model_providers table in Codex config/read response: expected an object"
+                .into(),
+        ));
+    };
+    let mut providers = HashMap::with_capacity(entries.len());
+    for (id, value) in entries {
+        match serde_json::from_value(value.clone()) {
+            Ok(provider) => {
+                providers.insert(id.clone(), provider);
+            }
+            Err(error) => warn!(
+                provider_id = %id,
+                error = %error,
+                "Skipping malformed provider from Codex config/read response"
+            ),
+        }
+    }
+    Ok(providers)
 }
 
 async fn configured_workspace_write_roots(
@@ -1172,7 +1216,8 @@ async fn configured_workspace_write_roots(
         Ok(config) => {
             let mut roots = Vec::new();
             if let Some(sandbox) = config.sandbox_workspace_write {
-                for root in sandbox.writable_roots {
+                for root in sandbox.writable_roots.unwrap_or_default() {
+                    let root = PathBuf::from(root);
                     if root.is_absolute() {
                         roots.push(root);
                     } else {
@@ -2874,7 +2919,8 @@ async fn handle_list_mcp_servers(
 /// Codex owns provider configuration: `~/.codex/config.toml` holds each provider's display name,
 /// `base_url`, and `env_key`, and Giskard reads them back here instead of asking the user to
 /// restate them. `config/read` returns the whole effective config, so the `[model_providers]`
-/// table arrives as an unmodeled key that our own [`CodexConfig`] picks up.
+/// table arrives in the generated [`codex_codes::Config::additional`] map and only that table is
+/// decoded into Giskard's provider subset.
 ///
 /// The result is the built-in ids Codex always accepts plus every user-declared entry. Built-ins
 /// come first so a user entry that somehow shadows one wins on `id` collision; Codex itself
@@ -2887,6 +2933,7 @@ async fn handle_list_providers(
     cwd: String,
 ) -> Result<Vec<HarnessProvider>, HarnessError> {
     let config = read_codex_config(client, cwd, "list_providers").await?;
+    let configured_providers = configured_model_providers(&config)?;
 
     let mut providers: Vec<HarnessProvider> = CODEX_BUILT_IN_PROVIDER_IDS
         .iter()
@@ -2898,7 +2945,7 @@ async fn handle_list_providers(
         })
         .collect();
 
-    for (id, provider) in config.model_providers {
+    for (id, provider) in configured_providers {
         let entry = HarnessProvider {
             id: id.clone(),
             name: non_empty(provider.name.clone()),
@@ -4749,9 +4796,8 @@ mod tests {
             "the auth table should map to the command arm, timeout included"
         );
 
-        // An `auth` table Giskard cannot make sense of must not fail the whole `config/read`: the
-        // same response carries `sandbox_workspace_write.writable_roots`, so a strict parse here
-        // would silently narrow the sandbox. The provider still resolves by its `env_key`.
+        // An `auth` table Giskard cannot make sense of must not fail the whole provider listing.
+        // The provider still resolves by its `env_key`.
         let unfamiliar = by_id("unfamiliar-auth");
         assert_eq!(
             unfamiliar.auth,
@@ -4787,6 +4833,69 @@ mod tests {
             ),
             other => panic!("expected a transport failure, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn malformed_untyped_provider_table_is_a_protocol_error() {
+        let mut config = codex_codes::Config::default();
+        config.additional.insert(
+            "model_providers".into(),
+            serde_json::json!(["not", "a", "provider", "table"]),
+        );
+
+        match configured_model_providers(&config) {
+            Err(HarnessError::Protocol(message)) => {
+                assert!(message.contains("invalid model_providers table"));
+            }
+            other => panic!("expected protocol error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn malformed_provider_entry_does_not_hide_valid_providers() {
+        let mut config = codex_codes::Config::default();
+        config.additional.insert(
+            "model_providers".into(),
+            serde_json::json!({
+                "valid": { "name": "Valid", "env_key": "VALID_KEY" },
+                "malformed": { "name": ["not", "a", "string"] }
+            }),
+        );
+
+        let providers = configured_model_providers(&config).unwrap();
+        assert_eq!(providers.len(), 1);
+        assert_eq!(
+            providers
+                .get("valid")
+                .and_then(|provider| provider.name.as_deref()),
+            Some("Valid")
+        );
+    }
+
+    #[test]
+    fn unsupported_unrelated_config_field_uses_narrow_projection() {
+        let config = decode_codex_config(
+            serde_json::json!({
+                "config": {
+                    "approval_policy": "futurePolicy",
+                    "model_provider": "opencodex",
+                    "model_providers": { "opencodex": { "name": "OpenCodex" } },
+                    "sandbox_workspace_write": { "writable_roots": ["/tmp/cache"] }
+                },
+                "origins": {}
+            }),
+            "test_config_decode",
+        )
+        .unwrap();
+
+        assert_eq!(config.model_provider.as_deref(), Some("opencodex"));
+        assert!(config.additional.contains_key("model_providers"));
+        assert_eq!(
+            config
+                .sandbox_workspace_write
+                .and_then(|sandbox| sandbox.writable_roots),
+            Some(vec!["/tmp/cache".into()])
+        );
     }
 
     /// Without the routing provider there is no correct attribution, and guessing the default

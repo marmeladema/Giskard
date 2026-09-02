@@ -2216,6 +2216,10 @@ fn mcp_elicitation_meta(
     match params {
         codex_codes::protocol::McpServerElicitationRequestParams::Form { _meta, .. }
         | codex_codes::protocol::McpServerElicitationRequestParams::OpenaiForm { _meta, .. }
+        | codex_codes::protocol::McpServerElicitationRequestParams::OpenAiElicitationForm {
+            _meta,
+            ..
+        }
         | codex_codes::protocol::McpServerElicitationRequestParams::Url { _meta, .. } => {
             _meta.as_ref()
         }
@@ -2330,6 +2334,10 @@ fn detect_mcp_tool_approval_from_elicitation(
         codex_codes::protocol::McpServerElicitationRequestParams::Form { message, .. }
         | codex_codes::protocol::McpServerElicitationRequestParams::OpenaiForm {
             message, ..
+        }
+        | codex_codes::protocol::McpServerElicitationRequestParams::OpenAiElicitationForm {
+            message,
+            ..
         }
         | codex_codes::protocol::McpServerElicitationRequestParams::Url { message, .. } => {
             message.clone()
@@ -6879,6 +6887,44 @@ mod tests {
                         .contains(&ApprovalDecision::AcceptForSession)
                 );
             }
+            other => panic!("expected ApprovalRequested, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn mcp_tool_approval_from_openai_elicitation_form_is_promoted() {
+        let mut mapper = CodexMapper::new(PathBuf::from("/tmp"));
+        let fallback = ThreadId::new();
+        let request = CodexServerRequest::McpServerElicitationRequest(
+            serde_json::from_value(serde_json::json!({
+                "mode": "openaiForm",
+                "_meta": {
+                    "codex_approval_kind": "mcp_tool_call",
+                    "tool_name": "brave_web_search",
+                    "threadId": "th1",
+                    "turnId": "t1"
+                },
+                "message": "Allow brave-search to run tool \"brave_web_search\"?",
+                "requestedSchema": { "type": "object", "properties": {} }
+            }))
+            .unwrap(),
+        );
+
+        let event = mapper
+            .map_server_request(
+                &RequestId::String("mcp-openai-form".into()),
+                &request,
+                fallback,
+            )
+            .unwrap();
+        match event {
+            AgentEvent::ApprovalRequested { request, .. } => match request.kind {
+                ApprovalKind::McpToolCall { server, tool_name } => {
+                    assert_eq!(server, "brave-search");
+                    assert_eq!(tool_name, "brave_web_search");
+                }
+                other => panic!("expected McpToolCall, got {other:?}"),
+            },
             other => panic!("expected ApprovalRequested, got {other:?}"),
         }
     }
