@@ -118,7 +118,7 @@ where
                     self.receivers.done.send_replace(true);
                     return;
                 }
-                msg = self.client.next_message(), if should_poll_codex_messages(&self.mapper, &self.active_turns, &self.pending_compactions) || !self.pending_context_restores.is_empty() => {
+                msg = self.client.next_message() => {
                     match msg {
                         Ok(Some(msg)) => {
                             observe_pending_context_restore(&mut self.pending_context_restores, &msg);

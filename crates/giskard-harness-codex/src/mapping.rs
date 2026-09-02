@@ -192,12 +192,9 @@ impl CodexMapper {
         }
     }
 
+    #[cfg(test)]
     pub fn has_running_commands(&self) -> bool {
         !self.running_commands.is_empty()
-    }
-
-    pub fn has_active_turns(&self) -> bool {
-        !self.active_turns.is_empty()
     }
 
     pub fn running_command_fallback_thread(&self) -> Option<ThreadId> {

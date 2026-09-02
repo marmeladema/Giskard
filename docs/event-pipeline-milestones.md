@@ -58,7 +58,7 @@ on rather than writing new ones.
 - B: events sent after the route exists and before `subscribe`; assert delivery. (M1)
 - C: 300 events with a stalled subscriber; assert none lost and no `Interrupted` turn. (M1)
 - D: owner replaced mid-turn; assert the replacement sees the tail. (M1, fully M4)
-- E: child events arriving while no turn is active in the adapter. (M1 with the polling gate, M5)
+- E: child events arriving while no turn is active in the adapter. (M3)
 - Parent link before child frames, child frames before parent link, and interleaved; assert one
   persisted thread, one persisted turn, same `ThreadId`. (M2)
 
@@ -151,16 +151,24 @@ They can be paced, and each still follows the rules.
 
 ## M3 — Single stdout reader
 
+**Status.** Implemented by the single-stdout-reader change.
+
 **Goal.** Bound adapter memory and order RPC responses relative to notifications. This is #218's
-slice, restated: it stays behind `CodexTransport` and touches nothing above it.
+slice, restated: it stays inside the Codex adapter. The transport is the primary seam; the only
+instance behavior change is the one-line removal of the adapter polling gate.
 
-**Design.** One reader task decodes stdout and appends every frame to the instance's inbox;
-responses are matched by request id to one-shot waiters. `request_json` never reads stdout. The
-inbox is bounded by the same byte cap and `Gap` rule as `EventLog`, so saturation is explicit rather
-than either silent or a stall inside Codex.
+**Design.** One reader task decodes stdout and appends notifications and requests to the
+transport-owned inbox; responses are matched by request id to one-shot waiters. `request_json`
+never reads stdout. The retained `EventLog` inbox has a 65,536-frame cap; a `Gap` is fatal, and the
+reader never blocks on a full inbox. One bounded-queue writer owns stdin and flushes each whole
+frame. The `codex-codes` stderr-drain helper is private, so production uses an equivalent local
+task: it continuously reads lines, strips ANSI control sequences, and routes recognizable
+`ERROR`, `WARN`, and `DEBUG` lines to the corresponding tracing level, with other lines at
+`TRACE`.
 
-**Exit.** No code path reads stdout except the reader; `AsyncClient::request` is not called;
-#217's open finding on write-failure classification is addressed at the writer.
+**Exit.** No code path reads stdout except the reader; `AsyncClient` and
+`should_poll_codex_messages` are absent; M0 test E passes; #217's open finding on write-failure
+classification is addressed at the writer.
 
 **Size.** #218 was this. Independent of M2, may land in either order after M1.
 
@@ -197,12 +205,10 @@ needs more than the files above, split "driver with old coordinator" from "delet
 the driver. The driver calls `harness.start_turn`, and correlates the returned `TurnId` with the
 native turn it later sees, because the adapter already registers the id from the `turn/start`
 response before notifications stream (`mapping.rs:229`). Compaction and interrupt follow the same
-path. The polling gate in `should_poll_codex_messages` is removed: the reader always reads and the
-log absorbs.
+path.
 
 **Exit.** `ThreadCoordinator` is plain data inside the driver with no mutex; `admit_operation`,
-`abort_admitted_operation`, `acknowledge_operation_turn`, `CoordinatorToken` deleted; M0 test E
-passes.
+`abort_admitted_operation`, `acknowledge_operation_turn`, `CoordinatorToken` deleted.
 
 ## M6 — Materialization off the event path
 

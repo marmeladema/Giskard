@@ -94,6 +94,9 @@ Cargo workspace with 8 crates under `crates/`:
   transport, mapper, active turns, pending compactions, and pending context restores must remain
   task-owned. Do not share them through `Arc<Mutex<_>>`, `Arc<RwLock<_>>`, or independent
   state-mutating workers; helper futures may borrow this state only through `&mut self`.
+  The transport may own internal reader and writer tasks solely for stdio, frame delivery, and
+  request correlation; those tasks must never access or mutate mapper, route, turn, compaction, or
+  context-restore state.
 - Every production Codex thread route must be established through the `CodexInstance` route
   methods; do not claim or replace mapper identity and publish its event log as separate
   operations. Traffic discovery must go through the same route methods. Resume-fallback
