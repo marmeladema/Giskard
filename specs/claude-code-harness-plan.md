@@ -285,19 +285,38 @@ that tracks the CLI release it models.
   That is precisely the hazard behind §2's cwd-scoped resume constraint, documented by someone who
   measured it rather than guessed.
 
-**What it does not cover.** `set_model`, `set_permission_mode`, `apply_flag_settings` and
-`get_settings` are absent — the four §3.3 verified for switching model, mode and reasoning effort on a
-live child. Two escape hatches make that a gap rather than a blocker: `ClaudeInput::Raw(Value)` is an
-untagged variant for sending anything unmodelled, and `receive_raw()` reads anything unparsed. Since
-the maintainer clearly tracks the protocol closely, upstreaming typed variants is the better long-term
-move than carrying a local fork.
-
-The CLI builder likewise lacks `--forward-subagent-text` (required by §5.8) and `--effort`. This costs
-nothing either: the client's constructor takes an already-spawned `Child`, so Giskard can build argv
-itself and still use the crate's typed IO.
-
 **Forward compatibility** is designed in — enums carry `Unknown(String)` variants that round-trip
 verbatim, which is the same tolerance §12 asks of the mapper.
+
+### 3.7.1 Gaps in `claude-codes` — candidates to upstream
+
+Audited against 2.1.259 by reading its source. **Nothing here blocks the adapter**: enums carry
+`Unknown` variants that round-trip verbatim, `ClaudeInput::Raw(Value)` sends anything unmodelled,
+`receive_raw()` reads anything unparsed, and the client constructor takes an already-spawned `Child`
+so Giskard can own argv. These are typed-access gaps — each one is a place the adapter would otherwise
+hand-build JSON that the crate is the natural home for.
+
+Ordered by how much the design leans on them.
+
+| # | Missing | Shape | Why this design needs it | Evidence |
+| --- | --- | --- | --- | --- |
+| 1 | `ControlRequestPayload::ApplyFlagSettings` | `{subtype:"apply_flag_settings", settings:{effortLevel, ultracode, model, fastMode, advisorModel, viewMode}}` | The only way to change **reasoning effort** on a live child (§3.3) | verified: `--effort low` child accepted `{effortLevel:"high"}` and reported `high` after |
+| 2 | `ControlRequestPayload::SetModel` | `{subtype:"set_model", model:"<id>"}` | Per-turn model switching without respawning (§3.3) | verified: Sonnet child answered as Haiku on the next turn, same session |
+| 3 | `ControlRequestPayload::SetPermissionMode` | `{subtype:"set_permission_mode", mode:"<mode>"}` | Plan/Build switching per turn (§8.2) | verified: response echoes `{"mode":"plan"}` |
+| 4 | `ControlRequestPayload::GetSettings` + response | request takes no params; response `{applied:{model, effort, ultracode}, effective, sources}` | Read-back for the above. **Load-bearing**, not cosmetic: an invalid `effortLevel` is answered `success` and silently ignored, so this is the only way to confirm a change landed (§3.3) | verified: `applied.effort` moved `low` → `high`; `"banana"` was accepted and ignored |
+| 5 | `ContentBlock::Document` | `{"type":"document","source":{…}}` where source is `{type:"base64", media_type, data}` **or** `{type:"text", media_type, data}` | PDF and plain-text user attachments (§3.6). `ContentBlock` has `Image` but no `Document` | verified both directions, including that a text document sent as base64 fails at the API with "document … could not be processed and was removed" |
+| 6 | `SystemMessage` subtype `autocompact_state` | `{enabled, effective_window, threshold, enforced, source}` | The **effective** context window, which is what the gauge wants (§6) | observed on every session start |
+| 7 | `SystemMessage` subtype `post_turn_summary` | `{summarizes_uuid, status_category, status_detail, needs_action}` | Activity labels; nice-to-have | observed, including `status_category: "blocked"` after a denial |
+| 8 | CLI builder flags | `--forward-subagent-text`, `--effort` | The first is **mandatory** for sub-agent child threads (§5.8); the second sets initial effort | present in `claude --help`, absent from `cli.rs` |
+
+Item 5 is the one worth doing carefully: the base64-versus-text distinction is invisible until it
+fails remotely, so a typed `DocumentSource` that makes the wrong pairing unrepresentable is worth more
+than the block itself.
+
+**Already covered**, and worth not duplicating: `parent_tool_use_id` (the routing key §5.8 depends on),
+the whole `task_started` / `task_progress` / `task_updated` / `task_notification` family,
+`non_execution_kind`, `blocked_path`, `permission_suggestions`, `RateLimitEvent`, `modelUsage`,
+`thinking_tokens`, and the transcript-location rule.
 
 ---
 
