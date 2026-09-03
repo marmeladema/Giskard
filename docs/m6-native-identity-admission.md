@@ -34,7 +34,7 @@ an already-classified child.
   leaves the admission path only. Two routes change order of operations to keep the exclusion
   they got from the lock; see "What the lifecycle lock protected".
 - No change to `attach_subagent_thread` (opening a persisted child by id) beyond sharing a helper.
-- No cursor-committed persistence (M7).
+- No cursor-committed persistence (now M8).
 
 ## Ground truth
 
