@@ -9,7 +9,15 @@
 
 **Document status:** Implementation-ready specification.
 **Audience:** An AI coding agent (and its human reviewer) implementing the system.
-**Version:** 1.81
+**Version:** 1.82
+
+> **Amendment — turn intents (1.82).** Starting a turn or context compaction sends a bounded
+> `TurnIntent` to the thread's long-lived event owner. That owner alone admits the operation,
+> reserves its runtime lease, polls the harness request in the same sequential loop as retained
+> native events, and attaches the first new native turn it observes to the admitted intent. There
+> is no coordinator token, generation, or prepared operation. Interrupt remains a direct harness
+> call because it reserves no turn. The coordinator continues to hold the binding,
+> classification, and owner phase for their other process-local readers.
 
 > **Amendment — one event driver per project (1.81).** Each active project harness has one event
 > driver task. It owns every native-thread event forwarder for that harness and serializes attach,
@@ -3612,13 +3620,13 @@ thread. The browser marks a turn active immediately after successfully sending `
 any harness `TurnStarted` event, and clears that optimistic state if the server rejects the send for
 anything other than `thread_turn_active`.
 
-The per-thread coordinator serializes prepared primary operations with externally observed native
-turns. `SendInput` and `CompactContext` attach context and a runtime lease to the coordinator before
-harness I/O. The long-lived owner atomically consumes that preparation when the first event for the
-native turn arrives; a promptless external turn instead receives context from durable thread
-metadata. Completion clears only the matching generation/token, so a stale completion cannot
-release or overwrite a later turn. No coordinator lock is held while awaiting harness, persistence,
-runtime publication, or owner shutdown.
+The long-lived event owner serializes primary turn admission with externally observed native turns.
+`SendInput` and `CompactContext` enqueue bounded intents to that owner. The owner rejects overlapping
+work before touching the runtime, reserves the lease, polls the harness call alongside its retained
+event stream, and attaches the first unseen native turn to the admitted context. A promptless
+external turn instead receives context from durable thread metadata and the current classification.
+Completion releases only the lease held in the owner's current-turn state. No coordinator lock is
+held while awaiting harness, persistence, runtime publication, or owner shutdown.
 
 > **Durable settings switches (P2/P3).** `SwitchMode`, `SelectModel`, and `SetPermissionPreset`
 > persist immediately to `<thread_id>.json` before the server acknowledges, then broadcast a

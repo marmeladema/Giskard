@@ -201,16 +201,23 @@ needs more than the files above, split "driver with old coordinator" from "delet
 
 ## M5 — Intents replace prepared operations
 
+**Status:** Complete. Implemented by the turn-intent change. See
+[`m5-turn-intents.md`](m5-turn-intents.md) for the implementation plan and interleaving analysis.
+
 **Goal.** Delete `CoordinatorToken`, generations and `PreparedOperation`.
 
-**Design.** `HarnessRegistry::start_turn` sends `Intent::StartTurn { input, overrides, reply }` to
-the driver. The driver calls `harness.start_turn`, and correlates the returned `TurnId` with the
-native turn it later sees, because the adapter already registers the id from the `turn/start`
-response before notifications stream (`mapping.rs:229`). Compaction and interrupt follow the same
-path.
+**Design.** `HarnessRegistry::start_turn` and `compact_thread` send a `TurnIntent` through the
+coordinator's live owner phase to the thread's event forwarder. That one sequential owner reserves
+the runtime lease, polls the harness request alongside retained events, and attaches the first new
+native turn it observes to the admitted intent. With admission and observation in one loop there is
+no stale preparation to guard with a generation or token. Interrupt remains a direct harness call
+because it reserves no turn.
 
-**Exit.** `ThreadCoordinator` is plain data inside the driver with no mutex; `admit_operation`,
-`abort_admitted_operation`, `acknowledge_operation_turn`, `CoordinatorToken` deleted.
+The coordinator remains mutex-protected data for the binding, classification, and owner phase;
+those fields still have registry, materialization, and driver readers and move in M6 territory.
+
+**Exit.** `CoordinatorToken`, generations, `PreparedOperation`, and the coordinator's operation and
+native-turn methods are deleted. Primary turn leases are reserved only by the forwarder.
 
 ## M6 — Materialization off the event path
 

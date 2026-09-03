@@ -1,13 +1,13 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use chrono::Utc;
 use futures::future::join_all;
-use tokio::sync::{Mutex, Notify, OwnedMutexGuard, oneshot, watch};
+use tokio::sync::{Mutex, Notify, OwnedMutexGuard, mpsc, oneshot, watch};
 use tokio::time::timeout;
 use tracing::{debug, error, info, warn};
 
@@ -63,8 +63,8 @@ use event_forwarder::{
 use project::{HarnessTransitions, LifecycleLock, ProjectAuthority, WeakLifecycleLock};
 pub(crate) use thread::ThreadAuthority;
 use thread::{
-    ClassificationPhase, CoordinatorToken, ExternalTurnDefaults, OwnerLock, ThreadBinding,
-    ThreadCoordinator, WeakOwnerLock,
+    ClassificationPhase, ExternalTurnDefaults, OwnerLock, ThreadBinding, ThreadCoordinator,
+    TurnIntent, WeakOwnerLock, external_turn_input_label,
 };
 
 #[async_trait]
@@ -392,49 +392,6 @@ impl RegistryShared {
             }
         }
         coordinators
-    }
-
-    async fn abort_admitted_operation(
-        &self,
-        coordinator: &ThreadCoordinator,
-        operation: CoordinatorToken,
-    ) {
-        if let Some(mut turn_gate) = coordinator.abort_operation(operation).await
-            && let Some(overview) = turn_gate.release()
-        {
-            self.hub.publish_runtime_overview(overview).await;
-        }
-    }
-
-    async fn admit_operation(
-        &self,
-        authority: &Arc<ThreadAuthority>,
-        coordinator: &ThreadCoordinator,
-        project_id: ProjectId,
-        handle: &ThreadHandle,
-        context: &TurnContext,
-    ) -> Result<CoordinatorToken, HarnessError> {
-        let turn_gate = match self
-            .runtime
-            .reserve_turn(authority, turn_reservation(project_id, handle, context))
-        {
-            Ok(turn_gate) => turn_gate,
-            Err(error) => return Err(error),
-        };
-        let operation = match coordinator
-            .prepare_operation(context.clone(), turn_gate)
-            .await
-        {
-            Ok(operation) => operation,
-            Err((error, mut turn_gate)) => {
-                if let Some(overview) = turn_gate.release() {
-                    self.hub.publish_runtime_overview(overview).await;
-                }
-                return Err(error);
-            }
-        };
-        publish_runtime_overview(self).await;
-        Ok(operation)
     }
 
     #[cfg(test)]
@@ -1090,100 +1047,30 @@ impl HarnessRegistry {
             .coordinator(thread_id)
             .await
             .ok_or(HarnessError::ThreadNotFound(thread_id))?;
-        let binding = coordinator.binding().await;
-        let project_id = binding.project_id;
-        let handle = binding.handle.clone();
-        debug!(
-            %project_id,
-            %thread_id,
-            harness_thread_id = %handle.harness_thread_id,
-            mode = ?overrides.mode,
-            provider = %effective_model.provider,
-            model = %effective_model.model,
-            "starting harness turn"
-        );
-
-        let harness = self
-            .shared
-            .active_harness(project_id)
-            .await
-            .ok_or(HarnessError::ThreadNotFound(thread_id))?;
-
+        let intents = coordinator.intent_sender().await?;
         let ctx = TurnContext {
             user_input: input.clone(),
             model: TurnModel::Known(effective_model),
             mode: TurnMode::Known(overrides.mode),
             kind: TurnContextKind::User,
         };
-        let request_started = Instant::now();
-        let authority = self
-            .shared
-            .thread_authority(thread_id)
+        let (reply, response) = oneshot::channel();
+        intents
+            .send(TurnIntent::StartTurn {
+                input,
+                overrides,
+                context: ctx,
+                reply,
+            })
             .await
-            .ok_or(HarnessError::ThreadNotFound(thread_id))?;
-        let operation = self
-            .shared
-            .admit_operation(&authority, &coordinator, project_id, &handle, &ctx)
-            .await?;
-        let Some(task_permit) = self.shared.background_tasks.register() else {
-            self.shared
-                .abort_admitted_operation(&coordinator, operation)
-                .await;
-            return Err(HarnessError::Protocol(
-                "server is shutting down; refusing to start a turn".into(),
-            ));
-        };
-        let task_coordinator = coordinator.clone();
-        let task_shared = self.shared.clone();
-        let task = tokio::spawn(async move {
-            let _task_permit = task_permit;
-            match harness.start_turn(&handle, input, overrides).await {
-                Ok(turn_id) => {
-                    info!(
-                        %project_id,
-                        %thread_id,
-                        %turn_id,
-                        harness_thread_id = %handle.harness_thread_id,
-                        mode = ?ctx.mode,
-                        model = ?ctx.model,
-                        ack_elapsed_ms = request_started.elapsed().as_millis(),
-                        "harness accepted turn start request"
-                    );
-                    task_coordinator
-                        .acknowledge_operation_turn(operation, turn_id)
-                        .await;
-                    publish_runtime_overview(&task_shared).await;
-                    Ok(turn_id)
-                }
-                Err(error) => {
-                    warn!(
-                        %project_id,
-                        %thread_id,
-                        harness_thread_id = %handle.harness_thread_id,
-                        mode = ?ctx.mode,
-                        model = ?ctx.model,
-                        error = %error,
-                        ack_elapsed_ms = request_started.elapsed().as_millis(),
-                        "harness rejected turn start request"
-                    );
-                    task_shared
-                        .abort_admitted_operation(&task_coordinator, operation)
-                        .await;
-                    Err(error)
-                }
-            }
-        });
-        match task.await {
-            Ok(result) => result,
-            Err(error) => {
-                self.shared
-                    .abort_admitted_operation(&coordinator, operation)
-                    .await;
-                Err(HarnessError::Protocol(format!(
-                    "turn start task failed: {error}"
-                )))
-            }
-        }
+            .map_err(|_| {
+                HarnessError::Protocol(format!("thread {thread_id} has no live event owner"))
+            })?;
+        response.await.map_err(|_| {
+            HarnessError::Protocol(format!(
+                "thread {thread_id} event owner exited before answering"
+            ))
+        })?
     }
 
     /// Route an approval decision to the harness that raised it (§9.2).
@@ -1404,87 +1291,28 @@ impl HarnessRegistry {
             .coordinator(thread_id)
             .await
             .ok_or(HarnessError::ThreadNotFound(thread_id))?;
-        let binding = coordinator.binding().await;
-        let project_id = binding.project_id;
-        let handle = binding.handle;
-        let harness = self
-            .shared
-            .active_harness(project_id)
-            .await
-            .ok_or(HarnessError::ThreadNotFound(thread_id))?;
-
-        let request_started = Instant::now();
-        info!(
-            %project_id,
-            %thread_id,
-            harness_thread_id = %handle.harness_thread_id,
-            provider = %effective_model.provider,
-            model = %effective_model.model,
-            mode = ?mode,
-            "starting context compaction"
-        );
+        let intents = coordinator.intent_sender().await?;
         let ctx = TurnContext {
             user_input: UserInput::text("/compact"),
             model: TurnModel::Known(effective_model),
             mode: TurnMode::Known(mode),
             kind: TurnContextKind::ManualCompaction,
         };
-        let operation = self
-            .shared
-            .admit_operation(
-                &self
-                    .shared
-                    .thread_authority(thread_id)
-                    .await
-                    .ok_or(HarnessError::ThreadNotFound(thread_id))?,
-                &coordinator,
-                project_id,
-                &handle,
-                &ctx,
-            )
-            .await?;
-        let Some(task_permit) = self.shared.background_tasks.register() else {
-            self.shared
-                .abort_admitted_operation(&coordinator, operation)
-                .await;
-            return Err(HarnessError::Protocol(
-                "server is shutting down; refusing context compaction".into(),
-            ));
-        };
-        let task_coordinator = coordinator.clone();
-        let task_shared = self.shared.clone();
-        let task = tokio::spawn(async move {
-            let _task_permit = task_permit;
-            match harness.compact_thread(&handle).await {
-                Ok(()) => {
-                    info!(
-                        %project_id,
-                        %thread_id,
-                        harness_thread_id = %handle.harness_thread_id,
-                        ack_elapsed_ms = request_started.elapsed().as_millis(),
-                        "harness accepted context compaction request"
-                    );
-                    Ok(())
-                }
-                Err(error) => {
-                    task_shared
-                        .abort_admitted_operation(&task_coordinator, operation)
-                        .await;
-                    Err(error)
-                }
-            }
-        });
-        match task.await {
-            Ok(result) => result,
-            Err(error) => {
-                self.shared
-                    .abort_admitted_operation(&coordinator, operation)
-                    .await;
-                Err(HarnessError::Protocol(format!(
-                    "context compaction task failed: {error}"
-                )))
-            }
-        }
+        let (reply, response) = oneshot::channel();
+        intents
+            .send(TurnIntent::Compact {
+                context: ctx,
+                reply,
+            })
+            .await
+            .map_err(|_| {
+                HarnessError::Protocol(format!("thread {thread_id} has no live event owner"))
+            })?;
+        response.await.map_err(|_| {
+            HarnessError::Protocol(format!(
+                "thread {thread_id} event owner exited before answering"
+            ))
+        })?
     }
 
     pub(crate) async fn open_subagent_link(
@@ -2687,7 +2515,6 @@ mod tests {
     use crate::hub::Hub;
     use crate::ledger;
     use crate::test_logs::CapturedLogWriter;
-    use crate::thread_runtime::ThreadRuntimeSupport;
 
     struct UnusedHarnessFactory;
 
@@ -4286,15 +4113,6 @@ mod tests {
         authority
     }
 
-    pub(super) fn test_authority(
-        binding: &super::LoadedThreadBinding,
-    ) -> Arc<super::ThreadAuthority> {
-        Arc::new(super::ThreadAuthority::new_for_test(
-            binding.handle.thread,
-            binding.project_id,
-        ))
-    }
-
     pub(super) fn test_turn_context() -> TurnContext {
         TurnContext {
             user_input: UserInput::text("test"),
@@ -4305,25 +4123,6 @@ mod tests {
             }),
             mode: TurnMode::Known(Mode::Build),
             kind: TurnContextKind::User,
-        }
-    }
-
-    pub(super) async fn prepare_test_operation(
-        coordinator: &super::ThreadCoordinator,
-        runtime: &ThreadRuntimeSupport,
-        context: TurnContext,
-    ) -> super::CoordinatorToken {
-        let binding = coordinator.binding().await;
-        let authority = test_authority(&binding);
-        let lease = runtime
-            .reserve_turn(
-                &authority,
-                turn_reservation(binding.project_id, &binding.handle, &context),
-            )
-            .unwrap();
-        match coordinator.prepare_operation(context, lease).await {
-            Ok(operation) => operation,
-            Err((error, _)) => panic!("test operation was rejected: {error}"),
         }
     }
 

@@ -91,11 +91,13 @@ transitions. Retirement is a `Detach` message to that driver. An attach that arr
 thread is detaching is queued until the old forwarder exits, so a replacement subscriber cannot
 overlap it and no task waits on another task's owner lifecycle.
 
-The first event carrying a previously unseen native turn ID atomically claims that turn before any
-live-buffer, browser, or persistence mutation. `TurnStarted` may arrive later. On completion the
-owner commits the real native turn, clears only the matching coordinator token, discards that
-turn's prompt context, and continues reading the same stream. Parent lifecycle labels establish or
-refresh links only: they never synthesize a child turn or terminal result.
+The first event carrying a previously unseen native turn ID is attached before any live-buffer,
+browser, or persistence mutation. The owner uses an admitted primary intent when one exists;
+otherwise it derives an external label from the thread's current classification and durable
+defaults. `TurnStarted` may arrive later. On completion the owner commits the real native turn,
+releases its lease, discards that turn's prompt context, and continues reading the same stream.
+Parent lifecycle labels establish or refresh links only: they never synthesize a child turn or
+terminal result.
 
 The harness retains a thread's events until its owner consumes them, so owner installation or
 replacement cannot lose events. The retention cap (`EVENT_LOG_RETAIN_LIMIT`) is the only loss
