@@ -36,7 +36,7 @@ this document.
 | | Codex (today) | Claude Code (planned) |
 | --- | --- | --- |
 | Transport | stdio newline-delimited **JSON-RPC** | stdio newline-delimited **JSON objects** (two overlaid channels: transcript messages, and `control_request`/`control_response`) |
-| Protocol crate | `codex-codes` 0.143.2 (typed, versioned) | **none exists for Rust** — Giskard owns the wire types |
+| Protocol crate | `codex-codes` 0.151.2 (typed, versioned) | **`claude-codes` 2.1.259** — same author and repository (`meawoppl/rust-code-agent-sdks`), same feature shape, version tracking the CLI (§3.7) |
 | Processes | **1 `codex app-server` per project**, multiplexing every thread | **1 `claude` per session**; a session ≈ one Giskard thread |
 | Native thread id | Codex-minted rollout id | **client-minted UUID** via `--session-id`; resumed with `--resume=<uuid>` |
 | Concurrency | one worker task fans out to N threads | N independent children, each single-threaded through its own turn. **Verified:** two sessions in the same cwd ran concurrent tool-using turns, each with its own `<uuid>.jsonl` under one cwd-encoded directory, no locking or contention (§3.4). |
@@ -50,7 +50,7 @@ Two consequences drive the whole design:
    thread-addressed. A `ClaudeHarness` is a project-scoped façade that internally owns a
    `HashMap<ThreadId, ChildSession>`. "One working context = one harness instance" (spec §4.7) still
    holds; the instance just fans out to children instead of multiplexing one pipe.
-2. **Resume is cwd-scoped.** Resuming works — **verified**: a fresh process launched with
+2. **Resume is cwd-scoped**, and the encoding is lossy (§3.7). Resuming works — **verified**: a fresh process launched with
    `--resume=<uuid>` answered a question that could only be answered from the previous process's
    conversation, and reused the same session id rather than forking. But the transcript it reads lives
    under a directory keyed by cwd, so a thread using a per-thread Git worktree
@@ -259,6 +259,45 @@ Two limits to respect:
 
 Giskard's existing rule that raw attachment bytes stay out of persisted history and the in-memory
 history cache applies unchanged: `UserInput`'s serializer already drops `data_base64`.
+
+### 3.7 The `claude-codes` crate
+
+An earlier draft of this plan said no Rust crate existed and Giskard would own the wire types. **That
+was wrong.** `claude-codes` 2.1.259 is published by the author of `codex-codes`, from the same
+repository (`meawoppl/rust-code-agent-sdks`), under Apache-2.0 — already on `deny.toml`'s allow list —
+with MSRV 1.85 against Giskard's 1.88, the same `async-client` feature shape, and a version number
+that tracks the CLI release it models.
+
+**What it covers**, verified by reading 2.1.259's source:
+
+- the stream-json message models and streaming parsers (`ClaudeInput`, `ClaudeOutput`);
+- the control protocol as `ControlRequestPayload::{CanUseTool, HookCallback, McpMessage, Initialize,
+  Interrupt}`, with `PermissionResult::{Allow{updated_input, updated_permissions},
+  Deny{message, interrupt}}` — the exact shapes §9 verified by hand, including the `interrupt` flag
+  that `Cancel` maps onto;
+- the permission vocabulary `PermissionSuggestion`, `PermissionRule`, `PermissionDestination`,
+  `PermissionBehavior`, `PermissionModeName` — so §9.3's destination invariant becomes a typed choice
+  rather than a string convention;
+- an async client with `resume_session(uuid)`, `send`, `receive`, `interrupt`,
+  `enable_tool_approval`, `send_control_response`, `session_uuid`, `take_stderr`, `shutdown`;
+- **`transcript.rs`**, which encodes the `~/.claude/projects/<encoded-cwd>/<session>.jsonl` location
+  rule — including that the encoding is **lossy and not injective**, so `a/b.c` and `a/b/c` collide.
+  That is precisely the hazard behind §2's cwd-scoped resume constraint, documented by someone who
+  measured it rather than guessed.
+
+**What it does not cover.** `set_model`, `set_permission_mode`, `apply_flag_settings` and
+`get_settings` are absent — the four §3.3 verified for switching model, mode and reasoning effort on a
+live child. Two escape hatches make that a gap rather than a blocker: `ClaudeInput::Raw(Value)` is an
+untagged variant for sending anything unmodelled, and `receive_raw()` reads anything unparsed. Since
+the maintainer clearly tracks the protocol closely, upstreaming typed variants is the better long-term
+move than carrying a local fork.
+
+The CLI builder likewise lacks `--forward-subagent-text` (required by §5.8) and `--effort`. This costs
+nothing either: the client's constructor takes an already-spawned `Child`, so Giskard can build argv
+itself and still use the crate's typed IO.
+
+**Forward compatibility** is designed in — enums carry `Unknown(String)` variants that round-trip
+verbatim, which is the same tolerance §12 asks of the mapper.
 
 ---
 
@@ -984,7 +1023,7 @@ asserting that turns, approvals, interrupts and deletion each reach the right in
 
 ### Phase 2 — `giskard-harness-claude` MVP
 
-New crate + README. Wire types, child supervisor, mapper
+New crate + README. **`claude-codes` as the protocol layer** (§3.7), child supervisor, mapper
 (`assistant`/`stream_event`/`user`/`result` → items and turns), `open_thread`/`start_turn`/
 `subscribe`/`interrupt`/`shutdown`, **`can_use_tool` ↔ `ApprovalRequested` with the §9 decision
 mapping**, user attachments as inline content blocks (§3.6), token usage, `ContextWindowUpdated`,
@@ -1036,7 +1075,7 @@ Codex adapter's identifier/lifecycle contract.
 
 | Risk | Mitigation |
 | --- | --- |
-| Giskard owns unversioned wire types; Claude Code ships often | Pin a tested version, log `claude_code_version`, warn on drift, keep the mapper tolerant of unknown message types (log at `debug`, never fail a turn) |
+| Protocol drift as Claude Code ships | Largely answered by `claude-codes` (§3.7), whose version tracks the CLI and whose enums tolerate unknown values. The residual risk is the crate lagging a CLI release — the same relationship Giskard already has with `codex-codes`. Still log `claude_code_version` and warn on drift |
 | User settings allow-rules pre-empt `ask_first` — **observed**, and now **accepted** by the §8.3 decision | Not mitigated by design: the UI wording must match what the preset actually promises, and the hook route (§9.4) is the only fix that keeps the user's settings *and* an absolute `ask_first` |
 | One process per loaded thread, **measured at 440–530 MB RSS** | MVP accepts the cost and logs the live-child count so growth is visible; reaping in Phase 5. At the spec's ~10-thread scale this is gigabytes, so it is a capacity question, not a detail |
 | Cross-harness model switch loses agent context | Explicit confirm + `Notice` + remembered native ids (§5.5) |
