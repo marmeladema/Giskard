@@ -432,6 +432,12 @@ impl AgentEventStream {
     pub async fn recv(&mut self) -> Result<AgentEvent, EventStreamError> {
         self.0.recv().await
     }
+
+    /// Poll the retained queue once without waiting.
+    #[doc(hidden)]
+    pub fn try_recv(&mut self) -> Option<Result<AgentEvent, EventStreamError>> {
+        self.0.try_recv()
+    }
 }
 
 /// A native thread the harness bound on first sight of its traffic.
