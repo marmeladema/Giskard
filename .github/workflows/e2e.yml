@@ -22,7 +22,10 @@ jobs:
 
       - name: Run Playwright tests
         run: |
+          mkdir -p "${{ github.workspace }}/tests/e2e/playwright-report"
           docker run --rm --ipc=host \
+            --user "$(id -u):$(id -g)" \
+            -e GISKARD_PLAYWRIGHT_OUTPUT_DIR=/tmp/giskard-playwright-test-results \
             -v "${{ github.workspace }}/tests/e2e/playwright-report:/e2e/playwright-report" \
             giskard-e2e
 

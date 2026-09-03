@@ -22,6 +22,8 @@ mkdir -p "$out_dir"
 # The image's entrypoint is `npx playwright test`; select the screenshots config and point its
 # output at the bind-mounted directory. --ipc=host keeps Chromium happy on small /dev/shm.
 docker run --rm --ipc=host \
+  --user "$(id -u):$(id -g)" \
+  -e GISKARD_PLAYWRIGHT_OUTPUT_DIR=/tmp/giskard-playwright-test-results \
   -e SCREENSHOT_DIR=/out \
   -v "$binary_path:/usr/local/bin/giskard-server-replay:ro" \
   -v "$out_dir:/out" \

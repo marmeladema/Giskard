@@ -18,6 +18,7 @@ export default defineConfig({
   // runs serially for determinism rather than for speed.
   fullyParallel: false,
   workers: 1,
+  outputDir: process.env.GISKARD_PLAYWRIGHT_OUTPUT_DIR ?? "test-results",
   forbidOnly: !!process.env.CI,
   retries: process.env.CI ? 1 : 0,
   reporter: [["list"], ["html", { open: "never" }]],
