@@ -259,7 +259,7 @@ enum RequestPayload {
 #[derive(Clone, Debug, PartialEq)]
 enum RequestStatus {
     Pending,
-    Responding(u64),
+    Responding { claim: u64, harness_resolved: bool },
     Resolved(RequestResolution),
 }
 
@@ -1228,7 +1228,10 @@ impl ThreadRuntimeSupport {
             )));
         }
         let claim_id = next_claim_id();
-        record.status = RequestStatus::Responding(claim_id);
+        record.status = RequestStatus::Responding {
+            claim: claim_id,
+            harness_resolved: false,
+        };
         record.revision = record.revision.saturating_add(1);
         let transition = RequestTransition {
             request_state: wire_request_state(thread_id, record),
@@ -1287,6 +1290,20 @@ impl ThreadRuntimeSupport {
             .values()
             .map(|record| wire_request_state(thread_id, record))
             .collect()
+    }
+
+    #[cfg(test)]
+    fn resolution_for_test(
+        &self,
+        authority: &Arc<ThreadAuthority>,
+        request_id: &RuntimeRequestId,
+    ) -> Option<RequestResolution> {
+        let entry = self.existing_entry(authority)?;
+        let entry = lock_unpoison(&entry, "thread runtime entry");
+        match &entry.requests.get(request_id)?.status {
+            RequestStatus::Resolved(resolution) => Some(resolution.clone()),
+            RequestStatus::Pending | RequestStatus::Responding { .. } => None,
+        }
     }
 
     pub(crate) fn current_overview(&self) -> ThreadRuntimeOverview {
@@ -1795,8 +1812,22 @@ fn resolve_server_request_from_harness(
         );
         return false;
     };
-    if matches!(record.status, RequestStatus::Resolved(_)) {
-        return false;
+    match &mut record.status {
+        RequestStatus::Responding {
+            harness_resolved, ..
+        } => {
+            if !*harness_resolved {
+                debug!(
+                    %thread_id,
+                    request_id = %request_id.0,
+                    "harness resolved a server request while a claim is in flight; deferring to the claimant"
+                );
+            }
+            *harness_resolved = true;
+            return false;
+        }
+        RequestStatus::Resolved(_) => return false,
+        RequestStatus::Pending => {}
     }
     debug!(
         %thread_id,
@@ -1833,10 +1864,10 @@ fn runtime_summary(
         .requests
         .iter()
         .filter_map(|(id, record)| {
-            let responding = matches!(record.status, RequestStatus::Responding(_));
+            let responding = matches!(record.status, RequestStatus::Responding { .. });
             matches!(
                 record.status,
-                RequestStatus::Pending | RequestStatus::Responding(_)
+                RequestStatus::Pending | RequestStatus::Responding { .. }
             )
             .then(|| OutstandingRequest {
                 request_id: id.as_str().to_string(),
@@ -1876,7 +1907,7 @@ fn wire_request_state(thread_id: ThreadId, record: &RequestRecord) -> WireReques
     };
     let status = match &record.status {
         RequestStatus::Pending => WireRequestStatus::Pending,
-        RequestStatus::Responding(_) => WireRequestStatus::Responding,
+        RequestStatus::Responding { .. } => WireRequestStatus::Responding,
         RequestStatus::Resolved(RequestResolution::Approval(decision)) => {
             WireRequestStatus::Resolved {
                 resolution: WireRequestResolution::Approval {
@@ -1931,7 +1962,10 @@ impl RequestClaim {
                 rollback: None,
             }));
         };
-        if record.status != RequestStatus::Responding(self.claim_id) {
+        if !matches!(
+            record.status,
+            RequestStatus::Responding { claim, .. } if claim == self.claim_id
+        ) {
             let error = HarnessError::Protocol(format!(
                 "stale claim for request {}",
                 self.request_id.as_str()
@@ -1978,9 +2012,19 @@ impl RequestClaim {
         };
         let mut entry = lock_unpoison(&entry, "thread runtime entry");
         if let Some(record) = entry.requests.get_mut(&self.request_id)
-            && record.status == RequestStatus::Responding(self.claim_id)
+            && let RequestStatus::Responding {
+                claim,
+                harness_resolved,
+            } = record.status
+            && claim == self.claim_id
         {
-            record.status = RequestStatus::Pending;
+            record.status = if harness_resolved {
+                RequestStatus::Resolved(RequestResolution::Server(ServerRequestResponse::result(
+                    serde_json::Value::Null,
+                )))
+            } else {
+                RequestStatus::Pending
+            };
             record.revision = record.revision.saturating_add(1);
             let transition = RequestTransition {
                 request_state: wire_request_state(self.thread_id, record),
@@ -1997,11 +2041,17 @@ impl RequestClaim {
 impl Drop for RequestClaim {
     fn drop(&mut self) {
         if let Some(transition) = self.rollback_inner() {
+            let outcome = match transition.request_state.status {
+                WireRequestStatus::Resolved { .. } => "resolved",
+                WireRequestStatus::Pending => "pending",
+                WireRequestStatus::Responding => "responding",
+            };
             warn!(
                 thread_id = %self.thread_id,
                 request_id = self.request_id.as_str(),
                 revision = transition.request_state.revision,
-                "request claim dropped without settlement; rolled request back to pending"
+                outcome,
+                "request claim dropped without settlement"
             );
         }
     }
@@ -2041,6 +2091,47 @@ mod tests {
             metadata: Vec::new(),
             available: vec![ApprovalDecision::Accept],
         }
+    }
+
+    fn server_request(id: &str) -> ServerRequest {
+        ServerRequest {
+            id: ServerRequestId(id.into()),
+            method: "item/tool/requestUserInput".into(),
+            params: serde_json::json!({"question": "continue?"}),
+            received_at: Utc::now(),
+        }
+    }
+
+    fn register_server_request(
+        runtime: &ThreadRuntimeSupport,
+        authority: &Arc<ThreadAuthority>,
+        request: ServerRequest,
+    ) -> AppliedRuntimeEvent {
+        runtime.apply_event(
+            authority,
+            &AgentEvent::ServerRequestReceived {
+                thread: authority.thread_id(),
+                turn: Some(TurnId::new()),
+                request,
+            },
+            false,
+        )
+    }
+
+    fn resolve_server_request(
+        runtime: &ThreadRuntimeSupport,
+        authority: &Arc<ThreadAuthority>,
+        id: &str,
+    ) -> AppliedRuntimeEvent {
+        runtime.apply_event(
+            authority,
+            &AgentEvent::ServerRequestResolved {
+                thread: authority.thread_id(),
+                turn: Some(TurnId::new()),
+                request_id: ServerRequestId(id.into()),
+            },
+            false,
+        )
     }
 
     #[test]
@@ -2628,6 +2719,350 @@ mod tests {
                 )
                 .is_err()
         );
+    }
+
+    #[test]
+    fn harness_resolution_during_claim_does_not_preempt_commit() {
+        let runtime = ThreadRuntimeSupport::new();
+        let authority = test_authority(ThreadId::new());
+        register_server_request(&runtime, &authority, server_request("srv"));
+        let request_id = RuntimeRequestId::Server(ServerRequestId("srv".into()));
+        let (claim, transition) = runtime
+            .claim_request(&authority, request_id.clone())
+            .unwrap();
+        assert_eq!(transition.request_state.revision, 2);
+        assert!(matches!(
+            transition.request_state.status,
+            WireRequestStatus::Responding
+        ));
+
+        let applied = resolve_server_request(&runtime, &authority, "srv");
+        assert!(applied.request_state.is_none());
+        let state = runtime.request_state(&authority, &request_id).unwrap();
+        assert_eq!(state.revision, 2);
+        assert!(matches!(state.status, WireRequestStatus::Responding));
+
+        let answer = ServerRequestResponse::result(serde_json::json!({"answer": 1}));
+        let committed = claim
+            .commit(RequestResolution::Server(answer.clone()))
+            .unwrap();
+        assert_eq!(committed.request_state.revision, 3);
+        assert!(matches!(
+            committed.request_state.status,
+            WireRequestStatus::Resolved { .. }
+        ));
+        assert_eq!(
+            runtime.resolution_for_test(&authority, &request_id),
+            Some(RequestResolution::Server(answer))
+        );
+    }
+
+    #[test]
+    fn harness_resolution_during_claim_resolves_on_rollback() {
+        let runtime = ThreadRuntimeSupport::new();
+        let authority = test_authority(ThreadId::new());
+        register_server_request(&runtime, &authority, server_request("srv"));
+        let request_id = RuntimeRequestId::Server(ServerRequestId("srv".into()));
+        let (claim, _) = runtime
+            .claim_request(&authority, request_id.clone())
+            .unwrap();
+        resolve_server_request(&runtime, &authority, "srv");
+
+        let transition = claim.rollback().unwrap();
+        assert_eq!(transition.request_state.revision, 3);
+        assert!(matches!(
+            transition.request_state.status,
+            WireRequestStatus::Resolved {
+                resolution: WireRequestResolution::Server
+            }
+        ));
+        assert!(
+            runtime
+                .claim_request(&authority, request_id)
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("is not pending")
+        );
+    }
+
+    #[test]
+    fn harness_resolution_during_claim_resolves_on_drop() {
+        let runtime = ThreadRuntimeSupport::new();
+        let authority = test_authority(ThreadId::new());
+        register_server_request(&runtime, &authority, server_request("srv"));
+        let request_id = RuntimeRequestId::Server(ServerRequestId("srv".into()));
+        let (claim, _) = runtime
+            .claim_request(&authority, request_id.clone())
+            .unwrap();
+        resolve_server_request(&runtime, &authority, "srv");
+        drop(claim);
+
+        let state = runtime.request_state(&authority, &request_id).unwrap();
+        assert_eq!(state.revision, 3);
+        assert!(matches!(state.status, WireRequestStatus::Resolved { .. }));
+    }
+
+    #[test]
+    fn rollback_without_harness_resolution_still_returns_to_pending() {
+        let runtime = ThreadRuntimeSupport::new();
+        let authority = test_authority(ThreadId::new());
+        register_server_request(&runtime, &authority, server_request("srv"));
+        let request_id = RuntimeRequestId::Server(ServerRequestId("srv".into()));
+        let (claim, _) = runtime
+            .claim_request(&authority, request_id.clone())
+            .unwrap();
+
+        let transition = claim.rollback().unwrap();
+        assert_eq!(transition.request_state.revision, 3);
+        assert!(matches!(
+            transition.request_state.status,
+            WireRequestStatus::Pending
+        ));
+        assert!(runtime.claim_request(&authority, request_id).is_ok());
+    }
+
+    #[test]
+    fn harness_resolution_before_any_claim_still_resolves_and_publishes() {
+        let runtime = ThreadRuntimeSupport::new();
+        let authority = test_authority(ThreadId::new());
+        register_server_request(&runtime, &authority, server_request("srv"));
+        let request_id = RuntimeRequestId::Server(ServerRequestId("srv".into()));
+
+        let applied = resolve_server_request(&runtime, &authority, "srv");
+        let state = applied.request_state.unwrap();
+        assert_eq!(state.revision, 2);
+        assert!(matches!(state.status, WireRequestStatus::Resolved { .. }));
+        assert!(runtime.claim_request(&authority, request_id).is_err());
+    }
+
+    #[test]
+    fn harness_resolution_after_commit_is_a_no_op() {
+        let runtime = ThreadRuntimeSupport::new();
+        let authority = test_authority(ThreadId::new());
+        register_server_request(&runtime, &authority, server_request("srv"));
+        let request_id = RuntimeRequestId::Server(ServerRequestId("srv".into()));
+        let answer = ServerRequestResponse::result(serde_json::json!({"answer": 1}));
+        runtime
+            .claim_request(&authority, request_id.clone())
+            .unwrap()
+            .0
+            .commit(RequestResolution::Server(answer.clone()))
+            .unwrap();
+
+        let applied = resolve_server_request(&runtime, &authority, "srv");
+        assert!(applied.request_state.is_none());
+        assert_eq!(
+            runtime
+                .request_state(&authority, &request_id)
+                .unwrap()
+                .revision,
+            3
+        );
+        assert_eq!(
+            runtime.resolution_for_test(&authority, &request_id),
+            Some(RequestResolution::Server(answer))
+        );
+    }
+
+    #[test]
+    fn repeated_harness_resolutions_during_claim_are_idempotent() {
+        let runtime = ThreadRuntimeSupport::new();
+        let authority = test_authority(ThreadId::new());
+        register_server_request(&runtime, &authority, server_request("srv"));
+        let request_id = RuntimeRequestId::Server(ServerRequestId("srv".into()));
+        let (claim, _) = runtime
+            .claim_request(&authority, request_id.clone())
+            .unwrap();
+
+        assert!(
+            resolve_server_request(&runtime, &authority, "srv")
+                .request_state
+                .is_none()
+        );
+        assert!(
+            resolve_server_request(&runtime, &authority, "srv")
+                .request_state
+                .is_none()
+        );
+        assert_eq!(
+            runtime
+                .request_state(&authority, &request_id)
+                .unwrap()
+                .revision,
+            2
+        );
+        assert!(
+            claim
+                .commit(RequestResolution::Server(ServerRequestResponse::result(
+                    serde_json::Value::Null,
+                )))
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn only_the_current_claim_can_settle_the_record() {
+        let runtime = ThreadRuntimeSupport::new();
+        let authority = test_authority(ThreadId::new());
+        register_server_request(&runtime, &authority, server_request("first"));
+        let first_id = RuntimeRequestId::Server(ServerRequestId("first".into()));
+        let (claim_a, _) = runtime.claim_request(&authority, first_id.clone()).unwrap();
+        claim_a.rollback();
+        let (claim_b, _) = runtime.claim_request(&authority, first_id.clone()).unwrap();
+        resolve_server_request(&runtime, &authority, "first");
+        assert!(
+            claim_b
+                .commit(RequestResolution::Server(ServerRequestResponse::result(
+                    serde_json::Value::Null,
+                )))
+                .is_ok()
+        );
+
+        register_server_request(&runtime, &authority, server_request("second"));
+        let second_id = RuntimeRequestId::Server(ServerRequestId("second".into()));
+        let (claim, _) = runtime
+            .claim_request(&authority, second_id.clone())
+            .unwrap();
+        assert!(
+            runtime
+                .claim_request(&authority, second_id.clone())
+                .err()
+                .unwrap()
+                .to_string()
+                .contains("is not pending")
+        );
+        resolve_server_request(&runtime, &authority, "second");
+        drop(claim);
+        assert!(runtime.claim_request(&authority, second_id).is_err());
+    }
+
+    #[test]
+    fn duplicate_request_delivery_during_a_claim_keeps_the_claim() {
+        let runtime = ThreadRuntimeSupport::new();
+        let authority = test_authority(ThreadId::new());
+        let request = server_request("srv");
+        register_server_request(&runtime, &authority, request.clone());
+        let request_id = RuntimeRequestId::Server(request.id.clone());
+        let (claim, _) = runtime
+            .claim_request(&authority, request_id.clone())
+            .unwrap();
+        assert!(
+            register_server_request(&runtime, &authority, request.clone())
+                .request_state
+                .is_none()
+        );
+        resolve_server_request(&runtime, &authority, "srv");
+        let mut refreshed = request;
+        refreshed.params = serde_json::json!({"question": "updated?"});
+        let changed = register_server_request(&runtime, &authority, refreshed);
+        assert_eq!(changed.request_state.unwrap().revision, 3);
+        assert!(
+            claim
+                .commit(RequestResolution::Server(ServerRequestResponse::result(
+                    serde_json::Value::Null,
+                )))
+                .is_ok()
+        );
+        assert_eq!(
+            runtime
+                .request_state(&authority, &request_id)
+                .unwrap()
+                .revision,
+            4
+        );
+
+        let rollback_request = server_request("rollback");
+        register_server_request(&runtime, &authority, rollback_request.clone());
+        let rollback_id = RuntimeRequestId::Server(rollback_request.id.clone());
+        let (claim, _) = runtime
+            .claim_request(&authority, rollback_id.clone())
+            .unwrap();
+        resolve_server_request(&runtime, &authority, "rollback");
+        let mut refreshed = rollback_request;
+        refreshed.params = serde_json::json!({"question": "updated before rollback?"});
+        register_server_request(&runtime, &authority, refreshed);
+
+        let rollback = claim.rollback().unwrap();
+        assert!(matches!(
+            rollback.request_state.status,
+            WireRequestStatus::Resolved { .. }
+        ));
+        assert!(runtime.claim_request(&authority, rollback_id).is_err());
+    }
+
+    #[test]
+    fn responding_record_with_harness_resolution_is_still_outstanding_in_the_overview() {
+        let runtime = ThreadRuntimeSupport::new();
+        let authority = test_authority(ThreadId::new());
+        register_server_request(&runtime, &authority, server_request("srv"));
+        let request_id = RuntimeRequestId::Server(ServerRequestId("srv".into()));
+        let (claim, _) = runtime.claim_request(&authority, request_id).unwrap();
+        resolve_server_request(&runtime, &authority, "srv");
+        let overview = runtime.current_overview();
+        assert_eq!(overview.threads[0].outstanding_requests.len(), 1);
+        assert!(overview.threads[0].outstanding_requests[0].responding);
+
+        claim
+            .commit(RequestResolution::Server(ServerRequestResponse::result(
+                serde_json::Value::Null,
+            )))
+            .unwrap();
+        assert!(runtime.current_overview().threads.is_empty());
+    }
+
+    #[test]
+    fn approval_claims_are_untouched_by_server_resolutions() {
+        let runtime = ThreadRuntimeSupport::new();
+        let authority = test_authority(ThreadId::new());
+        runtime.register_approval(&authority, approval("same"));
+        register_server_request(&runtime, &authority, server_request("same"));
+        let approval_id = RuntimeRequestId::Approval(ApprovalId("same".into()));
+        let server_id = RuntimeRequestId::Server(ServerRequestId("same".into()));
+        let (claim, _) = runtime
+            .claim_request(&authority, approval_id.clone())
+            .unwrap();
+
+        resolve_server_request(&runtime, &authority, "same");
+        assert!(matches!(
+            runtime
+                .request_state(&authority, &approval_id)
+                .unwrap()
+                .status,
+            WireRequestStatus::Responding
+        ));
+        assert!(matches!(
+            runtime
+                .request_state(&authority, &server_id)
+                .unwrap()
+                .status,
+            WireRequestStatus::Resolved { .. }
+        ));
+        assert!(
+            claim
+                .commit(RequestResolution::Approval(ApprovalDecision::Accept))
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn commit_with_mismatched_resolution_kind_after_harness_resolution_resolves_on_rollback() {
+        let runtime = ThreadRuntimeSupport::new();
+        let authority = test_authority(ThreadId::new());
+        register_server_request(&runtime, &authority, server_request("srv"));
+        let request_id = RuntimeRequestId::Server(ServerRequestId("srv".into()));
+        let (claim, _) = runtime.claim_request(&authority, request_id).unwrap();
+        resolve_server_request(&runtime, &authority, "srv");
+
+        let failure = claim
+            .commit(RequestResolution::Approval(ApprovalDecision::Accept))
+            .unwrap_err();
+        let rollback = failure.rollback.unwrap();
+        assert!(matches!(
+            rollback.request_state.status,
+            WireRequestStatus::Resolved { .. }
+        ));
+        assert!(matches!(failure.error, HarnessError::Protocol(_)));
     }
 
     #[test]

@@ -39,6 +39,7 @@ struct ServerRequestHarness {
     responses: Mutex<Vec<(ServerRequestId, ServerRequestResponse)>>,
     fail_next_response: Mutex<Option<HarnessError>>,
     hang_next_response: Mutex<bool>,
+    resolve_before_reply: Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
     /// When set, routing a response does not emit `ServerRequestResolved`/`TurnCompleted`. Real
     /// harnesses resolve on their own schedule and may never resolve at all, and that window is
     /// exactly what the reconnect snapshot has to survive.
@@ -54,6 +55,7 @@ impl ServerRequestHarness {
             responses: Mutex::new(Vec::new()),
             fail_next_response: Mutex::new(None),
             hang_next_response: Mutex::new(false),
+            resolve_before_reply: Mutex::new(None),
             suppress_resolution: Mutex::new(false),
         }
     }
@@ -68,6 +70,12 @@ impl ServerRequestHarness {
 
     async fn hang_next_response(&self) {
         *self.hang_next_response.lock().await = true;
+    }
+
+    async fn resolve_before_reply(&self) -> tokio::sync::oneshot::Sender<()> {
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        *self.resolve_before_reply.lock().await = Some(receiver);
+        sender
     }
 
     async fn wait_for_response(&self) -> (ServerRequestId, ServerRequestResponse) {
@@ -170,12 +178,6 @@ impl AgentHarness for ServerRequestHarness {
         req: ServerRequestId,
         response: ServerRequestResponse,
     ) -> Result<(), HarnessError> {
-        if std::mem::take(&mut *self.hang_next_response.lock().await) {
-            std::future::pending::<()>().await;
-        }
-        if let Some(error) = self.fail_next_response.lock().await.take() {
-            return Err(error);
-        }
         self.responses
             .lock()
             .await
@@ -183,12 +185,41 @@ impl AgentHarness for ServerRequestHarness {
         if *self.suppress_resolution.lock().await {
             return Ok(());
         }
-        let (thread, turn) = self.active.lock().await.take().unwrap_or_default();
-        let _ = self.tx.append(AgentEvent::ServerRequestResolved {
-            thread,
-            turn: Some(turn),
-            request_id: req,
-        });
+        let receiver = self.resolve_before_reply.lock().await.take();
+        let mut active = None;
+        if let Some(receiver) = receiver {
+            let (thread, turn) = self.active.lock().await.take().unwrap_or_default();
+            active = Some((thread, turn));
+            let _ = self.tx.append(AgentEvent::ServerRequestResolved {
+                thread,
+                turn: Some(turn),
+                request_id: req.clone(),
+            });
+            let _ = self.tx.append(AgentEvent::Notice {
+                thread,
+                turn: Some(turn),
+                message: "resolution-fence".into(),
+            });
+            let _ = receiver.await;
+        }
+        if let Some(error) = self.fail_next_response.lock().await.take() {
+            return Err(error);
+        }
+        if std::mem::take(&mut *self.hang_next_response.lock().await) {
+            std::future::pending::<()>().await;
+        }
+        let (thread, turn) = match active {
+            Some(active) => active,
+            None => {
+                let active = self.active.lock().await.take().unwrap_or_default();
+                let _ = self.tx.append(AgentEvent::ServerRequestResolved {
+                    thread: active.0,
+                    turn: Some(active.1),
+                    request_id: req,
+                });
+                active
+            }
+        };
         let _ = self.tx.append(AgentEvent::TurnCompleted {
             thread,
             turn,
@@ -641,6 +672,235 @@ async fn answered_server_request_is_not_pending_after_reconnect() {
 }
 
 #[tokio::test]
+async fn server_request_answer_succeeds_when_the_harness_resolves_first() {
+    let (_tmp, harness, addr, cookie, thread_id) = spawn_test_app().await;
+    let mut ws = connect_ws(addr, &cookie).await;
+    ws.send(ws_text(&ClientMessage::Subscribe {
+        thread_id,
+        since: None,
+    }))
+    .await
+    .unwrap();
+    ws.send(ws_text(&ClientMessage::SendInput {
+        thread_id,
+        text: "ask me".into(),
+        attachments: Vec::new(),
+    }))
+    .await
+    .unwrap();
+    wait_for_server_request(&mut ws).await;
+
+    let gate = harness.resolve_before_reply().await;
+    ws.send(ws_text(&ClientMessage::ServerRequestResponse {
+        thread_id,
+        request_id: "srv_1".into(),
+        response: ServerRequestResponse::result(serde_json::json!({ "answers": ["Yes"] })),
+    }))
+    .await
+    .unwrap();
+    wait_for_notice(&mut ws, "resolution-fence").await;
+    gate.send(()).unwrap();
+
+    let resolved = wait_for_resolved_and_completion_without_error(&mut ws).await;
+    assert_eq!(resolved.revision, 3);
+    let (request_id, response) = harness.wait_for_response().await;
+    assert_eq!(request_id, ServerRequestId("srv_1".into()));
+    assert_eq!(
+        response,
+        ServerRequestResponse::result(serde_json::json!({ "answers": ["Yes"] }))
+    );
+}
+
+#[tokio::test]
+async fn harness_failure_after_a_native_resolution_leaves_the_request_resolved() {
+    let (_tmp, harness, addr, cookie, thread_id) = spawn_test_app().await;
+    let mut ws = connect_ws(addr, &cookie).await;
+    let mut peer = connect_ws(addr, &cookie).await;
+    for socket in [&mut ws, &mut peer] {
+        socket
+            .send(ws_text(&ClientMessage::Subscribe {
+                thread_id,
+                since: None,
+            }))
+            .await
+            .unwrap();
+    }
+    ws.send(ws_text(&ClientMessage::SendInput {
+        thread_id,
+        text: "ask me".into(),
+        attachments: Vec::new(),
+    }))
+    .await
+    .unwrap();
+    wait_for_server_request(&mut ws).await;
+    assert_eq!(
+        wait_for_request_state(&mut peer, "pending").await.revision,
+        1
+    );
+
+    harness
+        .fail_next_response(HarnessError::Protocol("late failure".into()))
+        .await;
+    let gate = harness.resolve_before_reply().await;
+    ws.send(ws_text(&ClientMessage::ServerRequestResponse {
+        thread_id,
+        request_id: "srv_1".into(),
+        response: ServerRequestResponse::result(serde_json::json!({ "answers": ["Yes"] })),
+    }))
+    .await
+    .unwrap();
+    assert_eq!(
+        wait_for_request_state(&mut peer, "responding")
+            .await
+            .revision,
+        2
+    );
+    wait_for_notice(&mut ws, "resolution-fence").await;
+    gate.send(()).unwrap();
+
+    let error = wait_for_ws_error(&mut ws).await;
+    assert!(
+        error
+            .detail
+            .as_deref()
+            .unwrap_or_default()
+            .contains("late failure")
+    );
+    let resolved = wait_for_request_state(&mut peer, "resolved").await;
+    assert_eq!(resolved.revision, 3);
+
+    ws.send(ws_text(&ClientMessage::ServerRequestResponse {
+        thread_id,
+        request_id: "srv_1".into(),
+        response: ServerRequestResponse::result(serde_json::json!({ "answers": ["again"] })),
+    }))
+    .await
+    .unwrap();
+    let error = wait_for_ws_error(&mut ws).await;
+    assert!(
+        error
+            .detail
+            .as_deref()
+            .unwrap_or_default()
+            .contains("is not pending")
+    );
+}
+
+#[tokio::test]
+async fn timeout_after_a_native_resolution_republishes_resolved_to_peer_tabs() {
+    let (_tmp, harness, addr, cookie, thread_id) = spawn_test_app().await;
+    let mut claimant = connect_ws(addr, &cookie).await;
+    let mut peer = connect_ws(addr, &cookie).await;
+    for ws in [&mut claimant, &mut peer] {
+        ws.send(ws_text(&ClientMessage::Subscribe {
+            thread_id,
+            since: None,
+        }))
+        .await
+        .unwrap();
+    }
+    claimant
+        .send(ws_text(&ClientMessage::SendInput {
+            thread_id,
+            text: "ask me".into(),
+            attachments: Vec::new(),
+        }))
+        .await
+        .unwrap();
+    wait_for_server_request(&mut claimant).await;
+    assert_eq!(
+        wait_for_request_state(&mut peer, "pending").await.revision,
+        1
+    );
+
+    harness.hang_next_response().await;
+    let gate = harness.resolve_before_reply().await;
+    claimant
+        .send(ws_text(&ClientMessage::ServerRequestResponse {
+            thread_id,
+            request_id: "srv_1".into(),
+            response: ServerRequestResponse::result(serde_json::json!({ "answers": ["Yes"] })),
+        }))
+        .await
+        .unwrap();
+    assert_eq!(
+        wait_for_request_state(&mut peer, "responding")
+            .await
+            .revision,
+        2
+    );
+    wait_for_notice(&mut peer, "resolution-fence").await;
+    gate.send(()).unwrap();
+    assert_eq!(
+        wait_for_ws_error(&mut claimant).await.code,
+        "harness_timeout"
+    );
+    peer.send(ws_text(&ClientMessage::ServerRequestResponse {
+        thread_id,
+        request_id: "srv_1".into(),
+        response: ServerRequestResponse::result(serde_json::json!({ "answers": ["again"] })),
+    }))
+    .await
+    .unwrap();
+    let resolved = wait_for_resolved_and_rejection_without_pending(&mut peer).await;
+    assert_eq!(resolved.revision, 3);
+}
+
+#[tokio::test]
+async fn reconnect_after_a_native_resolution_during_a_claim_does_not_re_prompt() {
+    let (_tmp, harness, addr, cookie, thread_id) = spawn_test_app().await;
+    let mut ws = connect_ws(addr, &cookie).await;
+    ws.send(ws_text(&ClientMessage::Subscribe {
+        thread_id,
+        since: None,
+    }))
+    .await
+    .unwrap();
+    ws.send(ws_text(&ClientMessage::SendInput {
+        thread_id,
+        text: "ask me".into(),
+        attachments: Vec::new(),
+    }))
+    .await
+    .unwrap();
+    wait_for_server_request(&mut ws).await;
+
+    let gate = harness.resolve_before_reply().await;
+    ws.send(ws_text(&ClientMessage::ServerRequestResponse {
+        thread_id,
+        request_id: "srv_1".into(),
+        response: ServerRequestResponse::result(serde_json::json!({ "answers": ["Yes"] })),
+    }))
+    .await
+    .unwrap();
+    wait_for_notice(&mut ws, "resolution-fence").await;
+
+    let mut reconnect = connect_ws(addr, &cookie).await;
+    reconnect
+        .send(ws_text(&ClientMessage::Subscribe {
+            thread_id,
+            since: None,
+        }))
+        .await
+        .unwrap();
+    let snapshot = wait_for_live_snapshot(&mut reconnect).await;
+    let rows = server_request_rows(&snapshot);
+    let [(request, resolved)] = &rows[..] else {
+        panic!("expected exactly one server request row, got {rows:?}");
+    };
+    assert_eq!(request.id, ServerRequestId("srv_1".into()));
+    assert!(*resolved);
+
+    gate.send(()).unwrap();
+    assert_eq!(
+        wait_for_resolved_and_completion_without_error(&mut ws)
+            .await
+            .revision,
+        3
+    );
+}
+
+#[tokio::test]
 async fn websocket_unknown_server_request_response_surfaces_error() {
     let (_tmp, _harness, addr, cookie, thread_id) = spawn_test_app().await;
     let mut ws = connect_ws(addr, &cookie).await;
@@ -680,6 +940,24 @@ async fn wait_for_server_request(ws: &mut TestWs) {
         }
     }
     panic!("server request event not observed");
+}
+
+async fn wait_for_notice(ws: &mut TestWs, expected_message: &str) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline {
+        match tokio::time::timeout(Duration::from_secs(1), ws.next()).await {
+            Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Text(text)))) => {
+                if let Ok(ServerMessage::Event { agent_event, .. }) = serde_json::from_str(&text)
+                    && matches!(&*agent_event, WireAgentEvent::Notice { message, .. } if message == expected_message)
+                {
+                    return;
+                }
+            }
+            Ok(Some(Ok(_))) => {}
+            _ => {}
+        }
+    }
+    panic!("notice {expected_message:?} not observed");
 }
 
 async fn wait_for_ws_error(ws: &mut TestWs) -> giskard_proto::ErrorInfo {
@@ -723,6 +1001,88 @@ async fn wait_for_request_state(
         }
     }
     panic!("request state {expected_status} not observed");
+}
+
+async fn wait_for_resolved_and_completion_without_error(
+    ws: &mut TestWs,
+) -> giskard_proto::RequestState {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut resolved = None;
+    let mut completed = false;
+    while Instant::now() < deadline {
+        match tokio::time::timeout(Duration::from_secs(1), ws.next()).await {
+            Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Text(text)))) => {
+                match serde_json::from_str::<ServerMessage>(&text) {
+                    Ok(ServerMessage::Error { error }) => {
+                        panic!("unexpected websocket error before completion: {error:?}")
+                    }
+                    Ok(ServerMessage::RequestState(state))
+                        if state.request_id == "srv_1"
+                            && matches!(
+                                state.status,
+                                giskard_proto::RequestStatus::Resolved { .. }
+                            ) =>
+                    {
+                        resolved = Some(state);
+                    }
+                    Ok(ServerMessage::Event { agent_event, .. })
+                        if matches!(*agent_event, WireAgentEvent::TurnCompleted { .. }) =>
+                    {
+                        completed = true;
+                    }
+                    _ => {}
+                }
+                if completed && let Some(resolved) = resolved {
+                    return resolved;
+                }
+            }
+            Ok(Some(Ok(_))) => {}
+            _ => {}
+        }
+    }
+    panic!("resolved request state and turn completion not observed");
+}
+
+async fn wait_for_resolved_and_rejection_without_pending(
+    ws: &mut TestWs,
+) -> giskard_proto::RequestState {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut resolved = None;
+    while Instant::now() < deadline {
+        match tokio::time::timeout(Duration::from_secs(1), ws.next()).await {
+            Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Text(text)))) => {
+                match serde_json::from_str::<ServerMessage>(&text) {
+                    Ok(ServerMessage::RequestState(state)) if state.request_id == "srv_1" => {
+                        match state.status {
+                            giskard_proto::RequestStatus::Pending => {
+                                panic!(
+                                    "request was republished as pending at revision {}",
+                                    state.revision
+                                )
+                            }
+                            giskard_proto::RequestStatus::Resolved { .. } => resolved = Some(state),
+                            giskard_proto::RequestStatus::Responding => {}
+                        }
+                    }
+                    Ok(ServerMessage::Error { error })
+                        if error
+                            .detail
+                            .as_deref()
+                            .unwrap_or_default()
+                            .contains("is not pending") =>
+                    {
+                        return resolved.unwrap_or_else(|| {
+                            panic!("response rejection arrived before resolved request state")
+                        });
+                    }
+                    _ => {}
+                }
+            }
+            Ok(Some(Ok(_))) => {}
+            _ => {}
+        }
+    }
+    panic!("resolved request state and ordered response rejection not observed");
 }
 
 /// Every server-request row in the snapshot, paired with whether a reconnecting client would
