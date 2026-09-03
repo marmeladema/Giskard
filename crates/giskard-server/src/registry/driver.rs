@@ -12,7 +12,8 @@ use super::event_forwarder::{
     ForwarderExitReason, ThreadEventForwarder, forwarder_exit_reason_label,
 };
 use super::thread::{
-    ClassificationPhase, DetachRequestOutcome, OwnerExitOutcome, ThreadAuthority, ThreadCoordinator,
+    ClassificationPhase, DetachRequestOutcome, OwnerExitOutcome, TURN_INTENT_CAPACITY,
+    ThreadAuthority, ThreadCoordinator,
 };
 use super::{LoadedThreadBinding, RegistryShared, RegistryTaskPermit};
 
@@ -196,10 +197,12 @@ impl ProjectEventDriver {
         let stream = harness.subscribe(&attach.binding.handle);
         drop(harness);
         let (cancel_tx, cancel_rx) = watch::channel(false);
+        let (intent_tx, intent_rx) = mpsc::channel(TURN_INTENT_CAPACITY);
         let coordinator = Arc::new(ThreadCoordinator::new_live(
             attach.binding,
             attach.classification,
             cancel_tx,
+            intent_tx,
         ));
         if authority
             .install_coordinator_if_empty(coordinator.clone())
@@ -212,6 +215,7 @@ impl ProjectEventDriver {
             return;
         }
         let shared = self.shared.clone();
+        let owner_harness = self.harness.clone();
         let owner_authority = authority.clone();
         let owner_coordinator = coordinator.clone();
         self.owners.push(Box::pin(async move {
@@ -219,8 +223,10 @@ impl ProjectEventDriver {
                 shared,
                 owner_authority.clone(),
                 owner_coordinator.clone(),
+                owner_harness,
                 stream,
                 cancel_rx,
+                intent_rx,
             )
             .await;
             let reason = forwarder.run().await;
@@ -294,6 +300,7 @@ impl ProjectEventDriver {
 mod tests {
     use std::collections::HashMap;
     use std::path::PathBuf;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
     use async_trait::async_trait;
@@ -312,18 +319,22 @@ mod tests {
     use super::*;
     use crate::hub::Hub;
     use crate::ledger;
-    use crate::registry::{RegistryShared, TurnContext, TurnContextKind, turn_reservation};
+    use crate::registry::{RegistryShared, TurnContext, TurnContextKind, TurnIntent};
     use giskard_persist::PersistStore;
     use giskard_persist::store::ThreadFile;
 
     struct TestHarness {
         logs: Mutex<HashMap<ThreadId, Arc<EventLog>>>,
+        start_gate: tokio::sync::Notify,
+        start_calls: AtomicUsize,
     }
 
     impl TestHarness {
         fn new() -> Self {
             Self {
                 logs: Mutex::new(HashMap::new()),
+                start_gate: tokio::sync::Notify::new(),
+                start_calls: AtomicUsize::new(0),
             }
         }
 
@@ -360,7 +371,9 @@ mod tests {
             _input: UserInput,
             _overrides: giskard_core::turn::TurnOverrides,
         ) -> Result<TurnId, HarnessError> {
-            Err(HarnessError::Unsupported("unused".into()))
+            self.start_calls.fetch_add(1, Ordering::SeqCst);
+            self.start_gate.notified().await;
+            Ok(TurnId::new())
         }
 
         fn subscribe(&self, thread: &ThreadHandle) -> AgentEventStream {
@@ -520,7 +533,7 @@ mod tests {
 
     #[tokio::test]
     async fn detach_cancels_the_owner_and_clears_the_slot() {
-        let (shared, _harness, driver, project_id, _store) = setup();
+        let (shared, harness, driver, project_id, _store) = setup();
         let thread_id = ThreadId::new();
         driver
             .attach(
@@ -541,24 +554,32 @@ mod tests {
             mode: TurnMode::Known(Mode::Build),
             kind: TurnContextKind::User,
         };
-        let lease = shared
-            .runtime
-            .reserve_turn(
-                &authority,
-                turn_reservation(
-                    project_id,
-                    &binding(project_id, thread_id, "native").handle,
-                    &context,
-                ),
-            )
+        let intents = coordinator.intent_sender().await.unwrap();
+        let (reply, response) = oneshot::channel();
+        intents
+            .send(TurnIntent::StartTurn {
+                input: context.user_input.clone(),
+                overrides: giskard_core::turn::TurnOverrides {
+                    model: None,
+                    mode: Mode::Build,
+                    permission_preset: PermissionPreset::AskFirst,
+                },
+                context,
+                reply,
+            })
+            .await
             .unwrap();
-        if let Err((error, _)) = coordinator.prepare_operation(context, lease).await {
-            panic!("test operation was rejected: {error}");
-        }
-        assert!(shared.runtime.has_active_turn(&authority));
-        driver.detach(thread_id).await;
+        wait_until(|| harness.start_calls.load(Ordering::SeqCst) == 1).await;
+        tokio::time::timeout(std::time::Duration::from_secs(1), driver.detach(thread_id))
+            .await
+            .expect("detach should not wait for the harness reply");
         assert!(shared.coordinator(thread_id).await.is_none());
         assert!(!shared.runtime.has_active_turn(&authority));
+        assert!(matches!(
+            response.await.unwrap(),
+            Err(HarnessError::Protocol(message))
+                if message == "event owner exited before the harness answered"
+        ));
     }
 
     #[tokio::test]

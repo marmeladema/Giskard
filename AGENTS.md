@@ -127,6 +127,8 @@ Cargo workspace with 8 crates under `crates/`:
 - One `ProjectEventDriver` per harness owns every event forwarder for that project. Attach and
   detach are driver messages; no code outside the driver installs or clears a coordinator or
   spawns an event forwarder.
+- Turn admission is a `TurnIntent` to the thread's event forwarder. No code outside the forwarder
+  reserves a primary thread's turn lease or calls `start_turn` / `compact_thread` on a harness.
 - Entity-local state belongs on its authority or an authority-owned component. Do not add a peer
   owning map keyed directly or indirectly by project or thread identity.
 - Each root authority owner map must have an adjacent `ENTITY-AUTHORITY-OWNER` comment naming the

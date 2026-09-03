@@ -4,21 +4,30 @@ use std::sync::{Arc, Mutex, Weak};
 use giskard_core::error::HarnessError;
 use giskard_core::ids::{ProjectId, ThreadId, TurnId};
 use giskard_core::thread::ThreadKind;
-use giskard_core::turn::{TurnMode, TurnModel};
+use giskard_core::turn::{TurnMode, TurnModel, TurnOverrides};
 use giskard_core::user_input::UserInput;
 use giskard_harness::ThreadHandle;
-use tokio::sync::{Mutex as AsyncMutex, Notify, OwnedMutexGuard, oneshot, watch};
+use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard, mpsc, oneshot, watch};
 
 use super::{
     ForwarderExitReason, LoadedThreadBinding, RegistryTaskPermit, RegistryTaskTracker,
-    SubagentMaterializationJob, TurnContext, TurnContextKind, forwarder_exit_reason_label,
+    SubagentMaterializationJob, TurnContext, forwarder_exit_reason_label,
 };
-use crate::thread_runtime::{ThreadRuntimeEntry, ThreadRuntimeSlot, ThreadTurnLease};
+use crate::thread_runtime::{ThreadRuntimeEntry, ThreadRuntimeSlot};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) struct CoordinatorToken {
-    generation: u64,
-    sequence: u64,
+pub(super) const TURN_INTENT_CAPACITY: usize = 4;
+
+pub(super) enum TurnIntent {
+    StartTurn {
+        input: UserInput,
+        overrides: TurnOverrides,
+        context: TurnContext,
+        reply: oneshot::Sender<Result<TurnId, HarnessError>>,
+    },
+    Compact {
+        context: TurnContext,
+        reply: oneshot::Sender<Result<(), HarnessError>>,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -39,7 +48,10 @@ impl From<ThreadKind> for ClassificationPhase {
 }
 
 enum OwnerPhase {
-    Live(watch::Sender<bool>),
+    Live {
+        cancel: watch::Sender<bool>,
+        intents: mpsc::Sender<TurnIntent>,
+    },
     Detaching {
         cancel: watch::Sender<bool>,
         waiters: Vec<oneshot::Sender<()>>,
@@ -58,40 +70,6 @@ pub(super) enum DetachRequestOutcome {
     ClearFailed(oneshot::Sender<()>),
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum NativeActivity {
-    Unknown,
-    Idle,
-    Active,
-    Unloaded,
-}
-
-struct PreparedOperation {
-    pub(super) token: CoordinatorToken,
-    pub(super) context: TurnContext,
-    turn_gate: ThreadTurnLease,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum NativeTurnOrigin {
-    Prepared(CoordinatorToken),
-    External,
-}
-
-struct OwnedNativeTurn {
-    pub(super) token: CoordinatorToken,
-    turn_id: TurnId,
-    origin: NativeTurnOrigin,
-    pub(super) context: TurnContext,
-    turn_gate: Option<ThreadTurnLease>,
-}
-
-pub(super) struct ClaimedNativeTurn {
-    pub(super) token: CoordinatorToken,
-    pub(super) context: TurnContext,
-    pub(super) external: bool,
-}
-
 /// Persisted model and mode sampled outside the coordinator lock for one external claim.
 #[derive(Clone)]
 pub(super) struct ExternalTurnDefaults {
@@ -100,65 +78,61 @@ pub(super) struct ExternalTurnDefaults {
 }
 
 struct ThreadCoordinatorState {
-    generation: u64,
-    next_sequence: u64,
     binding: LoadedThreadBinding,
     classification: ClassificationPhase,
     owner: OwnerPhase,
-    operation: Option<PreparedOperation>,
-    native_turn: Option<OwnedNativeTurn>,
-    native_activity: NativeActivity,
 }
 
 pub(super) struct ThreadCoordinator {
     state: AsyncMutex<ThreadCoordinatorState>,
-    changed: Notify,
 }
 
 pub(super) type ThreadBinding = Arc<ThreadCoordinator>;
-impl ThreadCoordinatorState {
-    fn token(&mut self) -> CoordinatorToken {
-        self.next_sequence = self.next_sequence.wrapping_add(1);
-        CoordinatorToken {
-            generation: self.generation,
-            sequence: self.next_sequence,
-        }
-    }
-
-    fn token_is_current(&self, token: CoordinatorToken) -> bool {
-        self.generation == token.generation
-    }
-}
 
 impl ThreadCoordinator {
     #[cfg(test)]
     pub(super) fn new(binding: LoadedThreadBinding, classification: ClassificationPhase) -> Self {
         let (cancel, _) = watch::channel(false);
-        Self::new_live(binding, classification, cancel)
+        let (intents, _) = mpsc::channel(TURN_INTENT_CAPACITY);
+        Self::new_live(binding, classification, cancel, intents)
     }
 
     pub(super) fn new_live(
         binding: LoadedThreadBinding,
         classification: ClassificationPhase,
         cancel: watch::Sender<bool>,
+        intents: mpsc::Sender<TurnIntent>,
     ) -> Self {
         Self {
             state: AsyncMutex::new(ThreadCoordinatorState {
-                generation: 1,
-                next_sequence: 0,
                 binding,
                 classification,
-                owner: OwnerPhase::Live(cancel),
-                operation: None,
-                native_turn: None,
-                native_activity: NativeActivity::Idle,
+                owner: OwnerPhase::Live { cancel, intents },
             }),
-            changed: Notify::new(),
         }
     }
 
     pub(super) async fn binding(&self) -> LoadedThreadBinding {
         self.state.lock().await.binding.clone()
+    }
+
+    pub(super) async fn classification(&self) -> ClassificationPhase {
+        self.state.lock().await.classification
+    }
+
+    pub(super) async fn intent_sender(&self) -> Result<mpsc::Sender<TurnIntent>, HarnessError> {
+        let state = self.state.lock().await;
+        match &state.owner {
+            OwnerPhase::Live { intents, .. } => Ok(intents.clone()),
+            OwnerPhase::Failed(reason) => Err(HarnessError::Protocol(format!(
+                "thread {} event owner failed: {reason}",
+                state.binding.handle.thread
+            ))),
+            OwnerPhase::Detaching { .. } => Err(HarnessError::Protocol(format!(
+                "thread {} has no live event owner",
+                state.binding.handle.thread
+            ))),
+        }
     }
 
     pub(super) async fn classify_orphan_as_subagent(&self) -> Result<(), HarnessError> {
@@ -174,79 +148,6 @@ impl ThreadCoordinator {
                 state.binding.handle.thread
             ))),
         }
-    }
-
-    pub(super) async fn prepare_operation(
-        &self,
-        context: TurnContext,
-        turn_gate: ThreadTurnLease,
-    ) -> Result<CoordinatorToken, (HarnessError, ThreadTurnLease)> {
-        let mut state = self.state.lock().await;
-        if state.classification != ClassificationPhase::Primary {
-            return Err((
-                HarnessError::ThreadReadOnly {
-                    thread: state.binding.handle.thread,
-                },
-                turn_gate,
-            ));
-        }
-        if let OwnerPhase::Failed(reason) = &state.owner {
-            return Err((
-                HarnessError::Protocol(format!(
-                    "thread {} event owner failed: {reason}",
-                    state.binding.handle.thread
-                )),
-                turn_gate,
-            ));
-        }
-        if !matches!(state.owner, OwnerPhase::Live(_)) {
-            return Err((
-                HarnessError::Protocol(format!(
-                    "thread {} has no live event owner",
-                    state.binding.handle.thread
-                )),
-                turn_gate,
-            ));
-        }
-        if state.operation.is_some() || state.native_turn.is_some() {
-            return Err((
-                HarnessError::ThreadBusy {
-                    thread: state.binding.handle.thread,
-                },
-                turn_gate,
-            ));
-        }
-        let token = state.token();
-        state.operation = Some(PreparedOperation {
-            token,
-            context,
-            turn_gate,
-        });
-        Ok(token)
-    }
-
-    pub(super) async fn abort_operation(&self, token: CoordinatorToken) -> Option<ThreadTurnLease> {
-        let mut state = self.state.lock().await;
-        if state.operation.as_ref()?.token != token {
-            return None;
-        }
-        let operation = state.operation.take()?;
-        drop(state);
-        self.changed.notify_waiters();
-        Some(operation.turn_gate)
-    }
-
-    /// Clear an operation that never reached a native turn. The event owner calls this when its
-    /// stream exits, so both gate-less admission and an installed runtime lease have one terminal
-    /// cleanup path.
-    pub(super) async fn take_unclaimed_operation(&self) -> Option<ThreadTurnLease> {
-        let mut state = self.state.lock().await;
-        let operation = state.operation.take();
-        if operation.is_some() {
-            drop(state);
-            self.changed.notify_waiters();
-        }
-        operation.map(|operation| operation.turn_gate)
     }
 
     pub(super) async fn reusable_handle(
@@ -270,7 +171,7 @@ impl ThreadCoordinator {
             )));
         }
         match &state.owner {
-            OwnerPhase::Live(_) => Ok(state.binding.handle.clone()),
+            OwnerPhase::Live { .. } => Ok(state.binding.handle.clone()),
             OwnerPhase::Failed(reason) => Err(HarnessError::Protocol(format!(
                 "thread {} event owner failed: {reason}",
                 thread_id
@@ -279,140 +180,6 @@ impl ThreadCoordinator {
                 "thread {} event owner is not reusable",
                 thread_id
             ))),
-        }
-    }
-
-    pub(super) async fn acknowledge_operation_turn(
-        &self,
-        token: CoordinatorToken,
-        turn_id: TurnId,
-    ) {
-        let mut state = self.state.lock().await;
-        if let Some(operation) = state
-            .operation
-            .as_mut()
-            .filter(|operation| operation.token == token)
-        {
-            let _ = operation.turn_gate.acknowledge_turn(turn_id);
-            return;
-        }
-        if let Some(native_turn) = state.native_turn.as_mut()
-            && native_turn.origin == NativeTurnOrigin::Prepared(token)
-            && let Some(turn_gate) = native_turn.turn_gate.as_mut()
-        {
-            let _ = turn_gate.acknowledge_turn(turn_id);
-        }
-    }
-
-    pub(super) async fn claim_native_turn(
-        &self,
-        turn_id: TurnId,
-        external_defaults: ExternalTurnDefaults,
-    ) -> Result<ClaimedNativeTurn, HarnessError> {
-        let mut state = self.state.lock().await;
-        if let Some(native_turn) = state.native_turn.as_ref() {
-            if native_turn.turn_id != turn_id {
-                return Err(HarnessError::Protocol(format!(
-                    "native thread {} emitted turn {turn_id} while turn {} is active",
-                    state.binding.handle.harness_thread_id, native_turn.turn_id
-                )));
-            }
-            return Ok(ClaimedNativeTurn {
-                token: native_turn.token,
-                context: native_turn.context.clone(),
-                external: native_turn.origin == NativeTurnOrigin::External,
-            });
-        }
-
-        let (token, context, turn_gate, origin) = if let Some(operation) = state.operation.take() {
-            (
-                operation.token,
-                operation.context,
-                Some(operation.turn_gate),
-                NativeTurnOrigin::Prepared(operation.token),
-            )
-        } else {
-            let token = state.token();
-            let context = TurnContext {
-                user_input: external_turn_input_label(state.classification),
-                model: external_defaults.model,
-                mode: external_defaults.mode,
-                kind: match state.classification {
-                    ClassificationPhase::Primary => TurnContextKind::User,
-                    ClassificationPhase::Subagent => TurnContextKind::ExternalSubagent,
-                    ClassificationPhase::Orphan => TurnContextKind::ExternalOrphan,
-                },
-            };
-            (token, context, None, NativeTurnOrigin::External)
-        };
-        let external = origin == NativeTurnOrigin::External;
-        state.native_turn = Some(OwnedNativeTurn {
-            token,
-            turn_id,
-            origin,
-            context: context.clone(),
-            turn_gate,
-        });
-        state.native_activity = NativeActivity::Active;
-        Ok(ClaimedNativeTurn {
-            token,
-            context,
-            external,
-        })
-    }
-
-    pub(super) async fn install_native_turn_gate(
-        &self,
-        token: CoordinatorToken,
-        turn_id: TurnId,
-        turn_gate: ThreadTurnLease,
-    ) -> Result<(), ThreadTurnLease> {
-        let mut state = self.state.lock().await;
-        let Some(native_turn) = state.native_turn.as_mut().filter(|turn| {
-            turn.token == token && turn.turn_id == turn_id && turn.turn_gate.is_none()
-        }) else {
-            return Err(turn_gate);
-        };
-        native_turn.turn_gate = Some(turn_gate);
-        Ok(())
-    }
-
-    pub(super) async fn acknowledge_native_turn(
-        &self,
-        token: CoordinatorToken,
-        turn_id: TurnId,
-    ) -> Option<giskard_proto::ThreadRuntimeOverview> {
-        let mut state = self.state.lock().await;
-        state
-            .native_turn
-            .as_mut()
-            .filter(|turn| turn.token == token && turn.turn_id == turn_id)
-            .and_then(|turn| turn.turn_gate.as_mut())
-            .and_then(|turn_gate| turn_gate.acknowledge_turn(turn_id))
-    }
-
-    pub(super) async fn take_native_turn_gate(
-        &self,
-        token: CoordinatorToken,
-        turn_id: TurnId,
-    ) -> Option<ThreadTurnLease> {
-        let mut state = self.state.lock().await;
-        state
-            .native_turn
-            .as_mut()
-            .filter(|turn| turn.token == token && turn.turn_id == turn_id)
-            .and_then(|turn| turn.turn_gate.take())
-    }
-
-    pub(super) async fn finish_native_turn(&self, token: CoordinatorToken, turn_id: TurnId) {
-        let mut state = self.state.lock().await;
-        if state.native_turn.as_ref().is_some_and(|turn| {
-            turn.token == token && turn.turn_id == turn_id && state.token_is_current(token)
-        }) {
-            state.native_turn = None;
-            state.native_activity = NativeActivity::Idle;
-            drop(state);
-            self.changed.notify_waiters();
         }
     }
 
@@ -427,7 +194,7 @@ impl ThreadCoordinator {
     pub(super) async fn request_detach(&self, reply: oneshot::Sender<()>) -> DetachRequestOutcome {
         let mut state = self.state.lock().await;
         match &mut state.owner {
-            OwnerPhase::Live(cancel) => {
+            OwnerPhase::Live { cancel, .. } => {
                 let cancel = cancel.clone();
                 state.owner = OwnerPhase::Detaching {
                     cancel: cancel.clone(),
@@ -447,39 +214,22 @@ impl ThreadCoordinator {
 
     pub(super) async fn owner_exited(&self, reason: ForwarderExitReason) -> OwnerExitOutcome {
         let mut state = self.state.lock().await;
-        let outcome = match &mut state.owner {
+        match &mut state.owner {
             OwnerPhase::Detaching { waiters, .. } => {
                 let waiters = std::mem::take(waiters);
-                state.generation = state.generation.wrapping_add(1);
                 state.owner = OwnerPhase::Failed("detached".into());
-                state.native_activity = NativeActivity::Unloaded;
                 OwnerExitOutcome::Detached(waiters)
             }
-            OwnerPhase::Live(_) if reason == ForwarderExitReason::PersistenceBlocked => {
+            OwnerPhase::Live { .. } if reason == ForwarderExitReason::PersistenceBlocked => {
                 state.owner = OwnerPhase::Failed(forwarder_exit_reason_label(reason).into());
-                state.native_activity = NativeActivity::Unknown;
                 OwnerExitOutcome::RetainFailed
             }
-            OwnerPhase::Live(_) => {
+            OwnerPhase::Live { .. } => {
                 state.owner = OwnerPhase::Failed(forwarder_exit_reason_label(reason).into());
-                state.native_activity = NativeActivity::Unknown;
                 OwnerExitOutcome::ClearFailed
             }
             OwnerPhase::Failed(_) => OwnerExitOutcome::RetainFailed,
-        };
-        drop(state);
-        self.changed.notify_waiters();
-        outcome
-    }
-
-    #[cfg(test)]
-    pub(super) async fn owns_native_turn_for_test(&self, turn_id: TurnId) -> bool {
-        self.state
-            .lock()
-            .await
-            .native_turn
-            .as_ref()
-            .is_some_and(|native_turn| native_turn.turn_id == turn_id)
+        }
     }
 }
 
@@ -494,7 +244,7 @@ impl ThreadCoordinator {
 /// A turn claimed while the thread was unclassified keeps this label after classification, for the
 /// same reason its mode is not rewritten: the label records what was known when the turn was
 /// claimed, not what is known now.
-fn external_turn_input_label(classification: ClassificationPhase) -> UserInput {
+pub(super) fn external_turn_input_label(classification: ClassificationPhase) -> UserInput {
     match classification {
         ClassificationPhase::Primary => UserInput::text(""),
         ClassificationPhase::Subagent => UserInput::text("Sub-agent turn"),
@@ -716,19 +466,11 @@ impl ThreadAuthority {
 mod tests {
     use std::sync::Arc;
 
-    use giskard_core::ids::{ProjectId, ThreadId, TurnId};
-    use giskard_core::turn::Mode;
+    use giskard_core::ids::{ProjectId, ThreadId};
     use giskard_harness::ThreadHandle;
-    use giskard_persist::PersistStore;
 
     use super::*;
-    use crate::hub::Hub;
-    use crate::ledger;
-    use crate::registry::tests::{
-        prepare_test_operation, test_authority, test_coordinator, test_turn_context,
-    };
-    use crate::registry::{RegistryShared, turn_reservation};
-    use crate::thread_runtime::ThreadRuntimeSupport;
+    use crate::registry::tests::test_coordinator;
 
     fn coordinator(thread_id: ThreadId, native_id: &str) -> Arc<ThreadCoordinator> {
         Arc::new(ThreadCoordinator::new(
@@ -739,14 +481,6 @@ mod tests {
             },
             ClassificationPhase::Primary,
         ))
-    }
-
-    fn test_external_defaults() -> ExternalTurnDefaults {
-        let context = test_turn_context();
-        ExternalTurnDefaults {
-            model: context.model,
-            mode: context.mode,
-        }
     }
 
     #[test]
@@ -786,278 +520,30 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn subagent_coordinator_rejects_prepared_operations() {
-        let coordinator = test_coordinator(ClassificationPhase::Subagent);
-        let runtime = ThreadRuntimeSupport::new();
-        let binding = coordinator.binding().await;
-        let authority = test_authority(&binding);
-        let context = test_turn_context();
-        let lease = runtime
-            .reserve_turn(
-                &authority,
-                turn_reservation(binding.project_id, &binding.handle, &context),
-            )
-            .unwrap();
-        let error = match coordinator.prepare_operation(context, lease).await {
-            Ok(_) => panic!("sub-agent operation must be rejected"),
-            Err((error, _)) => error,
-        };
-        assert!(matches!(error, HarnessError::ThreadReadOnly { .. }));
-    }
-
-    #[tokio::test]
-    async fn cancelling_operation_admission_cannot_leave_runtime_reserved() {
-        let tmp = tempfile::tempdir().unwrap();
-        let store = Arc::new(PersistStore::new(tmp.path().to_path_buf()));
-        let shared = Arc::new(RegistryShared::new(
-            Arc::new(Hub::new()),
-            store.clone(),
-            ledger::spawn(store),
-        ));
-        let coordinator = Arc::new(test_coordinator(ClassificationPhase::Primary));
-        let binding = coordinator.binding().await;
-        let thread_id = binding.handle.thread;
-        let authority = shared
-            .intern_thread_authority(thread_id, binding.project_id)
-            .await
-            .unwrap();
-        let state_guard = coordinator.state.lock().await;
-        let task_shared = shared.clone();
-        let task_coordinator = coordinator.clone();
-        let task_authority = authority.clone();
-        let context = test_turn_context();
-        let task = tokio::spawn(async move {
-            task_shared
-                .admit_operation(
-                    &task_authority,
-                    &task_coordinator,
-                    binding.project_id,
-                    &binding.handle,
-                    &context,
-                )
-                .await
-        });
-
-        while !shared.runtime.has_active_turn(&authority) {
-            tokio::task::yield_now().await;
-        }
-        task.abort();
-        assert!(task.await.unwrap_err().is_cancelled());
-        drop(state_guard);
-
-        assert!(!shared.runtime.has_active_turn(&authority));
-        assert!(coordinator.state.lock().await.operation.is_none());
-    }
-
-    #[tokio::test]
-    async fn stale_operation_token_cannot_abort_a_later_operation() {
+    async fn intent_sender_follows_the_owner_phase() {
         let coordinator = test_coordinator(ClassificationPhase::Primary);
-        let runtime = ThreadRuntimeSupport::new();
-        let stale = prepare_test_operation(&coordinator, &runtime, test_turn_context()).await;
-        let mut stale_lease = coordinator.abort_operation(stale).await.unwrap();
-        let _ = stale_lease.release();
-        let current = prepare_test_operation(&coordinator, &runtime, test_turn_context()).await;
-
-        let _ = coordinator.abort_operation(stale).await;
-
-        let state = coordinator.state.lock().await;
-        assert_eq!(state.operation.as_ref().map(|op| op.token), Some(current));
-    }
-
-    #[tokio::test]
-    async fn external_claim_rederives_context_after_classification() {
-        let coordinator = test_coordinator(ClassificationPhase::Orphan);
-        let first_turn = TurnId::new();
-        let defaults_a = test_external_defaults();
-        let first = coordinator
-            .claim_native_turn(first_turn, defaults_a.clone())
-            .await
-            .unwrap();
-        coordinator.classify_orphan_as_subagent().await.unwrap();
-        let mut defaults_b = test_external_defaults();
-        if let TurnModel::Known(model) = &mut defaults_b.model {
-            model.model = "second-model".into();
-        }
-        defaults_b.mode = TurnMode::Known(Mode::Plan);
-        let still_first = coordinator
-            .claim_native_turn(first_turn, defaults_b.clone())
-            .await
-            .unwrap();
-        assert_eq!(still_first.context.kind, TurnContextKind::ExternalOrphan);
-        assert_eq!(still_first.context.model, defaults_a.model);
-        assert_eq!(still_first.context.mode, defaults_a.mode);
-        coordinator
-            .finish_native_turn(first.token, first_turn)
-            .await;
-
-        let second_turn = TurnId::new();
-        let second = coordinator
-            .claim_native_turn(second_turn, defaults_b.clone())
-            .await
-            .unwrap();
-
-        assert_eq!(first.context.kind, TurnContextKind::ExternalOrphan);
-        assert_eq!(
-            first.context.user_input,
-            UserInput::text("Unclassified native turn")
-        );
-        assert_eq!(first.context.model, defaults_a.model);
-        assert_eq!(first.context.mode, defaults_a.mode);
-        assert_eq!(second.context.kind, TurnContextKind::ExternalSubagent);
-        assert_eq!(second.context.user_input, UserInput::text("Sub-agent turn"));
-        assert_eq!(second.context.model, defaults_b.model);
-        assert_eq!(second.context.mode, defaults_b.mode);
-
-        let prepared = test_coordinator(ClassificationPhase::Primary);
-        let runtime = ThreadRuntimeSupport::new();
-        let prepared_context = test_turn_context();
-        let _token = prepare_test_operation(&prepared, &runtime, prepared_context.clone()).await;
-        let claimed = prepared
-            .claim_native_turn(TurnId::new(), defaults_b)
-            .await
-            .unwrap();
-        assert!(!claimed.external);
-        assert_eq!(claimed.context.user_input, prepared_context.user_input);
-        assert_eq!(claimed.context.model, prepared_context.model);
-        assert_eq!(claimed.context.mode, prepared_context.mode);
-        assert_eq!(claimed.context.kind, prepared_context.kind);
-    }
-
-    #[tokio::test]
-    async fn stale_operation_acknowledgement_cannot_acknowledge_a_later_lease() {
-        let coordinator = test_coordinator(ClassificationPhase::Primary);
-        let binding = coordinator.binding().await;
-        let authority = test_authority(&binding);
-        let runtime = ThreadRuntimeSupport::new();
-        let context = test_turn_context();
-
-        let stale_lease = runtime
-            .reserve_turn(
-                &authority,
-                turn_reservation(binding.project_id, &binding.handle, &context),
-            )
-            .unwrap();
-        let stale = match coordinator
-            .prepare_operation(context.clone(), stale_lease)
-            .await
-        {
-            Ok(operation) => operation,
-            Err((error, _)) => panic!("stale test operation was rejected: {error}"),
-        };
-        let mut stale_lease = coordinator.abort_operation(stale).await.unwrap();
-        let _ = stale_lease.release();
-
-        let current_lease = runtime
-            .reserve_turn(
-                &authority,
-                turn_reservation(binding.project_id, &binding.handle, &context),
-            )
-            .unwrap();
-        let current = match coordinator
-            .prepare_operation(context.clone(), current_lease)
-            .await
-        {
-            Ok(operation) => operation,
-            Err((error, _)) => panic!("current test operation was rejected: {error}"),
-        };
-
-        coordinator
-            .acknowledge_operation_turn(stale, TurnId::new())
-            .await;
-        let summary = runtime
-            .current_overview()
-            .threads
-            .into_iter()
-            .find(|summary| summary.thread_id == binding.handle.thread)
-            .unwrap();
+        let thread_id = coordinator.binding().await.handle.thread;
+        assert!(coordinator.intent_sender().await.is_ok());
+        let (reply, _) = oneshot::channel();
         assert!(matches!(
-            summary.turn_state,
-            giskard_proto::RuntimeTurnState::Active { turn_id: None }
+            coordinator.request_detach(reply).await,
+            DetachRequestOutcome::Pending
         ));
-        let mut current_lease = coordinator.abort_operation(current).await.unwrap();
-        let _ = current_lease.release();
-    }
+        assert!(matches!(
+            coordinator.intent_sender().await,
+            Err(HarnessError::Protocol(message))
+                if message == format!("thread {thread_id} has no live event owner")
+        ));
 
-    #[tokio::test]
-    async fn stale_native_completion_cannot_clear_a_later_turn() {
-        let coordinator = test_coordinator(ClassificationPhase::Subagent);
-        let first_turn = TurnId::new();
-        let first = coordinator
-            .claim_native_turn(first_turn, test_external_defaults())
-            .await
-            .unwrap();
-        coordinator
-            .finish_native_turn(first.token, first_turn)
-            .await;
-
-        let second_turn = TurnId::new();
-        let second = coordinator
-            .claim_native_turn(second_turn, test_external_defaults())
-            .await
-            .unwrap();
-        coordinator
-            .finish_native_turn(first.token, first_turn)
-            .await;
-
-        let state = coordinator.state.lock().await;
-        assert_eq!(
-            state
-                .native_turn
-                .as_ref()
-                .map(|turn| (turn.token, turn.turn_id)),
-            Some((second.token, second_turn))
-        );
-    }
-
-    #[tokio::test]
-    async fn mismatched_native_start_preserves_the_active_turn() {
-        let coordinator = test_coordinator(ClassificationPhase::Subagent);
-        let active_turn = TurnId::new();
-        let active = coordinator
-            .claim_native_turn(active_turn, test_external_defaults())
-            .await
-            .unwrap();
-
-        let other_turn = TurnId::new();
-        let error = match coordinator
-            .claim_native_turn(other_turn, test_external_defaults())
-            .await
-        {
-            Ok(_) => panic!("a second native turn must not replace the active turn"),
-            Err(error) => error,
-        };
-        assert!(matches!(error, HarnessError::Protocol(_)));
-        let state = coordinator.state.lock().await;
-        assert_eq!(
-            state
-                .native_turn
-                .as_ref()
-                .map(|turn| (turn.token, turn.turn_id)),
-            Some((active.token, active_turn))
-        );
-    }
-
-    #[tokio::test]
-    async fn failed_owner_rejects_new_preparation_before_io() {
         let coordinator = test_coordinator(ClassificationPhase::Primary);
+        let thread_id = coordinator.binding().await.handle.thread;
         let _ = coordinator
-            .owner_exited(ForwarderExitReason::StreamEndedWithoutTurn)
+            .owner_exited(ForwarderExitReason::PersistenceBlocked)
             .await;
-        let runtime = ThreadRuntimeSupport::new();
-        let binding = coordinator.binding().await;
-        let authority = test_authority(&binding);
-        let context = test_turn_context();
-        let lease = runtime
-            .reserve_turn(
-                &authority,
-                turn_reservation(binding.project_id, &binding.handle, &context),
-            )
-            .unwrap();
-        let error = match coordinator.prepare_operation(context, lease).await {
-            Ok(_) => panic!("failed owner must reject operation"),
-            Err((error, _)) => error,
-        };
-        assert!(matches!(error, HarnessError::Protocol(_)));
-        assert!(coordinator.state.lock().await.operation.is_none());
+        assert!(matches!(
+            coordinator.intent_sender().await,
+            Err(HarnessError::Protocol(message))
+                if message == format!("thread {thread_id} event owner failed: persistence_blocked")
+        ));
     }
 }
