@@ -2775,7 +2775,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn discovery_consumer_survives_a_failed_record() {
+    async fn discovery_consumer_retries_a_failed_record_after_success() {
         let output = Arc::new(StdMutex::new(Vec::new()));
         let writer_output = output.clone();
         let subscriber = tracing_subscriber::fmt()
@@ -2822,11 +2822,13 @@ mod tests {
             harness_thread_id: "native-admitted".into(),
             parent_harness_thread_id: None,
         });
-        wait_for_discovery_records(&registry, 2).await;
-        let file = wait_for_thread(&store, project, admitted).await;
-        assert_eq!(file.kind, giskard_core::ThreadKind::Orphan);
+        wait_for_discovery_records(&registry, 3).await;
+        let admitted_file = wait_for_thread(&store, project, admitted).await;
+        assert_eq!(admitted_file.kind, giskard_core::ThreadKind::Orphan);
         wait_for_coordinator(&registry, admitted).await;
-        assert!(store.load_thread(project, dropped).await.unwrap().is_none());
+        let retried_file = wait_for_thread(&store, project, dropped).await;
+        assert_eq!(retried_file.kind, giskard_core::ThreadKind::Orphan);
+        wait_for_coordinator(&registry, dropped).await;
         registry.shutdown().await.unwrap();
     }
 
