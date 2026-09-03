@@ -62,6 +62,14 @@ tests/e2e/run.sh --reporter=line
 ```
 
 The HTML report lands in `tests/e2e/playwright-report/` on your host.
+The test container runs with the invoking user's numeric UID and GID, so the report remains
+removable and writable without elevated privileges; transient Playwright test results stay in a
+container-only temporary filesystem. If an older run left root-owned report files, repair them
+once before rerunning:
+
+```bash
+sudo chown -R "$(id -u):$(id -g)" tests/e2e/playwright-report
+```
 
 The fallback builder keeps the Cargo registry, Git checkout, and compilation output in BuildKit
 cache mounts, exports only the executable to a temporary host directory, and bind-mounts it for the
@@ -106,7 +114,8 @@ This writes `docs/screenshots/ide-desktop.png` and `docs/screenshots/ide-mobile.
 IDE theme at desktop (1440×900 @2×) and mobile (390×844 @3×) viewports, each with a project open and
 a thread showing a message and the scripted reply. The generator lives in `screenshots/` and uses
 `screenshots.config.ts` (separate from the test suite so `run.sh` never regenerates images and this
-never runs the assertions).
+never runs the assertions). As with the report runner, generated files retain the invoking user's
+numeric UID and GID.
 
 Without Docker: `GISKARD_SERVER_BIN=../../target/debug/giskard-server-replay npx playwright test
 --config=screenshots.config.ts` after building the binary (see below). Override the output location
@@ -125,6 +134,7 @@ All knobs are environment variables with sensible defaults (see `playwright.conf
 | -------------------------- | ----------------------- | ------------------------------------------------- |
 | `GISKARD_SERVER_BIN`       | `giskard-server-replay` | Path/command for the replay server binary.        |
 | `GISKARD_E2E_PREBUILT_BIN` | unset                   | Existing replay binary to mount into Docker.      |
+| `GISKARD_PLAYWRIGHT_OUTPUT_DIR` | `test-results`     | Transient Playwright test output directory.       |
 | `GISKARD_HOST`             | `127.0.0.1`             | Host the server binds to and tests connect to.    |
 | `GISKARD_PORT`             | `8787`                  | Port for the same.                                |
 | `GISKARD_BASE_URL`         | `http://<host>:<port>`  | Full base URL (overrides host/port if set).       |

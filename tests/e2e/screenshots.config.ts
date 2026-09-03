@@ -16,6 +16,7 @@ export default defineConfig({
   testMatch: "**/*.ts",
   fullyParallel: false,
   workers: 1,
+  outputDir: process.env.GISKARD_PLAYWRIGHT_OUTPUT_DIR ?? "test-results",
   reporter: [["list"]],
   timeout: 60_000,
   expect: { timeout: 15_000 },

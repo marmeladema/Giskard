@@ -24,6 +24,8 @@ echo "==> Running Playwright tests"
 # host even when tests fail.
 mkdir -p "$repo_root/tests/e2e/playwright-report"
 docker run --rm --ipc=host \
+  --user "$(id -u):$(id -g)" \
+  -e GISKARD_PLAYWRIGHT_OUTPUT_DIR=/tmp/giskard-playwright-test-results \
   -v "$binary_path:/usr/local/bin/giskard-server-replay:ro" \
   -v "$repo_root/tests/e2e/playwright-report:/e2e/playwright-report" \
   "$image" "$@"
