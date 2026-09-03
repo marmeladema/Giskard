@@ -80,7 +80,11 @@ where
     S: Subscriber,
 {
     fn on_event(&self, event: &tracing::Event<'_>, _ctx: Context<'_, S>) {
-        if event.metadata().target() != "giskard_server::registry" {
+        if !event
+            .metadata()
+            .target()
+            .starts_with("giskard_server::registry")
+        {
             return;
         }
         let mut visitor = RegistryEventVisitor::default();
@@ -216,8 +220,13 @@ impl HarnessFactory for ActivityFactory {
     async fn create(
         &self,
         _config: &ProjectConfig,
-        _bootstrap: giskard_harness::HarnessBootstrap,
+        bootstrap: giskard_harness::HarnessBootstrap,
     ) -> Result<Arc<dyn giskard_harness::AgentHarness>, HarnessError> {
+        let mut routes = self.harness.native_routes.lock().await;
+        for binding in bootstrap.known_threads {
+            routes.insert(binding.harness_thread_id, binding.thread_id);
+        }
+        drop(routes);
         Ok(self.harness.clone())
     }
 }
@@ -258,6 +267,7 @@ struct SlowStartHarness {
 #[derive(Default)]
 struct ActivityHarness {
     threads: tokio::sync::Mutex<HashMap<ThreadId, Arc<EventLog>>>,
+    native_routes: tokio::sync::Mutex<HashMap<String, ThreadId>>,
     resumed_native_ids: tokio::sync::Mutex<Vec<String>>,
     claims: tokio::sync::Mutex<Vec<(String, ThreadId)>>,
     hold_native_child_open: AtomicBool,
@@ -967,6 +977,10 @@ impl AgentHarness for ActivityHarness {
         let tx = Arc::new(EventLog::new());
         self.threads.lock().await.insert(thread, tx);
         let harness_thread_id = opts.resume.unwrap_or_else(|| format!("test_{thread}"));
+        self.native_routes
+            .lock()
+            .await
+            .insert(harness_thread_id.clone(), thread);
         let agent_name = (harness_thread_id == "native-collab-child").then(|| "James".to_string());
         let parent_harness_thread_id = attested_native_parent(&harness_thread_id);
         Ok(ThreadHandle {
@@ -993,6 +1007,12 @@ impl AgentHarness for ActivityHarness {
                 tokio::task::yield_now().await;
             }
         }
+        let thread = *self
+            .native_routes
+            .lock()
+            .await
+            .entry(harness_thread_id.clone())
+            .or_insert(thread);
         self.claims
             .lock()
             .await
@@ -4202,7 +4222,10 @@ async fn importing_subagent_thread_records_parent_and_reuses_native_child() {
                 .await
                 .unwrap()
                 .unwrap();
-            if thread.harness_thread_id == "native-child" {
+            if thread.harness_thread_id == "native-child"
+                && thread.kind == giskard_core::ThreadKind::Subagent
+                && thread.parent_thread_id == Some(parent_id)
+            {
                 found = Some(thread.id);
                 break;
             }
@@ -4371,9 +4394,9 @@ async fn route_and_forwarder_import_same_native_child_once() {
             .send(),
     )
     .await
-    .expect("lifecycle-lock contention should have a bounded HTTP response")
+    .expect("active parent deletion should have a bounded HTTP response")
     .unwrap();
-    assert_eq!(blocked_delete.status(), 503);
+    assert_eq!(blocked_delete.status(), 409);
 
     let route_client = client.clone();
     let route_base = base.clone();
@@ -4413,8 +4436,7 @@ async fn route_and_forwarder_import_same_native_child_once() {
     .collect::<Vec<_>>();
     assert_eq!(native_children.len(), 1);
     assert_eq!(native_children[0].id, route_child_id);
-    // Identity is established once, by a claim: a provider-owned child is never resumed, so the
-    // duplicate-import guard is now visible as a single claim rather than a single resume.
+    // Both admissions use the harness's idempotent claim instead of resuming provider-owned work.
     assert_eq!(
         harness
             .resumed_native_ids()
@@ -4432,7 +4454,7 @@ async fn route_and_forwarder_import_same_native_child_once() {
             .iter()
             .filter(|(native_id, _)| native_id == "native-child")
             .count(),
-        1
+        2
     );
 
     harness
@@ -4775,7 +4797,9 @@ async fn collab_agent_spawn_start_imports_subagent_thread() {
                 .await
                 .unwrap()
                 .unwrap();
-            if thread.harness_thread_id == "native-collab-child" {
+            if thread.harness_thread_id == "native-collab-child"
+                && thread.kind == giskard_core::ThreadKind::Subagent
+            {
                 found = Some(thread);
                 break;
             }
@@ -5832,10 +5856,11 @@ async fn route_rejects_native_child_with_a_different_parent() {
 
     let import = open_subagent_link(&client, &base, &cookie, project_id, parent_id, item_id).await;
     assert_eq!(import.status(), 409);
-    assert_eq!(
-        state.store.list_threads(project_id).await.unwrap(),
-        vec![parent_id]
-    );
+    let thread_ids = state.store.list_threads(project_id).await.unwrap();
+    assert_eq!(thread_ids.len(), 2);
+    let foreign = wait_for_native_thread(&state, project_id, "native-foreign-child").await;
+    assert_eq!(foreign.kind, giskard_core::ThreadKind::Orphan);
+    assert_eq!(foreign.parent_thread_id, None);
 }
 
 #[tokio::test]

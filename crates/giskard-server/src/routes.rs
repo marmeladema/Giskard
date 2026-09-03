@@ -781,9 +781,6 @@ async fn open_subagent_link(
     State(state): State<AppState>,
     AxumPath((project_id, parent_thread_id, item_id)): AxumPath<(ProjectId, ThreadId, ItemId)>,
 ) -> Result<Json<OpenSubagentLinkResponse>, ApiError> {
-    // Materialization is serialized with every other lifecycle mutation for the project and may
-    // be queued behind a slow native resume. Bound the complete browser action so this endpoint
-    // has the same availability guarantee as HTTP handlers waiting directly on the lifecycle lock.
     let thread_id = tokio::time::timeout(
         PROJECT_LIFECYCLE_LOCK_TIMEOUT,
         state
@@ -1875,6 +1872,14 @@ async fn delete_thread(
         .ensure_thread_writable(project_id, thread_id)
         .await
         .map_err(harness_api_error)?;
+    let initial_graph = load_thread_graph(&state.store, project_id).await?;
+    let initial_deletion_order = descendant_deletion_order(&initial_graph, thread_id);
+    for candidate in &initial_deletion_order {
+        reject_thread_mutation_if_live(&state, *candidate).await?;
+    }
+    for candidate in &initial_deletion_order {
+        state.registry.retire_thread(*candidate).await;
+    }
     let graph = load_thread_graph(&state.store, project_id).await?;
     let deletion_order = descendant_deletion_order(&graph, thread_id);
     if deletion_order.is_empty() {

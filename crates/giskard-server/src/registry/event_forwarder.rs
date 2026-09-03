@@ -779,7 +779,6 @@ pub(super) struct ThreadEventForwarder {
     stream: giskard_harness::AgentEventStream,
     cancel: watch::Receiver<bool>,
     intents: mpsc::Receiver<TurnIntent>,
-    #[allow(dead_code)]
     driver: DriverHandle,
     intents_closed: bool,
     admitted: Option<AdmittedIntent>,
@@ -1606,37 +1605,41 @@ impl ThreadEventForwarder {
                 }
             }
             AgentEvent::ItemStarted { item, turn, .. } => {
-                if let Some(info) = subagent_start_info(item) {
-                    enqueue_subagent_materialization(
-                        thread_id,
-                        project_id,
-                        SubagentMaterializationJob {
+                if let Some(info) = subagent_start_info(item)
+                    && let Err(error) = self
+                        .driver
+                        .link(Link {
+                            parent_thread_id: thread_id,
                             spawned_by_turn_id: *turn,
                             item_id: item.id,
                             origin: "item_started",
                             info,
-                            result: None,
-                        },
-                        self.shared.clone(),
-                    )
-                    .await;
+                            reply: None,
+                        })
+                        .await
+                {
+                    warn!(%project_id, parent_thread_id = %thread_id, turn_id = %turn,
+                        item_id = %item.id, %error,
+                        "failed to send linked native identity to the project event driver");
                 }
             }
             AgentEvent::ItemCompleted { item, turn, .. } => {
-                if let Some(info) = subagent_activity_info(item) {
-                    enqueue_subagent_materialization(
-                        thread_id,
-                        project_id,
-                        SubagentMaterializationJob {
+                if let Some(info) = subagent_activity_info(item)
+                    && let Err(error) = self
+                        .driver
+                        .link(Link {
+                            parent_thread_id: thread_id,
                             spawned_by_turn_id: *turn,
                             item_id: item.id,
                             origin: "item_completed",
                             info,
-                            result: None,
-                        },
-                        self.shared.clone(),
-                    )
-                    .await;
+                            reply: None,
+                        })
+                        .await
+                {
+                    warn!(%project_id, parent_thread_id = %thread_id, turn_id = %turn,
+                        item_id = %item.id, %error,
+                        "failed to send linked native identity to the project event driver");
                 }
                 if self.turn.context.kind == TurnContextKind::ManualCompaction
                     && is_context_compaction_item(item)
