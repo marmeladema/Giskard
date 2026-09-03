@@ -1,4 +1,3 @@
-use std::collections::VecDeque;
 use std::sync::{Arc, Mutex, Weak};
 
 use giskard_core::error::HarnessError;
@@ -9,10 +8,7 @@ use giskard_core::user_input::UserInput;
 use giskard_harness::ThreadHandle;
 use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard, mpsc, oneshot, watch};
 
-use super::{
-    ForwarderExitReason, LoadedThreadBinding, RegistryTaskPermit, RegistryTaskTracker,
-    SubagentMaterializationJob, TurnContext, forwarder_exit_reason_label,
-};
+use super::{ForwarderExitReason, LoadedThreadBinding, TurnContext, forwarder_exit_reason_label};
 use crate::thread_runtime::{ThreadRuntimeEntry, ThreadRuntimeSlot};
 
 pub(super) const TURN_INTENT_CAPACITY: usize = 4;
@@ -252,9 +248,6 @@ pub(super) fn external_turn_input_label(classification: ClassificationPhase) -> 
     }
 }
 
-#[cfg(test)]
-use giskard_core::ids::ItemId;
-
 /// Role-specific handle for serializing one thread's event-owner changes.
 #[derive(Clone)]
 pub(super) struct OwnerLock(Arc<AsyncMutex<()>>);
@@ -307,13 +300,6 @@ struct CoordinatorSlot {
     current: AsyncMutex<Option<ThreadBinding>>,
 }
 
-/// Per-parent FIFO storage whose presence also records a running worker.
-#[derive(Default)]
-struct MaterializationSlot {
-    /// Queue presence is also the per-parent worker-running marker, including while empty.
-    queue: AsyncMutex<Option<VecDeque<SubagentMaterializationJob>>>,
-}
-
 /// Owns immutable identity and all process-local state for one verified thread.
 pub(crate) struct ThreadAuthority {
     thread_id: ThreadId,
@@ -321,7 +307,6 @@ pub(crate) struct ThreadAuthority {
     owner: OwnerLock,
     coordinator: CoordinatorSlot,
     runtime: ThreadRuntimeSlot,
-    materialization: MaterializationSlot,
 }
 
 impl ThreadAuthority {
@@ -333,7 +318,6 @@ impl ThreadAuthority {
             owner,
             coordinator: CoordinatorSlot::default(),
             runtime: ThreadRuntimeSlot::new(),
-            materialization: MaterializationSlot::default(),
         }
     }
 
@@ -411,54 +395,6 @@ impl ThreadAuthority {
         callback: impl FnOnce(&mut ThreadRuntimeEntry) -> R,
     ) -> Option<R> {
         self.runtime.with_exact_current(expected, callback)
-    }
-
-    #[allow(clippy::result_large_err)]
-    /// Enqueues FIFO work and returns a permit only when the caller must start the worker.
-    pub(super) async fn enqueue_materialization_job(
-        &self,
-        job: SubagentMaterializationJob,
-        establishment_permit: Option<RegistryTaskPermit>,
-        tracker: &Arc<RegistryTaskTracker>,
-    ) -> Result<Option<RegistryTaskPermit>, SubagentMaterializationJob> {
-        let mut queue = self.materialization.queue.lock().await;
-        let permit = if queue.is_some() {
-            None
-        } else if let Some(permit) = establishment_permit {
-            Some(permit)
-        } else {
-            let Some(permit) = tracker.register() else {
-                return Err(job);
-            };
-            Some(permit)
-        };
-        queue.get_or_insert_with(VecDeque::new).push_back(job);
-        Ok(permit)
-    }
-
-    /// Pops the next job, clearing the worker marker only on a later empty poll.
-    pub(super) async fn next_materialization_job(&self) -> Option<SubagentMaterializationJob> {
-        let mut queue = self.materialization.queue.lock().await;
-        let job = queue.as_mut().and_then(VecDeque::pop_front);
-        if job.is_none() {
-            *queue = None;
-        }
-        job
-    }
-
-    #[cfg(test)]
-    pub(super) async fn materialization_job_ids(&self) -> Option<Vec<ItemId>> {
-        self.materialization
-            .queue
-            .lock()
-            .await
-            .as_ref()
-            .map(|queue| queue.iter().map(|job| job.item_id).collect())
-    }
-
-    #[cfg(test)]
-    pub(super) async fn has_materialization_worker(&self) -> bool {
-        self.materialization.queue.lock().await.is_some()
     }
 }
 

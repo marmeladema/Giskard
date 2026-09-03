@@ -25,14 +25,13 @@ pub(super) enum Admission {
 pub(super) struct Admitted {
     pub(super) binding: LoadedThreadBinding,
     pub(super) classification: ClassificationPhase,
-    pub(super) link_result: Option<giskard_core::ids::ThreadId>,
+    pub(super) thread_id: giskard_core::ids::ThreadId,
 }
 
 fn admitted(
     project_id: giskard_core::ids::ProjectId,
     handle: ThreadHandle,
     file: &ThreadFile,
-    link_result: Option<giskard_core::ids::ThreadId>,
 ) -> Admitted {
     Admitted {
         binding: LoadedThreadBinding {
@@ -44,7 +43,7 @@ fn admitted(
             handle,
         },
         classification: ClassificationPhase::from(file.kind),
-        link_result,
+        thread_id: file.id,
     }
 }
 
@@ -147,7 +146,6 @@ pub(super) async fn admit(
         }
     };
 
-    let mut created = false;
     let mut file = match shared
         .store
         .load_thread(project_id, handle.thread)
@@ -156,29 +154,60 @@ pub(super) async fn admit(
     {
         Some(file) => file,
         None => {
-            created = true;
             let current_model = handle
                 .resumed_model
                 .clone()
                 .map(TurnModel::Known)
                 .unwrap_or(TurnModel::Unknown);
-            shared
+            let mut file = orphan_file(
+                project_id,
+                handle.thread,
+                handle.harness_thread_id.clone(),
+                current_model,
+            );
+            if let Some((link, parent)) = link.as_ref() {
+                let graph = load_thread_graph(&shared.store, project_id)
+                    .await
+                    .map_err(protocol)?;
+                if !parent_chain_is_valid(&graph, parent.id) {
+                    warn!(%project_id, parent_thread_id = %parent.id,
+                        linked_harness_thread_id = %handle.harness_thread_id,
+                        "refusing to materialize a sub-agent under an invalid parent chain");
+                } else if let Some(native_parent) = handle.parent_harness_thread_id.as_deref()
+                    && native_parent != parent.harness_thread_id
+                {
+                    warn!(%project_id, parent_thread_id = %parent.id,
+                        proposed_parent_harness_thread_id = %parent.harness_thread_id,
+                        reported_parent_harness_thread_id = %native_parent,
+                        linked_harness_thread_id = %handle.harness_thread_id,
+                        "refusing to materialize a native thread under a mismatched parent");
+                } else {
+                    file.title = subagent_thread_title(&subagent_info_with_agent_name(
+                        link.info.clone(),
+                        handle.agent_name.clone(),
+                    ));
+                    file.parent_thread_id = Some(parent.id);
+                    file.spawned_by_turn_id = Some(link.spawned_by_turn_id);
+                    file.kind = ThreadKind::Subagent;
+                    file.mode = parent.mode;
+                    file.permission_preset = parent.permission_preset;
+                }
+            }
+            let file = shared
                 .thread_metadata
-                .create(
-                    project_id,
-                    orphan_file(
-                        project_id,
-                        handle.thread,
-                        handle.harness_thread_id.clone(),
-                        current_model,
-                    ),
-                )
+                .create(project_id, file)
                 .await
-                .map_err(protocol)?
+                .map_err(protocol)?;
+            if file.kind == ThreadKind::Subagent {
+                shared
+                    .thread_metadata
+                    .publish_created(project_id, &file)
+                    .await;
+            }
+            return Ok(Some(admitted(project_id, handle, &file)));
         }
     };
 
-    let link_was_present = link.is_some();
     if let Some((link, parent)) = link {
         let needs_graph = parent.parent_thread_id == Some(file.id)
             || (file.kind != ThreadKind::Primary
@@ -210,11 +239,7 @@ pub(super) async fn admit(
                 linked_harness_thread_id = %handle.harness_thread_id,
                 disposition = ?disposition, reason = disposition.reason(),
                 "ignoring sub-agent materialization for an existing thread with incompatible ownership");
-            return if created {
-                Ok(Some(admitted(project_id, handle, &file, None)))
-            } else {
-                Ok(None)
-            };
+            return Ok(None);
         }
 
         if file.kind == ThreadKind::Orphan {
@@ -225,7 +250,7 @@ pub(super) async fn admit(
                 warn!(%project_id, parent_thread_id = %parent.id,
                     linked_harness_thread_id = %handle.harness_thread_id,
                     "refusing to materialize a sub-agent under an invalid parent chain");
-                return Ok(Some(admitted(project_id, handle, &file, None)));
+                return Ok(Some(admitted(project_id, handle, &file)));
             }
             if let Some(native_parent) = handle.parent_harness_thread_id.as_deref()
                 && native_parent != parent.harness_thread_id
@@ -235,7 +260,7 @@ pub(super) async fn admit(
                     reported_parent_harness_thread_id = %native_parent,
                     linked_harness_thread_id = %handle.harness_thread_id,
                     "refusing to materialize a native thread under a mismatched parent");
-                return Ok(Some(admitted(project_id, handle, &file, None)));
+                return Ok(Some(admitted(project_id, handle, &file)));
             }
             let desired_title = subagent_thread_title(&subagent_info_with_agent_name(
                 link.info.clone(),
@@ -302,6 +327,5 @@ pub(super) async fn admit(
         return Ok(None);
     }
 
-    let link_result = link_was_present.then_some(file.id);
-    Ok(Some(admitted(project_id, handle, &file, link_result)))
+    Ok(Some(admitted(project_id, handle, &file)))
 }

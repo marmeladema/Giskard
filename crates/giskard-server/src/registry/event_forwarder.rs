@@ -791,6 +791,7 @@ pub(super) struct ThreadEventForwarder {
 }
 
 impl ThreadEventForwarder {
+    #[allow(clippy::too_many_arguments)]
     pub(super) async fn new(
         shared: Arc<RegistryShared>,
         authority: Arc<ThreadAuthority>,
