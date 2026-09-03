@@ -221,15 +221,21 @@ native-turn methods are deleted. Primary turn leases are reserved only by the fo
 
 ## M6 — Materialization off the event path
 
+**Status:** Complete. Implemented by the native-identity admission change. See
+[`m6-native-identity-admission.md`](m6-native-identity-admission.md) for the implementation plan
+and deletion-ordering analysis.
+
 **Goal.** Delete the per-parent FIFO and the project lifecycle lock from the event path.
 
-**Design.** With M2, a parent link only classifies an orphan the driver already knows, or records a
-link for a child whose discovery has not been consumed yet. Both are per-thread state updates in the
-driver. Graph validation runs at classification time only, not on every `interacted` activity.
+**Design.** Discoveries, sub-agent links from forwarders, and explicit link opens are native
+identity admissions processed one at a time by the project's event driver. Native-to-Giskard
+identity lookup uses the harness's idempotent claim operation. A claimed identity is always
+recorded, while the thread graph is loaded only when the driver must decide or validate a
+relationship, not for repeated activity on an already classified child.
 
-**Exit.** `enqueue_subagent_materialization`, `MaterializationSlot`, `coordinator_snapshot` scans
-and `load_thread_graph` on the hot path deleted; `lock_project_lifecycle` is not taken between
-stdout and persistence.
+**Exit.** `enqueue_subagent_materialization`, `MaterializationSlot`, the admission-path
+`coordinator_snapshot` scans, and hot-path graph loads are deleted. `lock_project_lifecycle` is no
+longer taken between stdout and persistence.
 
 ## M7 — Cursor-committed persistence (optional)
 

@@ -178,9 +178,10 @@ parents are rejected.
 
 `POST /api/projects/{project_id}/threads` opens an existing persisted thread and requires its
 `thread_id`; it cannot fabricate sub-agent ownership. Harness-observed and explicit link-open
-materialization share one per-project lifecycle lock, while linked evidence from one
-parent is processed through a FIFO. Concurrent attempts therefore cannot persist two Giskard
-threads for one native child or install competing owners. Browser HTTP operations
+native identity admissions are processed one at a time by the project's event driver in arrival
+order. Native-to-Giskard lookup uses the harness's idempotent claim, and the thread graph is read
+only when a relationship must be decided. Concurrent attempts therefore cannot persist two
+Giskard threads for one native child or install competing owners. Browser HTTP operations
 waiting on that lifecycle serialization return `503 Service Unavailable` after five seconds rather
 than hanging indefinitely. First-time materialization runs outside the parent event-forwarding
 path; repeated activity reuses the live binding without rescanning every thread file.
@@ -202,8 +203,9 @@ Deleting a primary thread deletes its complete ownership subtree in leaf-first o
 native harness threads and local transcripts. An individual sub-agent cannot be the requested
 deletion root. Before deleting anything, Giskard rejects the operation if the primary or any
 descendant has an active turn or running task. Each long-lived owner is retired as its binding is
-removed, so a late child event cannot recreate storage after deletion. Imports and deletion share
-the same project lifecycle lock.
+removed, so a late child event cannot recreate storage after deletion. Project deletion quiesces
+the event driver before removing files. Subtree deletion retires every candidate before reloading
+the graph and computing its final deletion order.
 
 Codex may report that a native rollout is already absent. Only the exact matching missing-rollout
 response is treated as idempotent success, allowing stale local metadata to be removed. Other native
