@@ -178,14 +178,12 @@ impl AgentHarness for ServerRequestHarness {
         req: ServerRequestId,
         response: ServerRequestResponse,
     ) -> Result<(), HarnessError> {
-        self.responses
-            .lock()
-            .await
-            .push((req.clone(), response.clone()));
-        if *self.suppress_resolution.lock().await {
-            return Ok(());
-        }
-        let receiver = self.resolve_before_reply.lock().await.take();
+        let suppress_resolution = *self.suppress_resolution.lock().await;
+        let receiver = if suppress_resolution {
+            None
+        } else {
+            self.resolve_before_reply.lock().await.take()
+        };
         let mut active = None;
         if let Some(receiver) = receiver {
             let (thread, turn) = self.active.lock().await.take().unwrap_or_default();
@@ -207,6 +205,13 @@ impl AgentHarness for ServerRequestHarness {
         }
         if std::mem::take(&mut *self.hang_next_response.lock().await) {
             std::future::pending::<()>().await;
+        }
+        self.responses
+            .lock()
+            .await
+            .push((req.clone(), response.clone()));
+        if suppress_resolution {
+            return Ok(());
         }
         let (thread, turn) = match active {
             Some(active) => active,
