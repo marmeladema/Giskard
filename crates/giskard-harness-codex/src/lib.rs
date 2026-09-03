@@ -4588,10 +4588,8 @@ mod tests {
         });
         controller.wait_for_respond_json().await;
         assert!(
-            timeout(Duration::from_millis(50), stream.recv())
-                .await
-                .is_err(),
-            "resolved event must not be appended while the response write is blocked"
+            stream.try_recv().is_none(),
+            "resolved event must not be appended before the response write returns"
         );
         controller.release_respond_json().await;
         recv_matching_event(&mut stream, "server request resolution", |event| {

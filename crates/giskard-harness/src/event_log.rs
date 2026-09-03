@@ -226,6 +226,13 @@ impl<T> EventLogReader<T>
 where
     T: Clone + Send + 'static,
 {
+    /// Poll the retained queue once without waiting.
+    #[doc(hidden)]
+    pub fn try_recv(&mut self) -> Option<Result<T, EventStreamError>> {
+        let mut state = self.log.lock();
+        EventLog::poll_reader(&mut state, self.id)
+    }
+
     /// The next event, waiting if none is retained yet. Cancel-safe: a cancelled call consumes
     /// nothing.
     pub async fn recv(&mut self) -> Result<T, EventStreamError> {
