@@ -1406,8 +1406,8 @@ impl HarnessRegistry {
             let mut harnesses = HashMap::new();
             for authority in authorities {
                 let mut harness = transitions.project(&authority).await;
-                if let Some(harness) = harness.take_for_shutdown() {
-                    harnesses.insert(authority.project_id(), harness);
+                if let Some(harness_and_driver) = harness.take_for_shutdown() {
+                    harnesses.insert(authority.project_id(), harness_and_driver);
                 }
             }
             harnesses
@@ -1420,39 +1420,48 @@ impl HarnessRegistry {
                 "shutting down project harnesses"
             );
         }
-        let results = join_all(
-            harnesses
-                .into_iter()
-                .map(|(project_id, harness)| async move {
-                    let started = Instant::now();
-                    let result = match timeout(HARNESS_SHUTDOWN_TIMEOUT, harness.shutdown()).await {
-                        Ok(result) => result,
-                        Err(_) => Err(HarnessError::Timeout(format!(
-                            "harness shutdown exceeded {} ms",
-                            HARNESS_SHUTDOWN_TIMEOUT.as_millis()
-                        ))),
-                    };
-                    match &result {
-                        Ok(()) => info!(
-                            %project_id,
-                            elapsed_ms = started.elapsed().as_millis(),
-                            "project harness shutdown completed"
-                        ),
-                        Err(error) => error!(
-                            %project_id,
-                            %error,
-                            elapsed_ms = started.elapsed().as_millis(),
-                            "project harness shutdown failed"
-                        ),
-                    }
-                    (project_id, result)
-                }),
-        )
+        for (project_id, (_, driver)) in &harnesses {
+            if let Err(error) = driver.quiesce().await {
+                debug!(
+                    %project_id,
+                    %error,
+                    "project event driver was already gone during registry shutdown"
+                );
+            }
+        }
+        let results = join_all(harnesses.into_iter().map(
+            |(project_id, (harness, driver))| async move {
+                let started = Instant::now();
+                let result = match timeout(HARNESS_SHUTDOWN_TIMEOUT, harness.shutdown()).await {
+                    Ok(result) => result,
+                    Err(_) => Err(HarnessError::Timeout(format!(
+                        "harness shutdown exceeded {} ms",
+                        HARNESS_SHUTDOWN_TIMEOUT.as_millis()
+                    ))),
+                };
+                match &result {
+                    Ok(()) => info!(
+                        %project_id,
+                        elapsed_ms = started.elapsed().as_millis(),
+                        "project harness shutdown completed"
+                    ),
+                    Err(error) => error!(
+                        %project_id,
+                        %error,
+                        elapsed_ms = started.elapsed().as_millis(),
+                        "project harness shutdown failed"
+                    ),
+                }
+                (project_id, result, driver)
+            },
+        ))
         .await;
 
         let mut failures = results
             .into_iter()
-            .filter_map(|(project_id, result)| result.err().map(|error| (project_id, error)))
+            .filter_map(|(project_id, result, _driver)| {
+                result.err().map(|error| (project_id, error))
+            })
             .map(|(project_id, error)| format!("{project_id}: {error}"))
             .collect::<Vec<_>>();
         if let Err(error) = self
@@ -1490,13 +1499,7 @@ impl HarnessRegistry {
     }
 
     pub async fn delete_project(&self, project_id: ProjectId) -> Result<(), HarnessError> {
-        let coordinators = self.shared.coordinator_snapshot().await;
         let mut thread_ids = HashSet::new();
-        for (thread_id, coordinator) in coordinators {
-            if coordinator.binding().await.project_id == project_id {
-                thread_ids.insert(thread_id);
-            }
-        }
         let authority = self.shared.project_authority(project_id).await;
         let harness_and_driver = if let Some(authority) = authority.as_ref() {
             let mut transitions = self.shared.harness_transitions.lock().await;
@@ -1515,6 +1518,11 @@ impl HarnessRegistry {
                         .rollback_delete_if_running(harness);
                 }
                 return Err(error);
+            }
+            for (thread_id, coordinator) in self.shared.coordinator_snapshot().await {
+                if coordinator.binding().await.project_id == project_id {
+                    thread_ids.insert(thread_id);
+                }
             }
             if let Err(error) = harness.shutdown().await {
                 if let Err(resume_error) = driver.resume().await {
@@ -1535,6 +1543,12 @@ impl HarnessRegistry {
             let mut transitions = self.shared.harness_transitions.lock().await;
             if let Some(authority) = authority.as_ref() {
                 transitions.project(authority).await.finish_delete(&harness);
+            }
+        } else {
+            for (thread_id, coordinator) in self.shared.coordinator_snapshot().await {
+                if coordinator.binding().await.project_id == project_id {
+                    thread_ids.insert(thread_id);
+                }
             }
         }
 
@@ -1957,6 +1971,11 @@ mod tests {
         discoveries: Arc<EventLog<ThreadDiscovered>>,
         routes: StdMutex<HashMap<String, ThreadHandle>>,
         logs: StdMutex<HashMap<ThreadId, Arc<EventLog>>>,
+        claim_gate: StdMutex<Option<Arc<Notify>>>,
+        claim_started: AtomicUsize,
+        claim_finished: AtomicUsize,
+        shutdown_calls: AtomicUsize,
+        shutdown_observed_finished_claim: AtomicBool,
     }
 
     impl DiscoveryHarness {
@@ -1976,7 +1995,18 @@ mod tests {
                 discoveries: Arc::new(EventLog::new()),
                 routes: StdMutex::new(routes),
                 logs: StdMutex::new(logs),
+                claim_gate: StdMutex::new(None),
+                claim_started: AtomicUsize::new(0),
+                claim_finished: AtomicUsize::new(0),
+                shutdown_calls: AtomicUsize::new(0),
+                shutdown_observed_finished_claim: AtomicBool::new(false),
             }
+        }
+
+        fn gate_claims(&self) -> Arc<Notify> {
+            let gate = Arc::new(Notify::new());
+            *self.claim_gate.lock().unwrap() = Some(gate.clone());
+            gate
         }
 
         fn announce(&self, record: ThreadDiscovered) {
@@ -2029,8 +2059,14 @@ mod tests {
             harness_thread_id: String,
             workspace_root: PathBuf,
         ) -> Result<ThreadHandle, HarnessError> {
+            self.claim_started.fetch_add(1, Ordering::SeqCst);
+            let gate = self.claim_gate.lock().unwrap().clone();
+            if let Some(gate) = gate {
+                gate.notified().await;
+            }
             let mut routes = self.routes.lock().unwrap();
             if let Some(existing) = routes.get(&harness_thread_id) {
+                self.claim_finished.fetch_add(1, Ordering::SeqCst);
                 return Ok(existing.clone());
             }
             let handle = ThreadHandle::opened(thread, harness_thread_id.clone(), workspace_root);
@@ -2040,6 +2076,7 @@ mod tests {
                 .unwrap()
                 .entry(thread)
                 .or_insert_with(|| Arc::new(EventLog::new()));
+            self.claim_finished.fetch_add(1, Ordering::SeqCst);
             Ok(handle)
         }
 
@@ -2088,6 +2125,11 @@ mod tests {
         }
 
         async fn shutdown(&self) -> Result<(), HarnessError> {
+            self.shutdown_calls.fetch_add(1, Ordering::SeqCst);
+            self.shutdown_observed_finished_claim.store(
+                self.claim_finished.load(Ordering::SeqCst) != 0,
+                Ordering::SeqCst,
+            );
             self.discoveries.close();
             for log in self.logs.lock().unwrap().values() {
                 log.close();
@@ -2444,6 +2486,154 @@ mod tests {
         })
         .await
         .expect("discovery consumer did not process the expected records");
+    }
+
+    async fn attach_test_primary(
+        registry: &super::HarnessRegistry,
+        project: ProjectId,
+        thread: ThreadId,
+        native: &str,
+    ) {
+        let driver = registry.shared.event_driver(project).await.unwrap();
+        driver
+            .attach(
+                super::LoadedThreadBinding {
+                    project_id: project,
+                    handle: ThreadHandle::opened(thread, native.into(), PathBuf::from("/tmp/test")),
+                    native_model: None,
+                },
+                super::ClassificationPhase::Primary,
+            )
+            .await
+            .unwrap();
+    }
+
+    async fn start_gated_link(
+        registry: &super::HarnessRegistry,
+        project: ProjectId,
+        parent: ThreadId,
+    ) -> tokio::sync::oneshot::Receiver<Result<Option<ThreadId>, HarnessError>> {
+        let driver = registry.shared.event_driver(project).await.unwrap();
+        let (reply, response) = tokio::sync::oneshot::channel();
+        driver
+            .link(super::Link {
+                parent_thread_id: parent,
+                spawned_by_turn_id: TurnId::new(),
+                item_id: ItemId::new(),
+                origin: "test",
+                info: super::SubagentActivityInfo {
+                    native_thread_id: "native-child".into(),
+                    agent_name: None,
+                    agent_path: None,
+                    title: Some("child".into()),
+                },
+                reply: Some(reply),
+            })
+            .await
+            .unwrap();
+        response
+    }
+
+    async fn wait_for_claim(harness: &DiscoveryHarness) {
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while harness.claim_started.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("native claim did not start");
+    }
+
+    #[tokio::test]
+    async fn delete_project_detaches_an_owner_admitted_during_quiesce() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(PersistStore::new(tmp.path().to_path_buf()));
+        let (project, config) = create_test_project(&store, "delete-admission-fence").await;
+        let parent = ThreadId::new();
+        store
+            .save_thread(
+                project,
+                &test_thread_file(
+                    project,
+                    parent,
+                    "native-parent",
+                    giskard_core::ThreadKind::Primary,
+                ),
+            )
+            .await
+            .unwrap();
+        let (registry, factory) = discovery_registry(store).await;
+        registry
+            .get_or_create_harness(project, &config)
+            .await
+            .unwrap();
+        attach_test_primary(&registry, project, parent, "native-parent").await;
+        let harness = factory.harness.lock().unwrap().clone().unwrap();
+        let gate = harness.gate_claims();
+        let child_response = start_gated_link(&registry, project, parent).await;
+        wait_for_claim(&harness).await;
+
+        let deleting = tokio::spawn({
+            let registry = registry.clone();
+            async move { registry.delete_project(project).await }
+        });
+        tokio::task::yield_now().await;
+        assert!(!deleting.is_finished());
+        gate.notify_one();
+
+        let child = child_response.await.unwrap().unwrap().unwrap();
+        deleting.await.unwrap().unwrap();
+        assert!(registry.shared.coordinator(child).await.is_none());
+        assert!(!registry.thread_has_active_turn(child).await);
+    }
+
+    #[tokio::test]
+    async fn registry_shutdown_quiesces_drivers_before_harness_shutdown() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(PersistStore::new(tmp.path().to_path_buf()));
+        let (project, config) = create_test_project(&store, "shutdown-admission-fence").await;
+        let parent = ThreadId::new();
+        store
+            .save_thread(
+                project,
+                &test_thread_file(
+                    project,
+                    parent,
+                    "native-parent",
+                    giskard_core::ThreadKind::Primary,
+                ),
+            )
+            .await
+            .unwrap();
+        let (registry, factory) = discovery_registry(store).await;
+        registry
+            .get_or_create_harness(project, &config)
+            .await
+            .unwrap();
+        attach_test_primary(&registry, project, parent, "native-parent").await;
+        let harness = factory.harness.lock().unwrap().clone().unwrap();
+        let gate = harness.gate_claims();
+        let child_response = start_gated_link(&registry, project, parent).await;
+        wait_for_claim(&harness).await;
+
+        let shutting_down = tokio::spawn({
+            let registry = registry.clone();
+            async move { registry.shutdown().await }
+        });
+        tokio::task::yield_now().await;
+        assert_eq!(harness.shutdown_calls.load(Ordering::SeqCst), 0);
+        assert!(!shutting_down.is_finished());
+        gate.notify_one();
+
+        let child = child_response.await.unwrap().unwrap().unwrap();
+        shutting_down.await.unwrap().unwrap();
+        assert_eq!(harness.shutdown_calls.load(Ordering::SeqCst), 1);
+        assert!(
+            harness
+                .shutdown_observed_finished_claim
+                .load(Ordering::SeqCst)
+        );
+        assert!(registry.shared.coordinator(child).await.is_none());
     }
 
     #[tokio::test]
