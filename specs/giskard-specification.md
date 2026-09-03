@@ -9,7 +9,15 @@
 
 **Document status:** Implementation-ready specification.
 **Audience:** An AI coding agent (and its human reviewer) implementing the system.
-**Version:** 1.82
+**Version:** 1.83
+
+> **Amendment — native identity admission (1.83).** Discoveries, sub-agent links, and explicit
+> link opens are native identity admissions processed one at a time by the project's event driver.
+> The path from a harness event to persistence uses neither the project lifecycle lock nor a
+> per-parent materialization queue. Native-to-Giskard identity lookup uses the harness's
+> idempotent claim operation. Every claimed identity is recorded durably: a validating link makes
+> it a managed sub-agent, while an invalid or incompatible relationship leaves it as a hidden
+> orphan.
 
 > **Amendment — turn intents (1.82).** Starting a turn or context compaction sends a bounded
 > `TurnIntent` to the thread's long-lived event owner. That owner alone admits the operation,
@@ -515,13 +523,14 @@ runtime overview; the hoisting and notification behavior remains current.
   harness and local persistence in leaf-first order. The server preflights the entire subtree, and
   an active turn or running task anywhere returns `409 Conflict` before deletion begins. The browser
   confirms descendant count, native scope, and irreversibility, then clears any deleted active view.
-  Explicit link-open materialization, asynchronously observed materialization, and deletion share
-  one project lifecycle lock;
-  HTTP contention is bounded to five seconds and returns `503 Service Unavailable`. Linked
-  lifecycle evidence is processed through a per-parent FIFO so terminal evidence cannot overtake
-  earlier active evidence. Materialization runs outside the parent event-forwarding path and
-  repeated live-child activity avoids full project scans. Deletion cancels idle monitors and
-  repeats its preflight before the first native or local record is removed.
+  Discoveries, sub-agent links, and explicit link opens are serialized as admissions by the
+  project's event driver. The harness's idempotent native-identity claim prevents duplicate local
+  identities, and relationship validation reads the thread graph only when needed. Project
+  deletion quiesces the driver before harness shutdown and file removal. Subtree deletion retires
+  every candidate owner, reloads the graph, computes the final leaf-first order, and performs its
+  liveness and worktree preflight against that order before the first native or local record is
+  removed. Other HTTP operations that take the project lifecycle lock retain their five-second
+  contention bound and return `503 Service Unavailable` on timeout.
   Codex treats only the exact JSON-RPC `-32600` response
   `no rollout found for thread id <requested-id>` as idempotent deletion success; a different ID or
   any other native failure still aborts before local deletion.
@@ -2582,18 +2591,17 @@ yet, so there is no catalog to choose from (§8.3).
 
 - `RegistryShared` owns the sole strong process-local thread map. Each stable `ThreadAuthority`
   records its verified thread and project IDs and the adopted event-owner mutex, with independently
-  synchronized optional coordinator, runtime, and parent-materialization components. Project
-  authorities do not contain thread authorities; process ownership does not mirror durable project
-  containment.
+  synchronized optional coordinator and runtime components. Project authorities do not contain
+  thread authorities; process ownership does not mirror durable project containment.
 - A thread authority shell is process-local identity, not evidence that the durable thread exists,
   that a coordinator is installed, or that runtime state is present. Its first verified project
-  association is immutable. Once interned, the shell remains while coordinator retirement, runtime
-  cleanup, and materialization completion clear their respective optional components.
+  association is immutable. Once interned, the shell remains while coordinator retirement and
+  runtime cleanup clear their respective optional components.
 - Event-owner locking may precede verified thread association. The root therefore retains weak
   unpublished owner-lock entries; publishing a verified authority adopts that exact mutex and
-  removes its weak entry atomically under the thread-index membership lock. The optional
-  materialization FIFO remains present while its one per-parent worker is active, including while
-  that worker is processing a dequeued job.
+  removes its weak entry atomically under the thread-index membership lock. Native identity
+  admission is instead a project event-driver input processed one at a time; no thread authority
+  owns a materialization queue or worker.
 - **Draft new thread:** user starts a new thread in a project; the browser opens an unpersisted
   draft immediately, with mode and permission preset defaulted synchronously and the composer
   editable. The model is resolved asynchronously (LT6/LT7): until it lands the draft has no model

@@ -340,8 +340,8 @@ The refactor succeeds only if these disappear:
 - `tokio::sync::broadcast` in `giskard-harness-codex` and `giskard-server/src/registry`;
 - `SenderMap` and the synchronous `AgentHarness::subscribe`;
 - `CoordinatorToken`, owner generations, `OwnerPhase::Draining`, `lock_thread_owner_after_drain`;
-- `enqueue_subagent_materialization` and its per-parent queue;
-- `lock_project_lifecycle` anywhere on the path from stdout to persistence;
+- [x] `enqueue_subagent_materialization` and its per-parent queue;
+- [x] `lock_project_lifecycle` anywhere on the path from stdout to persistence;
 - `claim_native_thread` as a control-queue round trip triggered by an event;
 - the `"dropping Codex notification for unknown native thread"` log line for non-empty ids;
 - the `Lagged` handling and "persist prefix as Interrupted".
@@ -367,4 +367,3 @@ methods; do not claim … and publish its event sender as separate operations"; 
 from traffic". The goal behind the last one, never two Giskard ids for one native thread, is right.
 The consequence chosen, dropping the frame, is what makes the system lossy. The right consequence
 is to record under the native key and label later.
-
