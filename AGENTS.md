@@ -126,7 +126,8 @@ Cargo workspace with 8 crates under `crates/`:
   maps for project and thread identity.
 - One `ProjectEventDriver` per harness owns every event forwarder for that project. Attach and
   detach are driver messages; no code outside the driver installs or clears a coordinator or
-  spawns an event forwarder.
+  spawns an event forwarder. Project deletion and registry shutdown quiesce the driver before the
+  owner set is taken or the harness is shut down.
 - Turn admission is a `TurnIntent` to the thread's event forwarder. No code outside the forwarder
   reserves a primary thread's turn lease or calls `start_turn` / `compact_thread` on a harness.
 - Native identity admission (a discovery, a sub-agent link, or an explicit link open) is a driver

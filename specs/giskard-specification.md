@@ -9,7 +9,19 @@
 
 **Document status:** Implementation-ready specification.
 **Audience:** An AI coding agent (and its human reviewer) implementing the system.
-**Version:** 1.83
+**Version:** 1.84
+
+> **Amendment — lifecycle fences (1.84).** Project deletion and registry shutdown quiesce each
+> project event driver before taking the authoritative owner set or shutting down its harness. A
+> quiesced driver leaves its discovery cursor unchanged and holds reply-less links for a possible
+> resume. Failed reply-less native identity admissions are retried after the next successful
+> admission or driver resume, up to three
+> times. A retained event-log eviction that happened while no reader existed is reported as a
+> typed gap to the next reader created. A thread event owner closes and drains its intent lane on
+> cancellation, rejecting queued work, and retained events already available are processed before
+> intents.
+> Codex stdout JSONL frames are bounded by `CODEX_MAX_FRAME_BYTES`; an oversized frame fatally
+> closes the transport.
 
 > **Amendment — native identity admission (1.83).** Discoveries, sub-agent links, and explicit
 > link opens are native identity admissions processed one at a time by the project's event driver.

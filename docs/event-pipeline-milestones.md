@@ -81,9 +81,11 @@ failures.
 **Design.** Add `giskard_harness::EventLog`: per-thread `VecDeque<AgentEvent>` with a base
 sequence, a `Notify`, and cursor-based readers. `AgentEventStream` becomes a cursor over a log.
 `recv()` returns the next event at the cursor or waits; it never lags. Entries below the lowest
-cursor are trimmed; with no reader the log retains everything up to a byte cap, and crossing the cap
-records an explicit `Gap` marker rather than dropping silently. This is a pull model: no pump task,
-no channel, and `subscribe` stays synchronous because creating a cursor is synchronous.
+cursor are trimmed; with no reader the log retains everything up to an entry-count cap, and crossing
+the cap records an explicit `Gap` marker rather than dropping silently. `EVENT_LOG_RETAIN_LIMIT`
+counts entries, not bytes; Codex transport input is separately bounded per frame by
+`CODEX_MAX_FRAME_BYTES`. This is a pull model: no pump task, no channel, and `subscribe` stays
+synchronous because creating a cursor is synchronous.
 
 **Scope.**
 
@@ -160,9 +162,10 @@ instance behavior change is the one-line removal of the adapter polling gate.
 **Design.** One reader task decodes stdout and appends notifications and requests to the
 transport-owned inbox; responses are matched by request id to one-shot waiters. `request_json`
 never reads stdout. The retained `EventLog` inbox has a 65,536-frame cap; a `Gap` is fatal, and the
-reader never blocks on a full inbox. One bounded-queue writer owns stdin and flushes each whole
-frame. The `codex-codes` stderr-drain helper is private, so production uses an equivalent local
-task: it continuously reads lines, strips ANSI control sequences, and routes recognizable
+reader never blocks on a full inbox. The cap counts frames, and each stdout JSONL frame is bounded
+to `CODEX_MAX_FRAME_BYTES` before it enters the inbox. One bounded-queue writer owns stdin and
+flushes each whole frame. The `codex-codes` stderr-drain helper is private, so production uses an
+equivalent local task: it continuously reads lines, strips ANSI control sequences, and routes recognizable
 `ERROR`, `WARN`, and `DEBUG` lines to the corresponding tracing level, with other lines at
 `TRACE`.
 
@@ -237,7 +240,28 @@ relationship, not for repeated activity on an already classified child.
 `coordinator_snapshot` scans, and hot-path graph loads are deleted. `lock_project_lifecycle` is no
 longer taken between stdout and persistence.
 
-## M7 — Cursor-committed persistence (optional)
+## M7 — Lifecycle fences and reader contracts
+
+**Status.** Implemented by the lifecycle-fences change.
+
+**Goal.** Close the remaining lifecycle races at the driver admission lane, retained-log reader
+boundary, forwarder intent lane, and Codex stdout transport.
+
+**Design.** Project deletion and registry shutdown quiesce each project driver before taking the
+authoritative owner set or shutting down its harness. A quiesced driver stops polling discovery and
+holds reply-less forwarder links for a possible resume. Failed reply-less admissions are retried
+after the next successful admission or resume, at most three times. An `EventLog` eviction that
+occurred with no reader is reported as a `Gap` to the next reader created. Forwarders process
+retained events before intents; cancellation closes the intent lane and rejects anything already
+queued, so sender clones cannot admit work after detach. Codex stdout frames have a 64 MiB maximum;
+exceeding it fatally closes the transport.
+
+**Exit.** Deletion and shutdown cannot race admission; failed deletion does not consume discovery;
+reply-less admission has a bounded event-driven retry; no-reader eviction is visible to the next
+consumer; queued native events precede intents; cancelled owners admit no new intent; oversized
+frames fail loudly.
+
+## M8 — Cursor-committed persistence (optional)
 
 **Goal.** Crash-safe replay of an unpersisted turn.
 
@@ -251,7 +275,7 @@ tail is re-projected. Item upserts already make re-application idempotent.
 ## Ordering and dependencies
 
 ```text
-M0 ──► M1 ──► M2 ──► M4 ──► M5 ──► M6 ──► M7 (optional)
+M0 ──► M1 ──► M2 ──► M4 ──► M5 ──► M6 ──► M7 ──► M8 (optional)
               │
               └──► M3 (any time after M1)
 ```
