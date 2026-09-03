@@ -50,6 +50,7 @@ use crate::thread_runtime::{
     RestorePermit, RuntimeRequestId, ThreadRuntimeSupport, ThreadTurnLease, TurnReservation,
 };
 
+mod admission;
 mod driver;
 mod event_forwarder;
 mod project;
@@ -849,7 +850,13 @@ impl HarnessRegistry {
                 "server is shutting down; refusing to start a project event driver".into(),
             ));
         };
-        let driver = spawn_project_event_driver(project, self.shared.clone(), &h, driver_permit);
+        let driver = spawn_project_event_driver(
+            project,
+            self.shared.clone(),
+            &h,
+            giskard_harness::DiscoveryStream::closed(),
+            driver_permit,
+        );
         slot.publish_active(h.clone(), driver);
         spawn_discovery_consumer(self.shared.clone(), project, h.clone());
         Ok(h)
@@ -1765,11 +1772,11 @@ async fn publish_runtime_overview(shared: &RegistryShared) {
 }
 
 #[derive(Clone)]
-struct SubagentActivityInfo {
-    native_thread_id: String,
-    agent_name: Option<String>,
-    agent_path: Option<String>,
-    title: Option<String>,
+pub(super) struct SubagentActivityInfo {
+    pub(super) native_thread_id: String,
+    pub(super) agent_name: Option<String>,
+    pub(super) agent_path: Option<String>,
+    pub(super) title: Option<String>,
 }
 
 type SubagentMaterializationResult = Result<Option<ThreadId>, HarnessError>;
@@ -1891,7 +1898,7 @@ fn subagent_link_info(
     })
 }
 
-fn subagent_thread_title(info: &SubagentActivityInfo) -> String {
+pub(super) fn subagent_thread_title(info: &SubagentActivityInfo) -> String {
     let raw = info
         .agent_name
         .as_ref()
@@ -1923,7 +1930,7 @@ fn normalize_subagent_title(raw: String) -> String {
     title.chars().take(120).collect()
 }
 
-fn subagent_info_with_agent_name(
+pub(super) fn subagent_info_with_agent_name(
     mut info: SubagentActivityInfo,
     agent_name: Option<String>,
 ) -> SubagentActivityInfo {

@@ -779,6 +779,8 @@ pub(super) struct ThreadEventForwarder {
     stream: giskard_harness::AgentEventStream,
     cancel: watch::Receiver<bool>,
     intents: mpsc::Receiver<TurnIntent>,
+    #[allow(dead_code)]
+    driver: DriverHandle,
     intents_closed: bool,
     admitted: Option<AdmittedIntent>,
     inflight: Option<InflightRequest>,
@@ -798,6 +800,7 @@ impl ThreadEventForwarder {
         stream: giskard_harness::AgentEventStream,
         cancel: watch::Receiver<bool>,
         intents: mpsc::Receiver<TurnIntent>,
+        driver: DriverHandle,
     ) -> Self {
         let binding = coordinator.binding().await;
         let thread_id = binding.handle.thread;
@@ -841,6 +844,7 @@ impl ThreadEventForwarder {
             stream,
             cancel,
             intents,
+            driver,
             intents_closed: false,
             admitted: None,
             inflight: None,
@@ -2130,6 +2134,7 @@ mod tests {
             AgentEventStream::new(log.reader()),
             cancel_rx,
             intent_rx,
+            DriverHandle::disconnected(),
         )
         .await;
         let handle = tokio::spawn(async move {
@@ -3374,6 +3379,7 @@ mod tests {
                 AgentEventStream::new(log.reader()),
                 cancel_rx,
                 intent_rx,
+                DriverHandle::disconnected(),
             )
             .await
             .run(),
@@ -4890,6 +4896,7 @@ mod tests {
                 stream,
                 cancel_rx,
                 intent_rx,
+                DriverHandle::disconnected(),
             )
             .await
             .run()
@@ -4944,6 +4951,7 @@ mod tests {
                 AgentEventStream::new(log.reader()),
                 cancel_rx,
                 intent_rx,
+                DriverHandle::disconnected(),
             )
             .await
             .run(),
