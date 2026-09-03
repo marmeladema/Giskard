@@ -3587,8 +3587,9 @@ latest persisted turn timestamp; it never uses the repair time.
   The browser supplies only Giskard-owned coordinates. The server resolves the raw item from the
   parent's live buffer or persisted turns, derives its native child ID, prompt, lifecycle evidence,
   and containing `TurnId`, then idempotently materializes or returns the linked thread. Unknown and
-  non-link items return `409 Conflict`. A reverse child-to-parent item returns the existing parent
-  without changing ownership.
+  non-link items return `409 Conflict`. The parent must already have a live event owner; a request
+  against a cold, detaching, or failed parent returns `409 Conflict`. A reverse child-to-parent item
+  returns the existing parent without changing ownership.
 
 Linked-thread ownership is immutable once persisted. Existing primary threads are not reclassified,
 and existing children are not reparented. New child imports reject invalid/cyclic parent chains and

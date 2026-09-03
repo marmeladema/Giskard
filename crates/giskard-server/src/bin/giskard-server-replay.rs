@@ -478,14 +478,23 @@ impl AgentHarness for ScriptedHarness {
 
     async fn claim_native_thread(
         &self,
-        thread: ThreadId,
+        proposed_thread: ThreadId,
         harness_thread_id: String,
         workspace_root: PathBuf,
     ) -> Result<ThreadHandle, HarnessError> {
-        {
+        let thread = {
             let mut bindings = self.native_bindings.lock().await;
-            Self::claim_binding(&mut bindings, harness_thread_id.clone(), thread)?;
-        }
+            match bindings
+                .iter()
+                .find(|(native, _)| native == &harness_thread_id)
+            {
+                Some((_, existing_thread)) => *existing_thread,
+                None => {
+                    Self::claim_binding(&mut bindings, harness_thread_id.clone(), proposed_thread)?;
+                    proposed_thread
+                }
+            }
+        };
 
         let (parent_harness_thread_id, blocks_on_approval) =
             self.attach_thread(thread, &harness_thread_id).await;
@@ -1177,4 +1186,32 @@ fn run_git_seed<const N: usize>(workspace: &Path, args: [&str; N]) -> Result<(),
     } else {
         stderr
     })
+}
+
+#[cfg(test)]
+mod scripted_harness_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn native_claim_adopts_an_existing_binding() {
+        let thread = ThreadId::new();
+        let harness = ScriptedHarness::new(HarnessBootstrap {
+            known_threads: vec![giskard_harness::KnownThreadBinding {
+                harness_thread_id: "native-child".into(),
+                thread_id: thread,
+            }],
+        })
+        .unwrap();
+
+        let claimed = harness
+            .claim_native_thread(
+                ThreadId::new(),
+                "native-child".into(),
+                PathBuf::from("/tmp"),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(claimed.thread, thread);
+    }
 }

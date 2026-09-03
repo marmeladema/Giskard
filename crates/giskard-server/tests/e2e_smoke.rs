@@ -4816,6 +4816,7 @@ async fn collab_agent_spawn_start_imports_subagent_thread() {
     assert_eq!(child.parent_thread_id, Some(parent_id));
     assert_eq!(child.spawned_by_turn_id, Some(spawned_by_turn_id));
     assert_eq!(child.kind, giskard_core::ThreadKind::Subagent);
+    assert_eq!(child.revision, 1);
     assert_eq!(child.title, "Sub-agent: explorer");
 
     harness.wait_for_subscribers(child.id, 1).await;

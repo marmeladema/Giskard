@@ -63,7 +63,9 @@ it never writes uploads into the project workspace.
 `POST /api/projects/{id}/threads` requires `thread_id` and opens that existing persisted local
 thread. Linked transcript items use the dedicated parent/item endpoint above; the server resolves
 native routing, ownership, provenance, prompt, and lifecycle evidence from its authoritative item
-rather than accepting those fields from the browser. Thread summaries include the effective
+rather than accepting those fields from the browser. The parent thread must already be open with a
+live event owner; otherwise the linked-item open request returns `409 Conflict`. Thread summaries
+include the effective
 `workspace_root` the thread uses for file reads, Git status and diffs — the project's workspace for
 shared threads, the inherited worktree
 workspace for isolated threads and their sub-agents. Thread summaries and browser-facing sub-agent

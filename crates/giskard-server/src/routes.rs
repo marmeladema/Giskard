@@ -1874,8 +1874,44 @@ async fn delete_thread(
         .map_err(harness_api_error)?;
     let initial_graph = load_thread_graph(&state.store, project_id).await?;
     let initial_deletion_order = descendant_deletion_order(&initial_graph, thread_id);
+    if initial_deletion_order.is_empty() {
+        return Err(ApiError::NotFound);
+    }
     for candidate in &initial_deletion_order {
         reject_thread_mutation_if_live(&state, *candidate).await?;
+    }
+    // Refusals must happen before retirement: a failed worktree preflight deletes nothing, so it
+    // must not unload the event owners for the subtree either.
+    if !q.force {
+        for candidate in &initial_deletion_order {
+            let Some(worktree) = initial_graph
+                .get(candidate)
+                .and_then(|tf| tf.git_workspace.as_ref())
+                .and_then(ThreadGitWorkspace::as_worktree)
+            else {
+                continue;
+            };
+            let impact = worktree_deletion_impact(worktree).await.map_err(|error| {
+                warn!(
+                    %project_id,
+                    thread_id = %candidate,
+                    branch = %worktree.branch,
+                    %error,
+                    action = "delete_thread",
+                    "refusing to delete a thread whose worktree Git cannot report on"
+                );
+                ApiError::Conflict(format!(
+                    "could not check whether deleting worktree {} would destroy work: {error}",
+                    worktree.branch
+                ))
+            })?;
+            if impact.destroys_work() {
+                return Err(ApiError::Conflict(format!(
+                    "deleting this thread would destroy {}",
+                    impact.describe()
+                )));
+            }
+        }
     }
     for candidate in &initial_deletion_order {
         state.registry.retire_thread(*candidate).await;
@@ -1895,42 +1931,6 @@ async fn delete_thread(
         .load_project(project_id)
         .await?
         .ok_or(ApiError::NotFound)?;
-    // Worktrees are preflighted across the whole subtree before anything is deleted, for the same
-    // reason liveness is: a refusal partway through would leave a half-deleted ownership tree.
-    if !q.force {
-        for candidate in &deletion_order {
-            let Some(worktree) = graph
-                .get(candidate)
-                .and_then(|tf| tf.git_workspace.as_ref())
-                .and_then(ThreadGitWorkspace::as_worktree)
-            else {
-                continue;
-            };
-            let impact = worktree_deletion_impact(worktree).await.map_err(|error| {
-                warn!(
-                    %project_id,
-                    thread_id = %candidate,
-                    branch = %worktree.branch,
-                    %error,
-                    action = "delete_thread",
-                    "refusing to delete a thread whose worktree Git cannot report on"
-                );
-                // A conflict rather than a server error: the deletion is refused pending the user's
-                // say-so, and the browser's 409 path already offers exactly that — confirm again to
-                // go ahead anyway.
-                ApiError::Conflict(format!(
-                    "could not check whether deleting worktree {} would destroy work: {error}",
-                    worktree.branch
-                ))
-            })?;
-            if impact.destroys_work() {
-                return Err(ApiError::Conflict(format!(
-                    "deleting this thread would destroy {}",
-                    impact.describe()
-                )));
-            }
-        }
-    }
     let descendant_count = deletion_order.len().saturating_sub(1);
     info!(
         %project_id,
