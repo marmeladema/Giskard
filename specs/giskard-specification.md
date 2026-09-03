@@ -9,7 +9,12 @@
 
 **Document status:** Implementation-ready specification.
 **Audience:** An AI coding agent (and its human reviewer) implementing the system.
-**Version:** 1.85
+**Version:** 1.86
+
+> **Amendment — server-request claim settlement (1.86).** A claim owns a request until it
+> settles. A harness resolution that arrives during a claim is recorded on the request and
+> consumed by settlement, so a commit stores the user's answer and a rollback resolves instead
+> of re-pending. No `RequestState` is published for that resolution while the claim is open.
 
 > **Amendment — live turn usage (1.85).** Unknown-model turns retain their live token usage and
 > effective context window without warning, but never persist a per-model context window without
@@ -136,6 +141,11 @@
 > the intended frontend for the foreseeable future; treat every Dioxus/WASM/`giskard-ui` reference
 > below as historical design context, not a current requirement. The wire contract (`giskard-proto`)
 > and all backend design remain authoritative.
+
+**Changelog (1.85 → 1.86), server-request claim settlement:**
+- **RT6:** A claim owns a request until settlement. A harness resolution observed during the claim
+  is recorded on the request and consumed by settlement: commit stores the user's answer,
+  rollback resolves instead of re-pending, and no intermediate `RequestState` is published.
 
 **Changelog (1.84 → 1.85), live turn usage:**
 - **C10:** `TurnUsageUpdated` carries the active turn's latest usage and optional effective context
@@ -3731,6 +3741,8 @@ tabs. A response first atomically claims the request in its owning thread. Every
 authoritative revision-gated `RequestState`; local send state is never authoritative. A failed or
 timed-out harness call rolls the claim back to pending and publishes that newer state, while a
 successful call commits resolved. Duplicate, wrong-thread, and stale responses are protocol errors.
+A harness-side resolution observed while a claim is open does not preempt the claim; it is recorded
+on the request, and the claim's settlement resolves the request either way.
 `RequestState` is the sole authority for a request's resolution: there is no second, unrevisioned
 message announcing the same fact, because a client cannot gate one against the other.
 

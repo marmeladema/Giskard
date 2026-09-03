@@ -2008,7 +2008,7 @@ mod tests {
     use giskard_core::approval::{ApprovalKind, ApprovalRequest};
     use giskard_core::item::{CommandExecutionStart, ItemDelta, ItemKind, ItemStart};
     use giskard_core::model::ModelRef;
-    use giskard_core::server_request::ServerRequest;
+    use giskard_core::server_request::{ServerRequest, ServerRequestResponse};
     use giskard_core::token::{TokenLedger, TokenUsage};
     use giskard_core::turn::{Mode, PermissionPreset, TurnMode, TurnModel, TurnStatusKind};
     use giskard_core::user_input::UserInput;
@@ -2017,7 +2017,7 @@ mod tests {
     };
     use giskard_persist::PersistStore;
     use giskard_persist::store::ThreadFile;
-    use giskard_proto::{ServerMessage, WireAgentEvent};
+    use giskard_proto::{RequestStatus as WireRequestStatus, ServerMessage, WireAgentEvent};
     use tokio::sync::{Notify, mpsc};
     use tokio::task::JoinHandle;
 
@@ -2025,7 +2025,7 @@ mod tests {
     use crate::hub::Hub;
     use crate::ledger;
     use crate::test_logs::CapturedLogWriter;
-    use crate::thread_runtime::ThreadRuntimeSupport;
+    use crate::thread_runtime::{RequestResolution, RuntimeRequestId, ThreadRuntimeSupport};
 
     struct TestIntentHarness {
         start_result: Result<TurnId, HarnessError>,
@@ -4891,6 +4891,195 @@ mod tests {
             runtime.live_snapshot(&authority).is_none(),
             "turnless request alone must not create target-thread live turn state"
         );
+    }
+
+    #[tokio::test]
+    async fn forwarder_applied_harness_resolution_does_not_break_a_pending_claim() {
+        let (_tmp, store, project_id, thread_id, model) = usage_forwarder_fixture().await;
+        let log = Arc::new(EventLog::new());
+        let hub = Arc::new(Hub::new());
+        let (client_tx, mut client_rx) = mpsc::channel(16);
+        let _replacements = hub.register_client(1, client_tx).await;
+        assert!(hub.subscribe(thread_id, 1).await);
+        let ledger = ledger::spawn(store.clone());
+        let (runtime, authority) = spawn_forwarder(
+            thread_id,
+            project_id,
+            AgentEventStream::new(log.reader()),
+            hub.clone(),
+            store,
+            ledger,
+            model,
+            "request claim",
+        );
+        let turn = TurnId::new();
+        let request_id = ServerRequestId("q".into());
+        assert!(log.append(AgentEvent::TurnStarted {
+            thread: thread_id,
+            turn,
+        }));
+        assert!(log.append(AgentEvent::ServerRequestReceived {
+            thread: thread_id,
+            turn: Some(turn),
+            request: ServerRequest {
+                id: request_id.clone(),
+                method: "tool/request_user_input".into(),
+                params: serde_json::json!({"message": "Choose"}),
+                received_at: Utc::now(),
+            },
+        }));
+
+        let pending = tokio::time::timeout(tokio::time::Duration::from_secs(2), async {
+            loop {
+                if let Some(ServerMessage::RequestState(state)) = client_rx.recv().await
+                    && state.request_id == request_id.0
+                {
+                    break state;
+                }
+            }
+        })
+        .await
+        .expect("forwarder should publish the pending request");
+        assert_eq!(pending.revision, 1);
+        assert!(matches!(pending.status, WireRequestStatus::Pending));
+
+        let (claim, responding) = runtime
+            .claim_request(&authority, RuntimeRequestId::Server(request_id.clone()))
+            .unwrap();
+        assert_eq!(responding.request_state.revision, 2);
+        assert!(matches!(
+            responding.request_state.status,
+            WireRequestStatus::Responding
+        ));
+        hub.broadcast(
+            thread_id,
+            ServerMessage::RequestState(responding.request_state),
+        )
+        .await;
+
+        assert!(log.append(AgentEvent::ServerRequestResolved {
+            thread: thread_id,
+            turn: Some(turn),
+            request_id: request_id.clone(),
+        }));
+        assert!(log.append(AgentEvent::Notice {
+            thread: thread_id,
+            turn: Some(turn),
+            message: "fence-13".into(),
+        }));
+
+        let request_states = tokio::time::timeout(tokio::time::Duration::from_secs(2), async {
+            let mut request_states = Vec::new();
+            loop {
+                match client_rx
+                    .recv()
+                    .await
+                    .expect("subscriber should remain connected")
+                {
+                    ServerMessage::RequestState(state) => request_states.push(state),
+                    ServerMessage::Event { agent_event, .. }
+                        if matches!(
+                            *agent_event,
+                            WireAgentEvent::Notice { ref message, .. }
+                                if message == "fence-13"
+                        ) =>
+                    {
+                        break request_states;
+                    }
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .expect("forwarder should apply the resolution before the notice fence");
+        assert_eq!(request_states.len(), 1);
+        assert_eq!(request_states[0].revision, 2);
+        assert!(matches!(
+            request_states[0].status,
+            WireRequestStatus::Responding
+        ));
+
+        let committed = claim
+            .commit(RequestResolution::Server(ServerRequestResponse::result(
+                serde_json::json!({"answer": 1}),
+            )))
+            .unwrap();
+        assert_eq!(committed.request_state.revision, 3);
+        assert!(matches!(
+            committed.request_state.status,
+            WireRequestStatus::Resolved { .. }
+        ));
+        assert!(matches!(
+            client_rx.try_recv(),
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[tokio::test]
+    async fn forwarder_publishes_harness_resolution_for_an_unclaimed_request() {
+        let (_tmp, store, project_id, thread_id, model) = usage_forwarder_fixture().await;
+        let log = Arc::new(EventLog::new());
+        let hub = Arc::new(Hub::new());
+        let (client_tx, mut client_rx) = mpsc::channel(16);
+        let _replacements = hub.register_client(1, client_tx).await;
+        assert!(hub.subscribe(thread_id, 1).await);
+        let ledger = ledger::spawn(store.clone());
+        let (_runtime, _authority) = spawn_forwarder(
+            thread_id,
+            project_id,
+            AgentEventStream::new(log.reader()),
+            hub,
+            store,
+            ledger,
+            model,
+            "unclaimed request",
+        );
+        let turn = TurnId::new();
+        let request_id = ServerRequestId("q".into());
+        assert!(log.append(AgentEvent::TurnStarted {
+            thread: thread_id,
+            turn,
+        }));
+        assert!(log.append(AgentEvent::ServerRequestReceived {
+            thread: thread_id,
+            turn: Some(turn),
+            request: ServerRequest {
+                id: request_id.clone(),
+                method: "tool/request_user_input".into(),
+                params: serde_json::json!({"message": "Choose"}),
+                received_at: Utc::now(),
+            },
+        }));
+        assert!(log.append(AgentEvent::ServerRequestResolved {
+            thread: thread_id,
+            turn: Some(turn),
+            request_id: request_id.clone(),
+        }));
+
+        let states = tokio::time::timeout(tokio::time::Duration::from_secs(2), async {
+            let mut states = Vec::new();
+            loop {
+                if let Some(ServerMessage::RequestState(state)) = client_rx.recv().await
+                    && state.request_id == request_id.0
+                {
+                    let resolved = matches!(state.status, WireRequestStatus::Resolved { .. });
+                    states.push(state);
+                    if resolved {
+                        break states;
+                    }
+                }
+            }
+        })
+        .await
+        .expect("forwarder should publish the harness resolution");
+        assert_eq!(states.len(), 2);
+        assert_eq!(states[0].revision, 1);
+        assert!(matches!(states[0].status, WireRequestStatus::Pending));
+        assert_eq!(states[1].revision, 2);
+        assert!(matches!(
+            states[1].status,
+            WireRequestStatus::Resolved { .. }
+        ));
     }
 
     #[tokio::test]

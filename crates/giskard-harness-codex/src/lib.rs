@@ -3326,6 +3326,9 @@ mod tests {
         /// never set it does.
         config_model_provider: Option<String>,
         hang_response_json: bool,
+        block_next_respond_json: bool,
+        respond_json_started: Arc<tokio::sync::Notify>,
+        respond_json_release: Arc<tokio::sync::Notify>,
         respond_json_error: Option<String>,
         respond_error_json_error: Option<String>,
         hang_shutdown: bool,
@@ -3425,6 +3428,19 @@ mod tests {
 
         async fn hang_json_responses(&self) {
             self.state.lock().await.hang_response_json = true;
+        }
+
+        async fn block_next_respond_json(&self) {
+            self.state.lock().await.block_next_respond_json = true;
+        }
+
+        async fn wait_for_respond_json(&self) {
+            let started = self.state.lock().await.respond_json_started.clone();
+            started.notified().await;
+        }
+
+        async fn release_respond_json(&self) {
+            self.state.lock().await.respond_json_release.notify_one();
         }
 
         async fn fail_next_respond_json(&self, message: &str) {
@@ -3679,6 +3695,15 @@ mod tests {
             let mut state = self.state.lock().await;
             if let Some(error) = state.respond_json_error.take() {
                 return Err(HarnessError::Transport(error));
+            }
+            if state.block_next_respond_json {
+                state.block_next_respond_json = false;
+                let started = state.respond_json_started.clone();
+                let release = state.respond_json_release.clone();
+                drop(state);
+                started.notify_one();
+                release.notified().await;
+                state = self.state.lock().await;
             }
             if state.hang_response_json {
                 drop(state);
@@ -4514,6 +4539,78 @@ mod tests {
             )
         })
         .await;
+    }
+
+    #[tokio::test]
+    async fn server_request_response_is_written_before_the_resolved_event_is_appended() {
+        let (harness, controller) = spawn_fake_harness();
+        let thread = harness
+            .open_thread(open_opts(ThreadId::new(), None))
+            .await
+            .unwrap();
+        harness
+            .start_turn(
+                &thread,
+                UserInput::text("ask a question"),
+                build_turn_overrides(),
+            )
+            .await
+            .unwrap();
+        let native_turn = controller.started_turns().await[0].native_turn_id.clone();
+        let mut stream = harness.subscribe(&thread);
+        controller
+            .send_server_message(generic_user_input_request(
+                "ordered_server_req",
+                &thread.harness_thread_id,
+                &native_turn,
+            ))
+            .await;
+        recv_matching_event(&mut stream, "server request", |event| {
+            matches!(
+                event,
+                AgentEvent::ServerRequestReceived { request, .. }
+                    if request.id == ServerRequestId("ordered_server_req".into())
+            )
+        })
+        .await;
+
+        controller.block_next_respond_json().await;
+        let response_task = tokio::spawn({
+            let harness = harness.clone();
+            async move {
+                harness
+                    .respond_server_request(
+                        ServerRequestId("ordered_server_req".into()),
+                        ServerRequestResponse::result(json!({"answer": true})),
+                    )
+                    .await
+            }
+        });
+        controller.wait_for_respond_json().await;
+        assert!(
+            timeout(Duration::from_millis(50), stream.recv())
+                .await
+                .is_err(),
+            "resolved event must not be appended while the response write is blocked"
+        );
+        controller.release_respond_json().await;
+        recv_matching_event(&mut stream, "server request resolution", |event| {
+            matches!(
+                event,
+                AgentEvent::ServerRequestResolved { request_id, .. }
+                    if *request_id == ServerRequestId("ordered_server_req".into())
+            )
+        })
+        .await;
+
+        let responses = controller.responses().await;
+        assert_eq!(responses.len(), 1);
+        assert_eq!(
+            responses[0].id,
+            codex_codes::jsonrpc::RequestId::String("ordered_server_req".into())
+        );
+        assert_eq!(responses[0].value, json!({"answer": true}));
+        response_task.await.unwrap().unwrap();
     }
 
     #[tokio::test]
