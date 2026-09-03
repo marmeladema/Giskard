@@ -281,11 +281,19 @@ history cache applies unchanged: `UserInput`'s serializer already drops `data_ba
 | `context_compaction` | **true** | `/compact` as a user message [unverified]; `autocompact_state` feeds the gauge |
 | Native rename / archive / delete | **unsupported** | no equivalents — see §5.6 |
 | `terminate_command` | **unsupported (v1)** | background shells are controlled by the agent's own `KillShell` tool, not from outside |
-| Linked sub-agent threads | **unsupported** | Claude `Task` subagents are not resumable sessions, so `SubagentLink.harness_thread_id` has no value to carry. Map them as `ToolCall` items; optionally nest their text with `--forward-subagent-text` + `parent_tool_use_id`. |
+| Linked sub-agent threads | **supported, as local child threads** | The child is not a resumable session, but its whole transcript is forwarded and can be materialized as a read-only Giskard thread keyed by the Task call's `tool_use_id` — §5.8 |
 
 ---
 
 ## 5. Multi-harness architecture
+
+> **Structural references in §5.2, §5.4, §5.6 and §5.7 are stale.** They were written against a
+> registry that has since been replaced: `ProjectAuthority` now owns a single harness slot paired
+> with a per-project event driver, the `HashMap<ProjectId, Arc<dyn AgentHarness>>` and
+> `ThreadTurnGate` they cite no longer exist, and every line number in them points somewhere else.
+> The *conclusions* still hold — thread-addressed routing, harness-scoped native ids, soft
+> `Unsupported` — but how they are implemented is pending a decision on where a second harness
+> sits in the authority model. §5.1, §5.3, §5.5 and §5.8 are unaffected.
 
 ### 5.1 Harness identity comes from the provider table
 
@@ -463,6 +471,74 @@ server change, not an adapter workaround, and it needs error-path tests per `AGE
 - Record `claude_code_version` from `system/init` and warn when it differs from the pinned tested
   version — the same drift guard the spec already mandates for Codex, and more important here
   because Giskard owns the wire types.
+
+### 5.8 Sub-agent threads without native sessions
+
+Giskard expresses sub-agent structure **only** as threads: `Item` has no parent field, `ItemDelta` is
+just `Text` and `CommandOutput`, and every affordance in the UI — the Sub-agents card, subtree
+navigation, per-child activity hoisting — is keyed on `ThreadKind::Subagent` and `parent_thread_id`.
+A harness whose children are not threads therefore renders as nothing at all, or as one opaque tool
+call.
+
+Claude's children are not sessions: a `Task` runs inside the parent's session and its records are
+marked `isSidechain` in the same transcript (§3.6 note). But **the whole child transcript is
+forwarded**, so a thread can be materialized from it. With `--forward-subagent-text`, one delegation
+produced:
+
+```
+assistant parent=None            tool_use   Agent {"description":"Read data.txt for magic number"…}
+system/task_started              task_id=add7f09e… tool_use_id=toolu_019ZAnC8…
+user      parent=toolu_019ZAnC8  text       Read the file data.txt in the current working directory…
+assistant parent=toolu_019ZAnC8  tool_use   Read {"file_path":"…/data.txt"}
+user      parent=toolu_019ZAnC8  tool_result "1→the magic number is 4271"
+assistant parent=toolu_019ZAnC8  text       The magic number is **4271**.
+system/task_updated              patch={"status":"completed","end_time":…}
+user      parent=None            tool_result [{"type":"text","text":"The magic number is **4271**"…}]
+```
+
+That is a complete turn: delegated prompt as user input, the child's own tool calls and their results,
+and its closing message — not a narration of the work but the work itself.
+
+**Design: the Task call's `tool_use_id` becomes the child's `harness_thread_id`**, prefixed to declare
+what it is:
+
+```
+harness_thread_id = "task:toolu_019ZAnC8ARVNvy7R4aspovTx"
+```
+
+`parent_tool_use_id` is then the routing key: every forwarded item carries the id of the call it
+belongs to, so items land in the child thread rather than interleaving into the parent's transcript as
+if the main agent had run them. The parent's `Agent` item carries a `SubagentLink` with the same id,
+`initial_prompt`, and `action`/`status` mapped from the `system/task_*` messages (`task_started` →
+`Started`, `task_updated.patch.status` → `Completed`), which is what populates the Sub-agents card.
+
+**Why prefix rather than infer from `ThreadKind::Subagent`.** The kind is available wherever a
+`ThreadFile` is loaded, but not on the admission path: `HarnessBootstrap.known_threads` and
+`claim_native_thread` deal in bare `(harness_thread_id, thread_id)` pairs. Code there cannot ask "is
+this resumable?" without loading the thread. A prefix answers it at the point of use, and synthetic
+prefixed identifiers are already established practice here — `app.js` special-cases
+`subagent_prompt:` item ids.
+
+**Three requirements this imposes:**
+
+1. **`--forward-subagent-text` is mandatory**, not optional. Without it only the final result surfaces
+   and every child thread is an empty shell.
+2. **Child threads are permanently read-only.** `open_thread` must never attempt `--resume=task:…`;
+   there is no session behind it. The existing read-only path for threads whose harness cannot attach
+   (PS1, `read_only_info`) is the right mechanism, so this needs no new UI state — but it is
+   *permanent* here rather than a recoverable condition, and the wording should not imply otherwise.
+3. **The mapper keys off the tool named `Agent`.** The stream names the tool `Agent` in its `tool_use`
+   block even though the CLI and its documentation call it `Task`.
+
+**What makes this honest rather than a fiction.** The id is real, harness-minted and globally unique;
+it is a different *category* of identifier, which the prefix states. And the child's transcript is
+Giskard's own persisted history, so the thread stays readable forever — its unresumability is a
+property it shares with any thread whose native session has expired (§3.5, `cleanupPeriodDays`), not a
+special brokenness. What the design must never do is let a `task:` id reach `--resume`.
+
+**Open.** A sub-agent that itself delegates: the inner call's `parent_tool_use_id` should nest one
+level deeper, which the thread graph already supports, but it is unverified. Equally unverified is what
+arrives when a delegation is interrupted mid-flight.
 
 ---
 
@@ -912,7 +988,9 @@ New crate + README. Wire types, child supervisor, mapper
 (`assistant`/`stream_event`/`user`/`result` → items and turns), `open_thread`/`start_turn`/
 `subscribe`/`interrupt`/`shutdown`, **`can_use_tool` ↔ `ApprovalRequested` with the §9 decision
 mapping**, user attachments as inline content blocks (§3.6), token usage, `ContextWindowUpdated`,
-static `list_models`, capability set from §4. Mapper
+static `list_models`, capability set from §4. Sub-agent child threads (§5.8) can follow in Phase 3
+— the parent's `Agent` item is a normal tool call without them, so the MVP degrades to a readable
+transcript rather than a broken one. Mapper
 unit tests off Phase-0 fixtures, including a denial that must not be reported as an executed-and-failed
 tool call.
 
