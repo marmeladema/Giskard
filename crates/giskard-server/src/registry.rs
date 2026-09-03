@@ -56,7 +56,7 @@ mod event_forwarder;
 mod project;
 mod thread;
 
-use driver::{AttachOutcome, DriverHandle, spawn_project_event_driver};
+use driver::{AttachOutcome, DriverHandle, Link, spawn_project_event_driver};
 use event_forwarder::{
     ForwarderExitReason, event_item_id, event_kind, event_turn_id, forwarder_exit_reason_label,
     log_metadata_only_event_rejection,
@@ -854,11 +854,10 @@ impl HarnessRegistry {
             project,
             self.shared.clone(),
             &h,
-            giskard_harness::DiscoveryStream::closed(),
+            h.discoveries(),
             driver_permit,
         );
         slot.publish_active(h.clone(), driver);
-        spawn_discovery_consumer(self.shared.clone(), project, h.clone());
         Ok(h)
     }
 
@@ -1344,25 +1343,25 @@ impl HarnessRegistry {
             return Ok(Some(parent_target));
         }
 
-        let (result, receiver) = tokio::sync::oneshot::channel();
-        enqueue_subagent_materialization(
-            parent_thread_id,
-            project_id,
-            SubagentMaterializationJob {
+        let driver = self
+            .shared
+            .event_driver(project_id)
+            .await
+            .ok_or_else(|| HarnessError::Protocol("project event driver is gone".into()))?;
+        let (reply, response) = oneshot::channel();
+        driver
+            .link(Link {
+                parent_thread_id,
                 spawned_by_turn_id,
                 item_id,
                 origin: "explicit_open",
                 info,
-                result: Some(result),
-            },
-            self.shared.clone(),
-        )
-        .await;
-        receiver.await.map_err(|_| {
-            HarnessError::Protocol(format!(
-                "sub-agent materialization queue closed for item {item_id}"
-            ))
-        })?
+                reply: Some(reply),
+            })
+            .await?;
+        response
+            .await
+            .map_err(|_| HarnessError::Protocol("project event driver dropped link reply".into()))?
     }
 
     pub async fn terminate_command(
@@ -1670,8 +1669,7 @@ impl HarnessRegistry {
         };
         let mut retained_driver = None;
         if let Some((harness, driver)) = harness_and_driver {
-            retained_driver = Some(driver);
-            if let Err(error) = harness.shutdown().await {
+            if let Err(error) = driver.quiesce().await {
                 let mut transitions = self.shared.harness_transitions.lock().await;
                 if let Some(authority) = authority.as_ref() {
                     transitions
@@ -1681,6 +1679,22 @@ impl HarnessRegistry {
                 }
                 return Err(error);
             }
+            if let Err(error) = harness.shutdown().await {
+                if let Err(resume_error) = driver.resume().await {
+                    return Err(HarnessError::Protocol(format!(
+                        "harness shutdown failed: {error}; project event driver could not resume: {resume_error}"
+                    )));
+                }
+                let mut transitions = self.shared.harness_transitions.lock().await;
+                if let Some(authority) = authority.as_ref() {
+                    transitions
+                        .project(authority)
+                        .await
+                        .rollback_delete_if_running(harness);
+                }
+                return Err(error);
+            }
+            retained_driver = Some(driver);
             let mut transitions = self.shared.harness_transitions.lock().await;
             if let Some(authority) = authority.as_ref() {
                 transitions.project(authority).await.finish_delete(&harness);
@@ -3204,20 +3218,12 @@ mod tests {
         .unwrap()
         .unwrap();
         let harness = factory.harness.lock().unwrap().clone().unwrap();
-        let rejected = ThreadId::new();
         harness.announce(ThreadDiscovered {
-            thread: rejected,
+            thread: child,
             harness_thread_id: "native-child".into(),
             parent_harness_thread_id: Some("native-parent".into()),
         });
         wait_for_discovery_records(&registry, 1).await;
-        assert!(
-            store
-                .load_thread(project, rejected)
-                .await
-                .unwrap()
-                .is_none()
-        );
         assert_eq!(
             super::load_thread_graph(&store, project)
                 .await
@@ -3262,15 +3268,15 @@ mod tests {
             .await
             .unwrap();
         let harness = factory.harness.lock().unwrap().clone().unwrap();
-        let minted = ThreadId::new();
         harness.announce(ThreadDiscovered {
-            thread: minted,
+            thread: primary,
             harness_thread_id: "native-primary".into(),
             parent_harness_thread_id: None,
         });
         wait_for_discovery_records(&registry, 1).await;
-        assert!(store.load_thread(project, minted).await.unwrap().is_none());
-        assert!(registry.shared.coordinator(minted).await.is_none());
+        let unchanged = store.load_thread(project, primary).await.unwrap().unwrap();
+        assert_eq!(unchanged.kind, giskard_core::ThreadKind::Primary);
+        assert!(registry.shared.coordinator(primary).await.is_none());
         let logs = String::from_utf8(output.lock().unwrap().clone()).unwrap();
         assert!(
             logs.contains("ignoring traffic discovery for an already persisted primary thread")
@@ -3973,7 +3979,7 @@ mod tests {
             transitions
                 .project(&authority)
                 .await
-                .publish_active(harness.clone(), super::DriverHandle::disconnected());
+                .publish_active(harness.clone(), super::DriverHandle::responsive_for_test());
         }
 
         let error = registry.delete_project(project_id).await.unwrap_err();
