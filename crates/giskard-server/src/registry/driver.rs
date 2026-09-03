@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::sync::{Arc, Weak};
 
 use futures::future::BoxFuture;
@@ -21,6 +22,8 @@ use super::thread::{
 use super::{LoadedThreadBinding, RegistryShared, RegistryTaskPermit};
 
 const DRIVER_COMMAND_CAPACITY: usize = 64;
+const DEFERRED_ADMISSION_LIMIT: usize = 64;
+const ADMISSION_ATTEMPTS: u8 = 3;
 
 #[derive(Clone)]
 pub(super) struct DriverHandle {
@@ -69,13 +72,23 @@ enum DriverCommand {
 }
 
 enum AdmissionSource {
-    Discovery,
+    Discovery {
+        retry: Admission,
+        attempts: u8,
+    },
     Link {
+        retry: Option<Admission>,
+        attempts: u8,
         reply: Option<oneshot::Sender<Result<Option<ThreadId>, HarnessError>>>,
         parent_thread_id: ThreadId,
         item_id: ItemId,
         origin: &'static str,
     },
+}
+
+struct DeferredAdmission {
+    admission: Admission,
+    attempts: u8,
 }
 
 struct InflightAdmission {
@@ -104,6 +117,7 @@ struct ProjectEventDriver {
     discoveries: DiscoveryStream,
     discoveries_closed: bool,
     admission: Option<InflightAdmission>,
+    deferred: VecDeque<DeferredAdmission>,
     quiesced: bool,
 }
 
@@ -228,6 +242,7 @@ pub(super) fn spawn_project_event_driver(
         discoveries,
         discoveries_closed: false,
         admission: None,
+        deferred: VecDeque::new(),
         quiesced: false,
     };
     tokio::spawn(async move {
@@ -249,7 +264,7 @@ impl ProjectEventDriver {
                     Some(DriverCommand::Detach { thread_id, reply }) => {
                         self.detach(thread_id, reply).await;
                     }
-                    Some(DriverCommand::Link(link)) => self.begin_link(*link).await,
+                    Some(DriverCommand::Link(link)) => self.begin_link(*link, 0).await,
                     Some(DriverCommand::Quiesce { reply }) => {
                         self.quiesced = true;
                         let _ = reply.send(());
@@ -257,12 +272,13 @@ impl ProjectEventDriver {
                     Some(DriverCommand::Resume { reply }) => {
                         self.quiesced = false;
                         let _ = reply.send(());
+                        self.start_deferred().await;
                     }
                     None => closed = true,
                 },
                 record = self.discoveries.recv(),
                     if !self.quiesced && !self.discoveries_closed && self.admission.is_none() => match record {
-                    Ok(record) => self.begin_discovery(record),
+                    Ok(record) => self.begin_discovery(record, 0),
                     Err(EventStreamError::Closed) => self.discoveries_closed = true,
                     Err(EventStreamError::Gap { dropped }) => error!(
                         project_id = %self.project_id,
@@ -285,6 +301,13 @@ impl ProjectEventDriver {
                     let _ = attach.reply.send(Err(HarnessError::Protocol(
                         "project event driver is gone".into(),
                     )));
+                }
+                if !self.deferred.is_empty() {
+                    warn!(
+                        project_id = %self.project_id,
+                        count = self.deferred.len(),
+                        "project event driver dropped deferred admissions on exit"
+                    );
                 }
                 return;
             }
@@ -388,12 +411,16 @@ impl ProjectEventDriver {
         let _ = attach.reply.send(Ok(AttachOutcome::Installed));
     }
 
-    async fn begin_link(&mut self, mut link: Link) {
+    async fn begin_link(&mut self, mut link: Link, attempts: u8) {
         if self.quiesced {
             if let Some(reply) = link.reply.take() {
                 let _ = reply.send(Err(HarnessError::Protocol(
                     "project is being deleted".into(),
                 )));
+            } else {
+                // Forwarder-originated links have no waiting caller. Preserve them across a
+                // failed deletion just like discoveries whose cursor remains unconsumed.
+                self.queue_deferred(Admission::Link(Box::new(link)), attempts);
             }
             return;
         }
@@ -414,7 +441,19 @@ impl ProjectEventDriver {
             }
             return;
         }
+        let retry = link.reply.is_none().then(|| {
+            Admission::Link(Box::new(Link {
+                parent_thread_id: link.parent_thread_id,
+                spawned_by_turn_id: link.spawned_by_turn_id,
+                item_id: link.item_id,
+                origin: link.origin,
+                info: link.info.clone(),
+                reply: None,
+            }))
+        });
         let source = AdmissionSource::Link {
+            retry,
+            attempts,
             reply: link.reply.take(),
             parent_thread_id: link.parent_thread_id,
             item_id: link.item_id,
@@ -449,7 +488,7 @@ impl ProjectEventDriver {
         });
     }
 
-    fn begin_discovery(&mut self, record: giskard_harness::ThreadDiscovered) {
+    fn begin_discovery(&mut self, record: giskard_harness::ThreadDiscovered, attempts: u8) {
         let Some(harness) = self.harness.upgrade() else {
             warn!(project_id = %self.project_id, thread_id = %record.thread,
                 "dropping native thread discovery because the project harness is gone");
@@ -457,6 +496,7 @@ impl ProjectEventDriver {
         };
         let shared = self.shared.clone();
         let project_id = self.project_id;
+        let retry = Admission::Discovered(record.clone());
         self.admission = Some(InflightAdmission {
             work: Box::pin(async move {
                 AdmissionOutcome {
@@ -469,7 +509,7 @@ impl ProjectEventDriver {
                     .await,
                 }
             }),
-            source: AdmissionSource::Discovery,
+            source: AdmissionSource::Discovery { retry, attempts },
         });
     }
 
@@ -502,26 +542,34 @@ impl ProjectEventDriver {
             Ok(None) => Ok(None),
             Err(error) => Err(error),
         };
+        let succeeded = result.is_ok();
         self.finish_admission_reply(result, inflight.source);
+        if succeeded {
+            self.start_deferred().await;
+        }
     }
 
     fn finish_admission_reply(
-        &self,
+        &mut self,
         result: Result<Option<ThreadId>, HarnessError>,
         source: AdmissionSource,
     ) {
         match source {
-            AdmissionSource::Discovery => {
+            AdmissionSource::Discovery { retry, attempts } => {
                 #[cfg(test)]
                 self.shared
                     .discovery_records_processed
                     .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 if let Err(error) = result {
                     warn!(project_id = %self.project_id, %error,
+                        attempt = attempts + 1,
                         "failed to admit discovered native thread");
+                    self.defer_admission(retry, attempts, error);
                 }
             }
             AdmissionSource::Link {
+                retry,
+                attempts,
                 reply,
                 parent_thread_id,
                 item_id,
@@ -529,12 +577,50 @@ impl ProjectEventDriver {
             } => {
                 if let Err(error) = &result {
                     warn!(project_id = %self.project_id, %parent_thread_id, %item_id, origin, %error,
+                        attempt = attempts + 1,
                         "failed to admit linked native thread");
                 }
                 if let Some(reply) = reply {
                     let _ = reply.send(result);
+                } else if let (Some(retry), Err(error)) = (retry, result) {
+                    self.defer_admission(retry, attempts, error);
                 }
             }
+        }
+    }
+
+    fn defer_admission(&mut self, admission: Admission, attempts: u8, error: HarnessError) {
+        let attempts = attempts + 1;
+        if attempts >= ADMISSION_ATTEMPTS {
+            error!(project_id = %self.project_id, attempts, %error,
+                "dropping native identity admission after repeated failures");
+            return;
+        }
+        self.queue_deferred(admission, attempts);
+    }
+
+    fn queue_deferred(&mut self, admission: Admission, attempts: u8) {
+        if self.deferred.len() == DEFERRED_ADMISSION_LIMIT {
+            self.deferred.pop_front();
+            error!(project_id = %self.project_id, limit = DEFERRED_ADMISSION_LIMIT,
+                "deferred admission queue is full; dropping oldest admission");
+        }
+        self.deferred.push_back(DeferredAdmission {
+            admission,
+            attempts,
+        });
+    }
+
+    async fn start_deferred(&mut self) {
+        if self.quiesced || self.admission.is_some() {
+            return;
+        }
+        let Some(deferred) = self.deferred.pop_front() else {
+            return;
+        };
+        match deferred.admission {
+            Admission::Discovered(record) => self.begin_discovery(record, deferred.attempts),
+            Admission::Link(link) => self.begin_link(*link, deferred.attempts).await,
         }
     }
 
@@ -909,6 +995,24 @@ mod tests {
         store.load_thread(project_id, thread_id).await.unwrap()
     }
 
+    async fn obstruct_thread_creation(
+        store: &PersistStore,
+        project_id: ProjectId,
+        thread_id: ThreadId,
+    ) -> std::path::PathBuf {
+        let threads = store
+            .data_dir()
+            .join("projects")
+            .join(project_id.to_string())
+            .join("threads");
+        tokio::fs::create_dir_all(&threads).await.unwrap();
+        let obstruction = threads.join(thread_id.to_string());
+        tokio::fs::write(&obstruction, b"not a directory")
+            .await
+            .unwrap();
+        obstruction
+    }
+
     async fn wait_until(mut condition: impl FnMut() -> bool) {
         tokio::time::timeout(std::time::Duration::from_secs(2), async {
             while !condition() {
@@ -1045,6 +1149,7 @@ mod tests {
             discoveries: DiscoveryStream::closed(),
             discoveries_closed: false,
             admission: None,
+            deferred: VecDeque::new(),
             quiesced: false,
         };
         let _permit = permit;
@@ -1591,8 +1696,16 @@ mod tests {
                         result: Ok(Some(admitted)),
                     }
                 }),
-                source: AdmissionSource::Discovery,
+                source: AdmissionSource::Discovery {
+                    retry: Admission::Discovered(ThreadDiscovered {
+                        thread: discovered,
+                        harness_thread_id: "discovered".into(),
+                        parent_harness_thread_id: None,
+                    }),
+                    attempts: 0,
+                },
             }),
+            deferred: VecDeque::new(),
             quiesced: false,
         };
         let task = tokio::spawn(async move {
@@ -1675,6 +1788,152 @@ mod tests {
         let child = response.await.unwrap().unwrap().unwrap();
         let file = load_thread(&store, project_id, child).await.unwrap();
         assert_eq!(file.kind, giskard_core::thread::ThreadKind::Subagent);
+    }
+
+    #[tokio::test]
+    async fn a_quiesced_driver_defers_a_replyless_link_until_resume() {
+        let (_shared, harness, driver, project_id, store) = setup();
+        let parent = ThreadId::new();
+        persist_thread(&store, project_id, parent).await;
+        attach_primary(&driver, project_id, parent, "native").await;
+        driver.quiesce().await.unwrap();
+
+        let (mut request, _response) = link(parent, "deferred-child-native");
+        request.reply = None;
+        driver.link(request).await.unwrap();
+        driver.quiesce().await.unwrap();
+        assert_eq!(harness.claim_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(store.list_threads(project_id).await.unwrap().len(), 1);
+
+        driver.resume().await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let threads = store.list_threads(project_id).await.unwrap();
+                if threads.len() == 2 {
+                    let mut found = false;
+                    for thread_id in threads {
+                        if let Some(thread) =
+                            store.load_thread(project_id, thread_id).await.unwrap()
+                        {
+                            found |= thread.kind == giskard_core::thread::ThreadKind::Subagent
+                                && thread.harness_thread_id == "deferred-child-native";
+                        }
+                    }
+                    if found {
+                        break;
+                    }
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(harness.claim_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn a_failed_discovery_is_retried_after_the_next_successful_admission() {
+        let (shared, harness, driver, project_id, store) = setup();
+        let parent = ThreadId::new();
+        persist_thread(&store, project_id, parent).await;
+        attach_primary(&driver, project_id, parent, "native").await;
+
+        let discovered = ThreadId::new();
+        let obstruction = obstruct_thread_creation(&store, project_id, discovered).await;
+        harness.announce(ThreadDiscovered {
+            thread: discovered,
+            harness_thread_id: "deferred-discovery".into(),
+            parent_harness_thread_id: None,
+        });
+        wait_until(|| shared.discovery_records_processed.load(Ordering::SeqCst) == 1).await;
+        assert!(obstruction.is_file());
+
+        tokio::fs::remove_file(obstruction).await.unwrap();
+        let (request, response) = link(parent, "successful-child");
+        driver.link(request).await.unwrap();
+        assert!(response.await.unwrap().unwrap().is_some());
+        wait_until(|| shared.discovery_records_processed.load(Ordering::SeqCst) == 2).await;
+        assert!(load_thread(&store, project_id, discovered).await.is_some());
+    }
+
+    #[tokio::test]
+    async fn a_failed_discovery_is_dropped_after_three_attempts() {
+        let (shared, harness, driver, project_id, store) = setup();
+        let parent = ThreadId::new();
+        persist_thread(&store, project_id, parent).await;
+        attach_primary(&driver, project_id, parent, "native").await;
+
+        let discovered = ThreadId::new();
+        let obstruction = obstruct_thread_creation(&store, project_id, discovered).await;
+        harness.announce(ThreadDiscovered {
+            thread: discovered,
+            harness_thread_id: "always-failing-discovery".into(),
+            parent_harness_thread_id: None,
+        });
+        wait_until(|| shared.discovery_records_processed.load(Ordering::SeqCst) == 1).await;
+
+        for index in 0..3 {
+            let (request, response) = link(parent, &format!("successful-child-{index}"));
+            driver.link(request).await.unwrap();
+            assert!(response.await.unwrap().unwrap().is_some());
+            if index < 2 {
+                let expected_attempts = index + 2;
+                wait_until(|| {
+                    shared.discovery_records_processed.load(Ordering::SeqCst) == expected_attempts
+                })
+                .await;
+            }
+        }
+        driver.quiesce().await.unwrap();
+        assert_eq!(shared.discovery_records_processed.load(Ordering::SeqCst), 3);
+        assert!(obstruction.is_file());
+    }
+
+    #[tokio::test]
+    async fn a_failed_link_with_a_reply_is_not_deferred() {
+        let (_shared, _harness, driver, project_id, store) = setup();
+        let parent = ThreadId::new();
+        persist_thread(&store, project_id, parent).await;
+        attach_primary(&driver, project_id, parent, "native").await;
+        let project = store.load_project(project_id).await.unwrap().unwrap();
+        let project_path = store
+            .data_dir()
+            .join("projects")
+            .join(project_id.to_string())
+            .join("project.json");
+        tokio::fs::write(&project_path, b"invalid project json")
+            .await
+            .unwrap();
+
+        let (request, response) = link(parent, "failed-replied-child");
+        driver.link(request).await.unwrap();
+        assert!(response.await.unwrap().is_err());
+        store.save_project(&project).await.unwrap();
+
+        let (request, response) = link(parent, "successful-child");
+        driver.link(request).await.unwrap();
+        assert!(response.await.unwrap().unwrap().is_some());
+        assert_eq!(store.list_threads(project_id).await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_resume_retries_deferred_admissions() {
+        let (shared, harness, driver, project_id, store) = setup();
+        persist_thread(&store, project_id, ThreadId::new()).await;
+        let discovered = ThreadId::new();
+        let obstruction = obstruct_thread_creation(&store, project_id, discovered).await;
+        harness.announce(ThreadDiscovered {
+            thread: discovered,
+            harness_thread_id: "resume-discovery".into(),
+            parent_harness_thread_id: None,
+        });
+        wait_until(|| shared.discovery_records_processed.load(Ordering::SeqCst) == 1).await;
+        driver.quiesce().await.unwrap();
+        tokio::fs::remove_file(obstruction).await.unwrap();
+        driver.resume().await.unwrap();
+
+        wait_until(|| shared.discovery_records_processed.load(Ordering::SeqCst) == 2).await;
+        assert!(load_thread(&store, project_id, discovered).await.is_some());
     }
 
     #[tokio::test]
