@@ -987,9 +987,7 @@ impl ThreadRuntimeSupport {
     ) -> AppliedRuntimeEvent {
         let sequence = (!matches!(
             event,
-            AgentEvent::ThreadOpened { .. }
-                | AgentEvent::DiffUpdated { .. }
-                | AgentEvent::ContextWindowUpdated { .. }
+            AgentEvent::ThreadOpened { .. } | AgentEvent::DiffUpdated { .. }
         ))
         .then(|| {
             entry.event_sequence = entry.event_sequence.saturating_add(1);

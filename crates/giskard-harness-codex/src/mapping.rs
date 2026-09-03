@@ -101,15 +101,14 @@ pub struct CodexMapper {
     // Synchronization: The single Codex background task owns and mutates the mapper.
     // Invalidation/removal: Turn completion consumes the value; shutdown drops remaining entries.
     turn_usage: HashMap<NativeTurnKey, TokenUsage>,
-    /// Last effective context window emitted for each turn. Codex repeats the same window on every
-    /// token-usage notification, so this suppresses redundant persistence and browser updates.
+    /// Last usage and effective context-window pair emitted for each turn.
     // ENTITY-AUTHORITY-EXCEPTION:
-    // Role: Deduplicate effective context-window notifications per native turn.
-    // Source of truth: The latest valid Codex usage notification supplies the value.
+    // Role: Deduplicate usage notifications per native turn.
+    // Source of truth: The latest Codex usage notification supplies the pair.
     // Structural reason: Notification correlation belongs to the provider adapter.
     // Synchronization: The single Codex background task owns and mutates the mapper.
     // Invalidation/removal: Turn completion clears the entry; shutdown drops remaining entries.
-    turn_context_windows: HashMap<NativeTurnKey, u32>,
+    emitted_usage: HashMap<NativeTurnKey, (TokenUsage, Option<u32>)>,
     /// Model selected for each acknowledged native turn. Context-window notifications do not carry
     /// a model id, so the value must be bound when `turn/start` returns.
     // ENTITY-AUTHORITY-EXCEPTION:
@@ -119,14 +118,6 @@ pub struct CodexMapper {
     // Synchronization: The single Codex background task owns and mutates the mapper.
     // Invalidation/removal: Turn completion clears the entry; shutdown drops remaining entries.
     turn_models: HashMap<NativeTurnKey, ModelRef>,
-    /// Turns whose context window could not be attributed to a model, deduplicating warnings.
-    // ENTITY-AUTHORITY-EXCEPTION:
-    // Role: Deduplicate missing-model warnings by native thread and turn identity.
-    // Source of truth: Warning emission inserts the corresponding native turn key.
-    // Structural reason: This is provider-protocol diagnostic state, not thread ownership.
-    // Synchronization: The single Codex background task owns and mutates the mapper.
-    // Invalidation/removal: Turn cleanup removes entries; shutdown drops remaining entries.
-    missing_context_model_turns: HashSet<NativeTurnKey>,
     /// Turns for which an invalid context window was already logged. A later valid value is still
     /// accepted, but repeated malformed usage notifications do not flood service logs.
     // ENTITY-AUTHORITY-EXCEPTION:
@@ -179,9 +170,8 @@ impl CodexMapper {
             turn_ids: HashMap::new(),
             item_ids: HashMap::new(),
             turn_usage: HashMap::new(),
-            turn_context_windows: HashMap::new(),
+            emitted_usage: HashMap::new(),
             turn_models: HashMap::new(),
-            missing_context_model_turns: HashSet::new(),
             invalid_context_window_turns: HashSet::new(),
             active_turns: HashMap::new(),
             running_command_turns: HashMap::new(),
@@ -208,11 +198,8 @@ impl CodexMapper {
     pub fn clear_active_turn(&mut self, thread: ThreadId) {
         self.active_turns.remove(&thread);
         self.turn_usage.retain(|key, _| key.thread_id != thread);
-        self.turn_context_windows
-            .retain(|key, _| key.thread_id != thread);
+        self.emitted_usage.retain(|key, _| key.thread_id != thread);
         self.turn_models.retain(|key, _| key.thread_id != thread);
-        self.missing_context_model_turns
-            .retain(|key| key.thread_id != thread);
         self.invalid_context_window_turns
             .retain(|key| key.thread_id != thread);
         self.file_change_previews
@@ -247,8 +234,7 @@ impl CodexMapper {
         let native_turn_id = native_turn_id.trim();
         let turn = self.register_active_turn(thread, native_turn_id)?;
         let key = NativeTurnKey::new(thread, NativeTurnId::new(native_turn_id.to_string()));
-        self.turn_models.insert(key.clone(), model);
-        self.missing_context_model_turns.remove(&key);
+        self.turn_models.insert(key, model);
         Some(turn)
     }
 
@@ -448,9 +434,8 @@ impl CodexMapper {
                 // (spec §10.1). Defaults to zero if Codex sent no usage update for the turn.
                 let key = NativeTurnKey::new(thread, NativeTurnId::new(turn.id.clone()));
                 let usage = self.turn_usage.remove(&key).unwrap_or_default();
-                self.turn_context_windows.remove(&key);
+                self.emitted_usage.remove(&key);
                 self.turn_models.remove(&key);
-                self.missing_context_model_turns.remove(&key);
                 self.invalid_context_window_turns.remove(&key);
                 let completed_turn = self.resolve_turn(thread, &turn.id);
                 self.file_change_previews
@@ -481,54 +466,50 @@ impl CodexMapper {
                     return Ok(None);
                 }
                 let key = NativeTurnKey::new(thread, NativeTurnId::new(n.turn_id.clone()));
-                self.turn_usage
-                    .insert(key.clone(), breakdown_to_usage(&n.token_usage.last));
+                let usage = breakdown_to_usage(&n.token_usage.last);
+                self.turn_usage.insert(key.clone(), usage);
 
-                let Some(native_context_window) = n.token_usage.model_context_window else {
-                    return Ok(None);
+                let context_window = match n.token_usage.model_context_window {
+                    None => None,
+                    Some(native_context_window) => match u32::try_from(native_context_window) {
+                        Ok(0) => {
+                            if self.invalid_context_window_turns.insert(key.clone()) {
+                                warn!(
+                                    native_thread_id = %n.thread_id,
+                                    native_turn_id = %n.turn_id,
+                                    "ignoring zero Codex model context window"
+                                );
+                            }
+                            None
+                        }
+                        Ok(window) => {
+                            self.invalid_context_window_turns.remove(&key);
+                            Some(window)
+                        }
+                        Err(_) => {
+                            if self.invalid_context_window_turns.insert(key.clone()) {
+                                warn!(
+                                    native_thread_id = %n.thread_id,
+                                    native_turn_id = %n.turn_id,
+                                    native_context_window,
+                                    "ignoring invalid Codex model context window"
+                                );
+                            }
+                            None
+                        }
+                    },
                 };
-                let Ok(context_window) = u32::try_from(native_context_window) else {
-                    if self.invalid_context_window_turns.insert(key) {
-                        warn!(
-                            native_thread_id = %n.thread_id,
-                            native_turn_id = %n.turn_id,
-                            native_context_window,
-                            "ignoring invalid Codex model context window"
-                        );
-                    }
-                    return Ok(None);
-                };
-                if context_window == 0 {
-                    if self.invalid_context_window_turns.insert(key) {
-                        warn!(
-                            native_thread_id = %n.thread_id,
-                            native_turn_id = %n.turn_id,
-                            "ignoring zero Codex model context window"
-                        );
-                    }
+                if self.emitted_usage.get(&key) == Some(&(usage, context_window)) {
                     return Ok(None);
                 }
-                self.invalid_context_window_turns.remove(&key);
-                if self.turn_context_windows.get(&key) == Some(&context_window) {
-                    return Ok(None);
-                }
-                let Some(model) = self.turn_models.get(&key).cloned() else {
-                    if self.missing_context_model_turns.insert(key) {
-                        warn!(
-                            native_thread_id = %n.thread_id,
-                            native_turn_id = %n.turn_id,
-                            context_window,
-                            "ignoring Codex model context window without a registered turn model"
-                        );
-                    }
-                    return Ok(None);
-                };
-                self.turn_context_windows.insert(key, context_window);
-                Some(AgentEvent::ContextWindowUpdated {
+                self.emitted_usage
+                    .insert(key.clone(), (usage, context_window));
+                Some(AgentEvent::TurnUsageUpdated {
                     thread,
                     turn: self.resolve_turn(thread, &n.turn_id),
-                    model,
+                    usage,
                     context_window,
+                    model: self.turn_models.get(&key).cloned(),
                 })
             }
 
@@ -3783,8 +3764,121 @@ mod tests {
         }
     }
 
-    /// Usage from a `thread/tokenUsage/updated` notification is cached per turn and surfaced on the
-    /// matching `TurnCompleted`; its effective context window is emitted once when first observed.
+    fn usage_update(
+        thread_id: &str,
+        turn_id: &str,
+        input: u64,
+        context_window: Option<i64>,
+    ) -> Notification {
+        let mut token_usage = serde_json::json!({
+            "last": {
+                "cachedInputTokens": 0,
+                "inputTokens": input,
+                "outputTokens": 1,
+                "reasoningOutputTokens": 0,
+                "totalTokens": input + 1
+            },
+            "total": {
+                "cachedInputTokens": 0,
+                "inputTokens": input,
+                "outputTokens": 1,
+                "reasoningOutputTokens": 0,
+                "totalTokens": input + 1
+            }
+        });
+        if let Some(window) = context_window {
+            token_usage["modelContextWindow"] = serde_json::json!(window);
+        }
+        Notification::ThreadTokenUsageUpdated(
+            serde_json::from_value(serde_json::json!({
+                "threadId": thread_id,
+                "turnId": turn_id,
+                "tokenUsage": token_usage
+            }))
+            .unwrap(),
+        )
+    }
+
+    #[test]
+    fn usage_updates_emit_for_a_native_turn_without_a_registered_model() {
+        let mut mapper = CodexMapper::new(PathBuf::from("/tmp"));
+        let thread = ThreadId::new();
+        assert!(
+            mapper
+                .map_notification(&turn_started("t1"), thread)
+                .is_some()
+        );
+
+        assert!(matches!(
+            mapper.map_notification(&usage_update("th1", "t1", 12, Some(258_400)), thread),
+            Some(AgentEvent::TurnUsageUpdated {
+                usage: TokenUsage { input: 12, .. },
+                context_window: Some(258_400),
+                model: None,
+                ..
+            })
+        ));
+        assert!(matches!(
+            mapper.map_notification(&turn_completed("t1"), thread),
+            Some(AgentEvent::TurnCompleted {
+                usage: TokenUsage { input: 12, .. },
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn changed_usage_re_emits_with_the_unchanged_window() {
+        let mut mapper = CodexMapper::new(PathBuf::from("/tmp"));
+        let thread = ThreadId::new();
+        assert!(
+            mapper
+                .map_notification(&turn_started("t1"), thread)
+                .is_some()
+        );
+
+        assert!(
+            mapper
+                .map_notification(&usage_update("th1", "t1", 12, Some(258_400)), thread)
+                .is_some()
+        );
+        assert!(matches!(
+            mapper.map_notification(&usage_update("th1", "t1", 24, Some(258_400)), thread),
+            Some(AgentEvent::TurnUsageUpdated {
+                usage: TokenUsage { input: 24, .. },
+                context_window: Some(258_400),
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn usage_after_turn_completed_is_ignored() {
+        let mut mapper = CodexMapper::new(PathBuf::from("/tmp"));
+        let thread = ThreadId::new();
+        assert!(
+            mapper
+                .map_notification(&turn_started("t1"), thread)
+                .is_some()
+        );
+        assert!(
+            mapper
+                .map_notification(&turn_completed("t1"), thread)
+                .is_some()
+        );
+        assert!(
+            mapper
+                .map_notification(&usage_update("th1", "t1", 12, Some(258_400)), thread)
+                .is_none()
+        );
+        assert!(matches!(
+            mapper.map_notification(&turn_started("t2"), thread),
+            Some(AgentEvent::TurnStarted { .. })
+        ));
+    }
+
+    /// Usage from a `thread/tokenUsage/updated` notification is emitted live and cached for the
+    /// matching `TurnCompleted`; changed usage re-emits even when the window is unchanged.
     #[test]
     fn token_usage_attached_on_turn_completed() {
         let mut mapper = CodexMapper::new(PathBuf::from("/tmp"));
@@ -3825,19 +3919,20 @@ mod tests {
             .unwrap(),
         );
         match mapper.map_notification(&usage_notif, fallback).unwrap() {
-            AgentEvent::ContextWindowUpdated {
+            AgentEvent::TurnUsageUpdated {
                 thread,
                 turn,
                 model: reported_model,
                 context_window,
-                ..
+                usage,
             } => {
                 assert_eq!(thread, fallback);
                 assert_eq!(turn, mapper.resolve_turn(fallback, "t1"));
-                assert_eq!(reported_model, model);
-                assert_eq!(context_window, 258_400);
+                assert_eq!(reported_model, Some(model));
+                assert_eq!(context_window, Some(258_400));
+                assert_eq!(usage.input, 100);
             }
-            other => panic!("expected ContextWindowUpdated, got {other:?}"),
+            other => panic!("expected TurnUsageUpdated, got {other:?}"),
         }
         // Codex repeats the same context window with every usage update; emit it only once per turn.
         assert!(mapper.map_notification(&usage_notif, fallback).is_none());
@@ -3888,7 +3983,23 @@ mod tests {
             }))
             .unwrap(),
         );
-        assert!(mapper.map_notification(&usage_notif, fallback).is_none());
+        assert!(matches!(
+            mapper.map_notification(&usage_notif, fallback),
+            Some(AgentEvent::TurnUsageUpdated {
+                usage: TokenUsage { total: 15, .. },
+                context_window: None,
+                model: None,
+                ..
+            })
+        ));
+        assert!(matches!(
+            mapper.map_notification(&usage_update("th1", "t1", 14, Some(258_400)), fallback),
+            Some(AgentEvent::TurnUsageUpdated {
+                context_window: Some(258_400),
+                model: None,
+                ..
+            })
+        ));
 
         let completed = Notification::TurnCompleted(
             serde_json::from_value(serde_json::json!({
@@ -3993,16 +4104,16 @@ mod tests {
             )
         };
 
-        assert!(
-            mapper
-                .map_notification(&usage_notification("th1", 10), first_thread)
-                .is_none()
-        );
-        assert!(
-            mapper
-                .map_notification(&usage_notification("th2", 20), second_thread)
-                .is_none()
-        );
+        assert!(matches!(
+            mapper.map_notification(&usage_notification("th1", 10), first_thread),
+            Some(AgentEvent::TurnUsageUpdated { thread, usage, .. })
+                if thread == first_thread && usage.input == 10
+        ));
+        assert!(matches!(
+            mapper.map_notification(&usage_notification("th2", 20), second_thread),
+            Some(AgentEvent::TurnUsageUpdated { thread, usage, .. })
+                if thread == second_thread && usage.input == 20
+        ));
         let usage = |event| match event {
             AgentEvent::TurnCompleted { usage, .. } => usage,
             other => panic!("expected turn completion, got {other:?}"),

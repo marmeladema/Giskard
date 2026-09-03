@@ -3324,6 +3324,8 @@ fn browser_applies_revisioned_thread_metadata_to_the_gauge() {
     assert!(reconcile.contains("authority[kind] = { revision"));
     assert!(source.contains("updateGauge(state.contextUsed, effective.context_window || 0);"));
     assert!(!source.contains("case \"context_window_updated\":"));
+    assert!(source.contains("case \"turn_usage_updated\":"));
+    assert!(source.contains("ev.turn === state.currentRenderTurnId"));
     assert!(render.contains(
         "const appliesBootstrap = Object.prototype.hasOwnProperty.call(s, \"active_turn\");"
     ));

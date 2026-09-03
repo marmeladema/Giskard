@@ -24,16 +24,21 @@ pub enum AgentEvent {
         thread: ThreadId,
         turn: TurnId,
     },
-    /// The effective context window reported by the harness for this turn's model.
+    /// Live token usage for an in-flight turn, emitted whenever the harness reports a change.
     ///
-    /// This is runtime metadata rather than token usage: harnesses may reserve part of a model's
-    /// raw context capacity for prompts, tools, or output. The server persists the effective value
-    /// against the included turn model and updates the gauge only while that model is selected.
-    ContextWindowUpdated {
+    /// `usage` is the turn's latest reported usage (the same value `TurnCompleted` will carry at
+    /// the end). `context_window` is the effective window the harness applies to this turn when it
+    /// reports one; it is turn-scoped runtime data, not a property of a model. `model` is present
+    /// only when the harness acknowledged a model for this exact turn at start; the server persists
+    /// the window per `(provider, model)` only then, and never derives a model from thread state.
+    TurnUsageUpdated {
         thread: ThreadId,
         turn: TurnId,
-        model: ModelRef,
-        context_window: u32,
+        usage: TokenUsage,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        context_window: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model: Option<ModelRef>,
     },
     ItemStarted {
         thread: ThreadId,
@@ -105,7 +110,7 @@ impl AgentEvent {
         match self {
             Self::ThreadOpened { thread, .. }
             | Self::TurnStarted { thread, .. }
-            | Self::ContextWindowUpdated { thread, .. }
+            | Self::TurnUsageUpdated { thread, .. }
             | Self::ItemStarted { thread, .. }
             | Self::ItemDelta { thread, .. }
             | Self::ItemCompleted { thread, .. }
@@ -151,26 +156,29 @@ mod tests {
     }
 
     #[test]
-    fn context_window_update_serde_roundtrip() {
-        let event = AgentEvent::ContextWindowUpdated {
+    fn turn_usage_update_serde_roundtrip() {
+        let event = AgentEvent::TurnUsageUpdated {
             thread: ThreadId::new(),
             turn: TurnId::new(),
-            model: ModelRef {
-                provider: "openai".into(),
-                model: "gpt-5.6-sol".into(),
-                reasoning_effort: None,
+            usage: TokenUsage {
+                input: 12,
+                output: 3,
+                total: 15,
             },
-            context_window: 258_400,
+            context_window: None,
+            model: None,
         };
         let json = serde_json::to_value(&event).unwrap();
-        assert_eq!(json["kind"], "context_window_updated");
-        assert_eq!(json["model"]["model"], "gpt-5.6-sol");
-        assert_eq!(json["context_window"], 258_400);
+        assert_eq!(json["kind"], "turn_usage_updated");
+        assert_eq!(json["usage"]["input"], 12);
+        assert!(json.get("context_window").is_none());
+        assert!(json.get("model").is_none());
         let decoded: AgentEvent = serde_json::from_value(json).unwrap();
         assert!(matches!(
             decoded,
-            AgentEvent::ContextWindowUpdated {
-                context_window: 258_400,
+            AgentEvent::TurnUsageUpdated {
+                context_window: None,
+                model: None,
                 ..
             }
         ));
