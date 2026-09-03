@@ -345,13 +345,6 @@ the whole `task_started` / `task_progress` / `task_updated` / `task_notification
 
 ## 5. Multi-harness architecture
 
-> **Structural references in §5.2, §5.4, §5.6 and §5.7 are stale.** They were written against a
-> registry that has since been replaced: `ProjectAuthority` now owns a single harness slot paired
-> with a per-project event driver, the `HashMap<ProjectId, Arc<dyn AgentHarness>>` and
-> `ThreadTurnGate` they cite no longer exist, and every line number in them points somewhere else.
-> The *conclusions* still hold — thread-addressed routing, harness-scoped native ids, soft
-> `Unsupported` — but how they are implemented is pending a decision on where a second harness
-> sits in the authority model. §5.1, §5.3, §5.5 and §5.8 are unaffected.
 
 ### 5.1 Harness identity comes from the provider table
 
@@ -401,87 +394,123 @@ before this ships; the cheapest is that the project's default harness wins and t
 as a picker warning, which is also the one concrete job left for `ProjectConfig.harness` (open
 question 1).
 
-### 5.2 Registry re-keying
+### 5.2 A second harness inside the project authority
 
-`crates/giskard-server/src/registry.rs:391` holds `HashMap<ProjectId, Arc<dyn AgentHarness>>` and
-`get_or_create_harness(project, config)` (`:490`). Both become harness-aware:
+**The constraint that shapes this.** `AGENTS.md` now names `RegistryShared::projects` and
+`::threads` as the only strong process-local owner maps for project and thread identity, and forbids
+"a peer owning map keyed directly or indirectly by project or thread identity". An earlier draft of
+this plan proposed exactly that — `HashMap<(ProjectId, HarnessKind), Arc<dyn AgentHarness>>`. It is
+not available, and the rule is right: a second keyed map is a second place a project's liveness can
+disagree with itself.
+
+So the second harness lives **on the authority that already owns the first**. Today:
 
 ```rust
-harnesses: HashMap<(ProjectId, HarnessKind), Arc<dyn AgentHarness>>
-async fn get_or_create_harness(&self, project, kind, config) -> …
+struct ProjectHarnessSlot { current: Mutex<Option<ProjectHarnessState>> }
+enum ProjectHarnessState {
+    Active(Arc<dyn AgentHarness>, DriverHandle),
+    Deleting(Arc<dyn AgentHarness>, DriverHandle),
+}
 ```
 
-`ThreadBinding` (`:178`) gains the `HarnessKind` that opened it, so every existing lookup path
-resolves the right instance rather than "the project's harness":
+The change is to the slot's *cardinality*, not its ownership:
 
-- `start_turn`, `interrupt`, `compact_thread`, `terminate_command` — from the binding;
-- `respond_approval` (`:709`) and `respond_server_request` (`:745`) — via the `ApprovalId → ThreadId`
-  and `ServerRequestId → ThreadId` maps, then the binding. These already route by thread, so they
-  need the binding's kind, not a new map;
-- project delete / shutdown — must iterate **every** kind for that project, not one entry;
-- `find_thread_by_harness_id` (`routes.rs:560`) — must compare `(harness, harness_thread_id)`, since
-  a Claude UUID and a Codex rollout id live in the same field and must not alias.
+```rust
+struct ProjectHarnessSlot { current: Mutex<HashMap<HarnessKind, ProjectHarnessState>> }
+```
 
-`HarnessFactory::create` takes `(kind, &ProjectConfig, cwd)` and the binary's factory dispatches
-`"codex" | "claude"` (`bin/giskard-server.rs:19` currently rejects anything but `"codex"`).
+Keying by harness kind is not keying by project or thread identity, so this stays inside the rule:
+the map is entity-local state on `ProjectAuthority`, reached only through the authority, exactly as the
+single slot is now.
+
+**What this preserves for free**, which is the argument for doing it here rather than anywhere else:
+
+- **The transition fence.** `HarnessTransitions` remains the root serialization point; a project slot
+  is still only reachable through `HarnessTransitionGuard::project`, and `begin_shutdown` still fences
+  creation before draining. Multi-harness changes what a drain *iterates*, not what it means.
+- **Driver pairing.** `ProjectHarnessState` already carries its `DriverHandle` alongside the harness,
+  and a driver consumes that harness's `DiscoveryStream`. One entry per kind therefore yields one
+  driver per harness with no new wiring — which is required anyway, since two harnesses cannot share
+  one discovery stream.
+- **Deletion and shutdown semantics.** `begin_delete` and `take_for_shutdown` become iterations that
+  return every installed pair rather than one; `Deleting` remains per entry, so one harness can be
+  draining while another still serves turns.
+
+**Resolution moves from the project to the thread.** `RegistryShared::active_harness(project_id)`
+(`registry.rs:294`) is the current answer to "which harness", used by `start_turn`, `interrupt`,
+compaction, command termination and the lifecycle operations (`:935`, `:997`, `:1095`, `:1217`,
+`:1805`). Each becomes "the harness for *this thread*", resolved from the thread's durable harness kind
+(§5.3) and cached on its `ThreadAuthority` alongside the runtime it already holds. `ThreadAuthority`
+carries `thread_id`, `project_id`, an owner lock, a coordinator and a runtime slot — the kind belongs
+with them rather than in a lookup beside them.
+
+Approval and server-request routing need no new map: both already resolve through the thread, so they
+inherit the answer.
+
+**Instantiation stays lazy per kind.** A kind's entry is created when the first thread of that kind
+opens, which is what keeps the §1 promise that a `claude` child starts only when a thread with an
+Anthropic model is loaded — and it means a Codex-only project never constructs a Claude harness at all.
+
+**`HarnessFactory::create`** takes the kind alongside the config and bootstrap, and the binary's
+factory dispatches on it instead of rejecting everything but `"codex"`
+(`bin/giskard-server.rs:19`). `HarnessBootstrap.known_threads` must be filtered to the threads
+belonging to that kind, or a Claude harness would be handed Codex's rollout ids to install.
 
 ### 5.3 Persistence
 
-`ThreadFile` (`crates/giskard-persist/src/store.rs:61`) gains:
+`ThreadFile` gains the durable harness kind and, so a thread can cross harnesses and come back, the
+native id it held under each:
 
 ```rust
 #[serde(default = "default_harness")]           // "codex" for every existing file
-pub harness: String,
-/// Native thread id per harness, so switching a thread's model across harnesses and back
-/// resumes the original native session instead of orphaning it.
+pub harness: HarnessKind,
+/// Native id per harness, so switching a thread's model across harnesses and back resumes the
+/// original native session instead of orphaning it.
 #[serde(default, skip_serializing_if = "HashMap::is_empty")]
-pub harness_thread_ids: HashMap<String, String>,
+pub harness_thread_ids: HashMap<HarnessKind, String>,
 ```
 
-`harness_thread_id` stays as the **active** harness's id (no migration, no reader changes), with
-`harness_thread_ids` as the archive. `store.rs:578` stops hardcoding `harness: "codex"` for new
-projects and derives it from the project's `default_model` instead, since creation asks for a model and
-never for a harness (§5.1).
+`harness_thread_id` keeps its meaning — the **active** harness's id — so every existing reader is
+unaffected and there is no migration beyond serde defaults. Both fields are ordinary durable metadata:
+a mutation advances `ThreadFile.revision` under the same per-thread lock that commits it, like any
+other.
 
-### 5.4 Project-scoped harness queries become ambiguous
+Project creation derives the kind from the project's `default_model` rather than hardcoding
+`"codex"`, since creation asks for a model and never for a harness (§5.1).
 
-§5.2 covers the thread-addressed operations. The other half of the registry is **project-scoped** and
-silently assumes a project has exactly one harness:
+### 5.4 Project-scoped queries become per-harness
 
-| Call site | Today |
+§5.2 covers the thread-addressed operations. The rest of the registry's harness surface is
+project-scoped and assumes one answer per project:
+
+| Call | Today |
 | --- | --- |
-| `registry.capabilities(&project_config)` (`routes.rs:3374`, `:3425`, `:3474`, `:3518`) | capabilities of *the* project harness |
-| `registry.list_models(&project_config)` (`routes.rs:3393`) | catalog overlay for `GET /api/projects/{id}/models` |
-| `registry.list_providers(&project_config)` (`routes.rs:3447`, `:5068`) | the provider table behind discovery and id validation |
-| `registry.list_mcp_servers` / `reload_mcp_servers` / `start_mcp_oauth_login` | MCP endpoints, per project |
+| `HarnessRegistry::capabilities` (`registry.rs:1319`) | capabilities of *the* project harness |
+| `HarnessRegistry::list_models` (`:1295`) | catalog overlay for `GET /api/projects/{id}/models` |
+| `HarnessRegistry::list_providers` (`:1303`) | provider table behind discovery and id validation (§5.1) |
+| MCP status / reload / OAuth | the project's MCP endpoints |
 
-With two harnesses in one project each needs a defined rule:
+Three different rules apply, and conflating them is how this goes wrong:
 
-- **Capabilities must become thread-scoped.** The capability-driven UI (spec §13.5) decides what to
-  render — approval cards, the effort selector, the diff viewer — and those answers now differ between
-  two threads of the same project. A project-level capability answer would be wrong for one of them.
-  Resolving capabilities through the thread's harness (and, on a draft, through the model being
-  selected) is the correct shape; the project-level endpoints keep a project answer only where they
-  genuinely describe the project.
-- **Model catalogs merge rather than choose.** Each harness's catalog should overlay only the models
-  whose provider maps to it, so a project offering both Codex and Claude models gets accurate metadata
-  for both instead of one harness's view of the other's models.
-- **Provider tables union.** `list_providers` becomes an aggregation across the project's harnesses
-  (§5.1), and the union is what discovery and id validation run against. `harness_knows_provider`
-  (`routes.rs:5054`) must consult every harness before calling an id unknown, or configuring a Claude
-  provider would be reported as a mistake by the Codex harness that has never heard of it. Its
-  existing "every failure answers known" caution extends unchanged: one harness's silence must not
-  convict an id another harness knows.
-- **MCP endpoints need an explicit decision**, deferred with the rest of MCP (§10): Claude's MCP status
-  is per-child and read-only, so the honest v1 answer is that the MCP endpoints describe the Codex
-  harness and report nothing for Claude threads.
+- **Capabilities are thread-scoped.** The capability-driven UI (spec §13.5) decides whether to render
+  approval cards, the effort selector, the diff viewer — answers that now differ between two threads of
+  one project. A project-level answer is wrong for one of them. Resolve through the thread; on a draft,
+  through the harness that owns the model being selected.
+- **Catalogs and provider tables aggregate.** Each harness contributes its own providers and models,
+  and the union is the picker. `harness_knows_provider` must consult every installed harness before
+  calling an id unknown, or a Claude provider is reported as a mistake by the Codex harness that has
+  never heard of it — its existing "every failure answers known" caution extends to "one harness's
+  silence is not evidence either".
+- **MCP endpoints stay Codex-only in v1** (§10). Claude's MCP status is per-child and read-only, so
+  aggregating it would mean starting children to answer a project-level question.
 
-**A consequence for process lifecycle.** `capabilities()` currently calls `get_or_create_harness`, so
-answering it *spawns* the harness. Under the MVP's rule — a child process only when a thread with an
-Anthropic model is loaded (§1) — merely opening a project's model picker must not start a `claude`
-process. This is why the Claude harness is a **façade**: the `Arc<dyn AgentHarness>` registered for a
-project answers `capabilities()` and `list_models()` from static knowledge, and spawns child processes
-only in `open_thread`. Creating the façade must stay free.
+**The tension worth naming:** aggregation wants every harness alive, but instantiating a harness is
+exactly what §1 says to avoid until a thread needs it. Two things resolve it. `ProjectAuthority`
+already owns a `ProjectModelCatalogSlot`, so the composed catalog is cached per project and the cost is
+paid per refresh rather than per request. And the two harnesses are not symmetric: Codex needs a live
+app-server to answer `config/read`, while the Claude harness answers `capabilities`, `list_models` and
+`list_providers` from static knowledge (§5.1) — so the façade must be constructible without spawning a
+child. **Creating a Claude harness must stay free; only `open_thread` spawns.**
 
 ### 5.5 Switching a thread across harnesses
 
@@ -502,33 +531,54 @@ documentation treatment as worktrees.
 
 ### 5.6 Operations the Claude harness cannot do
 
-`harness_api_error` (`routes.rs:3549`) maps `HarnessError::Unsupported` → **400**, and
-`set_thread_name` / `set_thread_archived` / `delete_thread` call the harness *first* (spec TN2/TD3,
-`registry.rs:990–1072`). On a Claude thread, renaming would therefore fail with a 400 and never touch
-local state. Fix: treat `Unsupported` from these three lifecycle calls as a **soft** path — log at
-`debug`, proceed with the local mutation, and (for delete) skip only the native step. This is a
-server change, not an adapter workaround, and it needs error-path tests per `AGENTS.md`.
+`harness_api_error` (`routes.rs:3784`) maps `HarnessError::Unsupported` to **400**, and
+`set_thread_archived` (`registry.rs:1251`), `set_thread_name` (`:1268`) and `delete_thread` (`:1341`)
+call the harness *before* touching local state. On a Claude thread — no native rename, archive or
+delete — renaming would fail with a 400 and never reach the local mutation.
+
+The trait already declares these optional: its default implementations return `Unsupported`. The
+server contradicts that by turning the declaration into a user-visible error. Fix the contradiction on
+the server side: treat `Unsupported` from these three as a **soft** path — log at `debug`, perform the
+local mutation, and for delete skip only the native step. Error-path tests per `AGENTS.md`.
+
+This is P1 in §11 and stands on its own: it settles whether a harness may decline an operation at all,
+independently of Claude.
 
 ### 5.7 Process lifecycle (MVP)
 
-- Spawn on `open_thread`, one child per thread, `--session-id <fresh uuid>` or `--resume=<stored>`.
-- cwd = the thread's worktree if it has one, else the project workspace root. Extra writable roots come
-  from the user's own `permissions.additionalDirectories` (§8.3), so the adapter passes `--add-dir` only
-  for roots Giskard itself introduces, if any.
-- Threads of one project may run **concurrently in the same cwd** with no coordination between children
-  (§3.4); the adapter needs no cross-thread locking, only per-thread turn serialization, which the
-  server's existing `ThreadTurnGate` already provides.
-- Keep alive across turns. **No idle reaping in the MVP** — `harness.idle_shutdown_secs` is declared
-  in config but implemented nowhere today, and the MVP does not change that. The cost is larger than a
-  guess would suggest: a `claude` process was **measured at 440–530 MB RSS**, so Giskard's ~10-thread
-  target scale (spec §1.4) implies multiple gigabytes of resident memory if every thread is loaded.
-  Reaping is therefore the first post-MVP follow-up, and the MVP should at least log the count of live
-  children so the growth is visible before it becomes a complaint.
-- Child exit while a turn is live → `TurnCompleted{Failed}` + `Error`, thread marked disconnected,
-  same recovery UX as a Codex app-server crash.
-- Record `claude_code_version` from `system/init` and warn when it differs from the pinned tested
-  version — the same drift guard the spec already mandates for Codex, and more important here
-  because Giskard owns the wire types.
+- Spawn on `open_thread`: one child per thread, `--session-id <fresh uuid>` or `--resume=<stored>`.
+- cwd is the thread's worktree when it has one, else the project workspace root, and it must be the
+  same cwd on every respawn — the transcript lives under a cwd-derived directory whose encoding is
+  lossy (§3.7). `ThreadHandle.workspace_root` now carries this, so the handle states which root the
+  thread was opened against rather than leaving callers to recompute it.
+- Extra writable roots come from the user's own `permissions.additionalDirectories` (§8.3); the adapter
+  passes `--add-dir` only for roots Giskard itself introduces.
+- **Per-thread turn serialization is already provided.** The old `ThreadTurnGate` is gone; a thread's
+  `ThreadAuthority` owns an `OwnerLock` and a coordinator consuming `TurnIntent`s (`docs/m5-turn-intents.md`),
+  which serializes turns per thread regardless of harness. Children of one project run concurrently in
+  one cwd with no coordination between them (§3.4), so the adapter needs no cross-thread locking of its
+  own.
+- Events reach the server through a retained `EventLog` per thread rather than a broadcast channel —
+  the Codex adapter's `EventLogs(HashMap<ThreadId, Arc<EventLog>>)` is the shape to copy — and the
+  project's driver consumes the harness's `DiscoveryStream`. For Claude that stream is legitimately
+  empty (§5.8), so `discoveries()` returns `DiscoveryStream::closed()` and `claim_native_thread` stays
+  `Unsupported`.
+- `HarnessBootstrap.known_threads` installs the native↔Giskard identity table before the harness
+  dispatches anything. For Claude this is the façade's thread→child routing table, and it must be
+  filtered to this harness's threads (§5.2).
+- Post-open metadata has a channel: `OpenThreadOptions.updates` accepts
+  `ThreadUpdate::ContextWindowRestored`, which is where the `autocompact_state` a child emits at
+  startup belongs (§6).
+- **No idle reaping in the MVP.** `harness.idle_shutdown_secs` is declared in config and implemented
+  nowhere, and the MVP does not change that. A `claude` process was measured at **440–530 MB RSS**, so
+  the spec's ~10-thread scale (spec §1.4) is gigabytes if every thread is loaded. Reaping is the first
+  post-MVP follow-up; the MVP should at least log the live-child count so the growth is visible before
+  it becomes a complaint.
+- Child exit during a live turn → `TurnCompleted{Failed}` plus `Error`, thread marked disconnected,
+  the same recovery path as a Codex app-server crash.
+- Record `claude_code_version` from `system/init` and warn when it differs from the version the mapping
+  was tested against — the drift guard the spec already mandates for Codex, and still worth having with
+  `claude-codes` carrying the wire types (§3.7).
 
 ### 5.8 Sub-agent threads without native sessions
 
@@ -1017,14 +1067,14 @@ two-harness test with no CLI involved.
 
 | # | Change | Justification today, without Claude | Depends on |
 | --- | --- | --- | --- |
-| **P1** | **Soft `Unsupported` for `set_thread_name` / `set_thread_archived` / `delete_thread`** (§5.6) | **Resolves a contradiction inside the current design.** `AgentHarness` declares these optional — its default implementations return `Unsupported` — while the server turns `Unsupported` into a user-visible HTTP 400 (`routes.rs:3549`). The trait says "may be absent", the server says "must exist". Nothing trips it today (Codex implements all three; `ReplayHarness` overrides them with `Ok`), so this is a consistency fix rather than a bug fix — but it is the contract that decides whether a harness can decline an operation at all. | — |
+| **P1** | **Soft `Unsupported` for `set_thread_name` / `set_thread_archived` / `delete_thread`** (§5.6) | **Resolves a contradiction inside the current design.** `AgentHarness` declares these optional — its default implementations return `Unsupported` — while the server turns `Unsupported` into a user-visible HTTP 400 (`routes.rs:3784`). The trait says "may be absent", the server says "must exist". Nothing trips it today (Codex implements all three; `ReplayHarness` overrides them with `Ok`), so this is a consistency fix rather than a bug fix — but it is the contract that decides whether a harness can decline an operation at all. | — |
 | **P2** | **Thread-scoped capabilities** (§5.4) | **Corrects the shape, before it has consequences.** Capabilities belong to the harness serving a thread, not to a project; today the two coincide, so there is no user-visible symptom — which is precisely why it is cheap now and expensive once a project can hold two harnesses. The capability-driven UI (spec §13.5) is the consumer. | — |
 | **P3** | **`HarnessKind` newtype** replacing the bare `String` on `ProjectConfig.harness`, `config.toml`, and the factory | One place parses and validates a harness name instead of string comparisons scattered across the binary and the store. Pure typing; no behaviour change. | — |
 | **P4** | **`harness_for(&ModelRef)` resolved from the aggregated provider table** (§5.1) | No config change: the answer comes from `list_providers`, which `main` already added. With one harness the aggregation is the current behaviour, so this is a refactor of `harness_knows_provider` and the discovery path from "the project's harness" to "every harness the project can use". | P6 |
 | **P5** | **Dispatching `HarnessFactory`** — a table keyed by `HarnessKind` instead of `bin/giskard-server.rs:19`'s `if config.harness != "codex"` | Turns a hardcoded rejection into an extension point, and lets the replay binary register its own kind by the same mechanism the real binary uses. | P3 |
-| **P6** | **Registry re-keying to `(ProjectId, HarnessKind)`** plus the `HarnessKind` on `ThreadBinding` (§5.2) | The structural centre of the work, and the riskiest to combine with adapter development. Landing it alone keeps behaviour identical with one kind while making the two-harness test possible. | P3, P5 |
+| **P6** | **A harness map inside `ProjectHarnessSlot`**, plus the harness kind on `ThreadAuthority` (§5.2) | The structural centre of the work and the riskiest thing to combine with adapter development. Landing it alone keeps behaviour identical while there is one kind installed, and makes the two-harness test possible. Note what it is *not*: a new keyed map beside the authorities, which `AGENTS.md` forbids. | P3, P5 |
 | **P7** | **`ThreadFile.harness` + `harness_thread_ids`, default-on-read** (§5.3) | A forward-compatible persistence migration. Landing it early means existing installations are already writing files that carry the field before any feature reads it, so the Claude work never needs a migration step of its own. | P3 |
-| **P8** | **Harness-scoped `find_thread_by_harness_id`** (`routes.rs:560`) | Hardening: the lookup compares an opaque native id with no notion of which harness minted it. Harmless today, wrong the moment two id namespaces share the field. | P6, P7 |
+| **P8** | **Harness-scoped native-id lookup** (`registry.rs:1726`) | Hardening: the lookup compares an opaque native id against every thread with no notion of which harness minted it. Harmless while one harness exists, wrong the moment a Claude session UUID and a Codex rollout id share the field — and §5.8's `task:` ids widen that space further. | P6, P7 |
 
 Suggested order: **P1, P2** first — they are self-contained, argue for themselves as design fixes, and
 are worth merging whether or not the Claude harness is ever built. Then **P3 → P5 → P6**, the structural
