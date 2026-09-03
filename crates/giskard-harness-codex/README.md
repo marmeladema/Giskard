@@ -542,11 +542,12 @@ Codex includes the effective context capacity in
 actually applies after reserving any model-specific headroom, so it is authoritative
 for the thread gauge even when it differs from a provider's raw advertised maximum.
 
-During an active turn, the adapter emits `AgentEvent::ContextWindowUpdated` whenever
-the valid reported value changes and suppresses consecutive unchanged repeats. Each
-event carries the model selected for that turn.
-The server persists accepted values per `(provider, model)` so they survive reloads
-and model switches.
+During an active turn, the adapter emits `AgentEvent::TurnUsageUpdated` whenever the
+reported usage or valid context window changes and suppresses consecutive unchanged
+pairs. The event carries a model only when Giskard supplied and Codex acknowledged it
+for that exact `turn/start`. Unknown-model turns still report live usage and windows
+without warning, but never write the per-model cache. The server persists accepted
+values per `(provider, model)` only when the event carries that acknowledged model.
 
 Existing threads initialize the gauge from Giskard's latest persisted runtime value
 for the selected model. If none has been observed, they use provider/config metadata
@@ -558,8 +559,8 @@ channel with that model. The runtime registry accepts it only when no newer turn
 compaction, or deletion lifecycle superseded the open. This observation has no
 time-based deadline.
 
-An invalid or out-of-range `modelContextWindow` suppresses only the context-window
-update. It never suppresses the turn's token usage, which is still attached on
+An invalid or out-of-range `modelContextWindow` suppresses only the window on the live
+usage event. It never suppresses the turn's token usage, which is also attached on
 `turn/completed`. The transport reader remains active regardless of turn or restore state, so an
 arbitrarily late update can still be observed.
 

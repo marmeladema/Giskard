@@ -1726,7 +1726,7 @@ fn compaction_event_name(event: &AgentEvent) -> Option<&'static str> {
 fn agent_event_turn(event: &AgentEvent) -> Option<TurnId> {
     match event {
         AgentEvent::TurnStarted { turn, .. }
-        | AgentEvent::ContextWindowUpdated { turn, .. }
+        | AgentEvent::TurnUsageUpdated { turn, .. }
         | AgentEvent::ItemStarted { turn, .. }
         | AgentEvent::ItemDelta { turn, .. }
         | AgentEvent::ItemCompleted { turn, .. }
@@ -2280,7 +2280,7 @@ fn agent_event_kind(event: &AgentEvent) -> &'static str {
     match event {
         AgentEvent::ThreadOpened { .. } => "thread_opened",
         AgentEvent::TurnStarted { .. } => "turn_started",
-        AgentEvent::ContextWindowUpdated { .. } => "context_window_updated",
+        AgentEvent::TurnUsageUpdated { .. } => "turn_usage_updated",
         AgentEvent::ItemStarted { .. } => "item_started",
         AgentEvent::ItemDelta { .. } => "item_delta",
         AgentEvent::ItemCompleted { .. } => "item_completed",
@@ -2385,7 +2385,7 @@ fn event_thread(event: &AgentEvent) -> ThreadId {
     match event {
         AgentEvent::ThreadOpened { thread, .. }
         | AgentEvent::TurnStarted { thread, .. }
-        | AgentEvent::ContextWindowUpdated { thread, .. }
+        | AgentEvent::TurnUsageUpdated { thread, .. }
         | AgentEvent::ItemStarted { thread, .. }
         | AgentEvent::ItemDelta { thread, .. }
         | AgentEvent::ItemCompleted { thread, .. }

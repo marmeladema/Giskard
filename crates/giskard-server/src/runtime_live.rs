@@ -190,6 +190,10 @@ impl LiveTurnState {
                 }
             }
             let command_delta_item = command_output_item_id(&event);
+            if matches!(event, AgentEvent::TurnUsageUpdated { .. }) {
+                turn.events
+                    .retain(|event| !matches!(event, AgentEvent::TurnUsageUpdated { .. }));
+            }
             turn.events.push(event);
             if let Some(item_id) = command_delta_item {
                 compact_command_output_deltas(&mut turn.events, item_id);
@@ -724,6 +728,56 @@ mod tests {
         assert!(outputs[0].starts_with("head\n"));
         assert!(outputs[0].contains(LIVE_COMMAND_OUTPUT_TRUNCATED.trim()));
         assert!(outputs[0].ends_with("\ntail"));
+    }
+
+    #[test]
+    fn live_snapshot_keeps_only_the_latest_usage_event_at_the_end() {
+        let mut store = LiveTurnState::new();
+        let thread = ThreadId::new();
+        let turn = TurnId::new();
+        let item = ItemId::new();
+        store.start_turn(thread);
+        store.append(thread, AgentEvent::TurnStarted { thread, turn });
+        for input in [10, 20] {
+            if input == 20 {
+                store.append(
+                    thread,
+                    AgentEvent::ItemStarted {
+                        thread,
+                        turn,
+                        item: command_start(item),
+                    },
+                );
+            }
+            store.append(
+                thread,
+                AgentEvent::TurnUsageUpdated {
+                    thread,
+                    turn,
+                    usage: giskard_core::token::TokenUsage {
+                        input,
+                        output: 1,
+                        total: input + 1,
+                    },
+                    context_window: Some(258_400),
+                    model: None,
+                },
+            );
+        }
+
+        let snapshot = store.snapshot(thread).expect("snapshot");
+        assert_eq!(snapshot.accumulated.len(), 3);
+        assert!(matches!(
+            snapshot.accumulated[1],
+            WireAgentEvent::ItemStarted { .. }
+        ));
+        assert!(matches!(
+            snapshot.accumulated[2],
+            WireAgentEvent::TurnUsageUpdated {
+                usage: giskard_core::token::TokenUsage { input: 20, .. },
+                ..
+            }
+        ));
     }
 
     #[tokio::test]

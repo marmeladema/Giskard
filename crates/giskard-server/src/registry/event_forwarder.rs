@@ -20,7 +20,7 @@ fn should_skip_duplicate_notice(
 pub(super) fn event_turn_id(event: &AgentEvent) -> Option<TurnId> {
     match event {
         AgentEvent::TurnStarted { turn, .. }
-        | AgentEvent::ContextWindowUpdated { turn, .. }
+        | AgentEvent::TurnUsageUpdated { turn, .. }
         | AgentEvent::ItemStarted { turn, .. }
         | AgentEvent::ItemDelta { turn, .. }
         | AgentEvent::ItemCompleted { turn, .. }
@@ -101,7 +101,7 @@ pub(super) fn event_kind(event: &AgentEvent) -> &'static str {
     match event {
         AgentEvent::ThreadOpened { .. } => "thread_opened",
         AgentEvent::TurnStarted { .. } => "turn_started",
-        AgentEvent::ContextWindowUpdated { .. } => "context_window_updated",
+        AgentEvent::TurnUsageUpdated { .. } => "turn_usage_updated",
         AgentEvent::ItemStarted { .. } => "item_started",
         AgentEvent::ItemDelta { .. } => "item_delta",
         AgentEvent::ItemCompleted { .. } => "item_completed",
@@ -720,6 +720,10 @@ struct ForwardedTurnState {
     seen_notices: HashSet<(Option<TurnId>, String)>,
     item_ids_by_harness: HashMap<HarnessItemKey, ItemId>,
     saw_context_compaction_marker: bool,
+    live_usage: Option<giskard_core::token::TokenUsage>,
+    // Reserved for the documented additive `Turn.context_window` persistence extension.
+    live_context_window: Option<u32>,
+    persisted_context_window: Option<u32>,
 }
 
 impl ForwardedTurnState {
@@ -735,6 +739,9 @@ impl ForwardedTurnState {
             seen_notices: HashSet::new(),
             item_ids_by_harness: HashMap::new(),
             saw_context_compaction_marker: false,
+            live_usage: None,
+            live_context_window: None,
+            persisted_context_window: None,
         }
     }
 
@@ -749,6 +756,9 @@ impl ForwardedTurnState {
         self.seen_notices.clear();
         self.item_ids_by_harness.clear();
         self.saw_context_compaction_marker = false;
+        self.live_usage = None;
+        self.live_context_window = None;
+        self.persisted_context_window = None;
     }
 }
 
@@ -1234,13 +1244,13 @@ impl ThreadEventForwarder {
             let completion_event = AgentEvent::TurnCompleted {
                 thread: thread_id,
                 turn: incomplete_turn,
-                usage: giskard_core::token::TokenUsage::default(),
+                usage: self.turn.live_usage.unwrap_or_default(),
                 status: status.clone(),
             };
             let Some(_) = self
                 .complete_forwarded_turn(
                     incomplete_turn,
-                    giskard_core::token::TokenUsage::default(),
+                    self.turn.live_usage.unwrap_or_default(),
                     status,
                 )
                 .await
@@ -1422,6 +1432,15 @@ impl ThreadEventForwarder {
         if let Some(turn) = event_turn
             && self.seen_turn_ids.contains(&turn)
         {
+            if matches!(event, AgentEvent::TurnUsageUpdated { .. }) {
+                debug!(
+                    %project_id,
+                    %thread_id,
+                    %turn,
+                    "ignoring usage update for an already-persisted turn"
+                );
+                return ForwarderControl::Continue;
+            }
             let command_state_changed = if is_terminal_command_completion(&event) {
                 let before = terminating_command_before_terminal_completion(
                     &runtime,
@@ -1579,40 +1598,49 @@ impl ThreadEventForwarder {
         // persistence assembly, or browser projection can observe the event.
         let event = runtime.capture_event_diffs(&self.authority, event);
 
-        if let AgentEvent::ContextWindowUpdated {
+        if let AgentEvent::TurnUsageUpdated {
             turn,
+            usage,
             model,
             context_window,
             ..
         } = &event
         {
-            if self.turn.context.model.as_known().is_some_and(|expected| {
-                model.provider != expected.provider || model.model != expected.model
-            }) {
-                error!(
-                    %project_id,
-                    %thread_id,
-                    turn = %turn,
-                    expected_model = ?self.turn.context.model,
-                    event_provider = %model.provider,
-                    event_model = %model.model,
-                    "dropping context-window update for the wrong turn model"
-                );
-                return ForwarderControl::Continue;
+            self.turn.live_usage = Some(*usage);
+            if let Some(window) = context_window {
+                self.turn.live_context_window = Some(*window);
             }
-            if self.turn.context.model.as_known().is_none() {
-                self.turn.context.model = TurnModel::Known(model.clone());
+            if let (Some(model), Some(window)) = (model, context_window) {
+                if self.turn.context.model.as_known().is_some_and(|expected| {
+                    model.provider != expected.provider || model.model != expected.model
+                }) {
+                    error!(
+                        %project_id,
+                        %thread_id,
+                        turn = %turn,
+                        expected_model = ?self.turn.context.model,
+                        event_provider = %model.provider,
+                        event_model = %model.model,
+                        "skipping model context-window persistence for the wrong turn model"
+                    );
+                } else {
+                    if self.turn.context.model.as_known().is_none() {
+                        self.turn.context.model = TurnModel::Known(model.clone());
+                    }
+                    if self.turn.persisted_context_window != Some(*window) {
+                        persist_model_context_window(
+                            &self.shared.thread_metadata,
+                            project_id,
+                            thread_id,
+                            *turn,
+                            model,
+                            *window,
+                        )
+                        .await;
+                        self.turn.persisted_context_window = Some(*window);
+                    }
+                }
             }
-            persist_model_context_window(
-                &self.shared.thread_metadata,
-                project_id,
-                thread_id,
-                *turn,
-                model,
-                *context_window,
-            )
-            .await;
-            return ForwarderControl::Continue;
         }
 
         match &event {
@@ -2688,7 +2716,7 @@ mod tests {
             log_metadata_only_event_rejection(
                 project_id,
                 expected_thread_id,
-                "context_window_updated",
+                "diff_updated",
                 Some(turn_id),
                 None,
             );
@@ -2701,10 +2729,7 @@ mod tests {
             output.contains(&format!("event_turn_id={turn_id}")),
             "{output}"
         );
-        assert!(
-            output.contains("event_kind=\"context_window_updated\""),
-            "{output}"
-        );
+        assert!(output.contains("event_kind=\"diff_updated\""), "{output}");
         assert!(!output.contains("event_item_id"), "{output}");
         assert!(!output.contains("Some("), "{output}");
     }
@@ -3082,7 +3107,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn forwarder_drops_context_window_update_for_mismatched_turn_model() {
+    async fn forwarder_skips_persistence_for_mismatched_turn_model() {
         let tmp = tempfile::TempDir::new().unwrap();
         let store = Arc::new(PersistStore::new(tmp.path().to_path_buf()));
         let project_id = ProjectId::new();
@@ -3129,7 +3154,7 @@ mod tests {
 
         let log = Arc::new(EventLog::new());
         let hub = Arc::new(Hub::new());
-        let (client_tx, _client_rx) = mpsc::channel(16);
+        let (client_tx, mut client_rx) = mpsc::channel(16);
         let replacements = hub.register_client(1, client_tx.clone()).await;
         assert!(hub.subscribe(thread_id, 1).await);
         let ledger = ledger::spawn(store.clone());
@@ -3148,15 +3173,16 @@ mod tests {
             thread: thread_id,
             turn: turn_id,
         }));
-        assert!(log.append(AgentEvent::ContextWindowUpdated {
+        assert!(log.append(AgentEvent::TurnUsageUpdated {
             thread: thread_id,
             turn: turn_id,
-            model: ModelRef {
+            usage: TokenUsage::default(),
+            model: Some(ModelRef {
                 provider: model.provider.clone(),
                 model: "gpt-5.6-pro".into(),
                 reasoning_effort: None,
-            },
-            context_window: 400_000,
+            }),
+            context_window: Some(400_000),
         }));
         assert!(log.append(AgentEvent::TurnCompleted {
             thread: thread_id,
@@ -3184,6 +3210,13 @@ mod tests {
             persisted.model_context_windows.is_empty(),
             "a mismatched turn model must not be persisted"
         );
+        assert!(
+            std::iter::from_fn(|| client_rx.try_recv().ok()).any(|message| matches!(
+                message,
+                ServerMessage::Event { agent_event, .. }
+                    if matches!(*agent_event, WireAgentEvent::TurnUsageUpdated { .. })
+            ))
+        );
         while let Some(message) = replacements.try_recv() {
             if let ServerMessage::ThreadState(state) = message {
                 assert_ne!(state.metadata.context_window, 400_000);
@@ -3192,7 +3225,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn forwarder_persists_and_broadcasts_context_window_update_for_matching_turn_model() {
+    async fn unchanged_windows_do_not_bump_revision_and_usage_is_broadcast() {
         let tmp = tempfile::TempDir::new().unwrap();
         let store = Arc::new(PersistStore::new(tmp.path().to_path_buf()));
         let project_id = ProjectId::new();
@@ -3239,7 +3272,7 @@ mod tests {
 
         let log = Arc::new(EventLog::new());
         let hub = Arc::new(Hub::new());
-        let (client_tx, _client_rx) = mpsc::channel(16);
+        let (client_tx, mut client_rx) = mpsc::channel(16);
         let replacements = hub.register_client(1, client_tx.clone()).await;
         assert!(hub.subscribe(thread_id, 1).await);
         let ledger = ledger::spawn(store.clone());
@@ -3258,12 +3291,50 @@ mod tests {
             thread: thread_id,
             turn: turn_id,
         }));
-        assert!(log.append(AgentEvent::ContextWindowUpdated {
+        assert!(log.append(AgentEvent::TurnUsageUpdated {
             thread: thread_id,
             turn: turn_id,
-            model: model.clone(),
-            context_window: 258_400,
+            usage: TokenUsage {
+                input: 10,
+                output: 1,
+                total: 11,
+            },
+            model: Some(model.clone()),
+            context_window: Some(258_400),
         }));
+        for input in [20, 30] {
+            assert!(log.append(AgentEvent::TurnUsageUpdated {
+                thread: thread_id,
+                turn: turn_id,
+                usage: TokenUsage {
+                    input,
+                    output: 1,
+                    total: input + 1,
+                },
+                model: Some(model.clone()),
+                context_window: Some(258_400),
+            }));
+        }
+        let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(2);
+        loop {
+            let current = store
+                .load_thread(project_id, thread_id)
+                .await
+                .unwrap()
+                .unwrap();
+            if current.context_window == 258_400 {
+                assert_eq!(
+                    current.revision, 1,
+                    "unchanged windows must produce one metadata revision bump"
+                );
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "window was not persisted"
+            );
+            tokio::task::yield_now().await;
+        }
         assert!(log.append(AgentEvent::TurnCompleted {
             thread: thread_id,
             turn: turn_id,
@@ -3313,6 +3384,217 @@ mod tests {
         assert_eq!(
             matching_states, 1,
             "matching update must survive coalescing into the latest committed thread state"
+        );
+        assert!(
+            std::iter::from_fn(|| client_rx.try_recv().ok()).any(|message| matches!(
+                message,
+                ServerMessage::Event { agent_event, .. }
+                    if matches!(*agent_event, WireAgentEvent::TurnUsageUpdated { .. })
+            ))
+        );
+    }
+
+    #[tokio::test]
+    async fn forwarder_broadcasts_live_usage_for_an_unknown_model_turn_and_persists_nothing() {
+        let (_tmp, store, project_id, thread_id, model) = usage_forwarder_fixture().await;
+        let log = Arc::new(EventLog::new());
+        let hub = Arc::new(Hub::new());
+        let (client_tx, mut client_rx) = mpsc::channel(16);
+        let replacements = hub.register_client(1, client_tx).await;
+        assert!(hub.subscribe(thread_id, 1).await);
+        let ledger = ledger::spawn(store.clone());
+        let (handle, runtime, _coordinator, authority) = spawn_forwarder_handle_with_runtime(
+            thread_id,
+            project_id,
+            AgentEventStream::new(log.reader()),
+            hub,
+            store.clone(),
+            ledger,
+            model,
+            "unknown model usage",
+            None,
+        );
+        let turn = TurnId::new();
+        let usage = TokenUsage {
+            input: 42,
+            output: 3,
+            total: 45,
+        };
+        assert!(log.append(AgentEvent::TurnStarted {
+            thread: thread_id,
+            turn,
+        }));
+        assert!(log.append(AgentEvent::TurnUsageUpdated {
+            thread: thread_id,
+            turn,
+            usage,
+            context_window: Some(258_400),
+            model: None,
+        }));
+
+        let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(2);
+        loop {
+            if runtime.live_snapshot(&authority).is_some_and(|snapshot| {
+                snapshot.accumulated.iter().any(|event| {
+                    matches!(event, WireAgentEvent::TurnUsageUpdated { usage: got, .. } if *got == usage)
+                })
+            }) {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "usage was not live-buffered"
+            );
+            tokio::task::yield_now().await;
+        }
+        let persisted = store
+            .load_thread(project_id, thread_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(persisted.context_window, 128_000);
+        assert!(persisted.model_context_windows.is_empty());
+        while let Some(message) = replacements.try_recv() {
+            if let ServerMessage::ThreadState(state) = message {
+                assert_ne!(state.metadata.context_window, 258_400);
+            }
+        }
+        assert!(std::iter::from_fn(|| client_rx.try_recv().ok()).any(|message| matches!(
+            message,
+            ServerMessage::Event { agent_event, .. }
+                if matches!(*agent_event, WireAgentEvent::TurnUsageUpdated { usage: got, .. } if got == usage)
+        )));
+
+        assert!(log.append(AgentEvent::TurnCompleted {
+            thread: thread_id,
+            turn,
+            usage,
+            status: TurnStatus {
+                kind: TurnStatusKind::Completed,
+                message: None,
+            },
+        }));
+        log.close();
+        tokio::time::timeout(tokio::time::Duration::from_secs(2), handle)
+            .await
+            .unwrap()
+            .unwrap();
+        let turns = store.load_all_turns(project_id, thread_id).await.unwrap();
+        assert_eq!(turns[0].usage, usage);
+    }
+
+    #[tokio::test]
+    async fn forwarder_ignores_usage_for_an_already_persisted_turn() {
+        let (_tmp, store, project_id, thread_id, model) = usage_forwarder_fixture().await;
+        let old_turn = TurnId::new();
+        store
+            .append_turn(
+                project_id,
+                thread_id,
+                &Turn {
+                    id: old_turn,
+                    user_input: UserInput::text("old"),
+                    items: Vec::new(),
+                    diffs: Vec::new(),
+                    model: TurnModel::Known(model.clone()),
+                    mode: TurnMode::Known(Mode::Build),
+                    usage: TokenUsage::default(),
+                    status: TurnStatus {
+                        kind: TurnStatusKind::Completed,
+                        message: None,
+                    },
+                    started_at: Utc::now(),
+                    completed_at: Some(Utc::now()),
+                },
+            )
+            .await
+            .unwrap();
+        let log = Arc::new(EventLog::new());
+        let hub = Arc::new(Hub::new());
+        let (client_tx, mut client_rx) = mpsc::channel(16);
+        let _replacements = hub.register_client(1, client_tx).await;
+        assert!(hub.subscribe(thread_id, 1).await);
+        let ledger = ledger::spawn(store.clone());
+        let (handle, _runtime, _coordinator, _authority) = spawn_forwarder_handle_with_runtime(
+            thread_id,
+            project_id,
+            AgentEventStream::new(log.reader()),
+            hub,
+            store.clone(),
+            ledger,
+            model,
+            "late usage",
+            None,
+        );
+        let late_usage = AgentEvent::TurnUsageUpdated {
+            thread: thread_id,
+            turn: old_turn,
+            usage: TokenUsage {
+                input: 999,
+                output: 1,
+                total: 1_000,
+            },
+            context_window: Some(400_000),
+            model: None,
+        };
+        assert!(log.append(late_usage.clone()));
+        let new_turn = TurnId::new();
+        assert!(log.append(AgentEvent::TurnStarted {
+            thread: thread_id,
+            turn: new_turn,
+        }));
+        assert!(log.append(late_usage));
+        let new_usage = TokenUsage {
+            input: 12,
+            output: 1,
+            total: 13,
+        };
+        assert!(log.append(AgentEvent::TurnUsageUpdated {
+            thread: thread_id,
+            turn: new_turn,
+            usage: new_usage,
+            context_window: Some(258_400),
+            model: None,
+        }));
+        assert!(log.append(AgentEvent::TurnCompleted {
+            thread: thread_id,
+            turn: new_turn,
+            usage: TokenUsage::default(),
+            status: TurnStatus {
+                kind: TurnStatusKind::Completed,
+                message: None,
+            },
+        }));
+        log.close();
+        tokio::time::timeout(tokio::time::Duration::from_secs(2), handle)
+            .await
+            .unwrap()
+            .unwrap();
+        let messages = std::iter::from_fn(|| client_rx.try_recv().ok()).collect::<Vec<_>>();
+        assert!(!messages.iter().any(|message| matches!(
+            message,
+            ServerMessage::Event { agent_event, .. }
+                if matches!(agent_event.as_ref(), WireAgentEvent::TurnUsageUpdated { turn, .. } if *turn == old_turn)
+        )));
+        assert!(messages.iter().any(|message| matches!(
+            message,
+            ServerMessage::Event { agent_event, .. }
+                if matches!(agent_event.as_ref(), WireAgentEvent::TurnUsageUpdated { turn, usage, .. } if *turn == new_turn && *usage == new_usage)
+        )));
+        let persisted = store
+            .load_thread(project_id, thread_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(persisted.context_window, 128_000);
+        assert!(persisted.model_context_windows.is_empty());
+        assert_eq!(
+            store
+                .load_all_turns(project_id, thread_id)
+                .await
+                .unwrap()
+                .len(),
+            2
         );
     }
 
@@ -3802,7 +4084,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stream_end_before_completion_persists_interrupted_turn() {
+    async fn synthesized_interrupted_completion_carries_live_usage() {
         let tmp = tempfile::TempDir::new().unwrap();
         let store = Arc::new(PersistStore::new(tmp.path().to_path_buf()));
         let project_id = ProjectId::new();
@@ -3848,6 +4130,9 @@ mod tests {
 
         let log = Arc::new(EventLog::new());
         let hub = Arc::new(Hub::new());
+        let (client_tx, mut client_rx) = mpsc::channel(16);
+        let _replacements = hub.register_client(1, client_tx).await;
+        assert!(hub.subscribe(thread_id, 1).await);
         let ledger = ledger::spawn(store.clone());
         let (handle, runtime, _coordinator, authority) = spawn_forwarder_handle_with_runtime(
             thread_id,
@@ -3865,6 +4150,18 @@ mod tests {
         assert!(log.append(AgentEvent::TurnStarted {
             thread: thread_id,
             turn,
+        }));
+        let live_usage = TokenUsage {
+            input: 120,
+            output: 30,
+            total: 150,
+        };
+        assert!(log.append(AgentEvent::TurnUsageUpdated {
+            thread: thread_id,
+            turn,
+            usage: live_usage,
+            context_window: Some(258_400),
+            model: None,
         }));
         assert!(log.append(AgentEvent::ItemCompleted {
             thread: thread_id,
@@ -3906,6 +4203,17 @@ mod tests {
         assert_eq!(saved.len(), 1);
         assert_eq!(saved[0].id, turn);
         assert!(matches!(saved[0].status.kind, TurnStatusKind::Interrupted));
+        assert_eq!(saved[0].usage, live_usage);
+        assert!(
+            std::iter::from_fn(|| client_rx.try_recv().ok()).any(|message| matches!(
+                message,
+                ServerMessage::Event { agent_event, .. }
+                    if matches!(
+                        *agent_event,
+                        WireAgentEvent::TurnCompleted { usage, .. } if usage == live_usage
+                    )
+            ))
+        );
         assert_eq!(saved[0].items.len(), 1);
         assert!(
             runtime.live_snapshot(&authority).is_none(),
@@ -4962,6 +5270,58 @@ mod tests {
         );
         std::mem::drop(handle);
         (runtime, authority)
+    }
+
+    async fn usage_forwarder_fixture() -> (
+        tempfile::TempDir,
+        Arc<PersistStore>,
+        ProjectId,
+        ThreadId,
+        ModelRef,
+    ) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = Arc::new(PersistStore::new(tmp.path().to_path_buf()));
+        let project_id = ProjectId::new();
+        let thread_id = ThreadId::new();
+        let model = ModelRef {
+            provider: "openai".into(),
+            model: "gpt-5.5".into(),
+            reasoning_effort: None,
+        };
+        store
+            .create_project(project_id, "proj", "/tmp/test")
+            .await
+            .unwrap();
+        let now = Utc::now();
+        store
+            .save_thread(
+                project_id,
+                &ThreadFile {
+                    revision: 0,
+                    version: 1,
+                    id: thread_id,
+                    project_id,
+                    title: "usage".into(),
+                    harness_thread_id: "usage-native".into(),
+                    parent_thread_id: None,
+                    spawned_by_turn_id: None,
+                    kind: giskard_core::ThreadKind::Primary,
+                    mode: TurnMode::Known(Mode::Build),
+                    current_model: TurnModel::Known(model.clone()),
+                    context_window: 128_000,
+                    model_context_windows: Default::default(),
+                    permission_preset: PermissionPreset::AskFirst,
+                    model_efforts: Default::default(),
+                    tokens: TokenLedger::default(),
+                    created_at: now,
+                    updated_at: now,
+                    archived: false,
+                    git_workspace: None,
+                },
+            )
+            .await
+            .unwrap();
+        (tmp, store, project_id, thread_id, model)
     }
 
     #[allow(clippy::too_many_arguments)]

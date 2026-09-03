@@ -45,6 +45,13 @@ pub enum WireAgentEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         user_input: Option<UserInput>,
     },
+    TurnUsageUpdated {
+        thread: ThreadId,
+        turn: TurnId,
+        usage: TokenUsage,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        context_window: Option<u32>,
+    },
     ItemStarted {
         thread: ThreadId,
         turn: TurnId,
@@ -321,8 +328,6 @@ pub enum WireApprovalMetadata {
 impl WireAgentEvent {
     /// Convert a harness event that belongs on the browser's transcript stream.
     ///
-    /// Context-window updates mutate revisioned thread metadata instead, so they deliberately
-    /// have no wire-event representation.
     pub fn from_agent_event(e: AgentEvent) -> Option<Self> {
         let event = match e {
             AgentEvent::ThreadOpened {
@@ -337,7 +342,18 @@ impl WireAgentEvent {
                 turn,
                 user_input: None,
             },
-            AgentEvent::ContextWindowUpdated { .. } => return None,
+            AgentEvent::TurnUsageUpdated {
+                thread,
+                turn,
+                usage,
+                context_window,
+                ..
+            } => Self::TurnUsageUpdated {
+                thread,
+                turn,
+                usage,
+                context_window,
+            },
             AgentEvent::ItemStarted { thread, turn, item } => Self::ItemStarted {
                 thread,
                 turn,
@@ -1064,18 +1080,28 @@ mod tests {
     }
 
     #[test]
-    fn context_window_update_has_no_transcript_wire_variant() {
-        let event = AgentEvent::ContextWindowUpdated {
+    fn turn_usage_update_has_transcript_wire_variant_without_model() {
+        let event = AgentEvent::TurnUsageUpdated {
             thread: ThreadId::new(),
             turn: TurnId::new(),
-            model: ModelRef {
+            usage: TokenUsage {
+                input: 12,
+                output: 3,
+                total: 15,
+            },
+            context_window: Some(258_400),
+            model: Some(ModelRef {
                 provider: "openai".into(),
                 model: "gpt-5.5".into(),
                 reasoning_effort: None,
-            },
-            context_window: 258_400,
+            }),
         };
-        assert!(WireAgentEvent::from_agent_event(event).is_none());
+        let wire = WireAgentEvent::from_agent_event(event).unwrap();
+        let json = serde_json::to_value(wire).unwrap();
+        assert_eq!(json["kind"], "turn_usage_updated");
+        assert_eq!(json["usage"]["input"], 12);
+        assert_eq!(json["context_window"], 258_400);
+        assert!(json.get("model").is_none());
     }
 
     #[test]

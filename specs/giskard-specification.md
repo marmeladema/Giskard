@@ -9,7 +9,12 @@
 
 **Document status:** Implementation-ready specification.
 **Audience:** An AI coding agent (and its human reviewer) implementing the system.
-**Version:** 1.84
+**Version:** 1.85
+
+> **Amendment — live turn usage (1.85).** Unknown-model turns retain their live token usage and
+> effective context window without warning, but never persist a per-model context window without
+> a model acknowledged by `turn/start`. `TurnUsageUpdated` is an ordered active-transcript event,
+> and the live reconnect buffer retains only its latest value per turn.
 
 > **Amendment — lifecycle fences (1.84).** Project deletion and registry shutdown quiesce each
 > project event driver before taking the authoritative owner set or shutting down its harness. A
@@ -131,6 +136,14 @@
 > the intended frontend for the foreseeable future; treat every Dioxus/WASM/`giskard-ui` reference
 > below as historical design context, not a current requirement. The wire contract (`giskard-proto`)
 > and all backend design remain authoritative.
+
+**Changelog (1.84 → 1.85), live turn usage:**
+- **C10:** `TurnUsageUpdated` carries the active turn's latest usage and optional effective context
+  window on the ordered transcript lane. The browser applies it only to the turn currently being
+  rendered, and reconnect state retains only the latest update for that turn.
+- **C11:** The event carries a model only when it was acknowledged for that exact `turn/start`.
+  Unknown-model turns remain live and warning-free, while per-model context-window persistence is
+  skipped unless that event model is present.
 
 **Changelog (1.70 → 1.71), overlay title path truncation:**
 - **L8:** The diff view and code overlay title bar shows the workspace-relative path (the same truncation the transcript diff row uses) instead of the raw checkout/worktree-prefixed path. The raw path is still kept for the download/file API.
@@ -550,11 +563,11 @@ runtime overview; the hoisting and notification behavior remains current.
 **Changelog (1.53 → 1.54), authoritative context-window metadata:**
 - **C4:** Giskard has no model-name defaults table. Initial context capacity comes from exact
   config, provider-advertised `context_window` / `max_input_tokens`, or the conservative fallback.
-- **C8:** harnesses may emit `ContextWindowUpdated` for a turn. The server persists the effective
-  value for the event's exact `(provider, model)`, updates the active gauge only while that model is
-  selected, and restores it after reloads and model switches without replacing it during turn
-  completion.
-- **C9:** the Codex adapter maps
+- **C8 (superseded by 1.85/C10):** harnesses may emit `ContextWindowUpdated` for a turn. The server
+  persists the effective value for the event's exact `(provider, model)`, updates the active gauge
+  only while that model is selected, and restores it after reloads and model switches without
+  replacing it during turn completion.
+- **C9 (amended by 1.85/C11):** the Codex adapter maps
   `thread/tokenUsage/updated.tokenUsage.modelContextWindow`, rejects invalid values with a warning,
   and suppresses consecutive unchanged reports within a turn. Resume-time historical usage replay
   is not treated as a new runtime observation.
@@ -1799,11 +1812,12 @@ registry's projections, not to harness streams.
 pub enum AgentEvent {
     ThreadOpened { thread: ThreadId, harness_thread_id: String },
     TurnStarted  { thread: ThreadId, turn: TurnId },
-    ContextWindowUpdated {
+    TurnUsageUpdated {
         thread: ThreadId,
         turn: TurnId,
-        model: ModelRef,
-        context_window: u32,
+        usage: TokenUsage,
+        context_window: Option<u32>,
+        model: Option<ModelRef>,
     },
 
     ItemStarted   { thread: ThreadId, turn: TurnId, item: ItemStart },
@@ -3266,9 +3280,11 @@ running. Giskard does not need to warn near the limit because Codex may compact 
 > (cumulative usage keeps growing across turns; context occupancy reflects what's currently in
 > the window after any compaction). Codex reports usage through `thread/tokenUsage/updated`; the
 > payload distinguishes cumulative totals from the last turn's usage and exposes an effective
-> `modelContextWindow` denominator. The Codex adapter emits `ContextWindowUpdated` whenever the
-> value changes within a turn, tagged with that turn's exact model, and the server persists it by
-> `(provider, model)`. For the numerator,
+> `modelContextWindow` denominator. The Codex adapter emits `TurnUsageUpdated` for the active turn
+> whenever the reported usage or window changes, and the browser updates the gauge live only for
+> the turn it is rendering. The server persists the window per `(provider, model)` only when the
+> event carries the model acknowledged at `turn/start`; it never derives one from thread metadata.
+> For the numerator,
 > use an input-tokens / context-used figure per turn. **Candidate fields to use (in order):**
 > (1) an explicit context/window-used field on the turn's usage object if present in the
 > pinned schema; (2) otherwise the **last turn's input tokens** (the input side reflects the
@@ -3563,6 +3579,9 @@ than claiming that the current transitional stores already provide those clocks.
 | Cross-thread runtime overview | root runtime overview projection | process-local overview revision | revisioned replacement |
 | Direct action result | action handler | domain identity | direct control response |
 | Background notice | notice authority | notice identity/revision | revisioned replacement |
+
+Live turn usage is an Active transcript event. Its persisted per-model context window remains part
+of the Persisted thread metadata authority.
 
 Persisted thread revisions survive a server restart. Event, task, and overview counters do not;
 their bootstrap establishes a new per-connection baseline. A metadata revision does not order

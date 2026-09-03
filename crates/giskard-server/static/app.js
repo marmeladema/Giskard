@@ -4276,6 +4276,13 @@ function handleEvent(ev) {
       // Only the live path: replaying history must not poll git for changes long since made.
       if (ev.item && ((ev.item.payload || ev.item).kind) === "file_change") scheduleGitRefresh();
       break;
+    case "turn_usage_updated":
+      // Only the turn being rendered may move the gauge. A late or replayed update for another
+      // turn is ignored; turn_completed clears currentRenderTurnId for finished turns.
+      if (ev.turn && ev.turn === state.currentRenderTurnId) {
+        updateGaugeFromUsage(ev.usage, ev.context_window);
+      }
+      break;
     case "turn_completed":
       state.firstTurnStartingThreadId = null;
       // This turn is now persisted; advance the high-water cursor and stop stamping rows to it.
@@ -10101,12 +10108,12 @@ function updateGaugeFromTurns(turns) {
   const latest = turns[turns.length - 1];
   updateGaugeFromUsage(latest && latest.usage);
 }
-function updateGaugeFromUsage(usage) {
+function updateGaugeFromUsage(usage, window) {
   if (!usage) return;
   // Codex currently exposes `last.input_tokens` rather than a dedicated context-used field;
   // input tokens are the best available proxy for current context occupancy (spec §10.3).
   const used = Number.isFinite(usage.input) ? usage.input : usage.total;
-  if (Number.isFinite(used)) updateGauge(used, state.contextWindow);
+  if (Number.isFinite(used)) updateGauge(used, window || state.contextWindow);
 }
 function fmt(n) { return n>=1000 ? (n/1000).toFixed(1)+"k" : String(n); }
 function usagePercent() {

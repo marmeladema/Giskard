@@ -232,9 +232,7 @@ impl Hub {
     pub async fn broadcast_event(&self, thread_id: ThreadId, event: AgentEvent) {
         if matches!(
             event,
-            AgentEvent::ThreadOpened { .. }
-                | AgentEvent::DiffUpdated { .. }
-                | AgentEvent::ContextWindowUpdated { .. }
+            AgentEvent::ThreadOpened { .. } | AgentEvent::DiffUpdated { .. }
         ) {
             debug!(
                 %thread_id,
@@ -266,7 +264,7 @@ fn event_kind(event: &AgentEvent) -> &'static str {
     match event {
         AgentEvent::ThreadOpened { .. } => "thread_opened",
         AgentEvent::TurnStarted { .. } => "turn_started",
-        AgentEvent::ContextWindowUpdated { .. } => "context_window_updated",
+        AgentEvent::TurnUsageUpdated { .. } => "turn_usage_updated",
         AgentEvent::ItemStarted { .. } => "item_started",
         AgentEvent::ItemDelta { .. } => "item_delta",
         AgentEvent::ItemCompleted { .. } => "item_completed",
@@ -305,6 +303,56 @@ fn server_message_kind(msg: &ServerMessage) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn live_usage_is_broadcast_while_diff_stays_internal() {
+        let hub = Hub::new();
+        let thread_id = ThreadId::new();
+        let turn = giskard_core::ids::TurnId::new();
+        let (tx, mut rx) = mpsc::channel(2);
+        let _replacements = hub.register_client(1, tx).await;
+        assert!(hub.subscribe(thread_id, 1).await);
+
+        hub.broadcast_event(
+            thread_id,
+            AgentEvent::TurnUsageUpdated {
+                thread: thread_id,
+                turn,
+                usage: giskard_core::token::TokenUsage {
+                    input: 10,
+                    output: 1,
+                    total: 11,
+                },
+                context_window: Some(258_400),
+                model: None,
+            },
+        )
+        .await;
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(ServerMessage::Event { agent_event, .. })
+                if matches!(*agent_event, WireAgentEvent::TurnUsageUpdated { .. })
+        ));
+
+        hub.broadcast_event(
+            thread_id,
+            AgentEvent::DiffUpdated {
+                thread: thread_id,
+                turn,
+                diff: giskard_core::diff::FileDiff {
+                    path: "src/lib.rs".into(),
+                    change: giskard_core::item::FileChangeKind::Modified,
+                    old_text: None,
+                    new_text: None,
+                    hunks: Vec::new(),
+                    binary: false,
+                    captured: None,
+                },
+            },
+        )
+        .await;
+        assert!(rx.try_recv().is_err());
+    }
 
     #[tokio::test]
     async fn unregistered_client_cannot_create_a_receiverless_subscription() {
