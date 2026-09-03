@@ -204,7 +204,8 @@ native harness threads and local transcripts. An individual sub-agent cannot be 
 deletion root. Before deleting anything, Giskard rejects the operation if the primary or any
 descendant has an active turn or running task. Each long-lived owner is retired as its binding is
 removed, so a late child event cannot recreate storage after deletion. Project deletion quiesces
-the event driver before removing files. Subtree deletion retires every candidate before reloading
+the event driver, then takes the authoritative owner set before shutting down the harness and
+removing files. Subtree deletion retires every candidate before reloading
 the graph and computing its final deletion order.
 
 Codex may report that a native rollout is already absent. Only the exact matching missing-rollout

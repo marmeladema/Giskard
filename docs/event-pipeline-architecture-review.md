@@ -294,6 +294,10 @@ removes outright.
 
 ### 6.4 Costs, honestly
 
+The landed M7 logs are count-bounded: `EVENT_LOG_RETAIN_LIMIT` counts events and
+`CODEX_INBOX_RETAIN_LIMIT` counts frames, while `CODEX_MAX_FRAME_BYTES` bounds each stdout frame.
+The byte-bounded spill journal described here remains the M8 design; it is not the current log.
+
 - **Memory and disk.** The journal holds events until consumed. The projector is in-process and
   the slow step is persistence I/O, so the backlog is bounded by disk write speed, which is the same
   bound the current design has once a turn completes. Spill to disk is the cap; if the disk fails,
