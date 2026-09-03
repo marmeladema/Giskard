@@ -14,7 +14,9 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicI64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
-use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader, BufWriter};
+use tokio::io::{
+    AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader, BufWriter,
+};
 use tokio::process::Child;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
@@ -23,6 +25,7 @@ use tracing::{debug, error, trace, warn};
 const STDOUT_BUFFER_SIZE: usize = 10 * 1024 * 1024;
 const WRITER_QUEUE_CAPACITY: usize = 64;
 pub(super) const CODEX_INBOX_RETAIN_LIMIT: usize = 65_536;
+pub(super) const CODEX_MAX_FRAME_BYTES: usize = 64 * 1024 * 1024;
 
 type Waiter = oneshot::Sender<Result<Value, HarnessError>>;
 type Waiters = Arc<Mutex<HashMap<RequestId, Waiter>>>;
@@ -393,10 +396,11 @@ where
     R: AsyncRead + Unpin,
 {
     let mut reader = BufReader::with_capacity(STDOUT_BUFFER_SIZE, reader);
-    let mut line = String::new();
+    let mut buffer = Vec::new();
     loop {
-        line.clear();
-        match reader.read_line(&mut line).await {
+        buffer.clear();
+        let mut limited = (&mut reader).take(CODEX_MAX_FRAME_BYTES as u64 + 1);
+        match limited.read_until(b'\n', &mut buffer).await {
             Ok(0) => {
                 inbox.append(InboxItem::Eof);
                 fail_all_waiters(&waiters, "Codex stream closed");
@@ -413,6 +417,15 @@ where
                 return;
             }
         }
+        if buffer.len() > CODEX_MAX_FRAME_BYTES {
+            inbox.append(InboxItem::Fatal(format!(
+                "Codex stdout frame exceeded {CODEX_MAX_FRAME_BYTES} bytes"
+            )));
+            fail_all_waiters(&waiters, "Codex stream produced an oversized frame");
+            inbox.close();
+            return;
+        }
+        let mut line = String::from_utf8_lossy(&buffer).into_owned();
         trim_line_ending(&mut line);
         if line.trim().is_empty() {
             continue;
@@ -989,6 +1002,45 @@ mod tests {
             pending_result,
             Err(HarnessError::Transport(message)) if message == "Codex stream closed"
         ));
+    }
+
+    #[tokio::test]
+    async fn an_oversized_frame_is_fatal() {
+        let (mut transport, mut peer) = test_transport(CODEX_INBOX_RETAIN_LIMIT);
+        let (waiter_tx, waiter_rx) = oneshot::channel();
+        lock_waiters(&transport.waiters).insert(RequestId::Integer(7), waiter_tx);
+
+        let mut frame = vec![b'x'; CODEX_MAX_FRAME_BYTES];
+        frame.push(b'\n');
+        peer.writer.write_all(&frame).await.unwrap();
+
+        assert!(matches!(
+            waiter_rx.await.unwrap(),
+            Err(HarnessError::Transport(message))
+                if message == "Codex stream produced an oversized frame"
+        ));
+        assert!(matches!(
+            transport.next_message().await,
+            Err(CodexStreamError::Fatal(HarnessError::Transport(message)))
+                if message == format!(
+                    "Codex stdout frame exceeded {CODEX_MAX_FRAME_BYTES} bytes"
+                )
+        ));
+        assert!(transport.next_message().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn a_frame_at_the_limit_is_accepted() {
+        let (mut transport, mut peer) = test_transport(CODEX_INBOX_RETAIN_LIMIT);
+        let mut frame = vec![b'x'; CODEX_MAX_FRAME_BYTES - 1];
+        frame.push(b'\n');
+        peer.writer.write_all(&frame).await.unwrap();
+
+        let Err(CodexStreamError::NonJsonStdout { raw_bytes, .. }) = transport.next_message().await
+        else {
+            panic!("expected an accepted non-JSON frame");
+        };
+        assert_eq!(raw_bytes, CODEX_MAX_FRAME_BYTES - 1);
     }
 
     #[tokio::test]
