@@ -415,8 +415,10 @@ same form as the 1.84 one):
   and that the persisted window remains on the metadata row; do not add a table row.
 - Amendment text (1.85): unknown-model turns keep their live usage and window; no warning; no
   per-model persistence without an event model; live buffer keeps the latest usage event per turn.
-- Leave the 1.54 (C8/C9) and 1.70 (CR2) changelog entries as history; they describe versions that
-  existed.
+- Leave the 1.54 (C8/C9) and 1.70 (CR2) changelog entries as history with their original wording,
+  and prefix C8 with `(superseded by 1.85/C10)` and C9 with `(amended by 1.85/C11)`, the way
+  `WS2`, `LT9` and `Q2` are marked. The old event name staying inside a superseded entry is the
+  document's convention; only normative sections must stop naming it.
 
 `crates/giskard-harness-codex/README.md:538-565`: rewrite the two paragraphs about
 `ContextWindowUpdated` to describe `TurnUsageUpdated`, the model-only-from-`turn/start` rule, the
@@ -445,8 +447,9 @@ Expected size: roughly 300-500 non-test lines, most of them deletions and rename
 
 - `cargo test -p giskard-core -p giskard-proto -p giskard-harness-codex -p giskard-harness-replay
   -p giskard-server`, `cargo clippy --all-targets`, `cargo fmt --check`, and the UI source tests.
-- `grep -rn ContextWindowUpdated crates/ specs/ README.md docs/` returns only the historical
-  reconciliation plan.
+- `grep -rn ContextWindowUpdated crates/ specs/ README.md docs/` returns only superseded
+  changelog entries in the spec and the historical reconciliation plan; no normative spec section,
+  code, or README hit.
 - `grep -rn "without a registered turn model" crates/` returns nothing.
 - A manual run against Codex with a sub-agent spawn: no warning in the log, the child thread's gauge
   moves during its turn, the parent's gauge is unaffected by the child's events, and the child's
