@@ -868,18 +868,21 @@ impl ThreadEventForwarder {
                 Answered(Result<Option<TurnId>, HarnessError>),
                 Event(Result<AgentEvent, EventStreamError>),
             }
+            // Retained events intentionally precede harness answers: a browser reply may wait for
+            // the bounded event backlog, preserving native event order before admitting new work.
             let step = tokio::select! {
+                biased;
                 changed = self.cancel.changed() => {
                     Step::Cancelled(changed)
                 }
-                intent = self.intents.recv(), if !self.intents_closed => Step::Intent(intent),
+                result = self.stream.recv() => Step::Event(result),
                 outcome = async {
                     match self.inflight.as_mut() {
                         Some(request) => request.request.as_mut().await,
                         None => std::future::pending().await,
                     }
                 }, if self.inflight.is_some() => Step::Answered(outcome),
-                result = self.stream.recv() => Step::Event(result),
+                intent = self.intents.recv(), if !self.intents_closed => Step::Intent(intent),
             };
             match step {
                 Step::Cancelled(changed) => {
@@ -916,6 +919,13 @@ impl ThreadEventForwarder {
                 let _ = reply.send(Err(error));
             }
         };
+        if *self.cancel.borrow() {
+            reject(
+                intent,
+                HarnessError::Protocol(format!("thread {thread_id} has no live event owner")),
+            );
+            return;
+        }
         if self.coordinator.classification().await != ClassificationPhase::Primary {
             reject(intent, HarnessError::ThreadReadOnly { thread: thread_id });
             return;
@@ -1088,6 +1098,21 @@ impl ThreadEventForwarder {
     async fn finish(&mut self, exit_reason: ForwarderExitReason) -> ForwarderExitReason {
         let thread_id = self.thread_id();
         let project_id = self.binding.project_id;
+        // Closing first makes the cancellation fence cover every sender clone: intents already
+        // queued are rejected below, while blocked and future sends fail at the sender boundary.
+        self.intents.close();
+        while let Ok(intent) = self.intents.try_recv() {
+            let error =
+                HarnessError::Protocol(format!("thread {thread_id} has no live event owner"));
+            match intent {
+                TurnIntent::StartTurn { reply, .. } => {
+                    let _ = reply.send(Err(error));
+                }
+                TurnIntent::Compact { reply, .. } => {
+                    let _ = reply.send(Err(error));
+                }
+            }
+        }
         if let Some(mut admitted) = self.admitted.take()
             && let Some(overview) = admitted.lease.release()
         {
@@ -2093,15 +2118,17 @@ mod tests {
         )
     }
 
-    async fn running_intent_forwarder(
+    async fn intent_forwarder(
         classification: ClassificationPhase,
         harness: Arc<TestIntentHarness>,
     ) -> (
-        JoinHandle<ForwarderExitReason>,
+        ThreadEventForwarder,
         mpsc::Sender<TurnIntent>,
         Arc<EventLog>,
         Arc<RegistryShared>,
         Arc<ThreadAuthority>,
+        Arc<ThreadCoordinator>,
+        Arc<dyn AgentHarness>,
         ProjectId,
         ThreadId,
         tempfile::TempDir,
@@ -2133,7 +2160,7 @@ mod tests {
         let forwarder = ThreadEventForwarder::new(
             shared.clone(),
             authority.clone(),
-            coordinator,
+            coordinator.clone(),
             Arc::downgrade(&trait_harness),
             AgentEventStream::new(log.reader()),
             cancel_rx,
@@ -2141,6 +2168,45 @@ mod tests {
             DriverHandle::disconnected(),
         )
         .await;
+        (
+            forwarder,
+            intent_tx,
+            log,
+            shared,
+            authority,
+            coordinator,
+            trait_harness,
+            project_id,
+            thread_id,
+            temp,
+        )
+    }
+
+    async fn running_intent_forwarder(
+        classification: ClassificationPhase,
+        harness: Arc<TestIntentHarness>,
+    ) -> (
+        JoinHandle<ForwarderExitReason>,
+        mpsc::Sender<TurnIntent>,
+        Arc<EventLog>,
+        Arc<RegistryShared>,
+        Arc<ThreadAuthority>,
+        ProjectId,
+        ThreadId,
+        tempfile::TempDir,
+    ) {
+        let (
+            forwarder,
+            intent_tx,
+            log,
+            shared,
+            authority,
+            _coordinator,
+            trait_harness,
+            project_id,
+            thread_id,
+            temp,
+        ) = intent_forwarder(classification, harness).await;
         let handle = tokio::spawn(async move {
             let result = forwarder.run().await;
             drop(trait_harness);
@@ -2196,6 +2262,90 @@ mod tests {
         assert_eq!(harness.start_calls.load(Ordering::SeqCst), 0);
         assert!(!shared.runtime.has_active_turn(&authority));
         log.close();
+        handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_retained_event_is_processed_before_a_queued_intent() {
+        let harness = Arc::new(TestIntentHarness::accepting(TurnId::new()));
+        let (
+            forwarder,
+            intents,
+            log,
+            shared,
+            _authority,
+            _coordinator,
+            trait_harness,
+            project_id,
+            thread_id,
+            _temp,
+        ) = intent_forwarder(ClassificationPhase::Primary, harness.clone()).await;
+        let external_turn = TurnId::new();
+        assert!(log.append(AgentEvent::TurnStarted {
+            thread: thread_id,
+            turn: external_turn,
+        }));
+        let (intent, response) = start_intent(crate::registry::tests::test_turn_context());
+        intents.send(intent).await.unwrap();
+
+        let handle = tokio::spawn(async move {
+            let result = forwarder.run().await;
+            drop(trait_harness);
+            result
+        });
+        assert!(matches!(
+            response.await.unwrap(),
+            Err(HarnessError::ThreadBusy { thread }) if thread == thread_id
+        ));
+        assert_eq!(harness.start_calls.load(Ordering::SeqCst), 0);
+
+        assert!(log.append(AgentEvent::TurnCompleted {
+            thread: thread_id,
+            turn: external_turn,
+            usage: TokenUsage::default(),
+            status: TurnStatus {
+                kind: TurnStatusKind::Completed,
+                message: None,
+            },
+        }));
+        wait_for_turn_count(&shared.store, project_id, thread_id, 1).await;
+        let saved = shared
+            .store
+            .load_all_turns(project_id, thread_id)
+            .await
+            .unwrap();
+        assert_eq!(saved[0].user_input, UserInput::text(""));
+        log.close();
+        handle.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_intent_delivered_after_detach_began_is_refused() {
+        let harness = Arc::new(TestIntentHarness::accepting(TurnId::new()));
+        let (
+            forwarder,
+            intents,
+            _log,
+            _shared,
+            _authority,
+            coordinator,
+            _trait_harness,
+            _project_id,
+            thread_id,
+            _temp,
+        ) = intent_forwarder(ClassificationPhase::Primary, harness.clone()).await;
+        let (detach_reply, _detach_response) = oneshot::channel();
+        let _ = coordinator.request_detach(detach_reply).await;
+        let (intent, response) = start_intent(crate::registry::tests::test_turn_context());
+        intents.send(intent).await.unwrap();
+        let handle = tokio::spawn(async move { forwarder.run().await });
+
+        assert!(matches!(
+            response.await.unwrap(),
+            Err(HarnessError::Protocol(message))
+                if message == format!("thread {thread_id} has no live event owner")
+        ));
+        assert_eq!(harness.start_calls.load(Ordering::SeqCst), 0);
         handle.await.unwrap();
     }
 
