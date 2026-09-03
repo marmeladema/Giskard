@@ -3,10 +3,13 @@ use std::sync::{Arc, Weak};
 use futures::future::BoxFuture;
 use futures::stream::{FuturesUnordered, StreamExt};
 use giskard_core::error::HarnessError;
-use giskard_core::ids::{ProjectId, ThreadId};
-use giskard_harness::{AgentHarness, ThreadHandle};
+use giskard_core::ids::{ItemId, ProjectId, ThreadId, TurnId};
+use giskard_harness::{AgentHarness, DiscoveryStream, EventStreamError, ThreadHandle};
 use tokio::sync::{mpsc, oneshot, watch};
-use tracing::{debug, warn};
+use tracing::{debug, error, warn};
+
+use super::SubagentActivityInfo;
+use super::admission::{self, Admission, Admitted};
 
 use super::event_forwarder::{
     ForwarderExitReason, ThreadEventForwarder, forwarder_exit_reason_label,
@@ -21,7 +24,13 @@ const DRIVER_COMMAND_CAPACITY: usize = 64;
 
 #[derive(Clone)]
 pub(super) struct DriverHandle {
-    tx: mpsc::Sender<DriverCommand>,
+    tx: DriverSender,
+}
+
+#[derive(Clone)]
+enum DriverSender {
+    Strong(mpsc::Sender<DriverCommand>),
+    Weak(mpsc::WeakSender<DriverCommand>),
 }
 
 pub(super) enum AttachOutcome {
@@ -35,12 +44,48 @@ struct Attach {
     reply: oneshot::Sender<Result<AttachOutcome, HarnessError>>,
 }
 
+pub(super) struct Link {
+    pub(super) parent_thread_id: ThreadId,
+    pub(super) spawned_by_turn_id: TurnId,
+    pub(super) item_id: ItemId,
+    pub(super) origin: &'static str,
+    pub(super) info: SubagentActivityInfo,
+    pub(super) reply: Option<oneshot::Sender<Result<Option<ThreadId>, HarnessError>>>,
+}
+
 enum DriverCommand {
     Attach(Box<Attach>),
     Detach {
         thread_id: ThreadId,
         reply: oneshot::Sender<()>,
     },
+    Link(Box<Link>),
+    Quiesce {
+        reply: oneshot::Sender<()>,
+    },
+    Resume {
+        reply: oneshot::Sender<()>,
+    },
+}
+
+enum AdmissionSource {
+    Discovery,
+    Link {
+        reply: Option<oneshot::Sender<Result<Option<ThreadId>, HarnessError>>>,
+        parent_thread_id: ThreadId,
+        item_id: ItemId,
+        origin: &'static str,
+    },
+}
+
+struct InflightAdmission {
+    work: BoxFuture<'static, AdmissionOutcome>,
+    source: AdmissionSource,
+}
+
+enum AdmissionOutcome {
+    Decided(Box<Result<Option<Admitted>, HarnessError>>),
+    Attached(Result<Option<ThreadId>, HarnessError>),
 }
 
 struct OwnerExit {
@@ -56,6 +101,11 @@ struct ProjectEventDriver {
     shared: Arc<RegistryShared>,
     owners: FuturesUnordered<BoxFuture<'static, OwnerExit>>,
     parked: Vec<Attach>,
+    weak_tx: mpsc::WeakSender<DriverCommand>,
+    discoveries: DiscoveryStream,
+    discoveries_closed: bool,
+    admission: Option<InflightAdmission>,
+    quiesced: bool,
 }
 
 impl DriverHandle {
@@ -63,7 +113,51 @@ impl DriverHandle {
     pub(super) fn disconnected() -> Self {
         let (tx, rx) = mpsc::channel(1);
         drop(rx);
-        Self { tx }
+        Self {
+            tx: DriverSender::Strong(tx),
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn responsive_for_test() -> Self {
+        let (tx, mut rx) = mpsc::channel(4);
+        tokio::spawn(async move {
+            while let Some(command) = rx.recv().await {
+                match command {
+                    DriverCommand::Quiesce { reply } | DriverCommand::Resume { reply } => {
+                        let _ = reply.send(());
+                    }
+                    DriverCommand::Detach { reply, .. } => {
+                        let _ = reply.send(());
+                    }
+                    DriverCommand::Attach(attach) => {
+                        let _ = attach.reply.send(Err(HarnessError::Protocol(
+                            "test driver does not attach".into(),
+                        )));
+                    }
+                    DriverCommand::Link(mut link) => {
+                        if let Some(reply) = link.reply.take() {
+                            let _ = reply.send(Ok(None));
+                        }
+                    }
+                }
+            }
+        });
+        Self {
+            tx: DriverSender::Strong(tx),
+        }
+    }
+
+    async fn send(&self, command: DriverCommand) -> Result<(), HarnessError> {
+        let tx = match &self.tx {
+            DriverSender::Strong(tx) => tx.clone(),
+            DriverSender::Weak(tx) => tx
+                .upgrade()
+                .ok_or_else(|| HarnessError::Protocol("project event driver is gone".into()))?,
+        };
+        tx.send(command)
+            .await
+            .map_err(|_| HarnessError::Protocol("project event driver is gone".into()))
     }
 
     pub(super) async fn attach(
@@ -72,14 +166,12 @@ impl DriverHandle {
         classification: ClassificationPhase,
     ) -> Result<AttachOutcome, HarnessError> {
         let (reply, response) = oneshot::channel();
-        self.tx
-            .send(DriverCommand::Attach(Box::new(Attach {
-                binding,
-                classification,
-                reply,
-            })))
-            .await
-            .map_err(|_| HarnessError::Protocol("project event driver is gone".into()))?;
+        self.send(DriverCommand::Attach(Box::new(Attach {
+            binding,
+            classification,
+            reply,
+        })))
+        .await?;
         response.await.map_err(|_| {
             HarnessError::Protocol("project event driver dropped attach reply".into())
         })?
@@ -88,7 +180,6 @@ impl DriverHandle {
     pub(super) async fn detach(&self, thread_id: ThreadId) {
         let (reply, response) = oneshot::channel();
         if self
-            .tx
             .send(DriverCommand::Detach { thread_id, reply })
             .await
             .is_ok()
@@ -96,15 +187,37 @@ impl DriverHandle {
             let _ = response.await;
         }
     }
+
+    pub(super) async fn link(&self, link: Link) -> Result<(), HarnessError> {
+        self.send(DriverCommand::Link(Box::new(link))).await
+    }
+
+    pub(super) async fn quiesce(&self) -> Result<(), HarnessError> {
+        let (reply, response) = oneshot::channel();
+        self.send(DriverCommand::Quiesce { reply }).await?;
+        response.await.map_err(|_| {
+            HarnessError::Protocol("project event driver dropped quiesce reply".into())
+        })
+    }
+
+    pub(super) async fn resume(&self) -> Result<(), HarnessError> {
+        let (reply, response) = oneshot::channel();
+        self.send(DriverCommand::Resume { reply }).await?;
+        response
+            .await
+            .map_err(|_| HarnessError::Protocol("project event driver dropped resume reply".into()))
+    }
 }
 
 pub(super) fn spawn_project_event_driver(
     project_id: ProjectId,
     shared: Arc<RegistryShared>,
     harness: &Arc<dyn AgentHarness>,
+    discoveries: DiscoveryStream,
     permit: RegistryTaskPermit,
 ) -> DriverHandle {
     let (tx, rx) = mpsc::channel(DRIVER_COMMAND_CAPACITY);
+    let weak_tx = tx.downgrade();
     let driver = ProjectEventDriver {
         project_id,
         rx,
@@ -112,12 +225,19 @@ pub(super) fn spawn_project_event_driver(
         shared,
         owners: FuturesUnordered::new(),
         parked: Vec::new(),
+        weak_tx,
+        discoveries,
+        discoveries_closed: false,
+        admission: None,
+        quiesced: false,
     };
     tokio::spawn(async move {
         let _permit = permit;
         driver.run().await;
     });
-    DriverHandle { tx }
+    DriverHandle {
+        tx: DriverSender::Strong(tx),
+    }
 }
 
 impl ProjectEventDriver {
@@ -125,18 +245,43 @@ impl ProjectEventDriver {
         let mut closed = false;
         loop {
             tokio::select! {
-                command = self.rx.recv(), if !closed => match command {
+                command = self.rx.recv(), if !closed && self.admission.is_none() => match command {
                     Some(DriverCommand::Attach(attach)) => self.attach(*attach).await,
                     Some(DriverCommand::Detach { thread_id, reply }) => {
                         self.detach(thread_id, reply).await;
                     }
+                    Some(DriverCommand::Link(link)) => self.begin_link(*link).await,
+                    Some(DriverCommand::Quiesce { reply }) => {
+                        self.quiesced = true;
+                        let _ = reply.send(());
+                    }
+                    Some(DriverCommand::Resume { reply }) => {
+                        self.quiesced = false;
+                        let _ = reply.send(());
+                    }
                     None => closed = true,
                 },
+                record = self.discoveries.recv(),
+                    if !self.discoveries_closed && self.admission.is_none() => match record {
+                    Ok(record) => self.begin_discovery(record),
+                    Err(EventStreamError::Closed) => self.discoveries_closed = true,
+                    Err(EventStreamError::Gap { dropped }) => error!(
+                        project_id = %self.project_id,
+                        dropped,
+                        "native thread discovery log dropped records"
+                    ),
+                },
+                outcome = async {
+                    match self.admission.as_mut() {
+                        Some(admission) => admission.work.as_mut().await,
+                        None => std::future::pending().await,
+                    }
+                }, if self.admission.is_some() => self.finish_admission(outcome).await,
                 Some(exit) = self.owners.next(), if !self.owners.is_empty() => {
                     self.owner_exited(exit).await;
                 }
             }
-            if closed && self.owners.is_empty() {
+            if closed && self.owners.is_empty() && self.admission.is_none() {
                 for attach in self.parked.drain(..) {
                     let _ = attach.reply.send(Err(HarnessError::Protocol(
                         "project event driver is gone".into(),
@@ -218,6 +363,9 @@ impl ProjectEventDriver {
         let owner_harness = self.harness.clone();
         let owner_authority = authority.clone();
         let owner_coordinator = coordinator.clone();
+        let owner_driver = DriverHandle {
+            tx: DriverSender::Weak(self.weak_tx.clone()),
+        };
         self.owners.push(Box::pin(async move {
             let forwarder = ThreadEventForwarder::new(
                 shared,
@@ -227,6 +375,7 @@ impl ProjectEventDriver {
                 stream,
                 cancel_rx,
                 intent_rx,
+                owner_driver,
             )
             .await;
             let reason = forwarder.run().await;
@@ -238,6 +387,161 @@ impl ProjectEventDriver {
         }));
         debug!(%project_id, %thread_id, "installed long-lived native event owner");
         let _ = attach.reply.send(Ok(AttachOutcome::Installed));
+    }
+
+    async fn begin_link(&mut self, mut link: Link) {
+        if self.quiesced {
+            if let Some(reply) = link.reply.take() {
+                let _ = reply.send(Err(HarnessError::Protocol(
+                    "project is being deleted".into(),
+                )));
+            }
+            return;
+        }
+        let live = match self.shared.thread_authority(link.parent_thread_id).await {
+            Some(authority) => match authority.coordinator().await {
+                Some(coordinator) => {
+                    !coordinator.is_detaching().await && !coordinator.is_failed().await
+                }
+                None => false,
+            },
+            None => false,
+        };
+        if !live {
+            warn!(project_id = %self.project_id, parent_thread_id = %link.parent_thread_id,
+                origin = link.origin, "refusing native identity link from a parent without a live owner");
+            if let Some(reply) = link.reply.take() {
+                let _ = reply.send(Ok(None));
+            }
+            return;
+        }
+        let source = AdmissionSource::Link {
+            reply: link.reply.take(),
+            parent_thread_id: link.parent_thread_id,
+            item_id: link.item_id,
+            origin: link.origin,
+        };
+        let shared = self.shared.clone();
+        let Some(harness) = self.harness.upgrade() else {
+            if let AdmissionSource::Link {
+                reply: Some(reply), ..
+            } = source
+            {
+                let _ = reply.send(Err(HarnessError::Protocol(
+                    "project harness is gone".into(),
+                )));
+            }
+            return;
+        };
+        let project_id = self.project_id;
+        self.admission = Some(InflightAdmission {
+            work: Box::pin(async move {
+                AdmissionOutcome::Decided(Box::new(
+                    admission::admit(shared, harness, project_id, Admission::Link(Box::new(link)))
+                        .await,
+                ))
+            }),
+            source,
+        });
+    }
+
+    fn begin_discovery(&mut self, record: giskard_harness::ThreadDiscovered) {
+        if self.quiesced {
+            warn!(project_id = %self.project_id, thread_id = %record.thread,
+                "dropping native thread discovery after project quiesce");
+            #[cfg(test)]
+            self.shared
+                .discovery_records_processed
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            return;
+        }
+        let Some(harness) = self.harness.upgrade() else {
+            warn!(project_id = %self.project_id, thread_id = %record.thread,
+                "dropping native thread discovery because the project harness is gone");
+            return;
+        };
+        let shared = self.shared.clone();
+        let project_id = self.project_id;
+        self.admission = Some(InflightAdmission {
+            work: Box::pin(async move {
+                AdmissionOutcome::Decided(Box::new(
+                    admission::admit(shared, harness, project_id, Admission::Discovered(record))
+                        .await,
+                ))
+            }),
+            source: AdmissionSource::Discovery,
+        });
+    }
+
+    async fn finish_admission(&mut self, outcome: AdmissionOutcome) {
+        let Some(inflight) = self.admission.take() else {
+            return;
+        };
+        match outcome {
+            AdmissionOutcome::Decided(decision) => match *decision {
+                Ok(Some(admitted)) => {
+                    let link_result = admitted.link_result;
+                    let (reply, response) = oneshot::channel();
+                    self.attach(Attach {
+                        binding: admitted.binding,
+                        classification: admitted.classification,
+                        reply,
+                    })
+                    .await;
+                    self.admission = Some(InflightAdmission {
+                        source: inflight.source,
+                        work: Box::pin(async move {
+                            let result = match response.await {
+                                Ok(Ok(_)) => Ok(link_result),
+                                Ok(Err(error)) => Err(error),
+                                Err(_) => Err(HarnessError::Protocol(
+                                    "project event driver dropped admission attach reply".into(),
+                                )),
+                            };
+                            AdmissionOutcome::Attached(result)
+                        }),
+                    });
+                }
+                Ok(None) => self.finish_admission_reply(Ok(None), inflight.source),
+                Err(error) => self.finish_admission_reply(Err(error), inflight.source),
+            },
+            AdmissionOutcome::Attached(result) => {
+                self.finish_admission_reply(result, inflight.source)
+            }
+        }
+    }
+
+    fn finish_admission_reply(
+        &self,
+        result: Result<Option<ThreadId>, HarnessError>,
+        source: AdmissionSource,
+    ) {
+        match source {
+            AdmissionSource::Discovery => {
+                #[cfg(test)]
+                self.shared
+                    .discovery_records_processed
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                if let Err(error) = result {
+                    warn!(project_id = %self.project_id, %error,
+                        "failed to admit discovered native thread");
+                }
+            }
+            AdmissionSource::Link {
+                reply,
+                parent_thread_id,
+                item_id,
+                origin,
+            } => {
+                if let Err(error) = &result {
+                    warn!(project_id = %self.project_id, %parent_thread_id, %item_id, origin, %error,
+                        "failed to admit linked native thread");
+                }
+                if let Some(reply) = reply {
+                    let _ = reply.send(result);
+                }
+            }
+        }
     }
 
     async fn detach(&mut self, thread_id: ThreadId, reply: oneshot::Sender<()>) {
@@ -434,7 +738,13 @@ mod tests {
         let project_id = ProjectId::new();
         let permit = shared.background_tasks.register().unwrap();
         let trait_harness: Arc<dyn AgentHarness> = harness.clone();
-        let driver = spawn_project_event_driver(project_id, shared.clone(), &trait_harness, permit);
+        let driver = spawn_project_event_driver(
+            project_id,
+            shared.clone(),
+            &trait_harness,
+            trait_harness.discoveries(),
+            permit,
+        );
         (shared, harness, driver, project_id, store)
     }
 
@@ -598,7 +908,7 @@ mod tests {
         let (shared, harness, _handle, project_id, _store) = setup();
         let permit = shared.background_tasks.register().unwrap();
         let trait_harness: Arc<dyn AgentHarness> = harness;
-        let (_tx, rx) = mpsc::channel(1);
+        let (tx, rx) = mpsc::channel(1);
         let mut driver = ProjectEventDriver {
             project_id,
             rx,
@@ -606,6 +916,11 @@ mod tests {
             shared: shared.clone(),
             owners: FuturesUnordered::new(),
             parked: Vec::new(),
+            weak_tx: tx.downgrade(),
+            discoveries: DiscoveryStream::closed(),
+            discoveries_closed: false,
+            admission: None,
+            quiesced: false,
         };
         let _permit = permit;
         let thread_id = ThreadId::new();

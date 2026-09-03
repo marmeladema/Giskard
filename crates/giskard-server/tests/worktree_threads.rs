@@ -4,6 +4,7 @@
 //! strategy must be opened against the worktree rather than the project's checkout, and must still
 //! be after a restart. Everything here therefore records the workspace root the harness was handed.
 
+use std::collections::HashMap;
 use std::path::Path;
 use std::process::Command;
 use std::sync::Arc;
@@ -236,6 +237,7 @@ struct RecordingHarness {
     /// the map happened to be held. Every event for that thread would then vanish and the test would
     /// fail on an unexplained timeout. Nothing holds this guard across an await.
     threads: std::sync::Mutex<Vec<(ThreadId, Arc<EventLog>)>>,
+    native_routes: std::sync::Mutex<HashMap<String, ThreadId>>,
     /// When set, the next turn reports having spawned a sub-agent with this native id, which is what
     /// drives the registry to materialize a linked thread the way Codex does.
     spawns_subagent: Mutex<Option<String>>,
@@ -265,13 +267,14 @@ impl AgentHarness for RecordingHarness {
         let thread = opts.thread;
         let tx = Arc::new(EventLog::new());
         self.threads.lock().unwrap().push((thread, tx));
+        let harness_thread_id = opts.resume.unwrap_or_else(|| format!("native-{thread}"));
+        self.native_routes
+            .lock()
+            .unwrap()
+            .insert(harness_thread_id.clone(), thread);
         Ok(ThreadHandle {
             resumed_model: Some(opts.initial_model.clone()),
-            ..ThreadHandle::opened(
-                thread,
-                opts.resume.unwrap_or_else(|| format!("native-{thread}")),
-                opts.workspace_root.clone(),
-            )
+            ..ThreadHandle::opened(thread, harness_thread_id, opts.workspace_root.clone())
         })
     }
 
@@ -287,6 +290,12 @@ impl AgentHarness for RecordingHarness {
             .lock()
             .await
             .push(workspace_root.to_string_lossy().into_owned());
+        let thread = *self
+            .native_routes
+            .lock()
+            .unwrap()
+            .entry(harness_thread_id.clone())
+            .or_insert(thread);
         let tx = Arc::new(EventLog::new());
         self.threads.lock().unwrap().push((thread, tx));
         Ok(ThreadHandle::opened(
@@ -427,8 +436,13 @@ impl HarnessFactory for RecordingFactory {
     async fn create(
         &self,
         _config: &ProjectConfig,
-        _bootstrap: giskard_harness::HarnessBootstrap,
+        bootstrap: giskard_harness::HarnessBootstrap,
     ) -> Result<Arc<dyn AgentHarness>, HarnessError> {
+        let mut routes = self.0.native_routes.lock().unwrap();
+        for binding in bootstrap.known_threads {
+            routes.insert(binding.harness_thread_id, binding.thread_id);
+        }
+        drop(routes);
         Ok(self.0.clone())
     }
 }
