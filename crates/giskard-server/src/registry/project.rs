@@ -268,11 +268,10 @@ impl ProjectHarnessGuard<'_, '_, '_> {
     }
 
     /// Drains either harness state while the global shutdown fence is held.
-    pub(super) fn take_for_shutdown(&mut self) -> Option<Arc<dyn AgentHarness>> {
+    pub(super) fn take_for_shutdown(&mut self) -> Option<HarnessAndDriver> {
         self.slot.take().map(|state| match state {
-            ProjectHarnessState::Active(harness, _) | ProjectHarnessState::Deleting(harness, _) => {
-                harness
-            }
+            ProjectHarnessState::Active(harness, driver)
+            | ProjectHarnessState::Deleting(harness, driver) => (harness, driver),
         })
     }
 }

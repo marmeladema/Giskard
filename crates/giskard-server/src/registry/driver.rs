@@ -261,7 +261,7 @@ impl ProjectEventDriver {
                     None => closed = true,
                 },
                 record = self.discoveries.recv(),
-                    if !self.discoveries_closed && self.admission.is_none() => match record {
+                    if !self.quiesced && !self.discoveries_closed && self.admission.is_none() => match record {
                     Ok(record) => self.begin_discovery(record),
                     Err(EventStreamError::Closed) => self.discoveries_closed = true,
                     Err(EventStreamError::Gap { dropped }) => error!(
@@ -450,15 +450,6 @@ impl ProjectEventDriver {
     }
 
     fn begin_discovery(&mut self, record: giskard_harness::ThreadDiscovered) {
-        if self.quiesced {
-            warn!(project_id = %self.project_id, thread_id = %record.thread,
-                "dropping native thread discovery after project quiesce");
-            #[cfg(test)]
-            self.shared
-                .discovery_records_processed
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            return;
-        }
         let Some(harness) = self.harness.upgrade() else {
             warn!(project_id = %self.project_id, thread_id = %record.thread,
                 "dropping native thread discovery because the project harness is gone");
@@ -1643,7 +1634,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_quiesced_driver_refuses_links_and_drops_discoveries() {
+    async fn a_quiesced_driver_refuses_links_and_leaves_discoveries_unconsumed() {
         let (shared, harness, driver, project_id, store) = setup();
         let parent = ThreadId::new();
         persist_thread(&store, project_id, parent).await;
@@ -1660,8 +1651,14 @@ mod tests {
             harness_thread_id: "discovered".into(),
             parent_harness_thread_id: None,
         });
-        wait_until(|| shared.discovery_records_processed.load(Ordering::SeqCst) == 1).await;
+        tokio::task::yield_now().await;
+        assert_eq!(shared.discovery_records_processed.load(Ordering::SeqCst), 0);
         assert!(load_thread(&store, project_id, discovered).await.is_none());
+
+        driver.resume().await.unwrap();
+        wait_until(|| shared.discovery_records_processed.load(Ordering::SeqCst) == 1).await;
+        let file = wait_for_thread(&store, project_id, discovered).await;
+        assert_eq!(file.kind, giskard_core::thread::ThreadKind::Orphan);
     }
 
     #[tokio::test]
