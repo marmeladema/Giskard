@@ -5,6 +5,7 @@
 //! "subscribe after the first event" and "replace a reader mid-turn" lossless. The only way to
 //! lose an event is the retention cap, and that loss is reported to the reader as an explicit
 //! [`EventStreamError::Gap`] instead of happening silently.
+//! An eviction that happened while no reader existed is reported to the next reader created.
 //!
 //! Pull model: readers wait on a [`Notify`]; there is no channel and no pump task. Reader creation
 //! is synchronous, so a synchronous `AgentHarness::subscribe` stays possible.
@@ -38,11 +39,18 @@ struct LogState<T> {
     base: u64,
     entries: VecDeque<T>,
     /// Next sequence each live reader will consume.
-    cursors: HashMap<u64, u64>,
+    cursors: HashMap<u64, Cursor>,
     next_reader: u64,
+    /// Evictions no reader could observe, reported to the next reader created.
+    unreported_evictions: u64,
     closed: bool,
     /// Set once the cap has evicted at least one entry, so the error is logged once per log.
     overflowed: bool,
+}
+
+struct Cursor {
+    next: u64,
+    pending_gap: u64,
 }
 
 /// One thread's retained event log.
@@ -77,6 +85,7 @@ where
                 entries: VecDeque::new(),
                 cursors: HashMap::new(),
                 next_reader: 0,
+                unreported_evictions: 0,
                 closed: false,
                 overflowed: false,
             }),
@@ -106,6 +115,9 @@ where
             if state.entries.len() > self.limit {
                 state.entries.pop_front();
                 state.base += 1;
+                if state.cursors.is_empty() {
+                    state.unreported_evictions += 1;
+                }
                 if !state.overflowed {
                     state.overflowed = true;
                     error!(
@@ -146,7 +158,14 @@ where
         let id = state.next_reader;
         state.next_reader += 1;
         let base = state.base;
-        state.cursors.insert(id, base);
+        let pending_gap = std::mem::take(&mut state.unreported_evictions);
+        state.cursors.insert(
+            id,
+            Cursor {
+                next: base,
+                pending_gap,
+            },
+        );
         EventLogReader {
             log: Arc::clone(self),
             id,
@@ -161,7 +180,7 @@ where
     }
 
     fn trim(state: &mut LogState<T>) {
-        let Some(min_cursor) = state.cursors.values().copied().min() else {
+        let Some(min_cursor) = state.cursors.values().map(|cursor| cursor.next).min() else {
             return;
         };
         while state.base < min_cursor && !state.entries.is_empty() {
@@ -172,16 +191,21 @@ where
 
     /// Advance one reader. `None` means "nothing available yet, wait".
     fn poll_reader(state: &mut LogState<T>, id: u64) -> Option<Result<T, EventStreamError>> {
-        let cursor = *state.cursors.get(&id)?;
+        let cursor = state.cursors.get_mut(&id)?;
+        if cursor.pending_gap > 0 {
+            let dropped = std::mem::take(&mut cursor.pending_gap);
+            return Some(Err(EventStreamError::Gap { dropped }));
+        }
+        let cursor = cursor.next;
         if cursor < state.base {
             let dropped = state.base - cursor;
-            state.cursors.insert(id, state.base);
+            state.cursors.get_mut(&id)?.next = state.base;
             return Some(Err(EventStreamError::Gap { dropped }));
         }
         let offset = usize::try_from(cursor - state.base).ok()?;
         if let Some(event) = state.entries.get(offset) {
             let event = event.clone();
-            state.cursors.insert(id, cursor + 1);
+            state.cursors.get_mut(&id)?.next = cursor + 1;
             Self::trim(state);
             return Some(Ok(event));
         }
@@ -359,6 +383,59 @@ mod tests {
         );
         assert_eq!(message_of(&reader.recv().await.unwrap()), "3");
         assert_eq!(message_of(&reader.recv().await.unwrap()), "4");
+    }
+
+    #[tokio::test]
+    async fn evictions_before_the_first_reader_are_reported_as_a_gap() {
+        let thread = ThreadId::new();
+        let log = Arc::new(EventLog::with_limit(2));
+        for i in 0..5 {
+            log.append(notice(thread, &i.to_string()));
+        }
+        let mut reader = log.reader();
+        assert_eq!(
+            reader.recv().await.unwrap_err(),
+            EventStreamError::Gap { dropped: 3 }
+        );
+        assert_eq!(message_of(&reader.recv().await.unwrap()), "3");
+        assert_eq!(message_of(&reader.recv().await.unwrap()), "4");
+    }
+
+    #[tokio::test]
+    async fn evictions_between_readers_are_reported_to_the_next_reader() {
+        let thread = ThreadId::new();
+        let log = Arc::new(EventLog::with_limit(2));
+        let mut first = log.reader();
+        log.append(notice(thread, "consumed"));
+        assert_eq!(message_of(&first.recv().await.unwrap()), "consumed");
+        drop(first);
+
+        for i in 0..5 {
+            log.append(notice(thread, &i.to_string()));
+        }
+        let mut second = log.reader();
+        assert_eq!(
+            second.recv().await.unwrap_err(),
+            EventStreamError::Gap { dropped: 3 }
+        );
+        assert_eq!(message_of(&second.recv().await.unwrap()), "3");
+        assert_eq!(message_of(&second.recv().await.unwrap()), "4");
+    }
+
+    #[tokio::test]
+    async fn a_second_reader_created_without_an_intervening_append_gets_no_gap() {
+        let thread = ThreadId::new();
+        let log = Arc::new(EventLog::with_limit(2));
+        for i in 0..5 {
+            log.append(notice(thread, &i.to_string()));
+        }
+        let mut first = log.reader();
+        let mut second = log.reader();
+        assert_eq!(
+            first.recv().await.unwrap_err(),
+            EventStreamError::Gap { dropped: 3 }
+        );
+        assert_eq!(message_of(&second.recv().await.unwrap()), "3");
     }
 
     #[tokio::test]
