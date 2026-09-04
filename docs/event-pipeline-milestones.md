@@ -261,7 +261,23 @@ reply-less admission has a bounded event-driven retry; no-reader eviction is vis
 consumer; queued native events precede intents; cancelled owners admit no new intent; oversized
 frames fail loudly.
 
-## M8 — Cursor-committed persistence (optional)
+## M8 — Admission and reader fences
+
+**Status.** Implemented by the admission-and-reader-fences change.
+
+**Goal.** Finish the quiesce, deferred-admission, and retained-log reader fences left open by M7.
+
+**Design.** A quiesced driver refuses event-owner attachment, making the deletion snapshot final.
+Deferred admissions have no lifetime attempt cap, are deduplicated by native id, and retry one at
+a time only when an attach, detach, owner exit, successful admission, or resume wakes the driver.
+When the last retained-log reader is dropped behind its cursor, its unreported deficit is handed to
+the next reader.
+
+**Exit.** No owner can attach after deletion quiesces; transient admission failures remain
+recoverable without polling or retry loops; dropping a lagged last reader cannot erase evidence of
+retention loss.
+
+## M9 — Cursor-committed persistence (optional)
 
 **Goal.** Crash-safe replay of an unpersisted turn.
 
@@ -275,7 +291,7 @@ tail is re-projected. Item upserts already make re-application idempotent.
 ## Ordering and dependencies
 
 ```text
-M0 ──► M1 ──► M2 ──► M4 ──► M5 ──► M6 ──► M7 ──► M8 (optional)
+M0 ──► M1 ──► M2 ──► M4 ──► M5 ──► M6 ──► M7 ──► M8 ──► M9 (optional)
               │
               └──► M3 (any time after M1)
 ```

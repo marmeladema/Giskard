@@ -5,7 +5,8 @@
 //! "subscribe after the first event" and "replace a reader mid-turn" lossless. The only way to
 //! lose an event is the retention cap, and that loss is reported to the reader as an explicit
 //! [`EventStreamError::Gap`] instead of happening silently.
-//! An eviction that happened while no reader existed is reported to the next reader created.
+//! An eviction that no reader consumed, including one a reader was dropped without reporting, is
+//! reported to the next reader created.
 //!
 //! Pull model: readers wait on a [`Notify`]; there is no channel and no pump task. Reader creation
 //! is synchronous, so a synchronous `AgentHarness::subscribe` stays possible.
@@ -259,7 +260,12 @@ where
 {
     fn drop(&mut self) {
         let mut state = self.log.lock();
-        state.cursors.remove(&self.id);
+        if let Some(cursor) = state.cursors.remove(&self.id) {
+            let deficit = cursor.pending_gap + state.base.saturating_sub(cursor.next);
+            if state.cursors.is_empty() {
+                state.unreported_evictions += deficit;
+            }
+        }
         EventLog::trim(&mut state);
     }
 }
@@ -443,6 +449,61 @@ mod tests {
             EventStreamError::Gap { dropped: 3 }
         );
         assert_eq!(message_of(&second.recv().await.unwrap()), "3");
+    }
+
+    #[tokio::test]
+    async fn a_lagged_reader_dropped_last_reports_its_loss_to_the_next_reader() {
+        let thread = ThreadId::new();
+        let log = Arc::new(EventLog::with_limit(2));
+        let reader = log.reader();
+        for i in 0..5 {
+            log.append(notice(thread, &i.to_string()));
+        }
+        drop(reader);
+
+        let mut replacement = log.reader();
+        assert_eq!(
+            replacement.recv().await.unwrap_err(),
+            EventStreamError::Gap { dropped: 3 }
+        );
+        assert_eq!(message_of(&replacement.recv().await.unwrap()), "3");
+        assert_eq!(message_of(&replacement.recv().await.unwrap()), "4");
+    }
+
+    #[tokio::test]
+    async fn a_lagged_reader_dropped_with_a_peer_remaining_adds_nothing() {
+        let thread = ThreadId::new();
+        let log = Arc::new(EventLog::with_limit(2));
+        let reader = log.reader();
+        let mut peer = log.reader();
+        for i in 0..5 {
+            log.append(notice(thread, &i.to_string()));
+        }
+        drop(reader);
+
+        assert_eq!(
+            peer.recv().await.unwrap_err(),
+            EventStreamError::Gap { dropped: 3 }
+        );
+        let mut replacement = log.reader();
+        assert_eq!(message_of(&replacement.recv().await.unwrap()), "3");
+    }
+
+    #[tokio::test]
+    async fn a_dropped_reader_with_a_pending_gap_passes_it_on() {
+        let thread = ThreadId::new();
+        let log = Arc::new(EventLog::with_limit(2));
+        for i in 0..5 {
+            log.append(notice(thread, &i.to_string()));
+        }
+        let reader = log.reader();
+        drop(reader);
+
+        let mut replacement = log.reader();
+        assert_eq!(
+            replacement.recv().await.unwrap_err(),
+            EventStreamError::Gap { dropped: 3 }
+        );
     }
 
     #[tokio::test]
