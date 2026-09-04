@@ -114,7 +114,8 @@ async fn login(base: &str) -> (reqwest::Client, String) {
 
 #[tokio::test]
 async fn token_ledgers_and_dashboard() {
-    let port = 19200;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
     let tmp = tempfile::TempDir::new().unwrap();
     let hash = password_hash("testpass");
     tokio::fs::write(
@@ -135,9 +136,6 @@ async fn token_ledgers_and_dashboard() {
         (0..32u8).collect(),
     );
     let app = build_app(state.clone());
-    let listener = tokio::net::TcpListener::bind(format!("127.0.0.1:{port}"))
-        .await
-        .unwrap();
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
 
     let base = format!("http://127.0.0.1:{port}");

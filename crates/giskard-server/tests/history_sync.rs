@@ -161,7 +161,8 @@ async fn ws_connect(
 
 #[tokio::test]
 async fn history_pagination_over_http() {
-    let port = 19202;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
     let tmp = tempfile::TempDir::new().unwrap();
     let hash = password_hash("testpass");
     // Small page sizes so 5 seeded turns paginate: initial 2, page 2.
@@ -183,9 +184,6 @@ async fn history_pagination_over_http() {
         (0..32u8).collect(),
     );
     let app = build_app(state.clone());
-    let listener = tokio::net::TcpListener::bind(format!("127.0.0.1:{port}"))
-        .await
-        .unwrap();
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
 
     let base = format!("http://127.0.0.1:{port}");
@@ -309,7 +307,8 @@ async fn history_pagination_over_http() {
 /// after it, and a stale `since` falls back to a bounded reset delta.
 #[tokio::test]
 async fn resync_delta_over_websocket() {
-    let port = 19204;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
     let tmp = tempfile::TempDir::new().unwrap();
     let hash = password_hash("testpass");
     // initial=2 so the stale-cursor fallback returns a bounded page we can assert on.
@@ -331,9 +330,6 @@ async fn resync_delta_over_websocket() {
         (0..32u8).collect(),
     );
     let app = build_app(state.clone());
-    let listener = tokio::net::TcpListener::bind(format!("127.0.0.1:{port}"))
-        .await
-        .unwrap();
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
 
     let base = format!("http://127.0.0.1:{port}");
@@ -460,7 +456,8 @@ async fn resync_delta_over_websocket() {
 
 #[tokio::test]
 async fn subscribe_corrupt_history_returns_structured_error() {
-    let port = 19203;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
     let tmp = tempfile::TempDir::new().unwrap();
     let hash = password_hash("testpass");
     tokio::fs::write(
@@ -481,9 +478,6 @@ async fn subscribe_corrupt_history_returns_structured_error() {
         (0..32u8).collect(),
     );
     let app = build_app(state.clone());
-    let listener = tokio::net::TcpListener::bind(format!("127.0.0.1:{port}"))
-        .await
-        .unwrap();
     tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
 
     let base = format!("http://127.0.0.1:{port}");

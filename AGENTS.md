@@ -35,6 +35,12 @@ there is not finished.
 
 ## Build & Test
 
+Tests that open a network listener must not use a fixed port. Bind to port `0`, obtain the assigned
+port from the still-open listener with `local_addr()`, and pass that listener directly to the
+server. Do not probe and rebind a free port. Fixed ports are permitted only for fixture/config
+values that do not open sockets or for explicitly isolated infrastructure such as container-local
+test services.
+
 ```bash
 # Build all crates
 cargo build

@@ -44,15 +44,16 @@ fn generate_password_hash(password: &str) -> String {
         .to_string()
 }
 
-async fn start_server(
-    port: u16,
-) -> (
+async fn start_server() -> (
     tempfile::TempDir,
     tempfile::TempDir,
     Arc<AppState>,
     ProjectId,
     String,
+    u16,
 ) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
     let tmp = tempfile::TempDir::new().unwrap();
     let hash = generate_password_hash("testpass");
     let config_toml = format!(
@@ -75,9 +76,6 @@ session_days = 30
     let factory = Arc::new(DummyFactory);
     let state = AppState::new(store, factory, session_key);
     let app = build_app(state.clone());
-    let listener = tokio::net::TcpListener::bind(format!("127.0.0.1:{port}"))
-        .await
-        .unwrap();
     tokio::spawn(async move {
         axum::serve(listener, app).await.unwrap();
     });
@@ -129,13 +127,12 @@ session_days = 30
             .to_string()
     };
 
-    (tmp, proj_dir, Arc::new(state), pid, cookie)
+    (tmp, proj_dir, Arc::new(state), pid, cookie, port)
 }
 
 #[tokio::test]
 async fn thread_lifecycle_native_failure_preserves_local_thread() {
-    let port = 19037;
-    let (_data_dir, _proj_dir, state, pid, cookie) = start_server(port).await;
+    let (_data_dir, _proj_dir, state, pid, cookie, port) = start_server().await;
     let base = format!("http://127.0.0.1:{port}");
     let client = reqwest::Client::new();
 

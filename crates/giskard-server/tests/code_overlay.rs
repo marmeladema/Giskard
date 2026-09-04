@@ -45,16 +45,17 @@ fn generate_password_hash(password: &str) -> String {
 }
 
 /// The endpoints under test name a thread in their path, so the fixture persists one.
-async fn start_server(
-    port: u16,
-) -> (
+async fn start_server() -> (
     tempfile::TempDir,
     tempfile::TempDir,
     Arc<AppState>,
     ProjectId,
     ThreadId,
     String,
+    u16,
 ) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
     let tmp = tempfile::TempDir::new().unwrap();
     let hash = generate_password_hash("testpass");
     let config_toml = format!(
@@ -77,9 +78,6 @@ session_days = 30
     let factory = Arc::new(DummyFactory);
     let state = AppState::new(store, factory, session_key);
     let app = build_app(state.clone());
-    let listener = tokio::net::TcpListener::bind(format!("127.0.0.1:{port}"))
-        .await
-        .unwrap();
     tokio::spawn(async move {
         axum::serve(listener, app).await.unwrap();
     });
@@ -144,7 +142,7 @@ session_days = 30
             .to_string()
     };
 
-    (tmp, proj_dir, Arc::new(state), pid, tid, cookie)
+    (tmp, proj_dir, Arc::new(state), pid, tid, cookie, port)
 }
 
 fn thread_file(pid: ProjectId, tid: ThreadId) -> giskard_persist::store::ThreadFile {
@@ -233,8 +231,7 @@ fn command_output_url(
 
 #[tokio::test]
 async fn highlight_rust_file() {
-    let port = 19001;
-    let (_data_dir, _proj_dir, _state, pid, tid, cookie) = start_server(port).await;
+    let (_data_dir, _proj_dir, _state, pid, tid, cookie, port) = start_server().await;
     let base = format!("http://127.0.0.1:{port}");
     let client = reqwest::Client::new();
 
@@ -258,8 +255,7 @@ async fn highlight_rust_file() {
 
 #[tokio::test]
 async fn highlight_toml_file() {
-    let port = 19026;
-    let (_data_dir, _proj_dir, _state, pid, tid, cookie) = start_server(port).await;
+    let (_data_dir, _proj_dir, _state, pid, tid, cookie, port) = start_server().await;
     let base = format!("http://127.0.0.1:{port}");
     let client = reqwest::Client::new();
 
@@ -286,8 +282,7 @@ async fn highlight_toml_file() {
 
 #[tokio::test]
 async fn highlight_binary_file() {
-    let port = 19002;
-    let (_data_dir, _proj_dir, _state, pid, tid, cookie) = start_server(port).await;
+    let (_data_dir, _proj_dir, _state, pid, tid, cookie, port) = start_server().await;
     let base = format!("http://127.0.0.1:{port}");
     let client = reqwest::Client::new();
 
@@ -308,8 +303,7 @@ async fn highlight_binary_file() {
 
 #[tokio::test]
 async fn download_raw_file() {
-    let port = 19003;
-    let (_data_dir, _proj_dir, _state, pid, tid, cookie) = start_server(port).await;
+    let (_data_dir, _proj_dir, _state, pid, tid, cookie, port) = start_server().await;
     let base = format!("http://127.0.0.1:{port}");
     let client = reqwest::Client::new();
 
@@ -329,8 +323,7 @@ async fn download_raw_file() {
 
 #[tokio::test]
 async fn image_preview_serves_raster_image_inline() {
-    let port = 19027;
-    let (_data_dir, _proj_dir, _state, pid, tid, cookie) = start_server(port).await;
+    let (_data_dir, _proj_dir, _state, pid, tid, cookie, port) = start_server().await;
     let base = format!("http://127.0.0.1:{port}");
     let client = reqwest::Client::new();
 
@@ -355,8 +348,7 @@ async fn image_preview_serves_raster_image_inline() {
 
 #[tokio::test]
 async fn image_preview_rejects_svg() {
-    let port = 19028;
-    let (_data_dir, _proj_dir, _state, pid, tid, cookie) = start_server(port).await;
+    let (_data_dir, _proj_dir, _state, pid, tid, cookie, port) = start_server().await;
     let base = format!("http://127.0.0.1:{port}");
     let client = reqwest::Client::new();
 
@@ -374,8 +366,7 @@ async fn image_preview_rejects_svg() {
 
 #[tokio::test]
 async fn linkify_finds_paths() {
-    let port = 19004;
-    let (_data_dir, _proj_dir, _state, pid, tid, cookie) = start_server(port).await;
+    let (_data_dir, _proj_dir, _state, pid, tid, cookie, port) = start_server().await;
     let base = format!("http://127.0.0.1:{port}");
     let client = reqwest::Client::new();
 
@@ -396,8 +387,7 @@ async fn linkify_finds_paths() {
 
 #[tokio::test]
 async fn render_endpoint_returns_sanitized_markdown_with_path_links() {
-    let port = 19022;
-    let (_data_dir, _proj_dir, _state, pid, tid, cookie) = start_server(port).await;
+    let (_data_dir, _proj_dir, _state, pid, tid, cookie, port) = start_server().await;
     let base = format!("http://127.0.0.1:{port}");
     let client = reqwest::Client::new();
 
@@ -447,8 +437,7 @@ async fn render_endpoint_returns_sanitized_markdown_with_path_links() {
 
 #[tokio::test]
 async fn linkify_endpoint_returns_only_existing_workspace_files() {
-    let port = 19012;
-    let (_data_dir, proj_dir, _state, pid, tid, cookie) = start_server(port).await;
+    let (_data_dir, proj_dir, _state, pid, tid, cookie, port) = start_server().await;
     let base = format!("http://127.0.0.1:{port}");
     let client = reqwest::Client::new();
 
@@ -509,8 +498,7 @@ async fn linkify_endpoint_returns_only_existing_workspace_files() {
 
 #[tokio::test]
 async fn command_output_links_linkifies_persisted_output_with_matching_version() {
-    let port = 19029;
-    let (_data_dir, _proj_dir, state, pid, tid, cookie) = start_server(port).await;
+    let (_data_dir, _proj_dir, state, pid, tid, cookie, port) = start_server().await;
     let base = format!("http://127.0.0.1:{port}");
     let client = reqwest::Client::new();
     let (turn, item_id) = command_turn("compiler error at main.rs:2\n", Some("completed"));
@@ -547,8 +535,7 @@ async fn command_output_links_linkifies_persisted_output_with_matching_version()
 
 #[tokio::test]
 async fn command_output_links_enforces_output_version_precondition() {
-    let port = 19030;
-    let (_data_dir, _proj_dir, state, pid, tid, cookie) = start_server(port).await;
+    let (_data_dir, _proj_dir, state, pid, tid, cookie, port) = start_server().await;
     let base = format!("http://127.0.0.1:{port}");
     let client = reqwest::Client::new();
     let (turn, item_id) = command_turn("main.rs:1\n", None);
@@ -606,8 +593,7 @@ async fn command_output_links_enforces_output_version_precondition() {
 
 #[tokio::test]
 async fn command_output_links_rejects_unreadable_items_and_uses_thread_workspace() {
-    let port = 19031;
-    let (_data_dir, proj_dir, state, pid, tid, cookie) = start_server(port).await;
+    let (_data_dir, proj_dir, state, pid, tid, cookie, port) = start_server().await;
     let base = format!("http://127.0.0.1:{port}");
     let client = reqwest::Client::new();
     let isolated = tempfile::TempDir::new().unwrap();
@@ -714,14 +700,13 @@ async fn command_output_links_rejects_unreadable_items_and_uses_thread_workspace
 #[cfg(unix)]
 #[tokio::test]
 async fn linkify_endpoint_rejects_symlink_escape() {
-    let port = 19013;
     let outside = tempfile::TempDir::new().unwrap();
     let outside_file = outside.path().join("outside.rs");
     tokio::fs::write(&outside_file, "pub fn outside() {}\n")
         .await
         .unwrap();
 
-    let (_data_dir, proj_dir, _state, pid, tid, cookie) = start_server(port).await;
+    let (_data_dir, proj_dir, _state, pid, tid, cookie, port) = start_server().await;
     std::os::unix::fs::symlink(&outside_file, proj_dir.path().join("linked.rs")).unwrap();
 
     let base = format!("http://127.0.0.1:{port}");
@@ -744,8 +729,7 @@ async fn linkify_endpoint_rejects_symlink_escape() {
 
 #[tokio::test]
 async fn highlight_rejects_path_escape() {
-    let port = 19005;
-    let (_data_dir, _proj_dir, _state, pid, tid, cookie) = start_server(port).await;
+    let (_data_dir, _proj_dir, _state, pid, tid, cookie, port) = start_server().await;
     let base = format!("http://127.0.0.1:{port}");
     let client = reqwest::Client::new();
 
@@ -763,8 +747,7 @@ async fn highlight_rejects_path_escape() {
 
 #[tokio::test]
 async fn highlight_and_raw_reject_missing_files() {
-    let port = 19015;
-    let (_data_dir, _proj_dir, _state, pid, tid, cookie) = start_server(port).await;
+    let (_data_dir, _proj_dir, _state, pid, tid, cookie, port) = start_server().await;
     let base = format!("http://127.0.0.1:{port}");
     let client = reqwest::Client::new();
 
@@ -795,8 +778,7 @@ async fn highlight_and_raw_reject_missing_files() {
 /// and both are readable.
 #[tokio::test]
 async fn thread_reads_follow_the_configured_workspace_root() {
-    let port = 19018;
-    let (_data_dir, proj_dir, state, pid, tid, cookie) = start_server(port).await;
+    let (_data_dir, proj_dir, state, pid, tid, cookie, port) = start_server().await;
     let base = format!("http://127.0.0.1:{port}");
     let client = reqwest::Client::new();
 
@@ -840,8 +822,7 @@ async fn thread_reads_follow_the_configured_workspace_root() {
 /// resolve within this project would otherwise be served from a workspace the caller never named.
 #[tokio::test]
 async fn code_overlay_endpoints_refuse_a_thread_they_cannot_resolve() {
-    let port = 19017;
-    let (_data_dir, _proj_dir, state, pid, _tid, cookie) = start_server(port).await;
+    let (_data_dir, _proj_dir, state, pid, _tid, cookie, port) = start_server().await;
     let base = format!("http://127.0.0.1:{port}");
     let client = reqwest::Client::new();
 
@@ -887,8 +868,7 @@ async fn code_overlay_endpoints_refuse_a_thread_they_cannot_resolve() {
 
 #[tokio::test]
 async fn code_overlay_endpoints_return_not_found_for_missing_project() {
-    let port = 19016;
-    let (_data_dir, _proj_dir, _state, _pid, tid, cookie) = start_server(port).await;
+    let (_data_dir, _proj_dir, _state, _pid, tid, cookie, port) = start_server().await;
     let base = format!("http://127.0.0.1:{port}");
     let client = reqwest::Client::new();
     let missing_project = ProjectId::new();
@@ -919,14 +899,13 @@ async fn code_overlay_endpoints_return_not_found_for_missing_project() {
 #[cfg(unix)]
 #[tokio::test]
 async fn highlight_and_raw_reject_symlink_escape() {
-    let port = 19014;
     let outside = tempfile::TempDir::new().unwrap();
     let outside_file = outside.path().join("outside.rs");
     tokio::fs::write(&outside_file, "pub fn outside() {}\n")
         .await
         .unwrap();
 
-    let (_data_dir, proj_dir, _state, pid, tid, cookie) = start_server(port).await;
+    let (_data_dir, proj_dir, _state, pid, tid, cookie, port) = start_server().await;
     std::os::unix::fs::symlink(&outside_file, proj_dir.path().join("linked.rs")).unwrap();
 
     let base = format!("http://127.0.0.1:{port}");
@@ -952,8 +931,7 @@ async fn highlight_and_raw_reject_symlink_escape() {
 /// but still report `file_size` and `language` for the overlay metadata.
 #[tokio::test]
 async fn highlight_oversized_file_returns_metadata() {
-    let port = 19011;
-    let (_data_dir, proj_dir, _state, pid, tid, cookie) = start_server(port).await;
+    let (_data_dir, proj_dir, _state, pid, tid, cookie, port) = start_server().await;
     let base = format!("http://127.0.0.1:{port}");
     let client = reqwest::Client::new();
 
