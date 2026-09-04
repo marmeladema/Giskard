@@ -9,7 +9,12 @@
 
 **Document status:** Implementation-ready specification.
 **Audience:** An AI coding agent (and its human reviewer) implementing the system.
-**Version:** 1.87
+**Version:** 1.88
+
+> **Amendment — admission and reader fences (1.88).** A quiesced project event driver refuses
+> new event-owner attachment. Deferred admissions are retried after every driver event,
+> deduplicated by native id, and never discarded for repeated failure. A retained-log reader
+> dropped while behind hands its unreported loss to the next reader created.
 
 > **Amendment — composer growth (1.87).** The composer's input grows with its content instead of
 > holding a single line, bounded by a fraction of the *visible* viewport height (30%, expressed in
@@ -148,6 +153,13 @@
 > the intended frontend for the foreseeable future; treat every Dioxus/WASM/`giskard-ui` reference
 > below as historical design context, not a current requirement. The wire contract (`giskard-proto`)
 > and all backend design remain authoritative.
+
+**Changelog (1.87 → 1.88), admission and reader fences:**
+- **AF1:** A quiesced project event driver refuses event-owner attachment, completing the deletion
+  snapshot fence.
+- **AF2:** Deferred admissions retry only on driver events, are deduplicated by native id, and are
+  never discarded merely because earlier attempts failed.
+- **AF3:** The last retained-log reader transfers any unconsumed gap to the next reader created.
 
 **Changelog (1.85 → 1.86), server-request claim settlement:**
 - **RT6:** A claim owns a request until settlement. A harness resolution observed during the claim
@@ -568,11 +580,12 @@ runtime overview; the hoisting and notification behavior remains current.
   Discoveries, sub-agent links, and explicit link opens are serialized as admissions by the
   project's event driver. The harness's idempotent native-identity claim prevents duplicate local
   identities, and relationship validation reads the thread graph only when needed. Project
-  deletion quiesces the driver before harness shutdown and file removal. Subtree deletion retires
-  every candidate owner, reloads the graph, computes the final leaf-first order, and performs its
-  liveness and worktree preflight against that order before the first native or local record is
-  removed. Other HTTP operations that take the project lifecycle lock retain their five-second
-  contention bound and return `503 Service Unavailable` on timeout.
+  deletion quiesces the driver before harness shutdown and file removal. A quiesced driver refuses
+  event-owner attachment, so no owner can be installed after the deletion snapshot. Subtree
+  deletion retires every candidate owner, reloads the graph, computes the final leaf-first order,
+  and performs its liveness and worktree preflight against that order before the first native or
+  local record is removed. Other HTTP operations that take the project lifecycle lock retain their
+  five-second contention bound and return `503 Service Unavailable` on timeout.
   Codex treats only the exact JSON-RPC `-32600` response
   `no rollout found for thread id <requested-id>` as idempotent deletion success; a different ID or
   any other native failure still aborts before local deletion.

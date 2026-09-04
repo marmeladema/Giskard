@@ -22,6 +22,15 @@ pub(super) enum Admission {
     Link(Box<Link>),
 }
 
+impl Admission {
+    pub(super) fn native_thread_id(&self) -> &str {
+        match self {
+            Self::Discovered(record) => &record.harness_thread_id,
+            Self::Link(link) => &link.info.native_thread_id,
+        }
+    }
+}
+
 pub(super) struct Admitted {
     pub(super) binding: LoadedThreadBinding,
     pub(super) classification: ClassificationPhase,

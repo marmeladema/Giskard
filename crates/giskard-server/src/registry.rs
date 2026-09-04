@@ -1972,9 +1972,13 @@ mod tests {
         routes: StdMutex<HashMap<String, ThreadHandle>>,
         logs: StdMutex<HashMap<ThreadId, Arc<EventLog>>>,
         claim_gate: StdMutex<Option<Arc<Notify>>>,
+        open_gate: StdMutex<Option<Arc<Notify>>>,
+        shutdown_gate: StdMutex<Option<Arc<Notify>>>,
         claim_started: AtomicUsize,
+        open_started: AtomicUsize,
         claim_finished: AtomicUsize,
         shutdown_calls: AtomicUsize,
+        shutdown_failures: AtomicUsize,
         shutdown_observed_finished_claim: AtomicBool,
     }
 
@@ -1996,9 +2000,13 @@ mod tests {
                 routes: StdMutex::new(routes),
                 logs: StdMutex::new(logs),
                 claim_gate: StdMutex::new(None),
+                open_gate: StdMutex::new(None),
+                shutdown_gate: StdMutex::new(None),
                 claim_started: AtomicUsize::new(0),
+                open_started: AtomicUsize::new(0),
                 claim_finished: AtomicUsize::new(0),
                 shutdown_calls: AtomicUsize::new(0),
+                shutdown_failures: AtomicUsize::new(0),
                 shutdown_observed_finished_claim: AtomicBool::new(false),
             }
         }
@@ -2007,6 +2015,22 @@ mod tests {
             let gate = Arc::new(Notify::new());
             *self.claim_gate.lock().unwrap() = Some(gate.clone());
             gate
+        }
+
+        fn gate_opens(&self) -> Arc<Notify> {
+            let gate = Arc::new(Notify::new());
+            *self.open_gate.lock().unwrap() = Some(gate.clone());
+            gate
+        }
+
+        fn gate_shutdown(&self) -> Arc<Notify> {
+            let gate = Arc::new(Notify::new());
+            *self.shutdown_gate.lock().unwrap() = Some(gate.clone());
+            gate
+        }
+
+        fn fail_next_shutdown(&self) {
+            self.shutdown_failures.store(1, Ordering::SeqCst);
         }
 
         fn announce(&self, record: ThreadDiscovered) {
@@ -2046,11 +2070,23 @@ mod tests {
             Ok(Vec::new())
         }
 
-        async fn open_thread(
-            &self,
-            _opts: OpenThreadOptions,
-        ) -> Result<ThreadHandle, HarnessError> {
-            Err(HarnessError::Unsupported("unused".into()))
+        async fn open_thread(&self, opts: OpenThreadOptions) -> Result<ThreadHandle, HarnessError> {
+            self.open_started.fetch_add(1, Ordering::SeqCst);
+            let gate = self.open_gate.lock().unwrap().take();
+            if let Some(gate) = gate {
+                gate.notified().await;
+            }
+            let native = opts
+                .resume
+                .unwrap_or_else(|| format!("native-{}", opts.thread));
+            let handle = ThreadHandle::opened(opts.thread, native.clone(), opts.workspace_root);
+            self.routes.lock().unwrap().insert(native, handle.clone());
+            self.logs
+                .lock()
+                .unwrap()
+                .entry(opts.thread)
+                .or_insert_with(|| Arc::new(EventLog::new()));
+            Ok(handle)
         }
 
         async fn claim_native_thread(
@@ -2126,6 +2162,19 @@ mod tests {
 
         async fn shutdown(&self) -> Result<(), HarnessError> {
             self.shutdown_calls.fetch_add(1, Ordering::SeqCst);
+            let gate = self.shutdown_gate.lock().unwrap().take();
+            if let Some(gate) = gate {
+                gate.notified().await;
+            }
+            if self
+                .shutdown_failures
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                    remaining.checked_sub(1)
+                })
+                .is_ok()
+            {
+                return Err(HarnessError::Protocol("injected shutdown failure".into()));
+            }
             self.shutdown_observed_finished_claim.store(
                 self.claim_finished.load(Ordering::SeqCst) != 0,
                 Ordering::SeqCst,
@@ -2542,6 +2591,168 @@ mod tests {
         })
         .await
         .expect("native claim did not start");
+    }
+
+    async fn wait_for_open(harness: &DiscoveryHarness) {
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while harness.open_started.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("native open did not start");
+    }
+
+    async fn wait_for_shutdown(harness: &DiscoveryHarness) {
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while harness.shutdown_calls.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("harness shutdown did not start");
+    }
+
+    fn test_model() -> ModelRef {
+        ModelRef {
+            provider: "openai".into(),
+            model: "test".into(),
+            reasoning_effort: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn an_explicit_open_after_quiesce_is_refused_and_leaves_nothing_behind() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(PersistStore::new(tmp.path().to_path_buf()));
+        let (project, config) = create_test_project(&store, "delete-open-fence").await;
+        let thread = ThreadId::new();
+        store
+            .save_thread(
+                project,
+                &test_thread_file(
+                    project,
+                    thread,
+                    "native-primary",
+                    giskard_core::ThreadKind::Primary,
+                ),
+            )
+            .await
+            .unwrap();
+        let (registry, factory) = discovery_registry(store).await;
+        registry
+            .get_or_create_harness(project, &config)
+            .await
+            .unwrap();
+        let harness = factory.harness.lock().unwrap().clone().unwrap();
+        let open_gate = harness.gate_opens();
+        let shutdown_gate = harness.gate_shutdown();
+        let opening = tokio::spawn({
+            let registry = registry.clone();
+            let config = config.clone();
+            async move {
+                registry
+                    .open_thread(
+                        &config,
+                        "/tmp/test",
+                        thread,
+                        Some("native-primary".into()),
+                        test_model(),
+                    )
+                    .await
+            }
+        });
+        wait_for_open(&harness).await;
+        let deleting = tokio::spawn({
+            let registry = registry.clone();
+            async move { registry.delete_project(project).await }
+        });
+        wait_for_shutdown(&harness).await;
+        assert!(!deleting.is_finished());
+        open_gate.notify_one();
+        assert!(matches!(
+            opening.await.unwrap(),
+            Err(HarnessError::Protocol(message)) if message.contains("project is being deleted")
+        ));
+        shutdown_gate.notify_one();
+        deleting.await.unwrap().unwrap();
+        assert!(registry.shared.coordinator(thread).await.is_none());
+        assert!(!registry.thread_has_active_turn(thread).await);
+        assert!(
+            registry
+                .runtime_overview()
+                .threads
+                .iter()
+                .all(|summary| summary.thread_id != thread)
+        );
+    }
+
+    #[tokio::test]
+    async fn an_explicit_open_after_a_failed_deletion_resumes_succeeds() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(PersistStore::new(tmp.path().to_path_buf()));
+        let (project, config) = create_test_project(&store, "failed-delete-open-fence").await;
+        let thread = ThreadId::new();
+        store
+            .save_thread(
+                project,
+                &test_thread_file(
+                    project,
+                    thread,
+                    "native-primary",
+                    giskard_core::ThreadKind::Primary,
+                ),
+            )
+            .await
+            .unwrap();
+        let (registry, factory) = discovery_registry(store).await;
+        registry
+            .get_or_create_harness(project, &config)
+            .await
+            .unwrap();
+        let harness = factory.harness.lock().unwrap().clone().unwrap();
+        harness.fail_next_shutdown();
+        let open_gate = harness.gate_opens();
+        let shutdown_gate = harness.gate_shutdown();
+        let opening = tokio::spawn({
+            let registry = registry.clone();
+            let config = config.clone();
+            async move {
+                registry
+                    .open_thread(
+                        &config,
+                        "/tmp/test",
+                        thread,
+                        Some("native-primary".into()),
+                        test_model(),
+                    )
+                    .await
+            }
+        });
+        wait_for_open(&harness).await;
+        let deleting = tokio::spawn({
+            let registry = registry.clone();
+            async move { registry.delete_project(project).await }
+        });
+        wait_for_shutdown(&harness).await;
+        open_gate.notify_one();
+        assert!(matches!(
+            opening.await.unwrap(),
+            Err(HarnessError::Protocol(message)) if message.contains("project is being deleted")
+        ));
+        shutdown_gate.notify_one();
+        assert!(deleting.await.unwrap().is_err());
+        registry
+            .open_thread(
+                &config,
+                "/tmp/test",
+                thread,
+                Some("native-primary".into()),
+                test_model(),
+            )
+            .await
+            .unwrap();
+        assert!(registry.shared.coordinator(thread).await.is_some());
     }
 
     #[tokio::test]
