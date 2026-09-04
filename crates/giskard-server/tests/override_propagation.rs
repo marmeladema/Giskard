@@ -196,7 +196,8 @@ fn ws_text(msg: &ClientMessage) -> tokio_tungstenite::tungstenite::Message {
 
 #[tokio::test]
 async fn send_input_snapshot_carries_model_effort_and_permission_preset() {
-    let port = 19100;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
     let captured = Arc::new(TokioMutex::new(Vec::<TurnOverrides>::new()));
 
     // Server with a capturing harness.
@@ -230,9 +231,6 @@ session_days = 30
     let requested_models = factory.requested_models.clone();
     let state = AppState::new(store, factory, (0..32u8).collect());
     let app = build_app(state.clone());
-    let listener = tokio::net::TcpListener::bind(format!("127.0.0.1:{port}"))
-        .await
-        .unwrap();
     tokio::spawn(async move {
         axum::serve(listener, app).await.unwrap();
     });

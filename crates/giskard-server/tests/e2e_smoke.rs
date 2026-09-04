@@ -2090,59 +2090,6 @@ fn generate_password_hash(password: &str) -> String {
         .to_string()
 }
 
-async fn start_server_with_extra_config(
-    port: u16,
-    extra_config: &str,
-) -> (tempfile::TempDir, Arc<AppState>) {
-    start_server_with_fixture_and_extra_config(port, make_fixture(), extra_config).await
-}
-
-async fn start_server_with_fixture_and_extra_config(
-    port: u16,
-    fixture: ReplayFixture,
-    extra_config: &str,
-) -> (tempfile::TempDir, Arc<AppState>) {
-    let tmp = tempfile::TempDir::new().unwrap();
-
-    let hash = generate_password_hash("testpass");
-    let config_toml = format!(
-        r#"
-[server]
-bind = "127.0.0.1:{port}"
-secure_cookies = false
-
-[auth]
-password_hash = "{hash}"
-session_days = 30
-
-{extra_config}
-"#
-    );
-    tokio::fs::write(tmp.path().join("config.toml"), config_toml)
-        .await
-        .unwrap();
-
-    let store = Arc::new(giskard_persist::PersistStore::new(tmp.path().to_path_buf()));
-    let session_key: Vec<u8> = (0..32u8).collect();
-    let factory = Arc::new(TestFactory { fixture });
-
-    let state = AppState::new(store, factory, session_key);
-
-    let app = build_app(state.clone());
-    let listener = tokio::net::TcpListener::bind(format!("127.0.0.1:{port}"))
-        .await
-        .unwrap();
-    tokio::spawn(async move {
-        axum::serve(listener, app).await.unwrap();
-    });
-
-    (tmp, Arc::new(state))
-}
-
-async fn start_server(port: u16) -> (tempfile::TempDir, Arc<AppState>) {
-    start_server_with_extra_config(port, "").await
-}
-
 async fn start_server_with_extra_config_on_available_port(
     extra_config: &str,
 ) -> (tempfile::TempDir, Arc<AppState>, u16) {
@@ -6597,8 +6544,7 @@ async fn wait_for_policy(
 
 #[tokio::test]
 async fn subscribe_unknown_thread_returns_structured_error() {
-    let port = 18791;
-    let (_tmp, _state) = start_server(port).await;
+    let (_tmp, _state, port) = start_server_with_extra_config_on_available_port("").await;
     let base = format!("http://127.0.0.1:{port}");
     let ws_base = format!("ws://127.0.0.1:{port}");
 
@@ -6659,8 +6605,7 @@ async fn subscribe_unknown_thread_returns_structured_error() {
 
 #[tokio::test]
 async fn websocket_accepts_ticket_without_cookie_header() {
-    let port = 18793;
-    let (_tmp, _state) = start_server(port).await;
+    let (_tmp, _state, port) = start_server_with_extra_config_on_available_port("").await;
     let base = format!("http://127.0.0.1:{port}");
     let ws_base = format!("ws://127.0.0.1:{port}");
 
@@ -6734,8 +6679,7 @@ async fn websocket_accepts_ticket_without_cookie_header() {
 
 #[tokio::test]
 async fn websocket_serializes_harness_error_events() {
-    let port = 18794;
-    let (_tmp, state) = start_server(port).await;
+    let (_tmp, state, port) = start_server_with_extra_config_on_available_port("").await;
     let base = format!("http://127.0.0.1:{port}");
     let ws_base = format!("ws://127.0.0.1:{port}");
 
@@ -6869,8 +6813,7 @@ async fn websocket_serializes_harness_error_events() {
 
 #[tokio::test]
 async fn subscribe_reopens_persisted_thread() {
-    let port = 18792;
-    let (_tmp, state) = start_server(port).await;
+    let (_tmp, state, port) = start_server_with_extra_config_on_available_port("").await;
     let base = format!("http://127.0.0.1:{port}");
     let ws_base = format!("ws://127.0.0.1:{port}");
 
@@ -7014,8 +6957,7 @@ async fn subscribe_reopens_persisted_thread() {
 
 #[tokio::test]
 async fn persisted_thread_can_be_reopened_before_ws_send() {
-    let port = 18790;
-    let (_tmp, state) = start_server(port).await;
+    let (_tmp, state, port) = start_server_with_extra_config_on_available_port("").await;
     let base = format!("http://127.0.0.1:{port}");
     let ws_base = format!("ws://127.0.0.1:{port}");
 
@@ -8602,8 +8544,7 @@ async fn send_input_rejects_persisted_provider_mismatch_on_non_empty_thread() {
 
 #[tokio::test]
 async fn login_project_thread_message() {
-    let port = 18787;
-    let (_tmp, state) = start_server(port).await;
+    let (_tmp, state, port) = start_server_with_extra_config_on_available_port("").await;
     let base = format!("http://127.0.0.1:{port}");
     let ws_base = format!("ws://127.0.0.1:{port}");
 
@@ -8781,8 +8722,7 @@ async fn login_project_thread_message() {
 
 #[tokio::test]
 async fn auth_rejected_without_cookie() {
-    let port = 18788;
-    let (_tmp, _state) = start_server(port).await;
+    let (_tmp, _state, port) = start_server_with_extra_config_on_available_port("").await;
     let base = format!("http://127.0.0.1:{port}");
 
     let client = reqwest::Client::new();
@@ -8797,8 +8737,7 @@ async fn auth_rejected_without_cookie() {
 
 #[tokio::test]
 async fn login_rejected_wrong_password() {
-    let port = 18789;
-    let (_tmp, _state) = start_server(port).await;
+    let (_tmp, _state, port) = start_server_with_extra_config_on_available_port("").await;
     let base = format!("http://127.0.0.1:{port}");
 
     let client = reqwest::Client::new();

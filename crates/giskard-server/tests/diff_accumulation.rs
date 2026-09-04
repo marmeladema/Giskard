@@ -176,7 +176,8 @@ fn generate_password_hash(password: &str) -> String {
 /// separate entry.
 #[tokio::test]
 async fn diff_accumulation_persists_turn_diffs() {
-    let port = 19010;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
     let tmp = tempfile::TempDir::new().unwrap();
     let hash = generate_password_hash("testpass");
     let config_toml = format!(
@@ -201,9 +202,6 @@ session_days = 30
     });
     let state = AppState::new(store.clone(), factory, session_key);
     let app = build_app(state.clone());
-    let listener = tokio::net::TcpListener::bind(format!("127.0.0.1:{port}"))
-        .await
-        .unwrap();
     tokio::spawn(async move {
         axum::serve(listener, app).await.unwrap();
     });

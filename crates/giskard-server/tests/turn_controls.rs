@@ -134,7 +134,9 @@ fn generate_password_hash(password: &str) -> String {
         .to_string()
 }
 
-async fn start_server(port: u16) -> (tempfile::TempDir, Arc<AppState>) {
+async fn start_server() -> (tempfile::TempDir, Arc<AppState>, u16) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
     let tmp = tempfile::TempDir::new().unwrap();
     let hash = generate_password_hash("testpass");
     let config_toml = format!(
@@ -171,13 +173,10 @@ model_listing = false
     });
     let state = AppState::new(store, factory, session_key);
     let app = build_app(state.clone());
-    let listener = tokio::net::TcpListener::bind(format!("127.0.0.1:{port}"))
-        .await
-        .unwrap();
     tokio::spawn(async move {
         axum::serve(listener, app).await.unwrap();
     });
-    (tmp, Arc::new(state))
+    (tmp, Arc::new(state), port)
 }
 
 fn ws_text(msg: &ClientMessage) -> tokio_tungstenite::tungstenite::Message {
@@ -186,8 +185,7 @@ fn ws_text(msg: &ClientMessage) -> tokio_tungstenite::tungstenite::Message {
 
 #[tokio::test]
 async fn modes_models_approvals_and_plan_dump() {
-    let port = 18899;
-    let (_tmp, state) = start_server(port).await;
+    let (_tmp, state, port) = start_server().await;
     let base = format!("http://127.0.0.1:{port}");
     let ws_base = format!("ws://127.0.0.1:{port}");
 
