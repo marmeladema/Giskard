@@ -9,7 +9,14 @@
 
 **Document status:** Implementation-ready specification.
 **Audience:** An AI coding agent (and its human reviewer) implementing the system.
-**Version:** 1.86
+**Version:** 1.87
+
+> **Amendment — composer growth (1.87).** The composer's input grows with its content instead of
+> holding a single line, bounded by a fraction of the *visible* viewport height (30%, expressed in
+> CSS as `--composer-max-fraction` over `--app-height`). Past the bound it stops growing and
+> scrolls. The bound tracks the visible area rather than the layout viewport, so an on-screen
+> keyboard shrinks it and a box already taller than the new bound is brought back down. A
+> transcript that was following its newest row still follows it after the box resizes.
 
 > **Amendment — server-request claim settlement (1.86).** A claim owns a request until it
 > settles. A harness resolution that arrives during a claim is recorded on the request and
@@ -3526,6 +3533,11 @@ sessions, so clarity and low visual noise beat flourish. Explicitly avoid the ge
   collapse state is browser-local and persists across reloads.
 - **Center:** thread header (mode, model, permission preset, tasks menu, MCP menu, context usage menu
   with manual compact action, plan-dump & interrupt actions) + transcript + composer.
+- **Composer:** the input grows with what is typed — long prompts are the common case for an agent
+  — up to a fraction of the visible viewport height (30%), after which it scrolls instead of
+  growing. The bound is a fraction of the *visible* area, not the layout viewport, so it shrinks
+  with an on-screen keyboard; a box already taller than the new bound is brought back down rather
+  than left covering the transcript. Growing the box must not break a transcript's bottom-following.
 - **Composer drafts:** unsent text is browser-local and scoped to the active persisted thread id.
   A new-thread draft uses a per-project draft key until the first message creates the thread.
   Switching threads saves the previous draft and restores the target draft; sending successfully

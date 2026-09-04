@@ -123,7 +123,9 @@ Then open **http://127.0.0.1:8787**, log in, and:
    is allowed to do: its permission preset still applies unchanged. See
    [Per-thread Git worktrees](docs/git-worktrees.md) for what does and does not come across, branch
    naming, and what deleting an isolated thread destroys.
-3. Type in the composer (Enter to send). Use the attachment button or drop files onto the composer
+3. Type in the composer (Enter to send). The composer grows as you type, up to about 30% of the
+   screen, and scrolls beyond that — long prompts stay readable while you write them. Use the
+   attachment button or drop files onto the composer
    to include images, PDFs, or other files with the message. A message accepts up to eight files
    and 25 MiB total. The first send creates the Codex thread with the selected
    provider/model and starts the turn. Existing threads show the **Tasks** menu for running

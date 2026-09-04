@@ -12,6 +12,14 @@
      --app-top to stay aligned with the visible region's top edge. The 100vh / 0 fallbacks apply
      before the JS runs and on browsers without visualViewport. */
   :root { --app-height:100vh; --app-top:0px; }
+  /* How tall the composer's textarea is allowed to grow before it starts scrolling, as a fraction
+     of the *visible* viewport (--app-height, not the layout viewport) so the cap shrinks with the
+     on-screen keyboard instead of hiding the transcript behind it. This is the tuning point: a
+     desktop/mobile split is a `--composer-max-fraction` override in the max-width:820px block, and
+     a user preference is the same property set inline on the root element. Nothing reads the
+     fraction directly — autosizeComposer() in app.js measures the computed max-height — so either
+     change works with no JS edit. */
+  :root { --composer-max-fraction:.3; --composer-max-height:calc(var(--app-height) * var(--composer-max-fraction)); }
   /* html gets the same background as body so the strip above a translated shell (when iOS pans
      the layout viewport down by --app-top) doesn't show a lighter default background. The
      transform on body also makes it the containing block for position:fixed descendants
@@ -606,16 +614,40 @@
   .git-file-stat { flex:none; display:inline-flex; gap:5px; color:var(--muted); font-family:var(--mono); font-size:10.5px; font-variant-numeric:tabular-nums; }
   .git-empty { padding:8px 6px; color:var(--muted); font-size:12px; }
 
-  .composer { display:flex; gap:8px; padding:12px; border-top:1px solid var(--border); background:var(--panel); }
+  /* align-items:flex-end keeps the fixed-height ＋/send/stop buttons level with the *bottom* edge
+     of the textarea as it grows, so the send control stays where the eye and thumb expect it
+     rather than drifting to the top of a tall box. */
+  .composer { display:flex; gap:8px; padding:12px; border-top:1px solid var(--border); background:var(--panel); align-items:flex-end; }
   .composer.drag-over { outline:2px solid var(--accent); outline-offset:-4px; background:var(--panel2); }
   .composer #attachBtn {
     width:40px; min-width:40px; height:40px;
     padding:0; font-size:20px; line-height:1; display:flex; align-items:center; justify-content:center;
   }
-  .composer textarea { flex:1; resize:none; height:40px; }
+  /* The composer grows with what is typed instead of holding a single line: long prompts are the
+     common case, and a one-line box hid all but the last line of them. autosizeComposer() in app.js
+     sets `height` from the content on every change; CSS owns the bounds. min-height keeps the
+     at-rest box at the 40px it has always been (one line of content measures ~35px, so without it
+     the first keystroke would visibly shrink the composer), and max-height caps the growth — past
+     it the box stops growing and scrolls instead. The `height` here is only the pre-JS value; the
+     `overflow-y:hidden` is what the unclamped state looks like, flipped to `auto` by the same
+     function once the content is taller than the cap. */
+  .composer textarea {
+    flex:1; resize:none; height:40px; min-height:40px; max-height:var(--composer-max-height);
+    overflow-y:hidden;
+    scrollbar-width:thin; scrollbar-color:var(--scroll-thumb) var(--scroll-track);
+  }
+  /* Match the transcript's themed scrollbar so a scrolling composer doesn't render the platform's
+     default one in the middle of the app's own chrome. */
+  .composer textarea::-webkit-scrollbar { width:10px; }
+  .composer textarea::-webkit-scrollbar-track { background:var(--scroll-track); }
+  .composer textarea::-webkit-scrollbar-thumb {
+    background:var(--scroll-thumb); border:2px solid var(--scroll-track); border-radius:999px;
+  }
+  .composer textarea::-webkit-scrollbar-thumb:hover { background:var(--scroll-thumb-hover); }
   /* Send (up-pointing paper-plane arrow) and Stop (red filled square) are flex siblings; only one
      is ever visible (the other has [hidden]), so they occupy the same 40px slot. Both match the
-     textarea height, mirroring the ＋ attach button on the left for a symmetric composer. */
+     composer's at-rest height, mirroring the ＋ attach button on the left for a symmetric composer;
+     when the textarea grows they keep that height and stay aligned to its bottom edge. */
   .composer #sendBtn,
   .composer #stopBtn {
     width:40px; min-width:40px; height:40px; margin:0; padding:0;
