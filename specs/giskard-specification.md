@@ -9,7 +9,15 @@
 
 **Document status:** Implementation-ready specification.
 **Audience:** An AI coding agent (and its human reviewer) implementing the system.
-**Version:** 1.88
+**Version:** 1.89
+
+> **Amendment — deferred link retention (1.89).** A deferred reply-less sub-agent link whose parent
+> has no live owner is kept while the parent's thread file exists and dropped only once that file
+> is gone, and kept when the store cannot read it; a detach of a live owner leaves the deferred
+> wake to the owner exit that follows it, while a detach that finds no live owner wakes the queue
+> itself. The deferred queue has no count bound: deduplication by native id is its only limit. A
+> live event owner whose stream ends without a turn after its driver quiesced is expected teardown
+> and is not reported as a failure; any other exit under quiesce keeps its warning.
 
 > **Amendment — admission and reader fences (1.88).** A quiesced project event driver refuses
 > new event-owner attachment. Deferred admissions are retried after every driver event,
@@ -153,6 +161,16 @@
 > the intended frontend for the foreseeable future; treat every Dioxus/WASM/`giskard-ui` reference
 > below as historical design context, not a current requirement. The wire contract (`giskard-proto`)
 > and all backend design remain authoritative.
+
+**Changelog (1.88 → 1.89), deferred link retention:**
+- **AF4:** A deferred reply-less link is retried only against a live parent. While the parent is
+  detaching, failed, or unattached but still persisted, the link stays queued; it is dropped only
+  when the parent's thread file is known to be gone, never on a store read error.
+- **AF5:** The deferred admission queue is bounded by distinct native ids alone; no entry is
+  evicted by count. Crossing a size threshold is logged once per crossing.
+- **AF6:** A live event owner whose stream ends without a turn while its driver is quiesced is
+  teardown, logged at debug; every other exit reason, and the same exit outside quiesce, remains a
+  warning.
 
 **Changelog (1.87 → 1.88), admission and reader fences:**
 - **AF1:** A quiesced project event driver refuses event-owner attachment, completing the deletion

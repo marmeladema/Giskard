@@ -268,8 +268,11 @@ frames fail loudly.
 **Goal.** Finish the quiesce, deferred-admission, and retained-log reader fences left open by M7.
 
 **Design.** A quiesced driver refuses event-owner attachment, making the deletion snapshot final.
-Deferred admissions have no lifetime attempt cap, are deduplicated by native id, and retry one at
-a time only when an attach, detach, owner exit, successful admission, or resume wakes the driver.
+Deferred admissions have no lifetime attempt cap and no count bound, are deduplicated by native
+id, and retry one at a time only when an attach, an owner exit, a detach that finds no live owner,
+a successful admission, or a resume wakes the driver. A deferred reply-less link is kept while its
+parent is persisted (or cannot be read) but has no live owner, and is retried once the parent
+reattaches. An owner whose stream ends without a turn after quiesce is teardown, not a failure.
 When the last retained-log reader is dropped behind its cursor, its unreported deficit is handed to
 the next reader.
 
