@@ -283,6 +283,14 @@ struct RegistryShared {
     background_tasks: Arc<RegistryTaskTracker>,
     #[cfg(test)]
     discovery_records_processed: AtomicUsize,
+    #[cfg(test)]
+    link_admissions_processed: AtomicUsize,
+    #[cfg(test)]
+    deferred_link_requeues: AtomicUsize,
+    #[cfg(test)]
+    failed_owner_removals_warned: AtomicUsize,
+    #[cfg(test)]
+    teardown_owner_exits: AtomicUsize,
     hub: Arc<Hub>,
     runtime: Arc<ThreadRuntimeSupport>,
     store: Arc<PersistStore>,
@@ -418,6 +426,14 @@ impl RegistryShared {
             background_tasks: Arc::new(RegistryTaskTracker::default()),
             #[cfg(test)]
             discovery_records_processed: AtomicUsize::new(0),
+            #[cfg(test)]
+            link_admissions_processed: AtomicUsize::new(0),
+            #[cfg(test)]
+            deferred_link_requeues: AtomicUsize::new(0),
+            #[cfg(test)]
+            failed_owner_removals_warned: AtomicUsize::new(0),
+            #[cfg(test)]
+            teardown_owner_exits: AtomicUsize::new(0),
             hub,
             runtime: Arc::new(ThreadRuntimeSupport::with_max_command_output_bytes(
                 max_command_output_bytes,
