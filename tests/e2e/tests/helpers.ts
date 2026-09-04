@@ -182,6 +182,28 @@ export function selectedThread(page: Page): Promise<{ pid: string; tid: string }
   return page.evaluate(() => JSON.parse(localStorage.getItem("giskard.lastThread") || "null"));
 }
 
+/**
+ * Simulate the iOS Safari on-screen keyboard: shrink the *visual* viewport without resizing the
+ * layout viewport, and fire the visualViewport `resize`/`scroll` events `syncAppHeight` listens
+ * for. `window.innerHeight` stays at the viewport's full height, modelling Safari overlaying the
+ * keyboard rather than resizing the page; `offsetTop` models the layout-viewport pan Safari applies
+ * to reveal the focused composer. Playwright's headless Chromium has a real `visualViewport`, so its
+ * properties are shadowed with getters rather than replaced.
+ */
+export async function simulateIOSKeyboard(
+  page: Page,
+  visibleHeight = 400,
+  offsetTop = 0,
+): Promise<void> {
+  await page.evaluate(([vh, ot]) => {
+    const vv = window.visualViewport!;
+    Object.defineProperty(vv, "height", { configurable: true, get: () => vh });
+    Object.defineProperty(vv, "offsetTop", { configurable: true, get: () => ot });
+    vv.dispatchEvent(new Event("resize"));
+    vv.dispatchEvent(new Event("scroll"));
+  }, [visibleHeight, offsetTop]);
+}
+
 /** Log in through the real login form and wait for the app shell to become visible. */
 export async function login(page: Page, password: string = PASSWORD): Promise<void> {
   await page.goto("/");

@@ -1,5 +1,5 @@
 import { test, expect, type Page } from "@playwright/test";
-import { login } from "./helpers";
+import { login, simulateIOSKeyboard } from "./helpers";
 
 /**
  * The mobile top bar (#mobileBar) and the thread status header (header.thr) must stay pinned at
@@ -66,30 +66,6 @@ function transcriptBottomGap(page: Page) {
     const t = document.getElementById("transcript")!;
     return t.scrollHeight - t.scrollTop - t.clientHeight;
   });
-}
-
-/** Simulate the iOS Safari keyboard: shrink the visual viewport without resizing the layout, and
- *  dispatch the visualViewport resize/scroll events that syncAppHeight listens for. The layout
- *  viewport (window.innerHeight) stays at the full 844px, modelling Safari overlaying the keyboard
- *  rather than resizing the page. Returns the final visible height used. */
-async function simulateIOSKeyboard(
-  page: Page,
-  visibleHeight = 400,
-  offsetTop = 0,
-): Promise<void> {
-  // Model the iOS Safari keyboard: the visual viewport shrinks to the area above the keyboard
-  // (height = visibleHeight) and may pan down from the layout-viewport top (offsetTop > 0) when
-  // Safari shifts the layout viewport to reveal the focused composer. window.innerHeight stays
-  // at the full 844 (the LAYOUT viewport is NOT resized). Playwright's headless Chromium has a
-  // real visualViewport; shadow its properties with getters and dispatch the resize + scroll
-  // events syncAppHeight listens to.
-  await page.evaluate(([vh, ot]) => {
-    const vv = window.visualViewport!;
-    Object.defineProperty(vv, "height", { configurable: true, get: () => vh });
-    Object.defineProperty(vv, "offsetTop", { configurable: true, get: () => ot });
-    vv.dispatchEvent(new Event("resize"));
-    vv.dispatchEvent(new Event("scroll"));
-  }, [visibleHeight, offsetTop]);
 }
 
 test.describe("mobile title + status bars stay pinned at the top", () => {

@@ -99,6 +99,11 @@ const COMPOSER_HINT = COMPOSER_IS_TOUCH
     // layout viewport isn't shifted (the common case, including desktop and Android).
     document.documentElement.style.setProperty("--app-height", Math.round(vv.height) + "px");
     document.documentElement.style.setProperty("--app-top", Math.round(vv.offsetTop) + "px");
+    // The composer's growth cap is a fraction of --app-height, so it just moved. A box already
+    // taller than the new cap has to be brought back down here, or the keyboard opening would leave
+    // a composer covering the transcript it was sized against. (Declared later in this file;
+    // function declarations hoist, and it no-ops while the composer is still hidden.)
+    autosizeComposer();
     if (followTranscriptBottom) {
       requestAnimationFrame(() => {
         // A reader can scroll between the viewport event and this frame. Only restore the bottom
@@ -2399,6 +2404,45 @@ function isDraftThread() {
   return !!state.draftThread && !state.threadId;
 }
 
+// Size the composer's textarea to its content, bounded by the `max-height` CSS gives it (a fraction
+// of the visible viewport — see --composer-max-height in app.css). A long prompt is the common case
+// here, and a fixed one-line box showed only the last line of one.
+//
+// The cap is read from the computed style rather than recomputed here, so the CSS stays the single
+// place the limit is expressed: a desktop/mobile split or a user preference changes only that
+// property. Past the cap the box stops growing and scrolls, which is also the only state that needs
+// a scrollbar — `overflow-y` is toggled rather than left on `auto`, because a permanently scrollable
+// textarea reserves gutter space and shows a phantom bar on some platforms while the text still
+// fits.
+//
+// Growing the composer takes height from the transcript above it, and a scroll container keeps its
+// scrollTop (not its distance from the bottom) across a resize, so a transcript that was following
+// the newest row would otherwise drift away from it as the box grows. Capture that intent before
+// the reflow and restore it after, exactly as syncAppHeight does for the keyboard.
+function autosizeComposer() {
+  const ta = $("input");
+  if (!ta) return;
+  // No layout to measure while the composer is hidden (scrollHeight is 0 for a display:none
+  // subtree), and sizing it to that would collapse it. The paths that reveal the composer restore
+  // a draft right afterwards, which calls back here once there is a box to measure.
+  if (!ta.offsetParent) return;
+  const stick = transcriptShouldStickToBottom();
+  const style = getComputedStyle(ta);
+  // box-sizing is border-box app-wide, but scrollHeight covers only content + padding. Without the
+  // borders the assigned height is 2px short of the content and the box scrolls by a hairline from
+  // the very first line.
+  const borders = (parseFloat(style.borderTopWidth) || 0) + (parseFloat(style.borderBottomWidth) || 0);
+  const max = parseFloat(style.maxHeight);
+  // `height:auto` first: scrollHeight never reports less than the current height, so measuring
+  // without collapsing the box would let it grow and never shrink again.
+  ta.style.height = "auto";
+  const content = ta.scrollHeight + borders;
+  const clamped = Number.isFinite(max) && content > max;
+  ta.style.height = (clamped ? max : content) + "px";
+  ta.style.overflowY = clamped ? "auto" : "hidden";
+  keepTranscriptAtBottom(stick);
+}
+
 function composerDraftKey() {
   if (state.threadId) return `thread:${state.threadId}`;
   if (isDraftThread() && state.draftThread.projectId) return `draft:${state.draftThread.projectId}`;
@@ -2420,6 +2464,9 @@ function restoreComposerDraft() {
   if (!input) return;
   const key = composerDraftKey();
   input.value = key ? (state.inputDrafts.get(key) || "") : "";
+  // The restored draft is as tall as whatever was typed into it before the switch away, so the box
+  // has to be re-measured for it: a thread whose draft is ten lines opens with a ten-line composer.
+  autosizeComposer();
   // Last: clearing the attachments refreshes the Send button, and it has to see the restored text
   // rather than the outgoing thread's. Callers happen to refresh again afterwards (a draft when its
   // project's default model lands, a thread when its socket reports status), so the order here is
@@ -2430,7 +2477,7 @@ function restoreComposerDraft() {
 function clearComposerDraft(key) {
   if (key) state.inputDrafts.delete(key);
   const input = $("input");
-  if (input && composerDraftKey() === key) input.value = "";
+  if (input && composerDraftKey() === key) { input.value = ""; autosizeComposer(); }
 }
 
 // The transcript of a brand-new (unsent) thread is empty, which left users unsure what the view is
@@ -9420,8 +9467,13 @@ $("input").addEventListener("keydown", (e) => {
 });
 $("input").addEventListener("input", () => {
   saveComposerDraft();
+  autosizeComposer();         // fires for typing, paste, cut, drop, undo and IME commits alike
   updateComposerControls();   // the Send button tracks whether there is anything to send
 });
+// Where visualViewport exists, syncAppHeight's own handler re-clamps the composer when the visible
+// area changes. Without it the shell falls back to the 100vh/100dvh CSS and nothing else notices a
+// resize, so the window event is the signal there.
+if (!window.visualViewport) window.addEventListener("resize", autosizeComposer);
 $("gitStrategySel").onchange = (e) => setDraftGitStrategy(e.target.value);
 $("attachBtn").onclick = () => $("attachmentInput").click();
 $("attachmentInput").addEventListener("change", attachSelectedFiles);

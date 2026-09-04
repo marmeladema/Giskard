@@ -2,7 +2,8 @@
 
 Browser tests that drive Giskard's real web UI — login, projects/threads, live message streaming,
 linked sub-agent navigation/reload/prompt ordering/cascade deletion, how a sub-agent blocked on an
-approval is surfaced, server requests surviving a reload, and settings — through a headless
+approval is surfaced, server requests surviving a reload, the composer growing with what is typed
+(bounded, scrollable, and re-bounded by the on-screen keyboard), and settings — through a headless
 Chromium.
 
 Everything runs **inside Docker**, so you don't need Node, npm, or the Playwright browsers on your
