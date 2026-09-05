@@ -60,11 +60,37 @@ const MCP_TOOL_APPROVAL_LABEL_CANCEL: &str = "Cancel";
 
 type MappingResult<T> = Result<T, UnknownNativeThread>;
 
+/// Everything the adapter tracks for one native turn between its start and its completion.
+#[derive(Default)]
+struct NativeTurnState {
+    /// Latest `thread/tokenUsage/updated.last` for the turn; attached to `TurnCompleted`.
+    usage: TokenUsage,
+    /// Last `(usage, context_window)` pair emitted as `TurnUsageUpdated`, for dedup.
+    emitted_usage: Option<(TokenUsage, Option<u32>)>,
+    /// Model acknowledged by `turn/start`, when Giskard supplied one.
+    model: Option<ModelRef>,
+    /// Whether an invalid context window was already logged for this turn.
+    invalid_window_warned: bool,
+}
+
 /// Maps Codex app-server messages onto `giskard-core` events, owning the id-translation registries
 /// (spec §4.7): native `threadId → ThreadId` (B4),
 /// `(ThreadId, native turnId) → TurnId`, and
 /// `(ThreadId, TurnId, native itemId) → ItemId` (B2). The Giskard-owned item id is minted once and
 /// reused for every subsequent response, delta, or completion in that turn's item lifecycle.
+///
+/// Adapter state is grouped by lifetime, not by key type:
+/// - harness lifetime, never removed while the process runs: `routes`, `native_parents`,
+///   `turn_ids`, `item_ids` (identity must stay stable for late events);
+/// - one native turn, removed at `turn/completed` or `clear_active_turn`: `turns`,
+///   `file_change_previews`;
+/// - one running command, removed when the command ends, which may be after its turn:
+///   `running_commands`, `running_command_turns`;
+/// - one pending request, removed when answered: `pending_approval_responses`,
+///   `pending_server_requests`.
+///
+/// A new field joins the struct whose cleanup site matches its lifetime; a field that needs
+/// its own cleanup site gets its own map and its own exception comment.
 pub struct CodexMapper {
     workspace_root: PathBuf,
     routes: NativeThreadRoutes,
@@ -91,42 +117,14 @@ pub struct CodexMapper {
     // Synchronization: The single Codex background task owns and mutates the mapper.
     // Invalidation/removal: Entries live for one harness process and drop with the mapper.
     item_ids: HashMap<NativeItemKey, ItemId>,
-    /// Latest per-turn token usage, keyed by owning thread and native turn id. Codex reports usage
-    /// via a separate `thread/tokenUsage/updated` notification (not on `turn/completed`), so we
-    /// cache the most recent value per turn and attach it when the turn completes (spec §10.1).
     // ENTITY-AUTHORITY-EXCEPTION:
-    // Role: Correlate out-of-band Codex usage notifications with their owning native turn.
-    // Source of truth: The latest provider notification supplies the cached usage value.
-    // Structural reason: Codex delivers usage separately from turn completion.
+    // Role: Correlate out-of-band Codex usage, usage dedup, the acknowledged model, and the
+    //       invalid-window warning with their owning native turn.
+    // Source of truth: turn/start (model) and thread/tokenUsage/updated (the rest).
+    // Structural reason: Codex delivers these separately from turn completion.
     // Synchronization: The single Codex background task owns and mutates the mapper.
-    // Invalidation/removal: Turn completion consumes the value; shutdown drops remaining entries.
-    turn_usage: HashMap<NativeTurnKey, TokenUsage>,
-    /// Last usage and effective context-window pair emitted for each turn.
-    // ENTITY-AUTHORITY-EXCEPTION:
-    // Role: Deduplicate usage notifications per native turn.
-    // Source of truth: The latest Codex usage notification supplies the pair.
-    // Structural reason: Notification correlation belongs to the provider adapter.
-    // Synchronization: The single Codex background task owns and mutates the mapper.
-    // Invalidation/removal: Turn completion clears the entry; shutdown drops remaining entries.
-    emitted_usage: HashMap<NativeTurnKey, (TokenUsage, Option<u32>)>,
-    /// Model selected for each acknowledged native turn. Context-window notifications do not carry
-    /// a model id, so the value must be bound when `turn/start` returns.
-    // ENTITY-AUTHORITY-EXCEPTION:
-    // Role: Attribute native-turn context notifications to the acknowledged model.
-    // Source of truth: The Codex turn-start response supplies the selected model.
-    // Structural reason: Codex context notifications omit model identity.
-    // Synchronization: The single Codex background task owns and mutates the mapper.
-    // Invalidation/removal: Turn completion clears the entry; shutdown drops remaining entries.
-    turn_models: HashMap<NativeTurnKey, ModelRef>,
-    /// Turns for which an invalid context window was already logged. A later valid value is still
-    /// accepted, but repeated malformed usage notifications do not flood service logs.
-    // ENTITY-AUTHORITY-EXCEPTION:
-    // Role: Deduplicate invalid-context warnings by native thread and turn identity.
-    // Source of truth: Warning emission inserts the corresponding native turn key.
-    // Structural reason: This is provider-protocol diagnostic state, not thread ownership.
-    // Synchronization: The single Codex background task owns and mutates the mapper.
-    // Invalidation/removal: Turn cleanup removes entries; shutdown drops remaining entries.
-    invalid_context_window_turns: HashSet<NativeTurnKey>,
+    // Invalidation/removal: Turn completion or thread cleanup removes the entry; shutdown drops the rest.
+    turns: HashMap<NativeTurnKey, NativeTurnState>,
     // ENTITY-AUTHORITY-EXCEPTION:
     // Role: Route thread-scoped Codex events to the currently active native turn.
     // Source of truth: Codex turn start and terminal events update this adapter state.
@@ -169,10 +167,7 @@ impl CodexMapper {
             native_parents: HashMap::new(),
             turn_ids: HashMap::new(),
             item_ids: HashMap::new(),
-            turn_usage: HashMap::new(),
-            emitted_usage: HashMap::new(),
-            turn_models: HashMap::new(),
-            invalid_context_window_turns: HashSet::new(),
+            turns: HashMap::new(),
             active_turns: HashMap::new(),
             running_command_turns: HashMap::new(),
             running_commands: HashSet::new(),
@@ -197,11 +192,7 @@ impl CodexMapper {
 
     pub fn clear_active_turn(&mut self, thread: ThreadId) {
         self.active_turns.remove(&thread);
-        self.turn_usage.retain(|key, _| key.thread_id != thread);
-        self.emitted_usage.retain(|key, _| key.thread_id != thread);
-        self.turn_models.retain(|key, _| key.thread_id != thread);
-        self.invalid_context_window_turns
-            .retain(|key| key.thread_id != thread);
+        self.turns.retain(|key, _| key.thread_id != thread);
         self.file_change_previews
             .retain(|key, _| key.thread_id != thread);
     }
@@ -234,7 +225,7 @@ impl CodexMapper {
         let native_turn_id = native_turn_id.trim();
         let turn = self.register_active_turn(thread, native_turn_id)?;
         let key = NativeTurnKey::new(thread, NativeTurnId::new(native_turn_id.to_string()));
-        self.turn_models.insert(key, model);
+        self.turns.entry(key).or_default().model = Some(model);
         Some(turn)
     }
 
@@ -433,10 +424,11 @@ impl CodexMapper {
                 // Attach the usage cached from the last `thread/tokenUsage/updated` for this turn
                 // (spec §10.1). Defaults to zero if Codex sent no usage update for the turn.
                 let key = NativeTurnKey::new(thread, NativeTurnId::new(turn.id.clone()));
-                let usage = self.turn_usage.remove(&key).unwrap_or_default();
-                self.emitted_usage.remove(&key);
-                self.turn_models.remove(&key);
-                self.invalid_context_window_turns.remove(&key);
+                let usage = self
+                    .turns
+                    .remove(&key)
+                    .map(|turn| turn.usage)
+                    .unwrap_or_default();
                 let completed_turn = self.resolve_turn(thread, &turn.id);
                 self.file_change_previews
                     .retain(|key, _| key.thread_id != thread || key.turn_id != completed_turn);
@@ -467,13 +459,15 @@ impl CodexMapper {
                 }
                 let key = NativeTurnKey::new(thread, NativeTurnId::new(n.turn_id.clone()));
                 let usage = breakdown_to_usage(&n.token_usage.last);
-                self.turn_usage.insert(key.clone(), usage);
+                let turn = self.turns.entry(key).or_default();
+                turn.usage = usage;
 
                 let context_window = match n.token_usage.model_context_window {
                     None => None,
                     Some(native_context_window) => match u32::try_from(native_context_window) {
                         Ok(0) => {
-                            if self.invalid_context_window_turns.insert(key.clone()) {
+                            if !turn.invalid_window_warned {
+                                turn.invalid_window_warned = true;
                                 warn!(
                                     native_thread_id = %n.thread_id,
                                     native_turn_id = %n.turn_id,
@@ -483,11 +477,12 @@ impl CodexMapper {
                             None
                         }
                         Ok(window) => {
-                            self.invalid_context_window_turns.remove(&key);
+                            turn.invalid_window_warned = false;
                             Some(window)
                         }
                         Err(_) => {
-                            if self.invalid_context_window_turns.insert(key.clone()) {
+                            if !turn.invalid_window_warned {
+                                turn.invalid_window_warned = true;
                                 warn!(
                                     native_thread_id = %n.thread_id,
                                     native_turn_id = %n.turn_id,
@@ -499,17 +494,17 @@ impl CodexMapper {
                         }
                     },
                 };
-                if self.emitted_usage.get(&key) == Some(&(usage, context_window)) {
+                if turn.emitted_usage == Some((usage, context_window)) {
                     return Ok(None);
                 }
-                self.emitted_usage
-                    .insert(key.clone(), (usage, context_window));
+                turn.emitted_usage = Some((usage, context_window));
+                let model = turn.model.clone();
                 Some(AgentEvent::TurnUsageUpdated {
                     thread,
                     turn: self.resolve_turn(thread, &n.turn_id),
                     usage,
                     context_window,
-                    model: self.turn_models.get(&key).cloned(),
+                    model,
                 })
             }
 
@@ -3825,6 +3820,36 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn turn_state_is_created_on_first_usage_and_removed_on_completion() {
+        let mut mapper = CodexMapper::new(PathBuf::from("/tmp"));
+        let thread = ThreadId::new();
+        let key = NativeTurnKey::new(thread, NativeTurnId::new("t1".to_string()));
+
+        assert!(
+            mapper
+                .map_notification(&turn_started("t1"), thread)
+                .is_some()
+        );
+        assert!(!mapper.turns.contains_key(&key));
+
+        assert!(
+            mapper
+                .map_notification(&usage_update("th1", "t1", 12, Some(258_400)), thread)
+                .is_some()
+        );
+        assert_eq!(mapper.turns.len(), 1);
+        assert!(mapper.turns.contains_key(&key));
+
+        assert!(
+            mapper
+                .map_notification(&turn_completed("t1"), thread)
+                .is_some()
+        );
+        assert!(!mapper.turns.contains_key(&key));
+        assert!(mapper.turn_ids.contains_key(&key));
     }
 
     #[test]

@@ -142,6 +142,9 @@ Cargo workspace with 8 crates under `crates/`:
   driver refuses attachment and retries deferred admissions only on driver events; nothing polls.
 - Entity-local state belongs on its authority or an authority-owned component. Do not add a peer
   owning map keyed directly or indirectly by project or thread identity.
+- Keyed state is grouped by lifetime: a new map joins the struct whose cleanup site matches when it is
+  removed, or gets its own field, comment, and cleanup site. Both `CodexMapper` and
+  `ThreadRuntimeEntry` list their lifetime classes in a doc comment.
 - Each root authority owner map must have an adjacent `ENTITY-AUTHORITY-OWNER` comment naming the
   entity whose process-local identity it owns. Every long-lived struct field that is a permanent
   keyed exception must have an adjacent `ENTITY-AUTHORITY-EXCEPTION` comment. Function-body locals
