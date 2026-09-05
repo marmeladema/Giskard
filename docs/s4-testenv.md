@@ -1,4 +1,4 @@
-# S4 — A `giskard-testkit` crate for the server integration tests
+# S4 — A `giskard-testenv` crate for the server integration tests
 
 Implementation plan for step 4 of [`design-straightening-review.md`](design-straightening-review.md)
 (finding C6). Written against `main` at `36c42e8` (S3 merged); every file and line reference below
@@ -7,7 +7,7 @@ was checked against that tree. Re-check them if the branch has moved.
 ## Goal
 
 Replace the scaffolding that every server integration test binary rebuilds for itself with one
-crate, `giskard-testkit`: password hashing, the config baseline, spawning the app on an ephemeral
+crate, `giskard-testenv`: password hashing, the config baseline, spawning the app on an ephemeral
 port, logging in, project and thread setup, the WebSocket handshake, and the replay fixtures. After
 S4 a new integration test starts with `TestServer::spawn(factory)` and gets an authenticated
 client, a cookie, and a WebSocket in three calls. No test's assertions change; only how each test
@@ -17,7 +17,7 @@ reaches the server.
 
 S4 is the crate plus the migration of the *scaffolding* in all 21 test files. The fourteen
 hand-written `impl AgentHarness` fakes stay where they are, unchanged, and each is handed to the
-kit through a factory constructor. Unifying the fakes into one configurable `FakeHarness` is
+crate through a factory constructor. Unifying the fakes into one configurable `FakeHarness` is
 **S4b**, a separate plan written after S4 lands, for two reasons that the survey behind this plan
 made concrete:
 
@@ -36,12 +36,12 @@ made concrete:
 
 - No change to any test's assertions, to the messages it sends, or to the fakes' behaviour. The
   diff in each test file is deletions of helpers plus one-for-one replacements at call sites.
-- No change to `giskard-server`'s public API. The kit uses exactly what the tests use today:
-  `AppState::new`, `build_app`, `HarnessFactory`.
+- No change to `giskard-server`'s public API and no change to any `#[cfg(test)]` gate in it. The
+  crate uses exactly what the tests use today: `AppState::new`, `build_app`, `HarnessFactory`.
 - No change to the unit-test fakes inside `crates/giskard-server/src` (five `impl AgentHarness`
   in `registry.rs`, `registry/driver.rs`, `registry/event_forwarder.rs`), nor to
   `giskard-server-replay`'s `ScriptedHarness`.
-- No change to `giskard-harness-replay`. The kit wraps `ReplayHarness`; it does not extend it.
+- No change to `giskard-harness-replay`. The crate wraps `ReplayHarness`; it does not extend it.
 - No Playwright, no `tests/e2e/`.
 
 ## Ground truth
@@ -63,7 +63,7 @@ made concrete:
 | `reqwest::redirect::Policy::none()` clients: 22 builders (`e2e_smoke.rs` 18, `read_only_thread.rs` 2, `security.rs:85`, `turn_controls.rs` 1). No test relies on a followed redirect | grep `Policy::none` |
 | `giskard-harness-replay` is a regular dependency of `giskard-server`; 8 test files use `ReplayHarness`, all through `ReplayFixture::from_events` (no fixture files on disk) | `crates/giskard-server/Cargo.toml:13`; grep |
 | `[dev-dependencies]` of `giskard-server`: `tempfile`, `tokio-tungstenite = "0.29"`, `futures-util = "0.3"`. `argon2`, `rand`, `reqwest`, `axum`, `async-trait`, `serde_json`, `chrono` reach the tests through `[dependencies]` | `crates/giskard-server/Cargo.toml:46-49` |
-| A dev-dependency cycle (`giskard-server` dev-depends on `giskard-testkit`, which depends on `giskard-server`) is accepted by cargo: verified on this tree with a probe crate exposing a `giskard_server::AppState`-returning function, referenced from a test file; `cargo check -p giskard-server --tests` and `--lib` both pass and `cargo metadata` lists both packages | probe run, then reverted |
+| A dev-dependency cycle (`giskard-server` dev-depends on `giskard-testenv`, which depends on `giskard-server`) is accepted by cargo: verified on this tree with a probe crate exposing a `giskard_server::AppState`-returning function, referenced from a test file; `cargo check -p giskard-server --tests` and `--lib` both pass and `cargo metadata` lists both packages | probe run, then reverted |
 | CI: `cargo build --workspace --locked`, `cargo test --workspace --locked`, `cargo clippy --workspace --all-targets --locked -- -D warnings`; the new crate is built and linted by all three | `.github/workflows/ci.yml:41-55` |
 | Rule: tests must bind port `0` and pass the still-open listener to the server | `AGENTS.md:38-42` |
 | `ThreadHandle::opened(thread, harness_thread_id, workspace_root)`; `EventLog::new()`, `Arc<EventLog>::reader()` | `giskard-harness/src/lib.rs:385`; `event_log.rs:77`, `:157` |
@@ -73,7 +73,7 @@ made concrete:
 
 ### D1. Crate layout and dependencies
 
-`crates/giskard-testkit`, a workspace member, one library:
+`crates/giskard-testenv`, a workspace member, one library:
 
 ```
 src/lib.rs        pub mod auth; pub mod factory; pub mod fixtures; pub mod git; pub mod server; pub mod ws;
@@ -85,16 +85,27 @@ src/lib.rs        pub mod auth; pub mod factory; pub mod fixtures; pub mod git; 
 `giskard-server`, `tokio`, `async-trait`, `serde_json`, `chrono`, `tempfile`, `axum`, `reqwest`
 (same feature set as the server's: `default-features = false, features = ["json", "rustls-tls"]`),
 `argon2`, `rand`, `futures-util = "0.3"`, `tokio-tungstenite = "0.29"`. Add
-`giskard-testkit = { path = "crates/giskard-testkit" }` to `[workspace.dependencies]` and
-`giskard-testkit = { workspace = true }` to `giskard-server`'s `[dev-dependencies]`. Keep
+`giskard-testenv = { path = "crates/giskard-testenv" }` to `[workspace.dependencies]` and
+`giskard-testenv = { workspace = true }` to `giskard-server`'s `[dev-dependencies]`. Keep
 `tempfile`, `tokio-tungstenite`, and `futures-util` in the server's dev-dependencies: tests still
 name `TempDir`, `Message`, and `StreamExt` directly.
 
-Why a crate and not `tests/common`: the dead-code constraint in `common/mod.rs:1-6`. A kit with
+What the crate can see in `giskard-server`: exactly what the integration tests see today. Both
+link the crate's ordinary build, and `cfg(test)` is only set when a crate is compiled as its own
+test harness, so nothing gated by `#[cfg(test)]` in `giskard-server` (the `test_logs` module at
+`src/lib.rs:24`, the S3 `driver_events` sink and probe) is reachable from `tests/` now or from
+`giskard-testenv` afterwards. The tests never needed any of it: their whole surface is the six
+public symbols listed in the ground truth plus the two `#[doc(hidden)] pub fn *_for_test` hooks in
+`src/thread_runtime.rs:447-455`, and the crate uses only `AppState::new`, `build_app`, and
+`HarnessFactory`. No `cfg(test)` gate in `giskard-server` is removed or loosened by S4. If a later
+step wants a test-only hook shared with `giskard-testenv`, the mechanism is a cargo feature on
+`giskard-server` enabled from the dev-dependency, not `cfg(test)`; that is out of scope here.
+
+Why a crate and not `tests/common`: the dead-code constraint in `common/mod.rs:1-6`. A crate with
 a dozen helpers, each used by a subset of 21 binaries, cannot live in a per-binary module under
 `-D warnings` without `allow` attributes.
 
-Why one crate that depends on `giskard-server`, and not a server-free kit plus a `tests/common`
+Why one crate that depends on `giskard-server`, and not a server-free crate plus a `tests/common`
 spawner: the spawner is the biggest duplicate (35 sites) and the one every binary wants; splitting
 it back into `common` reintroduces the constraint above. The cycle is legal and verified.
 
@@ -222,7 +233,7 @@ pub async fn expect_live_snapshot(ws: &mut TestWs) -> LiveTurnSnapshot;      // 
 from_secs(5)` appears 105 times in the tests). S4 migrates only the duplicated ones
 (`wait_for_ws_error` ×3, `wait_for_error` ×1, `wait_for_live_snapshot` ×2); the file-local ones
 stay as they are and may adopt `recv_until` in S4b. One behavioural note: `interrupt.rs:896`
-`unwrap`s a frame that fails to parse, the kit skips it; no test sends an unparsable frame.
+`unwrap`s a frame that fails to parse, the crate skips it; no test sends an unparsable frame.
 
 ### D6. `fixtures`
 
@@ -289,19 +300,19 @@ Two things the table implies and the implementer should not undo:
 
 | File | Change |
 | --- | --- |
-| `Cargo.toml` | `crates/giskard-testkit` in `members`; `giskard-testkit` in `[workspace.dependencies]` |
-| `crates/giskard-testkit/{Cargo.toml, src/lib.rs, src/auth.rs, src/factory.rs, src/fixtures.rs, src/git.rs, src/server.rs, src/ws.rs}` | new |
-| `crates/giskard-server/Cargo.toml` | `giskard-testkit = { workspace = true }` under `[dev-dependencies]` |
+| `Cargo.toml` | `crates/giskard-testenv` in `members`; `giskard-testenv` in `[workspace.dependencies]` |
+| `crates/giskard-testenv/{Cargo.toml, src/lib.rs, src/auth.rs, src/factory.rs, src/fixtures.rs, src/git.rs, src/server.rs, src/ws.rs}` | new |
+| `crates/giskard-server/Cargo.toml` | `giskard-testenv = { workspace = true }` under `[dev-dependencies]` |
 | `crates/giskard-server/tests/common/` | deleted |
 | 20 of the 21 test files | per the migration table |
-| `AGENTS.md` "Build & Test" | one sentence: integration tests build their server through `giskard-testkit`'s `TestServer`, which binds port 0 for them |
+| `AGENTS.md` "Build & Test" | one sentence: integration tests build their server through `giskard-testenv`'s `TestServer`, which binds port 0 for them |
 | `docs/design-straightening-review.md` | mark C6 (step 4) landed |
 | `Cargo.lock` | regenerated by cargo |
 
 ## Tests
 
 The existing 226 integration tests are the specification; every one must pass unchanged in what
-it asserts. The kit gets its own unit tests in `crates/giskard-testkit/src/*.rs`, small and
+it asserts. The crate gets its own unit tests in `crates/giskard-testenv/src/*.rs`, small and
 without a server:
 
 1. `auth::password_hash` output verifies with `Argon2::default().verify_password` for `PASSWORD`
@@ -312,7 +323,7 @@ without a server:
 3. `fixtures::completed_turn_fixture` starts with `ThreadOpened { harness_thread_id: "th_tok" }`
    and ends with `TurnCompleted` carrying `TokenUsage::new(100, 50)`.
 
-And one integration test in the kit's own `tests/smoke.rs`: `TestServer::spawn(factory::failing(..))`
+And one integration test in the crate's own `tests/smoke.rs`: `TestServer::spawn(factory::failing(..))`
 logs in, `create_project_via_api` returns an id the store can load, `ws()` connects and the first
 frame parses as a `ServerMessage`. This is the only test that exercises `start` end to end outside
 the server's suite.
@@ -320,8 +331,8 @@ the server's suite.
 ## Order of work
 
 1. Create the crate with D2, D3, D5, D6, D7 and the unit tests; add the workspace and
-   dev-dependency wiring. `cargo test -p giskard-testkit`.
-2. Add D4 and the smoke test. `cargo test -p giskard-testkit`.
+   dev-dependency wiring. `cargo test -p giskard-testenv`.
+2. Add D4 and the smoke test. `cargo test -p giskard-testenv`.
 3. Migrate one small file end to end (`running_tasks.rs`, one test, 191 lines of preamble) and
    run it ten times. Then `thread_lifecycle.rs` and `code_overlay.rs` (the `failing` + config
    shape), `security.rs` (`unauthenticated` is not needed there, but `auth::login` and cookie
@@ -332,7 +343,7 @@ the server's suite.
 5. Delete `tests/common/`. `cargo test --workspace`, `cargo clippy --workspace --all-targets --
    -D warnings`, `cargo fmt --check`. Run the full server integration suite three times.
 
-Expected size: about 550 lines added in the kit, about 2 400 deleted across the test files.
+Expected size: about 550 lines added in the crate, about 2 400 deleted across the test files.
 
 ## Exit checks
 
@@ -363,7 +374,7 @@ grep -c "^fn ws_text(" $T/*.rs | awk -F: '{s+=$2} END{print s}'
 grep -cE "^async fn (login|login_cookie)\(" $T/*.rs | awk -F: '{s+=$2} END{print s}'
 # 4 → 0 ("type TestWs" ×3 + "type Ws")
 grep -cE "^type (TestWs|Ws) " $T/*.rs | awk -F: '{s+=$2} END{print s}'
-# 7 → 0: the "th_tok" fixture is only built by the kit
+# 7 → 0: the "th_tok" fixture is only built by the crate
 grep -o '"th_tok"' $T/*.rs | wc -l
 # 3 → 0, 2 → 0, 2 → 0
 grep -c "^fn make_turn(" $T/*.rs | awk -F: '{s+=$2} END{print s}'
@@ -396,9 +407,9 @@ grep -cE "^\s*#\[(tokio::)?test" $T/*.rs | awk -F: '{s+=$2} END{print s}'
 - The `security.rs` tests that assert `Secure`, `HttpOnly`, `Max-Age`, or an absent cookie must
   keep reading `set-cookie` themselves; `auth::login` returns only the name=value pair.
 - `provider_switch.rs` names its local struct `TestServer`; rename it (the table says `Fixture`)
-  before importing the kit's, or the two collide.
+  before importing the crate's, or the two collide.
 - A test that spawns two servers (`worktree_threads.rs` restart, `history_sync.rs` ×3) gets two
-  `TestServer`s; nothing in the kit is process-global.
+  `TestServer`s; nothing in the crate is process-global.
 
 ## Stop rules
 
@@ -409,5 +420,5 @@ Stop and re-cut if the diff:
 - adds an `allow` attribute anywhere;
 - leaves a `fn generate_password_hash`, an `impl HarnessFactory`, or a hand-rolled handshake in
   any test file;
-- puts a helper into the kit that only one test file uses (that helper stays local);
+- puts a helper into the crate that only one test file uses (that helper stays local);
 - touches `crates/giskard-harness-replay` or the unit-test fakes under `crates/giskard-server/src`.
