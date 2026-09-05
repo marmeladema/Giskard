@@ -25,4 +25,7 @@ pub mod worktree;
 pub(crate) mod test_logs;
 
 pub use app::{AppShutdown, AppState, build_app};
-pub use registry::{HarnessFactory, HarnessRegistry};
+pub use registry::{
+    DeferReason, DriverEvent, DriverEventSink, ForwarderExitReason, HarnessFactory,
+    HarnessRegistry, LogDriverEventSink, OwnerExitDisposition, RefusedSubject,
+};

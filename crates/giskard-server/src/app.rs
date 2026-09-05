@@ -8,7 +8,7 @@ use crate::headers::security_headers_middleware;
 use crate::highlight::Highlighter;
 use crate::hub::Hub;
 use crate::ledger;
-use crate::registry::{HarnessFactory, HarnessRegistry};
+use crate::registry::{DriverEventSink, HarnessFactory, HarnessRegistry, LogDriverEventSink};
 use crate::routes::{http_request_context_middleware, protected_routes, public_routes};
 use crate::thread_metadata::ThreadMetadataService;
 use crate::throttle::LoginThrottle;
@@ -65,7 +65,14 @@ impl AppState {
         factory: Arc<dyn HarnessFactory>,
         session_key: Vec<u8>,
     ) -> Self {
-        Self::new_with_config(store, factory, session_key, None, None)
+        Self::new_with_config(
+            store,
+            factory,
+            session_key,
+            None,
+            None,
+            Arc::new(LogDriverEventSink),
+        )
     }
 
     /// Create a new `AppState` with visualization config from `config.toml`.
@@ -77,6 +84,7 @@ impl AppState {
         session_key: Vec<u8>,
         viz_config: Option<&giskard_persist::config::VizConfig>,
         retention_config: Option<&giskard_persist::config::RetentionConfig>,
+        driver_events: Arc<dyn DriverEventSink>,
     ) -> Self {
         let hub = Arc::new(Hub::new());
         let max_command_output_bytes = retention_config.map_or(
@@ -94,6 +102,7 @@ impl AppState {
             max_command_output_bytes,
             store.clone(),
             ledger,
+            driver_events,
         ));
         let thread_metadata = registry.thread_metadata_service();
         Self {

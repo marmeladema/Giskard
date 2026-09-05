@@ -31,10 +31,10 @@ const DEFERRED_ADMISSION_WARN_THRESHOLD: usize = 64;
 ///
 /// Reported through `ProjectEventDriver::observe` at the point the decision is final and after
 /// any state it changed has been written, so an observer that sees the event may read the
-/// driver's effects. In production the event becomes the log line for that decision
-/// (`DriverEvent::log`); under `cfg(test)` it is also delivered to the test probe.
+/// driver's effects. It is delivered to the registry's `DriverEventSink`; the default sink turns
+/// it into the log line for that decision (`DriverEvent::log`).
 #[derive(Debug, Clone)]
-pub(super) enum DriverEvent {
+pub enum DriverEvent {
     /// A discovered native thread's admission ran to completion, successfully or not.
     DiscoveryFinished {
         native_thread_id: String,
@@ -74,7 +74,7 @@ pub(super) enum DriverEvent {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) enum DeferReason {
+pub enum DeferReason {
     /// The driver is quiesced; the link waits for a resume.
     Quiesced,
     /// The parent is detaching, failed, or not attached, and its thread file exists.
@@ -84,7 +84,7 @@ pub(super) enum DeferReason {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) enum RefusedSubject {
+pub enum RefusedSubject {
     /// An attach arrived while the driver was quiesced.
     AttachWhileQuiesced { thread_id: ThreadId },
     /// A link with a caller arrived while the driver was quiesced.
@@ -101,7 +101,7 @@ pub(super) enum RefusedSubject {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum OwnerExitDisposition {
+pub enum OwnerExitDisposition {
     /// A requested detach completed.
     Detached,
     /// The stream ended without a turn while the driver was quiesced (teardown).
@@ -115,7 +115,7 @@ pub(super) enum OwnerExitDisposition {
 impl DriverEvent {
     /// The log line for this decision. Levels, messages, field names, field order, and field
     /// formatting are those of the sites the lines moved from.
-    fn log(&self, project_id: ProjectId) {
+    pub fn log(&self, project_id: ProjectId) {
         match self {
             Self::DiscoveryFinished {
                 native_thread_id,
@@ -204,6 +204,22 @@ impl DriverEvent {
                 ..
             } => {}
         }
+    }
+}
+
+/// Receives every decision the project event driver reports. One sink serves every project
+/// driver in a registry, so `project_id` says which one decided.
+pub trait DriverEventSink: Send + Sync + 'static {
+    fn observe(&self, project_id: ProjectId, event: &DriverEvent);
+}
+
+/// The default sink: each decision becomes its log line (`DriverEvent::log`).
+#[derive(Debug, Default, Clone, Copy)]
+pub struct LogDriverEventSink;
+
+impl DriverEventSink for LogDriverEventSink {
+    fn observe(&self, project_id: ProjectId, event: &DriverEvent) {
+        event.log(project_id);
     }
 }
 
@@ -450,9 +466,7 @@ fn is_teardown_exit(quiesced: bool, reason: ForwarderExitReason) -> bool {
 
 impl ProjectEventDriver {
     fn observe(&self, event: DriverEvent) {
-        event.log(self.project_id);
-        #[cfg(test)]
-        self.shared.driver_events.emit(event);
+        self.shared.driver_events.observe(self.project_id, &event);
     }
 
     async fn run(mut self) {
@@ -1018,25 +1032,28 @@ impl ProjectEventDriver {
 
 #[cfg(test)]
 pub(super) mod probe {
-    use super::{DriverEvent, mpsc};
+    use super::{DriverEvent, DriverEventSink, ProjectId, mpsc};
 
     #[derive(Default)]
-    pub(in crate::registry) struct DriverEventSink(
+    pub(in crate::registry) struct ProbeSink(
         std::sync::Mutex<Option<mpsc::UnboundedSender<DriverEvent>>>,
     );
 
-    impl DriverEventSink {
+    impl ProbeSink {
         /// Start observing. Replaces any earlier observer; events emitted before this call are
         /// not replayed, so call it before triggering the behaviour under test.
-        pub(in crate::registry) fn observe(&self) -> DriverProbe {
+        pub(in crate::registry) fn probe(&self) -> DriverProbe {
             let (sender, receiver) = mpsc::unbounded_channel();
             *self.0.lock().unwrap() = Some(sender);
             DriverProbe(receiver)
         }
+    }
 
-        pub(super) fn emit(&self, event: DriverEvent) {
+    impl DriverEventSink for ProbeSink {
+        fn observe(&self, project_id: ProjectId, event: &DriverEvent) {
+            event.log(project_id);
             if let Some(sender) = self.0.lock().unwrap().as_ref() {
-                let _ = sender.send(event);
+                let _ = sender.send(event.clone());
             }
         }
     }
@@ -1267,13 +1284,16 @@ mod tests {
         DriverHandle,
         ProjectId,
         Arc<PersistStore>,
+        Arc<probe::ProbeSink>,
     ) {
         let temp = tempfile::TempDir::new().unwrap();
         let store = Arc::new(PersistStore::new(temp.keep()));
-        let shared = Arc::new(RegistryShared::new(
+        let sink = Arc::new(probe::ProbeSink::default());
+        let shared = Arc::new(RegistryShared::new_with_driver_events(
             Arc::new(Hub::new()),
             store.clone(),
             ledger::spawn(store.clone()),
+            sink.clone(),
         ));
         let harness = Arc::new(TestHarness::new());
         let project_id = ProjectId::new();
@@ -1286,11 +1306,7 @@ mod tests {
             trait_harness.discoveries(),
             permit,
         );
-        (shared, harness, driver, project_id, store)
-    }
-
-    fn observe(shared: &RegistryShared) -> probe::DriverProbe {
-        shared.driver_events.observe()
+        (shared, harness, driver, project_id, store, sink)
     }
 
     fn discovery_finished(native: &str) -> impl Fn(&DriverEvent) -> bool + '_ {
@@ -1480,8 +1496,8 @@ mod tests {
 
     #[tokio::test]
     async fn driver_events_are_emitted_after_their_effects() {
-        let (shared, harness, _driver, project_id, store) = setup();
-        let mut probe = observe(&shared);
+        let (shared, harness, _driver, project_id, store, sink) = setup();
+        let mut probe = sink.probe();
         store
             .create_project(project_id, "project", "/tmp/test")
             .await
@@ -1506,8 +1522,8 @@ mod tests {
 
     #[tokio::test]
     async fn a_refused_attach_is_observable() {
-        let (shared, _harness, driver, project_id, _store) = setup();
-        let mut probe = observe(&shared);
+        let (_shared, _harness, driver, project_id, _store, sink) = setup();
+        let mut probe = sink.probe();
         let thread_id = ThreadId::new();
         driver.quiesce().await.unwrap();
 
@@ -1537,7 +1553,7 @@ mod tests {
 
     #[tokio::test]
     async fn attach_installs_one_owner_and_a_second_attach_reuses_it() {
-        let (shared, _harness, driver, project_id, _store) = setup();
+        let (shared, _harness, driver, project_id, _store, _sink) = setup();
         let thread_id = ThreadId::new();
         assert!(matches!(
             driver
@@ -1562,7 +1578,7 @@ mod tests {
 
     #[tokio::test]
     async fn attach_with_an_incompatible_binding_is_rejected() {
-        let (_shared, _harness, driver, project_id, _store) = setup();
+        let (_shared, _harness, driver, project_id, _store, _sink) = setup();
         let thread_id = ThreadId::new();
         driver
             .attach(
@@ -1584,7 +1600,7 @@ mod tests {
 
     #[tokio::test]
     async fn detach_cancels_the_owner_and_clears_the_slot() {
-        let (shared, harness, driver, project_id, _store) = setup();
+        let (shared, harness, driver, project_id, _store, _sink) = setup();
         let thread_id = ThreadId::new();
         driver
             .attach(
@@ -1635,7 +1651,7 @@ mod tests {
 
     #[tokio::test]
     async fn detach_without_an_owner_replies_immediately() {
-        let (_shared, _harness, driver, _project_id, _store) = setup();
+        let (_shared, _harness, driver, _project_id, _store, _sink) = setup();
         tokio::time::timeout(
             std::time::Duration::from_secs(1),
             driver.detach(ThreadId::new()),
@@ -1646,7 +1662,7 @@ mod tests {
 
     #[tokio::test]
     async fn attach_during_detach_is_parked_until_the_detach_completes() {
-        let (shared, harness, _handle, project_id, _store) = setup();
+        let (shared, harness, _handle, project_id, _store, _sink) = setup();
         let permit = shared.background_tasks.register().unwrap();
         let trait_harness: Arc<dyn AgentHarness> = harness;
         let (tx, rx) = mpsc::channel(1);
@@ -1705,8 +1721,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_default_sink_is_the_log() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let store = Arc::new(PersistStore::new(temp.keep()));
+        let shared = Arc::new(RegistryShared::new(
+            Arc::new(Hub::new()),
+            store.clone(),
+            ledger::spawn(store),
+        ));
+        let harness: Arc<dyn AgentHarness> = Arc::new(TestHarness::new());
+        let project_id = ProjectId::new();
+        let permit = shared.background_tasks.register().unwrap();
+        let driver =
+            spawn_project_event_driver(project_id, shared, &harness, harness.discoveries(), permit);
+        driver.quiesce().await.unwrap();
+
+        assert!(matches!(
+            driver
+                .attach(
+                    binding(project_id, ThreadId::new(), "native"),
+                    ClassificationPhase::Primary,
+                )
+                .await,
+            Err(HarnessError::Protocol(message)) if message == "project is being deleted"
+        ));
+    }
+
+    #[tokio::test]
     async fn a_quiesced_driver_refuses_attach() {
-        let (shared, _harness, driver, project_id, store) = setup();
+        let (shared, _harness, driver, project_id, store, _sink) = setup();
         let first = ThreadId::new();
         persist_thread(&store, project_id, first).await;
         attach_primary(&driver, project_id, first, "native-first").await;
@@ -1740,7 +1783,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_parked_attach_is_refused_when_its_retry_runs_under_quiesce() {
-        let (shared, harness, _handle, project_id, _store) = setup();
+        let (shared, harness, _handle, project_id, _store, _sink) = setup();
         let trait_harness: Arc<dyn AgentHarness> = harness;
         let (tx, rx) = mpsc::channel(1);
         let mut driver = ProjectEventDriver {
@@ -1806,7 +1849,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_persistence_blocked_exit_keeps_the_failed_coordinator() {
-        let (shared, harness, driver, project_id, store) = setup();
+        let (shared, harness, driver, project_id, store, _sink) = setup();
         let thread_id = ThreadId::new();
         persist_thread(&store, project_id, thread_id).await;
         driver
@@ -1872,7 +1915,7 @@ mod tests {
 
     #[tokio::test]
     async fn any_other_owner_failure_clears_the_slot_so_the_thread_can_reopen() {
-        let (shared, harness, driver, project_id, _store) = setup();
+        let (shared, harness, driver, project_id, _store, _sink) = setup();
         let thread_id = ThreadId::new();
         driver
             .attach(
@@ -1903,7 +1946,7 @@ mod tests {
 
     #[tokio::test]
     async fn the_driver_exits_after_its_handle_drops_and_its_owners_finish() {
-        let (shared, harness, driver, project_id, _store) = setup();
+        let (shared, harness, driver, project_id, _store, _sink) = setup();
         let thread_id = ThreadId::new();
         driver
             .attach(
@@ -1926,7 +1969,7 @@ mod tests {
 
     #[tokio::test]
     async fn the_driver_does_not_keep_the_harness_alive() {
-        let (_shared, harness, driver, project_id, _store) = setup();
+        let (_shared, harness, driver, project_id, _store, _sink) = setup();
         let weak_harness = Arc::downgrade(&harness);
         driver
             .attach(
@@ -1973,7 +2016,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_link_for_an_unknown_native_id_creates_a_subagent_and_its_owner() {
-        let (shared, harness, driver, project_id, store) = setup();
+        let (shared, harness, driver, project_id, store, _sink) = setup();
         let parent = ThreadId::new();
         persist_thread(&store, project_id, parent).await;
         attach_primary(&driver, project_id, parent, "native").await;
@@ -1992,7 +2035,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_discovery_creates_a_hidden_orphan_and_its_owner() {
-        let (shared, harness, _driver, project_id, store) = setup();
+        let (shared, harness, _driver, project_id, store, _sink) = setup();
         store
             .create_project(project_id, "project", "/tmp/test")
             .await
@@ -2017,7 +2060,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_link_after_discovery_classifies_the_same_thread() {
-        let (shared, harness, driver, project_id, store) = setup();
+        let (shared, harness, driver, project_id, store, _sink) = setup();
         let parent = ThreadId::new();
         persist_thread(&store, project_id, parent).await;
         attach_primary(&driver, project_id, parent, "native").await;
@@ -2050,8 +2093,8 @@ mod tests {
 
     #[tokio::test]
     async fn a_discovery_after_link_reuses_the_existing_thread() {
-        let (shared, harness, driver, project_id, store) = setup();
-        let mut probe = observe(&shared);
+        let (shared, harness, driver, project_id, store, sink) = setup();
+        let mut probe = sink.probe();
         let parent = ThreadId::new();
         persist_thread(&store, project_id, parent).await;
         attach_primary(&driver, project_id, parent, "native").await;
@@ -2080,7 +2123,7 @@ mod tests {
 
     #[tokio::test]
     async fn repeated_activity_on_a_classified_child_reads_no_graph() {
-        let (_shared, harness, driver, project_id, store) = setup();
+        let (_shared, harness, driver, project_id, store, _sink) = setup();
         let parent = ThreadId::new();
         persist_thread(&store, project_id, parent).await;
         attach_primary(&driver, project_id, parent, "native").await;
@@ -2115,7 +2158,7 @@ mod tests {
 
     #[tokio::test]
     async fn an_invalid_link_still_records_the_claimed_identity_as_an_orphan() {
-        let (shared, _harness, driver, project_id, store) = setup();
+        let (shared, _harness, driver, project_id, store, _sink) = setup();
         store
             .create_project(project_id, "project", "/tmp/test")
             .await
@@ -2151,7 +2194,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_reverse_link_returns_none_and_creates_nothing() {
-        let (_shared, harness, driver, project_id, store) = setup();
+        let (_shared, harness, driver, project_id, store, _sink) = setup();
         store
             .create_project(project_id, "project", "/tmp/test")
             .await
@@ -2192,7 +2235,7 @@ mod tests {
 
     #[tokio::test]
     async fn admissions_are_sequential_and_ordered_with_detach() {
-        let (shared, harness, driver, project_id, store) = setup();
+        let (shared, harness, driver, project_id, store, _sink) = setup();
         let parent = ThreadId::new();
         persist_thread(&store, project_id, parent).await;
         attach_primary(&driver, project_id, parent, "native").await;
@@ -2236,7 +2279,7 @@ mod tests {
 
     #[tokio::test]
     async fn owners_keep_running_while_an_admission_is_in_flight() {
-        let (_shared, harness, driver, project_id, store) = setup();
+        let (_shared, harness, driver, project_id, store, _sink) = setup();
         let parent = ThreadId::new();
         persist_thread(&store, project_id, parent).await;
         attach_primary(&driver, project_id, parent, "native").await;
@@ -2279,8 +2322,8 @@ mod tests {
 
     #[tokio::test]
     async fn command_channel_close_does_not_abandon_inflight_discovery() {
-        let (shared, harness, spawned_driver, project_id, _store) = setup();
-        let mut probe = observe(&shared);
+        let (shared, harness, spawned_driver, project_id, _store, sink) = setup();
+        let mut probe = sink.probe();
         drop(spawned_driver);
         let (tx, rx) = mpsc::channel(1);
         let gate = Arc::new(tokio::sync::Notify::new());
@@ -2343,7 +2386,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_link_reports_owner_installation_failure() {
-        let (_shared, harness, driver, project_id, store) = setup();
+        let (_shared, harness, driver, project_id, store, _sink) = setup();
         let parent = ThreadId::new();
         persist_thread(&store, project_id, parent).await;
         attach_primary(&driver, project_id, parent, "native").await;
@@ -2362,8 +2405,8 @@ mod tests {
 
     #[tokio::test]
     async fn a_quiesced_driver_refuses_links_and_leaves_discoveries_unconsumed() {
-        let (shared, harness, driver, project_id, store) = setup();
-        let mut probe = observe(&shared);
+        let (_shared, harness, driver, project_id, store, sink) = setup();
+        let mut probe = sink.probe();
         let parent = ThreadId::new();
         persist_thread(&store, project_id, parent).await;
         attach_primary(&driver, project_id, parent, "native").await;
@@ -2400,7 +2443,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_resumed_driver_accepts_links_after_failed_deletion() {
-        let (_shared, _harness, driver, project_id, store) = setup();
+        let (_shared, _harness, driver, project_id, store, _sink) = setup();
         let parent = ThreadId::new();
         persist_thread(&store, project_id, parent).await;
         attach_primary(&driver, project_id, parent, "native").await;
@@ -2416,7 +2459,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_quiesced_driver_defers_a_replyless_link_until_resume() {
-        let (_shared, harness, driver, project_id, store) = setup();
+        let (_shared, harness, driver, project_id, store, _sink) = setup();
         let parent = ThreadId::new();
         persist_thread(&store, project_id, parent).await;
         attach_primary(&driver, project_id, parent, "native").await;
@@ -2457,8 +2500,8 @@ mod tests {
 
     #[tokio::test]
     async fn a_failed_discovery_is_retried_after_the_next_successful_admission() {
-        let (shared, harness, driver, project_id, store) = setup();
-        let mut probe = observe(&shared);
+        let (_shared, harness, driver, project_id, store, sink) = setup();
+        let mut probe = sink.probe();
         let parent = ThreadId::new();
         persist_thread(&store, project_id, parent).await;
         attach_primary(&driver, project_id, parent, "native").await;
@@ -2483,8 +2526,8 @@ mod tests {
 
     #[tokio::test]
     async fn a_failed_discovery_is_retried_after_an_attach() {
-        let (shared, harness, driver, project_id, store) = setup();
-        let mut probe = observe(&shared);
+        let (_shared, harness, driver, project_id, store, sink) = setup();
+        let mut probe = sink.probe();
         let discovered = ThreadId::new();
         let obstruction = obstruct_thread_creation(&store, project_id, discovered).await;
         harness.announce(ThreadDiscovered {
@@ -2507,8 +2550,8 @@ mod tests {
 
     #[tokio::test]
     async fn a_failed_discovery_is_retried_after_a_detached_owner_exits() {
-        let (shared, harness, driver, project_id, store) = setup();
-        let mut probe = observe(&shared);
+        let (_shared, harness, driver, project_id, store, sink) = setup();
+        let mut probe = sink.probe();
         let primary = ThreadId::new();
         persist_thread(&store, project_id, primary).await;
         attach_primary(&driver, project_id, primary, "native-primary").await;
@@ -2532,8 +2575,8 @@ mod tests {
 
     #[tokio::test]
     async fn a_failed_discovery_is_retried_after_an_owner_exit() {
-        let (shared, harness, driver, project_id, store) = setup();
-        let mut probe = observe(&shared);
+        let (_shared, harness, driver, project_id, store, sink) = setup();
+        let mut probe = sink.probe();
         let primary = ThreadId::new();
         persist_thread(&store, project_id, primary).await;
         attach_primary(&driver, project_id, primary, "native-primary").await;
@@ -2557,8 +2600,8 @@ mod tests {
 
     #[tokio::test]
     async fn a_failed_discovery_is_never_dropped() {
-        let (shared, harness, driver, project_id, store) = setup();
-        let mut probe = observe(&shared);
+        let (_shared, harness, driver, project_id, store, sink) = setup();
+        let mut probe = sink.probe();
         let parent = ThreadId::new();
         persist_thread(&store, project_id, parent).await;
         attach_primary(&driver, project_id, parent, "native").await;
@@ -2594,8 +2637,8 @@ mod tests {
 
     #[tokio::test]
     async fn deferred_admissions_are_deduplicated_by_native_id() {
-        let (shared, harness, driver, project_id, store) = setup();
-        let mut probe = observe(&shared);
+        let (_shared, harness, driver, project_id, store, sink) = setup();
+        let mut probe = sink.probe();
         let first = ThreadId::new();
         let second = ThreadId::new();
         let first_obstruction = obstruct_thread_creation(&store, project_id, first).await;
@@ -2636,8 +2679,8 @@ mod tests {
 
     #[tokio::test]
     async fn a_deferred_link_is_not_downgraded_by_a_discovery() {
-        let (shared, harness, driver, project_id, store) = setup();
-        let mut probe = observe(&shared);
+        let (_shared, harness, driver, project_id, store, sink) = setup();
+        let mut probe = sink.probe();
         let parent = ThreadId::new();
         persist_thread(&store, project_id, parent).await;
         attach_primary(&driver, project_id, parent, "native-primary").await;
@@ -2675,8 +2718,8 @@ mod tests {
 
     #[tokio::test]
     async fn a_failing_retry_does_not_spin() {
-        let (shared, harness, driver, project_id, store) = setup();
-        let mut probe = observe(&shared);
+        let (_shared, harness, driver, project_id, store, sink) = setup();
+        let mut probe = sink.probe();
         let parent = ThreadId::new();
         persist_thread(&store, project_id, parent).await;
         attach_primary(&driver, project_id, parent, "native-primary").await;
@@ -2714,8 +2757,8 @@ mod tests {
 
     #[tokio::test]
     async fn the_deferred_queue_keeps_every_distinct_native_id() {
-        let (shared, harness, driver, project_id, store) = setup();
-        let mut probe = observe(&shared);
+        let (_shared, harness, driver, project_id, store, sink) = setup();
+        let mut probe = sink.probe();
         let mut records = Vec::new();
         for index in 0..=DEFERRED_ADMISSION_WARN_THRESHOLD {
             let thread = ThreadId::new();
@@ -2745,8 +2788,8 @@ mod tests {
 
     #[tokio::test]
     async fn a_deferred_link_survives_its_parent_detaching_and_is_admitted_on_reattach() {
-        let (shared, harness, driver, project_id, store) = setup();
-        let mut probe = observe(&shared);
+        let (shared, harness, driver, project_id, store, sink) = setup();
+        let mut probe = sink.probe();
         let parent = ThreadId::new();
         persist_thread(&store, project_id, parent).await;
         attach_primary(&driver, project_id, parent, "native").await;
@@ -2778,8 +2821,8 @@ mod tests {
 
     #[tokio::test]
     async fn a_deferred_link_is_dropped_once_its_parent_thread_is_gone() {
-        let (shared, harness, driver, project_id, store) = setup();
-        let mut probe = observe(&shared);
+        let (shared, harness, driver, project_id, store, sink) = setup();
+        let mut probe = sink.probe();
         let parent = ThreadId::new();
         persist_thread(&store, project_id, parent).await;
         attach_primary(&driver, project_id, parent, "native").await;
@@ -2840,8 +2883,8 @@ mod tests {
 
     #[tokio::test]
     async fn an_unrelated_owner_exit_under_quiesce_still_warns() {
-        let (shared, harness, driver, project_id, store) = setup();
-        let mut probe = observe(&shared);
+        let (shared, harness, driver, project_id, store, sink) = setup();
+        let mut probe = sink.probe();
         let thread_id = ThreadId::new();
         persist_thread(&store, project_id, thread_id).await;
         attach_primary(&driver, project_id, thread_id, "native").await;
@@ -2867,8 +2910,8 @@ mod tests {
 
     #[tokio::test]
     async fn a_deferred_link_is_kept_when_its_parent_cannot_be_read() {
-        let (shared, harness, driver, project_id, store) = setup();
-        let mut probe = observe(&shared);
+        let (shared, harness, driver, project_id, store, sink) = setup();
+        let mut probe = sink.probe();
         let parent = ThreadId::new();
         persist_thread(&store, project_id, parent).await;
         attach_primary(&driver, project_id, parent, "native").await;
@@ -2916,8 +2959,8 @@ mod tests {
 
     #[tokio::test]
     async fn an_ineligible_link_at_the_head_does_not_block_an_eligible_one_behind_it() {
-        let (shared, harness, driver, project_id, store) = setup();
-        let mut probe = observe(&shared);
+        let (_shared, harness, driver, project_id, store, sink) = setup();
+        let mut probe = sink.probe();
         let offline_parent = ThreadId::new();
         let live_parent = ThreadId::new();
         persist_thread(&store, project_id, offline_parent).await;
@@ -2965,8 +3008,8 @@ mod tests {
 
     #[tokio::test]
     async fn a_failed_discovery_is_retried_after_a_detach_with_no_owner() {
-        let (shared, harness, driver, project_id, store) = setup();
-        let mut probe = observe(&shared);
+        let (_shared, harness, driver, project_id, store, sink) = setup();
+        let mut probe = sink.probe();
         persist_thread(&store, project_id, ThreadId::new()).await;
         let discovered = ThreadId::new();
         let obstruction = obstruct_thread_creation(&store, project_id, discovered).await;
@@ -2988,8 +3031,8 @@ mod tests {
 
     #[tokio::test]
     async fn an_owner_ending_during_teardown_is_not_a_warning() {
-        let (shared, harness, driver, project_id, _store) = setup();
-        let mut probe = observe(&shared);
+        let (shared, harness, driver, project_id, _store, sink) = setup();
+        let mut probe = sink.probe();
         let thread_id = ThreadId::new();
         attach_primary(&driver, project_id, thread_id, "native").await;
         driver.quiesce().await.unwrap();
@@ -3008,8 +3051,8 @@ mod tests {
 
     #[tokio::test]
     async fn an_owner_ending_outside_teardown_still_warns() {
-        let (shared, harness, driver, project_id, _store) = setup();
-        let mut probe = observe(&shared);
+        let (shared, harness, driver, project_id, _store, sink) = setup();
+        let mut probe = sink.probe();
         let thread_id = ThreadId::new();
         attach_primary(&driver, project_id, thread_id, "native").await;
         harness.log(thread_id).close();
@@ -3027,7 +3070,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_failed_link_with_a_reply_is_not_deferred() {
-        let (_shared, _harness, driver, project_id, store) = setup();
+        let (_shared, _harness, driver, project_id, store, _sink) = setup();
         let parent = ThreadId::new();
         persist_thread(&store, project_id, parent).await;
         attach_primary(&driver, project_id, parent, "native").await;
@@ -3054,8 +3097,8 @@ mod tests {
 
     #[tokio::test]
     async fn a_resume_retries_deferred_admissions() {
-        let (shared, harness, driver, project_id, store) = setup();
-        let mut probe = observe(&shared);
+        let (_shared, harness, driver, project_id, store, sink) = setup();
+        let mut probe = sink.probe();
         persist_thread(&store, project_id, ThreadId::new()).await;
         let discovered = ThreadId::new();
         let obstruction = obstruct_thread_creation(&store, project_id, discovered).await;
@@ -3075,7 +3118,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_link_from_a_parent_without_a_live_owner_is_refused() {
-        let (_shared, harness, driver, project_id, store) = setup();
+        let (_shared, harness, driver, project_id, store, _sink) = setup();
         let parent = ThreadId::new();
         persist_thread(&store, project_id, parent).await;
         let (request, response) = link(parent, "child-native");
