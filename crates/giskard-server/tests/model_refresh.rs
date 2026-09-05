@@ -6,27 +6,16 @@
 //! harness's own provider table (§8.2), so every test here goes through
 //! `GET /api/projects/{id}/models` rather than the no-project baseline.
 
-#[path = "common/thread_fixture.rs"]
-mod thread_fixture;
-
 use std::sync::Arc;
 use std::time::Duration;
 
 use axum::{Router, response::Json as AxumJson, routing::get};
-use chrono::Utc;
-use giskard_core::event::AgentEvent;
-use giskard_core::ids::{ItemId, ProjectId, ThreadId, TurnId};
-use giskard_core::item::{Item, ItemKind, ItemPayload, ItemStart};
-use giskard_core::token::TokenUsage;
-use giskard_core::turn::{TurnStatus, TurnStatusKind};
-use giskard_harness::{AgentHarness, HarnessProvider, ProviderAuth, ProviderAuthCommand};
+use giskard_core::ids::{ProjectId, ThreadId};
+use giskard_harness::{HarnessProvider, ProviderAuth, ProviderAuthCommand};
 use giskard_harness_replay::{ReplayFixture, ReplayHarness};
-use giskard_persist::store::ProjectConfig;
-use giskard_server::{AppState, HarnessFactory, build_app};
+use giskard_testenv::{TestServer, factory, fixtures};
 
-use thread_fixture::persist_primary_thread;
-
-struct DiffFactory {
+struct DiffHarnessConfig {
     fixture: ReplayFixture,
     /// Stands in for Codex's `[model_providers]` table: the endpoint and key location Giskard
     /// resolves discovery against. Empty ⇒ the harness does not advertise provider listing at all,
@@ -38,128 +27,27 @@ struct DiffFactory {
     harness_models: Vec<giskard_core::model::ModelDescriptor>,
 }
 
-#[async_trait::async_trait]
-impl HarnessFactory for DiffFactory {
-    async fn create(
-        &self,
-        _config: &ProjectConfig,
-        _bootstrap: giskard_harness::HarnessBootstrap,
-    ) -> Result<Arc<dyn AgentHarness>, giskard_core::HarnessError> {
-        let harness = ReplayHarness::from_fixture(self.fixture.clone());
-        let harness = if self.providers.is_empty() {
-            harness
-        } else {
-            harness.with_providers(self.providers.clone())
-        };
-        let harness = match &self.client_version {
-            Some(version) => harness.with_client_version(version.clone()),
-            None => harness,
-        };
-        let harness = if self.harness_models.is_empty() {
-            harness
-        } else {
-            harness.with_models(self.harness_models.clone())
-        };
-        Ok(Arc::new(harness))
+impl DiffHarnessConfig {
+    fn into_factory(self) -> Arc<dyn giskard_server::HarnessFactory> {
+        factory::from_fn(move |_, _| {
+            let harness = ReplayHarness::from_fixture(self.fixture.clone());
+            let harness = if self.providers.is_empty() {
+                harness
+            } else {
+                harness.with_providers(self.providers.clone())
+            };
+            let harness = match &self.client_version {
+                Some(version) => harness.with_client_version(version.clone()),
+                None => harness,
+            };
+            let harness = if self.harness_models.is_empty() {
+                harness
+            } else {
+                harness.with_models(self.harness_models.clone())
+            };
+            Ok(Arc::new(harness))
+        })
     }
-}
-
-/// Create a project and return its id, so a test can ask for the per-project model catalog.
-async fn create_project(client: &reqwest::Client, base: &str, cookie: &str) -> ProjectId {
-    let response = client
-        .post(format!("{base}/api/projects"))
-        .header("cookie", cookie)
-        .json(&serde_json::json!({
-            "name": "discovery",
-            "dir": "/tmp",
-        }))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(response.status(), reqwest::StatusCode::OK);
-    response.json::<serde_json::Value>().await.unwrap()["id"]
-        .as_str()
-        .unwrap()
-        .parse()
-        .unwrap()
-}
-
-fn make_fixture() -> ReplayFixture {
-    let thread = ThreadId::new();
-    let turn = TurnId::new();
-    let item = ItemId::new();
-    let now = Utc::now();
-    ReplayFixture::from_events(vec![
-        AgentEvent::ThreadOpened {
-            thread,
-            harness_thread_id: "th_tok".into(),
-        },
-        AgentEvent::TurnStarted { thread, turn },
-        AgentEvent::ItemStarted {
-            thread,
-            turn,
-            item: ItemStart {
-                id: item,
-                harness_item_id: "it_1".into(),
-                kind: ItemKind::AgentMessage,
-                command: None,
-                tool: None,
-            },
-        },
-        AgentEvent::ItemCompleted {
-            thread,
-            turn,
-            item: Item {
-                id: item,
-                harness_item_id: "it_1".into(),
-                payload: ItemPayload::AgentMessage {
-                    text: "done".into(),
-                },
-                created_at: now,
-            },
-        },
-        AgentEvent::TurnCompleted {
-            thread,
-            turn,
-            usage: TokenUsage::new(100, 50),
-            status: TurnStatus {
-                kind: TurnStatusKind::Completed,
-                message: None,
-            },
-        },
-    ])
-}
-
-fn password_hash(password: &str) -> String {
-    use argon2::password_hash::SaltString;
-    use argon2::{Argon2, PasswordHasher};
-    use rand::rngs::OsRng;
-    let salt = SaltString::generate(&mut OsRng);
-    Argon2::default()
-        .hash_password(password.as_bytes(), &salt)
-        .unwrap()
-        .to_string()
-}
-
-async fn login(base: &str) -> (reqwest::Client, String) {
-    let client = reqwest::Client::new();
-    let resp = client
-        .post(format!("{base}/api/login"))
-        .json(&serde_json::json!({"password": "testpass"}))
-        .send()
-        .await
-        .unwrap();
-    let cookie = resp
-        .headers()
-        .get("set-cookie")
-        .unwrap()
-        .to_str()
-        .unwrap()
-        .split(';')
-        .next()
-        .unwrap()
-        .to_string();
-    (client, cookie)
 }
 
 #[tokio::test]
@@ -181,56 +69,36 @@ async fn dynamic_model_refresh_merges_provider_listing() {
     let mock_addr = mock_listener.local_addr().unwrap();
     tokio::spawn(async move { axum::serve(mock_listener, mock).await.unwrap() });
 
-    let (listener, port) = ephemeral_listener().await;
-    let tmp = tempfile::TempDir::new().unwrap();
-    let hash = password_hash("testpass");
     // Provider points at the mock; model_listing enabled; one static model.
-    tokio::fs::write(
-        tmp.path().join("config.toml"),
-        format!(
-            r#"
-[server]
-bind = "127.0.0.1:{port}"
-secure_cookies = false
-
-[auth]
-password_hash = "{hash}"
-session_days = 30
-
-[providers.mock]
+    let extra_config = r#"[providers.mock]
 model_listing = true
   [[providers.mock.models]]
   id = "static-model"
   context_window = 65536
   supports_reasoning_effort = false
-"#
-        ),
-    )
-    .await
-    .unwrap();
+"#;
 
-    let store = Arc::new(giskard_persist::PersistStore::new(tmp.path().to_path_buf()));
-    let state = AppState::new(
-        store.clone(),
-        Arc::new(DiffFactory {
-            fixture: make_fixture(),
-            providers: vec![HarnessProvider {
-                id: "mock".into(),
-                name: Some("Mock".into()),
-                base_url: Some(format!("http://{mock_addr}")),
-                auth: None,
-            }],
-            client_version: None,
-            harness_models: Vec::new(),
-        }),
-        (0..32u8).collect(),
-    );
-    let app = build_app(state);
-    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let factory = DiffHarnessConfig {
+        fixture: fixtures::completed_turn_fixture(),
+        providers: vec![HarnessProvider {
+            id: "mock".into(),
+            name: Some("Mock".into()),
+            base_url: Some(format!("http://{mock_addr}")),
+            auth: None,
+        }],
+        client_version: None,
+        harness_models: Vec::new(),
+    }
+    .into_factory();
+    let server = TestServer::builder(factory)
+        .config(extra_config)
+        .start()
+        .await;
 
-    let base = format!("http://127.0.0.1:{port}");
-    let (client, cookie) = login(&base).await;
-    let discovery_project = create_project(&client, &base, &cookie).await;
+    let base = server.base.clone();
+    let client = server.client.clone();
+    let cookie = server.cookie.clone();
+    let discovery_project = server.create_project_via_api("discovery", "/tmp").await;
 
     let refreshed: serde_json::Value = client
         .get(format!("{base}/api/projects/{discovery_project}/models"))
@@ -295,8 +163,8 @@ model_listing = true
         .parse()
         .unwrap();
 
-    let thread_id = persist_primary_thread(
-        &store,
+    let thread_id = fixtures::persist_primary_thread(
+        server.store(),
         project_id,
         ThreadId::new(),
         "native-dynamic-model",
@@ -322,7 +190,8 @@ model_listing = true
             .parse()
             .unwrap();
     assert_eq!(reopened, thread_id);
-    let imported = store
+    let imported = server
+        .store()
         .load_thread(project_id, thread_id)
         .await
         .unwrap()
@@ -371,51 +240,31 @@ async fn dynamic_model_refresh_sends_api_key() {
     let mock_addr = mock_listener.local_addr().unwrap();
     tokio::spawn(async move { axum::serve(mock_listener, mock).await.unwrap() });
 
-    let (listener, port) = ephemeral_listener().await;
-    let tmp = tempfile::TempDir::new().unwrap();
-    let hash = password_hash("testpass");
-    tokio::fs::write(
-        tmp.path().join("config.toml"),
-        format!(
-            r#"
-[server]
-bind = "127.0.0.1:{port}"
-secure_cookies = false
-
-[auth]
-password_hash = "{hash}"
-session_days = 30
-
-[providers.secured]
+    let extra_config = r#"[providers.secured]
 model_listing = true
-"#
-        ),
-    )
-    .await
-    .unwrap();
+"#;
 
-    let store = Arc::new(giskard_persist::PersistStore::new(tmp.path().to_path_buf()));
-    let state = AppState::new(
-        store,
-        Arc::new(DiffFactory {
-            fixture: make_fixture(),
-            client_version: None,
-            harness_models: Vec::new(),
-            providers: vec![HarnessProvider {
-                id: "secured".into(),
-                name: Some("Secured".into()),
-                base_url: Some(format!("http://{mock_addr}")),
-                auth: Some(ProviderAuth::Env(KEY_ENV.into())),
-            }],
-        }),
-        (0..32u8).collect(),
-    );
-    let app = build_app(state);
-    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let factory = DiffHarnessConfig {
+        fixture: fixtures::completed_turn_fixture(),
+        client_version: None,
+        harness_models: Vec::new(),
+        providers: vec![HarnessProvider {
+            id: "secured".into(),
+            name: Some("Secured".into()),
+            base_url: Some(format!("http://{mock_addr}")),
+            auth: Some(ProviderAuth::Env(KEY_ENV.into())),
+        }],
+    }
+    .into_factory();
+    let server = TestServer::builder(factory)
+        .config(extra_config)
+        .start()
+        .await;
 
-    let base = format!("http://127.0.0.1:{port}");
-    let (client, cookie) = login(&base).await;
-    let project = create_project(&client, &base, &cookie).await;
+    let base = server.base.clone();
+    let client = server.client.clone();
+    let cookie = server.cookie.clone();
+    let project = server.create_project_via_api("discovery", "/tmp").await;
 
     let refreshed: serde_json::Value = client
         .get(format!("{base}/api/projects/{project}/models"))
@@ -456,52 +305,32 @@ async fn dynamic_model_refresh_reports_failure() {
     let mock_addr = mock_listener.local_addr().unwrap();
     tokio::spawn(async move { axum::serve(mock_listener, mock).await.unwrap() });
 
-    let (listener, port) = ephemeral_listener().await;
-    let tmp = tempfile::TempDir::new().unwrap();
-    let hash = password_hash("testpass");
     // model_listing enabled but the harness reports no key env var ⇒ the mock rejects with 401.
-    tokio::fs::write(
-        tmp.path().join("config.toml"),
-        format!(
-            r#"
-[server]
-bind = "127.0.0.1:{port}"
-secure_cookies = false
-
-[auth]
-password_hash = "{hash}"
-session_days = 30
-
-[providers.secured]
+    let extra_config = r#"[providers.secured]
 model_listing = true
-"#
-        ),
-    )
-    .await
-    .unwrap();
+"#;
 
-    let store = Arc::new(giskard_persist::PersistStore::new(tmp.path().to_path_buf()));
-    let state = AppState::new(
-        store,
-        Arc::new(DiffFactory {
-            fixture: make_fixture(),
-            client_version: None,
-            harness_models: Vec::new(),
-            providers: vec![HarnessProvider {
-                id: "secured".into(),
-                name: Some("Secured".into()),
-                base_url: Some(format!("http://{mock_addr}")),
-                auth: None,
-            }],
-        }),
-        (0..32u8).collect(),
-    );
-    let app = build_app(state);
-    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let factory = DiffHarnessConfig {
+        fixture: fixtures::completed_turn_fixture(),
+        client_version: None,
+        harness_models: Vec::new(),
+        providers: vec![HarnessProvider {
+            id: "secured".into(),
+            name: Some("Secured".into()),
+            base_url: Some(format!("http://{mock_addr}")),
+            auth: None,
+        }],
+    }
+    .into_factory();
+    let server = TestServer::builder(factory)
+        .config(extra_config)
+        .start()
+        .await;
 
-    let base = format!("http://127.0.0.1:{port}");
-    let (client, cookie) = login(&base).await;
-    let project = create_project(&client, &base, &cookie).await;
+    let base = server.base.clone();
+    let client = server.client.clone();
+    let cookie = server.cookie.clone();
+    let project = server.create_project_via_api("discovery", "/tmp").await;
 
     let refreshed: serde_json::Value = client
         .get(format!("{base}/api/projects/{project}/models"))
@@ -534,54 +363,34 @@ model_listing = true
 /// point: the alternative is a provider-side `model_not_found` in the middle of a turn.
 #[tokio::test]
 async fn unknown_provider_id_is_reported_against_the_harness_table() {
-    let (listener, port) = ephemeral_listener().await;
-    let tmp = tempfile::TempDir::new().unwrap();
-    let hash = password_hash("testpass");
-    tokio::fs::write(
-        tmp.path().join("config.toml"),
-        format!(
-            r#"
-[server]
-bind = "127.0.0.1:{port}"
-secure_cookies = false
-
-[auth]
-password_hash = "{hash}"
-session_days = 30
-
-[providers.typoed]
+    let extra_config = r#"[providers.typoed]
   [[providers.typoed.models]]
   id = "some-model"
   context_window = 65536
-"#
-        ),
-    )
-    .await
-    .unwrap();
+"#;
 
-    let store = Arc::new(giskard_persist::PersistStore::new(tmp.path().to_path_buf()));
-    let state = AppState::new(
-        store,
-        Arc::new(DiffFactory {
-            fixture: make_fixture(),
-            client_version: None,
-            harness_models: Vec::new(),
-            // The harness knows "openai" — nothing named "typoed".
-            providers: vec![HarnessProvider {
-                id: "openai".into(),
-                name: None,
-                base_url: None,
-                auth: None,
-            }],
-        }),
-        (0..32u8).collect(),
-    );
-    let app = build_app(state);
-    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let factory = DiffHarnessConfig {
+        fixture: fixtures::completed_turn_fixture(),
+        client_version: None,
+        harness_models: Vec::new(),
+        // The harness knows "openai" — nothing named "typoed".
+        providers: vec![HarnessProvider {
+            id: "openai".into(),
+            name: None,
+            base_url: None,
+            auth: None,
+        }],
+    }
+    .into_factory();
+    let server = TestServer::builder(factory)
+        .config(extra_config)
+        .start()
+        .await;
 
-    let base = format!("http://127.0.0.1:{port}");
-    let (client, cookie) = login(&base).await;
-    let project = create_project(&client, &base, &cookie).await;
+    let base = server.base.clone();
+    let client = server.client.clone();
+    let cookie = server.cookie.clone();
+    let project = server.create_project_via_api("discovery", "/tmp").await;
 
     let catalog: serde_json::Value = client
         .get(format!("{base}/api/projects/{project}/models"))
@@ -621,49 +430,28 @@ session_days = 30
 /// every configured id as unknown: no table is not the same as an empty table.
 #[tokio::test]
 async fn provider_ids_are_not_validated_without_a_harness_table() {
-    let (listener, port) = ephemeral_listener().await;
-    let tmp = tempfile::TempDir::new().unwrap();
-    let hash = password_hash("testpass");
-    tokio::fs::write(
-        tmp.path().join("config.toml"),
-        format!(
-            r#"
-[server]
-bind = "127.0.0.1:{port}"
-secure_cookies = false
-
-[auth]
-password_hash = "{hash}"
-session_days = 30
-
-[providers.unverifiable]
+    let extra_config = r#"[providers.unverifiable]
   [[providers.unverifiable.models]]
   id = "some-model"
   context_window = 65536
-"#
-        ),
-    )
-    .await
-    .unwrap();
+"#;
 
-    let store = Arc::new(giskard_persist::PersistStore::new(tmp.path().to_path_buf()));
-    let state = AppState::new(
-        store,
-        // No `with_providers` ⇒ the replay harness leaves `provider_listing` off.
-        Arc::new(DiffFactory {
-            fixture: make_fixture(),
+    let factory =         // No `with_providers` ⇒ the replay harness leaves `provider_listing` off.
+        DiffHarnessConfig {
+            fixture: fixtures::completed_turn_fixture(),
             client_version: None,
             harness_models: Vec::new(),
             providers: Vec::new(),
-        }),
-        (0..32u8).collect(),
-    );
-    let app = build_app(state);
-    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        }.into_factory();
+    let server = TestServer::builder(factory)
+        .config(extra_config)
+        .start()
+        .await;
 
-    let base = format!("http://127.0.0.1:{port}");
-    let (client, cookie) = login(&base).await;
-    let project = create_project(&client, &base, &cookie).await;
+    let base = server.base.clone();
+    let client = server.client.clone();
+    let cookie = server.cookie.clone();
+    let project = server.create_project_via_api("discovery", "/tmp").await;
 
     let catalog: serde_json::Value = client
         .get(format!("{base}/api/projects/{project}/models"))
@@ -689,50 +477,29 @@ session_days = 30
 /// a short list with no explanation is the failure mode this warning exists to prevent.
 #[tokio::test]
 async fn model_listing_without_a_harness_table_explains_why_discovery_did_not_run() {
-    let (listener, port) = ephemeral_listener().await;
-    let tmp = tempfile::TempDir::new().unwrap();
-    let hash = password_hash("testpass");
-    tokio::fs::write(
-        tmp.path().join("config.toml"),
-        format!(
-            r#"
-[server]
-bind = "127.0.0.1:{port}"
-secure_cookies = false
-
-[auth]
-password_hash = "{hash}"
-session_days = 30
-
-[providers.wants-discovery]
+    let extra_config = r#"[providers.wants-discovery]
 model_listing = true
   [[providers.wants-discovery.models]]
   id = "declared-only"
   context_window = 65536
-"#
-        ),
-    )
-    .await
-    .unwrap();
+"#;
 
-    let store = Arc::new(giskard_persist::PersistStore::new(tmp.path().to_path_buf()));
-    let state = AppState::new(
-        store,
-        // No provider table: the replay harness leaves `provider_listing` off.
-        Arc::new(DiffFactory {
-            fixture: make_fixture(),
+    let factory =         // No provider table: the replay harness leaves `provider_listing` off.
+        DiffHarnessConfig {
+            fixture: fixtures::completed_turn_fixture(),
             client_version: None,
             harness_models: Vec::new(),
             providers: Vec::new(),
-        }),
-        (0..32u8).collect(),
-    );
-    let app = build_app(state);
-    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        }.into_factory();
+    let server = TestServer::builder(factory)
+        .config(extra_config)
+        .start()
+        .await;
 
-    let base = format!("http://127.0.0.1:{port}");
-    let (client, cookie) = login(&base).await;
-    let project = create_project(&client, &base, &cookie).await;
+    let base = server.base.clone();
+    let client = server.client.clone();
+    let cookie = server.cookie.clone();
+    let project = server.create_project_via_api("discovery", "/tmp").await;
 
     let catalog: serde_json::Value = client
         .get(format!("{base}/api/projects/{project}/models"))
@@ -862,69 +629,37 @@ async fn a_failing_provider_auth_command_is_reported() {
     }
 }
 
-/// A listener on a port the OS picked, and that port.
-///
-/// The mock providers here already bind `:0`; the server under test used to take a hard-coded one,
-/// which fails whenever anything else on the machine happens to hold it. Bound before the config is
-/// written so the real port can go into `[server] bind` — inert for these tests, which serve on
-/// this listener directly, but worth keeping honest.
-async fn ephemeral_listener() -> (tokio::net::TcpListener, u16) {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let port = listener.local_addr().unwrap().port();
-    (listener, port)
-}
-
 /// Stand up a server whose single `model_listing` provider authenticates the given way, and return
 /// the discovered model ids plus the catalog warnings.
 async fn discover_with_auth(
     mock_addr: std::net::SocketAddr,
     auth: ProviderAuth,
 ) -> (Vec<String>, Vec<String>) {
-    let (listener, port) = ephemeral_listener().await;
-    let tmp = tempfile::TempDir::new().unwrap();
-    let hash = password_hash("testpass");
-    tokio::fs::write(
-        tmp.path().join("config.toml"),
-        format!(
-            r#"
-[server]
-bind = "127.0.0.1:{port}"
-secure_cookies = false
-
-[auth]
-password_hash = "{hash}"
-session_days = 30
-
-[providers.secured]
+    let extra_config = r#"[providers.secured]
 model_listing = true
-"#
-        ),
-    )
-    .await
-    .unwrap();
+"#;
 
-    let store = Arc::new(giskard_persist::PersistStore::new(tmp.path().to_path_buf()));
-    let state = AppState::new(
-        store,
-        Arc::new(DiffFactory {
-            fixture: make_fixture(),
-            client_version: None,
-            harness_models: Vec::new(),
-            providers: vec![HarnessProvider {
-                id: "secured".into(),
-                name: Some("Secured".into()),
-                base_url: Some(format!("http://{mock_addr}")),
-                auth: Some(auth),
-            }],
-        }),
-        (0..32u8).collect(),
-    );
-    let app = build_app(state);
-    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+    let factory = DiffHarnessConfig {
+        fixture: fixtures::completed_turn_fixture(),
+        client_version: None,
+        harness_models: Vec::new(),
+        providers: vec![HarnessProvider {
+            id: "secured".into(),
+            name: Some("Secured".into()),
+            base_url: Some(format!("http://{mock_addr}")),
+            auth: Some(auth),
+        }],
+    }
+    .into_factory();
+    let server = TestServer::builder(factory)
+        .config(extra_config)
+        .start()
+        .await;
 
-    let base = format!("http://127.0.0.1:{port}");
-    let (client, cookie) = login(&base).await;
-    let project = create_project(&client, &base, &cookie).await;
+    let base = server.base.clone();
+    let client = server.client.clone();
+    let cookie = server.cookie.clone();
+    let project = server.create_project_via_api("discovery", "/tmp").await;
     let body: serde_json::Value = client
         .get(format!("{base}/api/projects/{project}/models"))
         .header("cookie", &cookie)
@@ -1041,48 +776,24 @@ async fn discover_catalog_with(
     client_version: Option<&str>,
     providers: &str,
 ) -> (Vec<serde_json::Value>, Vec<String>) {
-    let (listener, port) = ephemeral_listener().await;
-    let tmp = tempfile::TempDir::new().unwrap();
-    let hash = password_hash("testpass");
-    tokio::fs::write(
-        tmp.path().join("config.toml"),
-        format!(
-            r#"
-[server]
-bind = "127.0.0.1:{port}"
-secure_cookies = false
+    let factory = DiffHarnessConfig {
+        fixture: fixtures::completed_turn_fixture(),
+        providers: vec![HarnessProvider {
+            id: "opencodex".into(),
+            name: Some("OpenCodex".into()),
+            base_url: Some(format!("http://{mock_addr}")),
+            auth: None,
+        }],
+        client_version: client_version.map(str::to_string),
+        harness_models: Vec::new(),
+    }
+    .into_factory();
+    let server = TestServer::builder(factory).config(providers).start().await;
 
-[auth]
-password_hash = "{hash}"
-session_days = 30
-{providers}"#
-        ),
-    )
-    .await
-    .unwrap();
-
-    let store = Arc::new(giskard_persist::PersistStore::new(tmp.path().to_path_buf()));
-    let state = AppState::new(
-        store,
-        Arc::new(DiffFactory {
-            fixture: make_fixture(),
-            providers: vec![HarnessProvider {
-                id: "opencodex".into(),
-                name: Some("OpenCodex".into()),
-                base_url: Some(format!("http://{mock_addr}")),
-                auth: None,
-            }],
-            client_version: client_version.map(str::to_string),
-            harness_models: Vec::new(),
-        }),
-        (0..32u8).collect(),
-    );
-    let app = build_app(state);
-    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-
-    let base = format!("http://127.0.0.1:{port}");
-    let (client, cookie) = login(&base).await;
-    let project = create_project(&client, &base, &cookie).await;
+    let base = server.base.clone();
+    let client = server.client.clone();
+    let cookie = server.cookie.clone();
+    let project = server.create_project_via_api("discovery", "/tmp").await;
     let body: serde_json::Value = client
         .get(format!("{base}/api/projects/{project}/models"))
         .header("cookie", &cookie)
@@ -1273,49 +984,33 @@ async fn providers_are_queried_concurrently() {
 /// attributed to the provider Codex routes to, it produced an empty picker in silence.
 #[tokio::test]
 async fn a_stock_harness_catalog_fills_the_picker_on_its_own() {
-    let tmp = tempfile::TempDir::new().unwrap();
-    let hash = password_hash("testpass");
-    let (listener, port) = ephemeral_listener().await;
-    tokio::fs::write(
-        tmp.path().join("config.toml"),
-        format!(
-            "\n[server]\nbind = \"127.0.0.1:{port}\"\nsecure_cookies = false\n\n[auth]\npassword_hash = \"{hash}\"\nsession_days = 30\n"
-        ),
-    )
-    .await
-    .unwrap();
+    let factory = DiffHarnessConfig {
+        fixture: fixtures::completed_turn_fixture(),
+        client_version: None,
+        harness_models: vec![giskard_core::model::ModelDescriptor {
+            provider: "openai".into(),
+            model: "gpt-5.5".into(),
+            context_window: giskard_core::model::ModelDescriptor::CONSERVATIVE_CONTEXT_WINDOW,
+            supports_reasoning_effort: true,
+            reasoning_efforts: vec!["low".into(), "high".into()],
+            display_name: Some("GPT-5.5".into()),
+            is_default: true,
+        }],
+        // Like Codex's built-ins: known, but with nothing to query.
+        providers: vec![HarnessProvider {
+            id: "openai".into(),
+            name: None,
+            base_url: None,
+            auth: None,
+        }],
+    }
+    .into_factory();
+    let server = TestServer::builder(factory).start().await;
 
-    let store = Arc::new(giskard_persist::PersistStore::new(tmp.path().to_path_buf()));
-    let state = AppState::new(
-        store,
-        Arc::new(DiffFactory {
-            fixture: make_fixture(),
-            client_version: None,
-            harness_models: vec![giskard_core::model::ModelDescriptor {
-                provider: "openai".into(),
-                model: "gpt-5.5".into(),
-                context_window: giskard_core::model::ModelDescriptor::CONSERVATIVE_CONTEXT_WINDOW,
-                supports_reasoning_effort: true,
-                reasoning_efforts: vec!["low".into(), "high".into()],
-                display_name: Some("GPT-5.5".into()),
-                is_default: true,
-            }],
-            // Like Codex's built-ins: known, but with nothing to query.
-            providers: vec![HarnessProvider {
-                id: "openai".into(),
-                name: None,
-                base_url: None,
-                auth: None,
-            }],
-        }),
-        (0..32u8).collect(),
-    );
-    let app = build_app(state);
-    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-
-    let base = format!("http://127.0.0.1:{port}");
-    let (client, cookie) = login(&base).await;
-    let project = create_project(&client, &base, &cookie).await;
+    let base = server.base.clone();
+    let client = server.client.clone();
+    let cookie = server.cookie.clone();
+    let project = server.create_project_via_api("discovery", "/tmp").await;
     let body: serde_json::Value = client
         .get(format!("{base}/api/projects/{project}/models"))
         .header("cookie", &cookie)
@@ -1346,40 +1041,24 @@ async fn a_stock_harness_catalog_fills_the_picker_on_its_own() {
 /// The backstop: when nothing at all can supply a model, say so instead of serving a blank picker.
 #[tokio::test]
 async fn an_empty_picker_explains_itself() {
-    let tmp = tempfile::TempDir::new().unwrap();
-    let hash = password_hash("testpass");
-    let (listener, port) = ephemeral_listener().await;
-    tokio::fs::write(
-        tmp.path().join("config.toml"),
-        format!(
-            "\n[server]\nbind = \"127.0.0.1:{port}\"\nsecure_cookies = false\n\n[auth]\npassword_hash = \"{hash}\"\nsession_days = 30\n"
-        ),
-    )
-    .await
-    .unwrap();
+    let factory = DiffHarnessConfig {
+        fixture: fixtures::completed_turn_fixture(),
+        client_version: None,
+        harness_models: Vec::new(),
+        providers: vec![HarnessProvider {
+            id: "openai".into(),
+            name: None,
+            base_url: None,
+            auth: None,
+        }],
+    }
+    .into_factory();
+    let server = TestServer::builder(factory).start().await;
 
-    let store = Arc::new(giskard_persist::PersistStore::new(tmp.path().to_path_buf()));
-    let state = AppState::new(
-        store,
-        Arc::new(DiffFactory {
-            fixture: make_fixture(),
-            client_version: None,
-            harness_models: Vec::new(),
-            providers: vec![HarnessProvider {
-                id: "openai".into(),
-                name: None,
-                base_url: None,
-                auth: None,
-            }],
-        }),
-        (0..32u8).collect(),
-    );
-    let app = build_app(state);
-    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-
-    let base = format!("http://127.0.0.1:{port}");
-    let (client, cookie) = login(&base).await;
-    let project = create_project(&client, &base, &cookie).await;
+    let base = server.base.clone();
+    let client = server.client.clone();
+    let cookie = server.cookie.clone();
+    let project = server.create_project_via_api("discovery", "/tmp").await;
     let body: serde_json::Value = client
         .get(format!("{base}/api/projects/{project}/models"))
         .header("cookie", &cookie)

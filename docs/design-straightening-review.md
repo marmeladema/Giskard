@@ -224,7 +224,7 @@ requests: RequestLedger, live: LiveTurnState, tasks: RunningTaskState, outputs: 
 gate: TurnGate }`. `runtime_live.rs` and `runtime_tasks.rs` already are this shape; the other
 three are inline. `apply_event_locked` then reads as five `apply` calls.
 
-**C6. A test-support crate.** Twenty-one `impl AgentHarness for` fakes, twelve copies of
+**C6. A test-support crate — landed in S4a.** Twenty-one `impl AgentHarness for` fakes, twelve copies of
 `generate_password_hash`, six of `ws_text`, three of `spawn_test_app`, and `e2e_smoke.rs` at
 8 815 lines say the same thing: there is no shared fixture. A `giskard-testkit` crate (or a
 `tests/support` module for the server crate) with one configurable `FakeHarness` (gates for open,
@@ -266,7 +266,7 @@ Each step is one PR that stands alone on `main`, mechanical first:
 | 1 | C1 `AgentEvent` accessors; delete the ten copies — **landed in S1** | mechanical | −150 |
 | 2 | B1 `NativeTurnState`; B2 `ItemOutputs` — **landed in S2** | mechanical | −120 |
 | 3 | A `DriverEvent` seam; delete the five counters | contract for tests only | ±80 |
-| 4 | C6 test-support crate; migrate the server integration tests to it | tests only | −3000 |
+| 4 | C6 test-support crate; migrate the server integration tests to it — **landed in S4a** | tests only | −3000 |
 | 5 | C3 `Hub::publish(Outbound)` | one seam | ±100 |
 | 6 | B3 `Services` split; forwarder takes `Arc<Services>` | mechanical | ±60 |
 | 7 | C5 runtime components | structural, no behaviour change | ±300 |

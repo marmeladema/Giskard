@@ -2,137 +2,58 @@
 //! (e.g. it fails to attach), the HTTP operation surfaces an error and the locally persisted thread
 //! is left intact rather than being partially mutated.
 
-use std::sync::Arc;
-
 use chrono::Utc;
+use giskard_core::HarnessError;
 use giskard_core::ids::{ProjectId, ThreadId};
 use giskard_core::model::ModelRef;
 use giskard_core::turn::{Mode, PermissionPreset};
-use giskard_harness::AgentHarness;
-use giskard_persist::store::{ProjectConfig, ThreadFile};
-use giskard_server::{AppState, HarnessFactory, build_app};
+use giskard_persist::store::ThreadFile;
+use giskard_testenv::{TestProject, TestServer, factory, fixtures};
 
-const TINY_PNG: &[u8] = &[
-    0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, b'I', b'H', b'D', b'R',
-    0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1f, 0x15, 0xc4,
-    0x89, 0x00, 0x00, 0x00, 0x0a, b'I', b'D', b'A', b'T', 0x78, 0x9c, 0x63, 0x00, 0x01, 0x00, 0x00,
-    0x05, 0x00, 0x01, 0x0d, 0x0a, 0x2d, 0xb4, 0x00, 0x00, 0x00, 0x00, b'I', b'E', b'N', b'D', 0xae,
-    0x42, 0x60, 0x82,
-];
-
-struct DummyFactory;
-
-#[async_trait::async_trait]
-impl HarnessFactory for DummyFactory {
-    async fn create(
-        &self,
-        _config: &ProjectConfig,
-        _bootstrap: giskard_harness::HarnessBootstrap,
-    ) -> Result<Arc<dyn AgentHarness>, giskard_core::HarnessError> {
-        Err(giskard_core::HarnessError::Spawn("dummy".into()))
-    }
+struct Fixture {
+    server: TestServer,
+    _project: TestProject,
+    pid: ProjectId,
 }
 
-fn generate_password_hash(password: &str) -> String {
-    use argon2::password_hash::SaltString;
-    use argon2::{Argon2, PasswordHasher};
-    use rand::rngs::OsRng;
-    let salt = SaltString::generate(&mut OsRng);
-    Argon2::default()
-        .hash_password(password.as_bytes(), &salt)
-        .unwrap()
-        .to_string()
-}
-
-async fn start_server() -> (
-    tempfile::TempDir,
-    tempfile::TempDir,
-    Arc<AppState>,
-    ProjectId,
-    String,
-    u16,
-) {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let port = listener.local_addr().unwrap().port();
-    let tmp = tempfile::TempDir::new().unwrap();
-    let hash = generate_password_hash("testpass");
-    let config_toml = format!(
-        r#"
-[server]
-bind = "127.0.0.1:{port}"
-secure_cookies = false
-
-[auth]
-password_hash = "{hash}"
-session_days = 30
-"#
-    );
-    tokio::fs::write(tmp.path().join("config.toml"), config_toml)
-        .await
-        .unwrap();
-
-    let store = Arc::new(giskard_persist::PersistStore::new(tmp.path().to_path_buf()));
-    let session_key: Vec<u8> = (0..32u8).collect();
-    let factory = Arc::new(DummyFactory);
-    let state = AppState::new(store, factory, session_key);
-    let app = build_app(state.clone());
-    tokio::spawn(async move {
-        axum::serve(listener, app).await.unwrap();
-    });
-
-    let proj_dir = tempfile::TempDir::new().unwrap();
-    let proj_dir_path = proj_dir.path().to_string_lossy().to_string();
-    let pid = ProjectId::new();
-    state
-        .store
-        .create_project(pid, "viz-test", &proj_dir_path)
-        .await
-        .unwrap();
+async fn start_server() -> Fixture {
+    let server = TestServer::spawn(factory::failing(HarnessError::Spawn("dummy".into()))).await;
+    let project = server.create_project("viz-test").await;
+    let pid = project.id;
 
     tokio::fs::write(
-        proj_dir.path().join("main.rs"),
+        project.dir.path().join("main.rs"),
         "fn main() {\n    println!(\"hi\");\n}\n",
     )
     .await
     .unwrap();
-    tokio::fs::write(proj_dir.path().join("data.bin"), b"bin\x00ary\x00data")
+    tokio::fs::write(project.dir.path().join("data.bin"), b"bin\x00ary\x00data")
         .await
         .unwrap();
-    tokio::fs::write(proj_dir.path().join("image.png"), TINY_PNG)
+    tokio::fs::write(project.dir.path().join("image.png"), fixtures::TINY_PNG)
         .await
         .unwrap();
     tokio::fs::write(
-        proj_dir.path().join("vector.svg"),
+        project.dir.path().join("vector.svg"),
         r#"<svg xmlns="http://www.w3.org/2000/svg"></svg>"#,
     )
     .await
     .unwrap();
 
-    let cookie = {
-        let client = reqwest::Client::new();
-        let resp = client
-            .post(format!("http://127.0.0.1:{port}/api/login"))
-            .json(&serde_json::json!({"password": "testpass"}))
-            .send()
-            .await
-            .unwrap();
-        resp.headers()
-            .get("set-cookie")
-            .unwrap()
-            .to_str()
-            .unwrap()
-            .split(';')
-            .next()
-            .unwrap()
-            .to_string()
-    };
-
-    (tmp, proj_dir, Arc::new(state), pid, cookie, port)
+    Fixture {
+        server,
+        _project: project,
+        pid,
+    }
 }
 
 #[tokio::test]
 async fn thread_lifecycle_native_failure_preserves_local_thread() {
-    let (_data_dir, _proj_dir, state, pid, cookie, port) = start_server().await;
+    let fixture = start_server().await;
+    let state = &fixture.server.state;
+    let pid = fixture.pid;
+    let cookie = fixture.server.cookie.clone();
+    let port = fixture.server.addr.port();
     let base = format!("http://127.0.0.1:{port}");
     let client = reqwest::Client::new();
 

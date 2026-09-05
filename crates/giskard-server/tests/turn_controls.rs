@@ -1,10 +1,5 @@
 //! Per-turn control integration tests: modes, model selection, permission preset, and plan dump.
 
-#[path = "common/thread_fixture.rs"]
-mod thread_fixture;
-
-use std::sync::Arc;
-
 use chrono::Utc;
 use futures_util::{SinkExt, StreamExt};
 use giskard_core::approval::{ApprovalDecision, ApprovalKind, ApprovalMetadata, ApprovalRequest};
@@ -14,30 +9,12 @@ use giskard_core::item::{Item, ItemKind, ItemPayload, ItemStart};
 use giskard_core::model::ModelRef;
 use giskard_core::token::TokenUsage;
 use giskard_core::turn::{Mode, TurnStatus, TurnStatusKind};
-use giskard_harness::AgentHarness;
-use giskard_harness_replay::{ReplayFixture, ReplayHarness};
-use giskard_persist::store::ProjectConfig;
+use giskard_harness_replay::ReplayFixture;
 use giskard_proto::{
     ClientMessage, ErrorSeverity, ServerMessage, WireAgentEvent, WireApprovalMetadata,
 };
-use giskard_server::{AppState, HarnessFactory, build_app};
-
-use thread_fixture::persist_primary_thread;
-
-struct TestFactory {
-    fixture: ReplayFixture,
-}
-
-#[async_trait::async_trait]
-impl HarnessFactory for TestFactory {
-    async fn create(
-        &self,
-        _config: &ProjectConfig,
-        _bootstrap: giskard_harness::HarnessBootstrap,
-    ) -> Result<Arc<dyn AgentHarness>, giskard_core::HarnessError> {
-        Ok(Arc::new(ReplayHarness::from_fixture(self.fixture.clone())))
-    }
-}
+use giskard_server::AppState;
+use giskard_testenv::{TestServer, factory, fixtures, ws};
 
 /// Fixture: an agent plan message + a command-execution approval + turn completion.
 fn make_fixture() -> ReplayFixture {
@@ -123,35 +100,12 @@ fn make_fixture() -> ReplayFixture {
     ])
 }
 
-fn generate_password_hash(password: &str) -> String {
-    use argon2::password_hash::SaltString;
-    use argon2::{Argon2, PasswordHasher};
-    use rand::rngs::OsRng;
-    let salt = SaltString::generate(&mut OsRng);
-    Argon2::default()
-        .hash_password(password.as_bytes(), &salt)
-        .unwrap()
-        .to_string()
-}
-
-async fn start_server() -> (tempfile::TempDir, Arc<AppState>, u16) {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let port = listener.local_addr().unwrap().port();
-    let tmp = tempfile::TempDir::new().unwrap();
-    let hash = generate_password_hash("testpass");
-    let config_toml = format!(
-        r#"
-[server]
-bind = "127.0.0.1:{port}"
-secure_cookies = false
-
-[auth]
-password_hash = "{hash}"
-session_days = 30
-
-[plan]
+async fn start_server() -> TestServer {
+    TestServer::builder(factory::fixture(make_fixture()))
+        .config(
+            r#"[plan]
 default_dir = "docs"
-filename_template = "plan-{{slug}}-{{ts}}.md"
+filename_template = "plan-{slug}-{ts}.md"
 
 [providers.cloudflare-litellm]
 model_listing = false
@@ -160,61 +114,25 @@ model_listing = false
   display_name = "GLM-4.7"
   context_window = 131072
   supports_reasoning_effort = false
-"#
-    );
-    tokio::fs::write(tmp.path().join("config.toml"), config_toml)
+"#,
+        )
+        .start()
         .await
-        .unwrap();
-
-    let store = Arc::new(giskard_persist::PersistStore::new(tmp.path().to_path_buf()));
-    let session_key: Vec<u8> = (0..32u8).collect();
-    let factory = Arc::new(TestFactory {
-        fixture: make_fixture(),
-    });
-    let state = AppState::new(store, factory, session_key);
-    let app = build_app(state.clone());
-    tokio::spawn(async move {
-        axum::serve(listener, app).await.unwrap();
-    });
-    (tmp, Arc::new(state), port)
-}
-
-fn ws_text(msg: &ClientMessage) -> tokio_tungstenite::tungstenite::Message {
-    tokio_tungstenite::tungstenite::Message::Text(serde_json::to_string(msg).unwrap().into())
 }
 
 #[tokio::test]
 async fn modes_models_approvals_and_plan_dump() {
-    let (_tmp, state, port) = start_server().await;
+    let server = start_server().await;
+    let state = &server.state;
+    let port = server.addr.port();
     let base = format!("http://127.0.0.1:{port}");
-    let ws_base = format!("ws://127.0.0.1:{port}");
 
     // A writable project directory (workspace root) so the plan dump can be written.
     let proj_dir = tempfile::TempDir::new().unwrap();
     let proj_dir_path = proj_dir.path().to_string_lossy().to_string();
 
-    let client = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .unwrap();
-
-    // Login.
-    let resp = client
-        .post(format!("{base}/api/login"))
-        .json(&serde_json::json!({"password": "testpass"}))
-        .send()
-        .await
-        .unwrap();
-    let cookie = resp
-        .headers()
-        .get("set-cookie")
-        .unwrap()
-        .to_str()
-        .unwrap()
-        .split(';')
-        .next()
-        .unwrap()
-        .to_string();
+    let client = &server.client;
+    let cookie = server.cookie.clone();
 
     // Create project pointing at the writable dir.
     let resp = client
@@ -233,7 +151,7 @@ async fn modes_models_approvals_and_plan_dump() {
         .to_string();
 
     let pid: ProjectId = project_id.parse().unwrap();
-    let tid = persist_primary_thread(
+    let tid = fixtures::persist_primary_thread(
         &state.store,
         pid,
         ThreadId::new(),
@@ -262,23 +180,9 @@ async fn modes_models_approvals_and_plan_dump() {
     let returned_tid: ThreadId = thread_id.parse().unwrap();
     assert_eq!(returned_tid, tid);
 
-    // Connect WS.
-    use tokio_tungstenite::tungstenite::http::Request;
-    let ws_request = Request::builder()
-        .uri(format!("{ws_base}/api/ws"))
-        .header("host", format!("127.0.0.1:{port}"))
-        .header("cookie", &cookie)
-        .header("upgrade", "websocket")
-        .header("connection", "upgrade")
-        .header("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ==")
-        .header("sec-websocket-version", "13")
-        .body(())
-        .unwrap();
-    let (mut ws, _) = tokio_tungstenite::connect_async(ws_request)
-        .await
-        .expect("WS connect");
+    let mut ws = server.ws().await;
 
-    ws.send(ws_text(&ClientMessage::Subscribe {
+    ws.send(ws::text(&ClientMessage::Subscribe {
         thread_id: tid,
         since: None,
     }))
@@ -286,14 +190,14 @@ async fn modes_models_approvals_and_plan_dump() {
     .unwrap();
 
     // --- SwitchMode -> Plan (persisted) ---
-    ws.send(ws_text(&ClientMessage::SwitchMode {
+    ws.send(ws::text(&ClientMessage::SwitchMode {
         thread_id: tid,
         request_id: "switch-mode".into(),
         mode: Mode::Plan,
     }))
     .await
     .unwrap();
-    let tf = poll_thread(&state, pid, tid, |tf| {
+    let tf = poll_thread(state, pid, tid, |tf| {
         tf.mode == giskard_core::turn::TurnMode::Known(Mode::Plan)
     })
     .await;
@@ -304,7 +208,7 @@ async fn modes_models_approvals_and_plan_dump() {
     );
 
     // --- SelectModel -> glm (context window loaded from the configured descriptor) ---
-    ws.send(ws_text(&ClientMessage::SelectModel {
+    ws.send(ws::text(&ClientMessage::SelectModel {
         thread_id: tid,
         request_id: "select-model".into(),
         model_ref: ModelRef {
@@ -315,7 +219,7 @@ async fn modes_models_approvals_and_plan_dump() {
     }))
     .await
     .unwrap();
-    let tf = poll_thread(&state, pid, tid, |tf| {
+    let tf = poll_thread(state, pid, tid, |tf| {
         tf.current_model
             .as_known()
             .is_some_and(|model| model.model == "@cf/z-ai/glm-4.7")
@@ -327,7 +231,7 @@ async fn modes_models_approvals_and_plan_dump() {
     );
 
     // --- SendInput -> turn streams and is persisted ---
-    ws.send(ws_text(&ClientMessage::SendInput {
+    ws.send(ws::text(&ClientMessage::SendInput {
         thread_id: tid,
         text: "make a plan".into(),
         attachments: Vec::new(),
@@ -409,7 +313,7 @@ async fn modes_models_approvals_and_plan_dump() {
     assert!(saw_completed, "should observe TurnCompleted");
 
     // Turn persisted to the authoritative JSONL history (H1); tokens folded into metadata.
-    let tf = poll_thread(&state, pid, tid, |tf| tf.tokens.total.total == 1540).await;
+    let tf = poll_thread(state, pid, tid, |tf| tf.tokens.total.total == 1540).await;
     let turns = state.store.load_all_turns(pid, tid).await.unwrap();
     assert_eq!(turns.len(), 1);
     assert_eq!(
@@ -440,7 +344,7 @@ async fn modes_models_approvals_and_plan_dump() {
     );
 
     // --- Plan dump: writes the latest Plan-mode turn's agent text to markdown. ---
-    ws.send(ws_text(&ClientMessage::SavePlan {
+    ws.send(ws::text(&ClientMessage::SavePlan {
         thread_id: tid,
         path: "docs/plan.md".into(),
     }))
@@ -460,7 +364,7 @@ async fn modes_models_approvals_and_plan_dump() {
     );
 
     // Failed plan writes return a structured WS error through the normal handler path.
-    ws.send(ws_text(&ClientMessage::SavePlan {
+    ws.send(ws::text(&ClientMessage::SavePlan {
         thread_id: tid,
         path: "../escape.md".into(),
     }))

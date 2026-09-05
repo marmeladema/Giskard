@@ -1,7 +1,3 @@
-mod common;
-#[path = "common/thread_fixture.rs"]
-mod thread_fixture;
-
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -24,19 +20,18 @@ use giskard_core::user_input::UserInput;
 use giskard_harness::{
     AgentEventStream, AgentHarness, EventLog, HarnessCapabilities, OpenThreadOptions, ThreadHandle,
 };
-use giskard_harness_replay::{ReplayFixture, ReplayHarness};
-use giskard_persist::store::ProjectConfig;
+use giskard_harness_replay::ReplayFixture;
 use giskard_proto::{
     ClientMessage, ErrorSeverity, RequestKind, RuntimeTurnState, ServerMessage, WireAgentEvent,
 };
-use giskard_server::{AppState, HarnessFactory, build_app};
+use giskard_server::AppState;
+use giskard_testenv::{TestServer, auth, factory, fixtures, ws};
 use tracing::Subscriber;
 use tracing_subscriber::Layer;
 use tracing_subscriber::layer::Context;
 use tracing_subscriber::prelude::*;
 
-use common::fake_native_model;
-use thread_fixture::persist_primary_thread;
+use fixtures::fake_native_model;
 
 #[derive(Clone, Debug)]
 struct CapturedRegistryEvent {
@@ -127,119 +122,6 @@ fn captured_registry_events(project_id: ProjectId) -> Vec<CapturedRegistryEvent>
         .filter(|event| event.project_id == project_id)
         .cloned()
         .collect()
-}
-
-struct TestFactory {
-    fixture: ReplayFixture,
-}
-
-#[async_trait::async_trait]
-impl HarnessFactory for TestFactory {
-    async fn create(
-        &self,
-        _config: &ProjectConfig,
-        _bootstrap: giskard_harness::HarnessBootstrap,
-    ) -> Result<Arc<dyn giskard_harness::AgentHarness>, HarnessError> {
-        Ok(Arc::new(ReplayHarness::from_fixture(self.fixture.clone())))
-    }
-}
-
-struct NoMcpFactory;
-struct UnsupportedCompactionFactory;
-struct SlowCompactionFactory;
-struct HeldCompactionFactory {
-    harness: Arc<SlowCompactionHarness>,
-}
-struct SlowStartFactory {
-    harness: Arc<SlowStartHarness>,
-}
-struct ActivityFactory {
-    harness: Arc<ActivityHarness>,
-}
-struct CountingOpenFactory {
-    harness: Arc<CountingOpenHarness>,
-}
-
-#[async_trait::async_trait]
-impl HarnessFactory for NoMcpFactory {
-    async fn create(
-        &self,
-        _config: &ProjectConfig,
-        _bootstrap: giskard_harness::HarnessBootstrap,
-    ) -> Result<Arc<dyn giskard_harness::AgentHarness>, HarnessError> {
-        Ok(Arc::new(NoMcpHarness))
-    }
-}
-
-#[async_trait::async_trait]
-impl HarnessFactory for UnsupportedCompactionFactory {
-    async fn create(
-        &self,
-        _config: &ProjectConfig,
-        _bootstrap: giskard_harness::HarnessBootstrap,
-    ) -> Result<Arc<dyn giskard_harness::AgentHarness>, HarnessError> {
-        Ok(Arc::new(UnsupportedCompactionHarness::default()))
-    }
-}
-
-#[async_trait::async_trait]
-impl HarnessFactory for SlowCompactionFactory {
-    async fn create(
-        &self,
-        _config: &ProjectConfig,
-        _bootstrap: giskard_harness::HarnessBootstrap,
-    ) -> Result<Arc<dyn giskard_harness::AgentHarness>, HarnessError> {
-        Ok(Arc::new(SlowCompactionHarness::default()))
-    }
-}
-
-#[async_trait::async_trait]
-impl HarnessFactory for HeldCompactionFactory {
-    async fn create(
-        &self,
-        _config: &ProjectConfig,
-        _bootstrap: giskard_harness::HarnessBootstrap,
-    ) -> Result<Arc<dyn giskard_harness::AgentHarness>, HarnessError> {
-        Ok(self.harness.clone())
-    }
-}
-
-#[async_trait::async_trait]
-impl HarnessFactory for SlowStartFactory {
-    async fn create(
-        &self,
-        _config: &ProjectConfig,
-        _bootstrap: giskard_harness::HarnessBootstrap,
-    ) -> Result<Arc<dyn giskard_harness::AgentHarness>, HarnessError> {
-        Ok(self.harness.clone())
-    }
-}
-
-#[async_trait::async_trait]
-impl HarnessFactory for ActivityFactory {
-    async fn create(
-        &self,
-        _config: &ProjectConfig,
-        bootstrap: giskard_harness::HarnessBootstrap,
-    ) -> Result<Arc<dyn giskard_harness::AgentHarness>, HarnessError> {
-        let mut routes = self.harness.native_routes.lock().await;
-        for binding in bootstrap.known_threads {
-            routes.insert(binding.harness_thread_id, binding.thread_id);
-        }
-        drop(routes);
-        Ok(self.harness.clone())
-    }
-}
-
-#[async_trait::async_trait]
-impl HarnessFactory for CountingOpenFactory {
-    async fn create(
-        &self,
-        _config: &ProjectConfig,
-        _bootstrap: giskard_harness::HarnessBootstrap,
-    ) -> Result<Arc<dyn giskard_harness::AgentHarness>, HarnessError> {
-        Ok(self.harness.clone())
-    }
 }
 
 struct NoMcpHarness;
@@ -2079,235 +1961,76 @@ fn notice_fixture(thread: ThreadId, turn: TurnId) -> ReplayFixture {
     ])
 }
 
-fn generate_password_hash(password: &str) -> String {
-    use argon2::password_hash::SaltString;
-    use argon2::{Argon2, PasswordHasher};
-    use rand::rngs::OsRng;
-    let salt = SaltString::generate(&mut OsRng);
-    Argon2::default()
-        .hash_password(password.as_bytes(), &salt)
-        .unwrap()
-        .to_string()
-}
-
-async fn start_server_with_extra_config_on_available_port(
-    extra_config: &str,
-) -> (tempfile::TempDir, Arc<AppState>, u16) {
+async fn start_server_with_extra_config_on_available_port(extra_config: &str) -> TestServer {
     start_server_with_fixture_and_extra_config_on_available_port(make_fixture(), extra_config).await
 }
 
 async fn start_server_with_fixture_and_extra_config_on_available_port(
     fixture: ReplayFixture,
     extra_config: &str,
-) -> (tempfile::TempDir, Arc<AppState>, u16) {
-    let tmp = tempfile::TempDir::new().unwrap();
-
-    let hash = generate_password_hash("testpass");
-    let config_toml = format!(
-        r#"
-[server]
-bind = "127.0.0.1:0"
-secure_cookies = false
-
-[auth]
-password_hash = "{hash}"
-session_days = 30
-
-{extra_config}
-"#
-    );
-    tokio::fs::write(tmp.path().join("config.toml"), config_toml)
-        .await
-        .unwrap();
-
-    let store = Arc::new(giskard_persist::PersistStore::new(tmp.path().to_path_buf()));
-    let session_key: Vec<u8> = (0..32u8).collect();
-    let factory = Arc::new(TestFactory { fixture });
-
-    let state = AppState::new(store, factory, session_key);
-
-    let app = build_app(state.clone());
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let port = listener.local_addr().unwrap().port();
-    tokio::spawn(async move {
-        axum::serve(listener, app).await.unwrap();
-    });
-
-    (tmp, Arc::new(state), port)
+) -> TestServer {
+    let factory = factory::fixture(fixture);
+    start_custom_server_with_extra_config_on_available_port(factory, extra_config).await
 }
 
-async fn start_no_mcp_server_on_available_port() -> (tempfile::TempDir, Arc<AppState>, u16) {
-    let tmp = tempfile::TempDir::new().unwrap();
-
-    let hash = generate_password_hash("testpass");
-    let config_toml = format!(
-        r#"
-[server]
-bind = "127.0.0.1:0"
-secure_cookies = false
-
-[auth]
-password_hash = "{hash}"
-session_days = 30
-"#
-    );
-    tokio::fs::write(tmp.path().join("config.toml"), config_toml)
-        .await
-        .unwrap();
-
-    let store = Arc::new(giskard_persist::PersistStore::new(tmp.path().to_path_buf()));
-    let session_key: Vec<u8> = (0..32u8).collect();
-    let state = AppState::new(store, Arc::new(NoMcpFactory), session_key);
-
-    let app = build_app(state.clone());
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let port = listener.local_addr().unwrap().port();
-    tokio::spawn(async move {
-        axum::serve(listener, app).await.unwrap();
-    });
-
-    (tmp, Arc::new(state), port)
+async fn start_no_mcp_server_on_available_port() -> TestServer {
+    start_custom_server_on_available_port(factory::from_fn(|_, _| Ok(Arc::new(NoMcpHarness)))).await
 }
 
-async fn start_unsupported_compaction_server_on_available_port()
--> (tempfile::TempDir, Arc<AppState>, u16) {
-    let tmp = tempfile::TempDir::new().unwrap();
-
-    let hash = generate_password_hash("testpass");
-    let config_toml = format!(
-        r#"
-[server]
-bind = "127.0.0.1:0"
-secure_cookies = false
-
-[auth]
-password_hash = "{hash}"
-session_days = 30
-"#
-    );
-    tokio::fs::write(tmp.path().join("config.toml"), config_toml)
-        .await
-        .unwrap();
-
-    let store = Arc::new(giskard_persist::PersistStore::new(tmp.path().to_path_buf()));
-    let session_key: Vec<u8> = (0..32u8).collect();
-    let state = AppState::new(store, Arc::new(UnsupportedCompactionFactory), session_key);
-
-    let app = build_app(state.clone());
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let port = listener.local_addr().unwrap().port();
-    tokio::spawn(async move {
-        axum::serve(listener, app).await.unwrap();
-    });
-
-    (tmp, Arc::new(state), port)
+async fn start_unsupported_compaction_server_on_available_port() -> TestServer {
+    start_custom_server_on_available_port(factory::from_fn(|_, _| {
+        Ok(Arc::new(UnsupportedCompactionHarness::default()))
+    }))
+    .await
 }
 
-async fn start_slow_compaction_server_on_available_port() -> (tempfile::TempDir, Arc<AppState>, u16)
-{
-    start_custom_server_on_available_port(Arc::new(SlowCompactionFactory)).await
+async fn start_slow_compaction_server_on_available_port() -> TestServer {
+    start_custom_server_on_available_port(factory::from_fn(|_, _| {
+        Ok(Arc::new(SlowCompactionHarness::default()))
+    }))
+    .await
 }
 
 async fn start_held_compaction_server_on_available_port(
     harness: Arc<SlowCompactionHarness>,
-) -> (tempfile::TempDir, Arc<AppState>, u16) {
-    start_custom_server_on_available_port(Arc::new(HeldCompactionFactory { harness })).await
+) -> TestServer {
+    start_custom_server_on_available_port(factory::shared(harness)).await
 }
 
-async fn start_slow_start_server_on_available_port(
-    harness: Arc<SlowStartHarness>,
-) -> (tempfile::TempDir, Arc<AppState>, u16) {
-    start_custom_server_on_available_port(Arc::new(SlowStartFactory { harness })).await
+async fn start_slow_start_server_on_available_port(harness: Arc<SlowStartHarness>) -> TestServer {
+    start_custom_server_on_available_port(factory::shared(harness)).await
 }
 
-async fn start_activity_server_on_available_port(
-    harness: Arc<ActivityHarness>,
-) -> (tempfile::TempDir, Arc<AppState>, u16) {
-    start_custom_server_on_available_port(Arc::new(ActivityFactory { harness })).await
+async fn start_activity_server_on_available_port(harness: Arc<ActivityHarness>) -> TestServer {
+    let factory = factory::from_fn(move |_, bootstrap| {
+        // Factory creation precedes harness publication, so no harness operation can hold this
+        // lock. Surface a violated lifecycle invariant as a harness error instead of panicking.
+        let mut routes = harness.native_routes.try_lock().map_err(|_| {
+            HarnessError::Transport("activity harness routes were busy during bootstrap".into())
+        })?;
+        for binding in bootstrap.known_threads {
+            routes.insert(binding.harness_thread_id, binding.thread_id);
+        }
+        drop(routes);
+        Ok(harness.clone())
+    });
+    start_custom_server_on_available_port(factory).await
 }
 
 async fn start_custom_server_on_available_port(
-    factory: Arc<dyn HarnessFactory>,
-) -> (tempfile::TempDir, Arc<AppState>, u16) {
+    factory: Arc<dyn giskard_server::HarnessFactory>,
+) -> TestServer {
     start_custom_server_with_extra_config_on_available_port(factory, "").await
 }
 
 async fn start_custom_server_with_extra_config_on_available_port(
-    factory: Arc<dyn HarnessFactory>,
+    factory: Arc<dyn giskard_server::HarnessFactory>,
     extra_config: &str,
-) -> (tempfile::TempDir, Arc<AppState>, u16) {
-    let tmp = tempfile::TempDir::new().unwrap();
-
-    let hash = generate_password_hash("testpass");
-    let config_toml = format!(
-        r#"
-[server]
-bind = "127.0.0.1:0"
-secure_cookies = false
-
-[auth]
-password_hash = "{hash}"
-session_days = 30
-
-{extra_config}
-"#
-    );
-    tokio::fs::write(tmp.path().join("config.toml"), config_toml)
+) -> TestServer {
+    TestServer::builder(factory)
+        .config(extra_config)
+        .start()
         .await
-        .unwrap();
-
-    let store = Arc::new(giskard_persist::PersistStore::new(tmp.path().to_path_buf()));
-    let session_key: Vec<u8> = (0..32u8).collect();
-    let state = AppState::new(store, factory, session_key);
-    let app = build_app(state.clone());
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let port = listener.local_addr().unwrap().port();
-    tokio::spawn(async move {
-        axum::serve(listener, app).await.unwrap();
-    });
-
-    (tmp, Arc::new(state), port)
-}
-
-async fn login_cookie(client: &reqwest::Client, base: &str) -> String {
-    let resp = client
-        .post(format!("{base}/api/login"))
-        .json(&serde_json::json!({"password": "testpass"}))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), 200);
-    resp.headers()
-        .get("set-cookie")
-        .unwrap()
-        .to_str()
-        .unwrap()
-        .split(';')
-        .next()
-        .unwrap()
-        .to_string()
-}
-
-async fn connect_ws(
-    port: u16,
-    cookie: &str,
-) -> tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>> {
-    use tokio_tungstenite::tungstenite::http::Request;
-
-    let ws_request = Request::builder()
-        .uri(format!("ws://127.0.0.1:{port}/api/ws"))
-        .header("host", format!("127.0.0.1:{port}"))
-        .header("cookie", cookie)
-        .header("upgrade", "websocket")
-        .header("connection", "upgrade")
-        .header("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ==")
-        .header("sec-websocket-version", "13")
-        .body(())
-        .unwrap();
-    tokio_tungstenite::connect_async(ws_request)
-        .await
-        .expect("WS connect")
-        .0
 }
 
 async fn create_project_and_thread(
@@ -2317,7 +2040,7 @@ async fn create_project_and_thread(
     cookie: &str,
 ) -> (ProjectId, ThreadId) {
     let project_id = create_project_only(client, base, cookie).await;
-    let thread_id = persist_primary_thread(
+    let thread_id = fixtures::persist_primary_thread(
         &state.store,
         project_id,
         ThreadId::new(),
@@ -2823,13 +2546,15 @@ fn is_turn_completed_activity(kind: &ThreadActivityKind) -> bool {
 #[tokio::test]
 async fn send_input_rejects_second_turn_before_turn_started() {
     let harness = Arc::new(SlowStartHarness::new());
-    let (_tmp, state, port) = start_slow_start_server_on_available_port(harness.clone()).await;
-    let base = format!("http://127.0.0.1:{port}");
+    let server = start_slow_start_server_on_available_port(harness.clone()).await;
+    let state = &server.state;
+    let port = server.addr.port();
+    let base = server.base.clone();
     let client = reqwest::Client::new();
-    let cookie = login_cookie(&client, &base).await;
-    let (_, thread_id) = create_project_and_thread(&state, &client, &base, &cookie).await;
-    let mut first = connect_ws(port, &cookie).await;
-    let mut second = connect_ws(port, &cookie).await;
+    let cookie = auth::login(&client, &base).await;
+    let (_, thread_id) = create_project_and_thread(state, &client, &base, &cookie).await;
+    let mut first = ws::connect(([127, 0, 0, 1], port).into(), &cookie).await;
+    let mut second = ws::connect(([127, 0, 0, 1], port).into(), &cookie).await;
 
     for ws in [&mut first, &mut second] {
         ws.send(tokio_tungstenite::tungstenite::Message::Text(
@@ -2899,11 +2624,12 @@ async fn send_input_rejects_second_turn_before_turn_started() {
 #[tokio::test]
 async fn cancelling_start_turn_caller_does_not_abandon_admitted_operation() {
     let harness = Arc::new(SlowStartHarness::new());
-    let (_tmp, state, port) = start_slow_start_server_on_available_port(harness.clone()).await;
-    let base = format!("http://127.0.0.1:{port}");
+    let server = start_slow_start_server_on_available_port(harness.clone()).await;
+    let state = &server.state;
+    let base = server.base.clone();
     let client = reqwest::Client::new();
-    let cookie = login_cookie(&client, &base).await;
-    let (project_id, thread_id) = create_project_and_thread(&state, &client, &base, &cookie).await;
+    let cookie = auth::login(&client, &base).await;
+    let (project_id, thread_id) = create_project_and_thread(state, &client, &base, &cookie).await;
     let thread = state
         .store
         .load_thread(project_id, thread_id)
@@ -2960,11 +2686,12 @@ async fn cancelling_start_turn_caller_does_not_abandon_admitted_operation() {
 #[tokio::test]
 async fn cancelling_compaction_caller_does_not_abandon_admitted_operation() {
     let harness = Arc::new(SlowCompactionHarness::held());
-    let (_tmp, state, port) = start_held_compaction_server_on_available_port(harness.clone()).await;
-    let base = format!("http://127.0.0.1:{port}");
+    let server = start_held_compaction_server_on_available_port(harness.clone()).await;
+    let state = &server.state;
+    let base = server.base.clone();
     let client = reqwest::Client::new();
-    let cookie = login_cookie(&client, &base).await;
-    let (project_id, thread_id) = create_project_and_thread(&state, &client, &base, &cookie).await;
+    let cookie = auth::login(&client, &base).await;
+    let (project_id, thread_id) = create_project_and_thread(state, &client, &base, &cookie).await;
     let thread = state
         .store
         .load_thread(project_id, thread_id)
@@ -3016,11 +2743,13 @@ async fn cancelling_compaction_caller_does_not_abandon_admitted_operation() {
 /// a turn that ended before it was ever watched.
 #[tokio::test]
 async fn subscribe_thread_state_reports_a_turn_that_ended_before_the_socket_attached() {
-    let (_tmp, state, port) = start_server_with_extra_config_on_available_port("").await;
-    let base = format!("http://127.0.0.1:{port}");
+    let server = start_server_with_extra_config_on_available_port("").await;
+    let state = &server.state;
+    let port = server.addr.port();
+    let base = server.base.clone();
     let client = reqwest::Client::new();
-    let cookie = login_cookie(&client, &base).await;
-    let (project_id, thread_id) = create_project_and_thread(&state, &client, &base, &cookie).await;
+    let cookie = auth::login(&client, &base).await;
+    let (project_id, thread_id) = create_project_and_thread(state, &client, &base, &cookie).await;
 
     // The whole turn happens with no socket subscribed to this thread — the window the browser
     // races when it starts a turn over HTTP and only then opens the thread. Driven through the
@@ -3053,7 +2782,7 @@ async fn subscribe_thread_state_reports_a_turn_that_ended_before_the_socket_atta
         tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
     }
 
-    let mut ws = connect_ws(port, &cookie).await;
+    let mut ws = ws::connect(([127, 0, 0, 1], port).into(), &cookie).await;
     ws.send(tokio_tungstenite::tungstenite::Message::Text(
         serde_json::to_string(&ClientMessage::Subscribe {
             thread_id,
@@ -3079,13 +2808,15 @@ async fn subscribe_thread_state_reports_a_turn_that_ended_before_the_socket_atta
 #[tokio::test]
 async fn subscribe_thread_state_reports_a_turn_the_harness_has_not_streamed_yet() {
     let harness = Arc::new(SlowStartHarness::new());
-    let (_tmp, state, port) = start_slow_start_server_on_available_port(harness.clone()).await;
-    let base = format!("http://127.0.0.1:{port}");
+    let server = start_slow_start_server_on_available_port(harness.clone()).await;
+    let state = &server.state;
+    let port = server.addr.port();
+    let base = server.base.clone();
     let client = reqwest::Client::new();
-    let cookie = login_cookie(&client, &base).await;
-    let (_, thread_id) = create_project_and_thread(&state, &client, &base, &cookie).await;
+    let cookie = auth::login(&client, &base).await;
+    let (_, thread_id) = create_project_and_thread(state, &client, &base, &cookie).await;
 
-    let mut sender = connect_ws(port, &cookie).await;
+    let mut sender = ws::connect(([127, 0, 0, 1], port).into(), &cookie).await;
     sender
         .send(tokio_tungstenite::tungstenite::Message::Text(
             serde_json::to_string(&ClientMessage::Subscribe {
@@ -3120,7 +2851,7 @@ async fn subscribe_thread_state_reports_a_turn_the_harness_has_not_streamed_yet(
         "the harness is still inside start_turn, so there is nothing buffered for this turn"
     );
 
-    let mut latecomer = connect_ws(port, &cookie).await;
+    let mut latecomer = ws::connect(([127, 0, 0, 1], port).into(), &cookie).await;
     latecomer
         .send(tokio_tungstenite::tungstenite::Message::Text(
             serde_json::to_string(&ClientMessage::Subscribe {
@@ -3145,12 +2876,14 @@ async fn subscribe_thread_state_reports_a_turn_the_harness_has_not_streamed_yet(
 
 #[tokio::test]
 async fn send_input_rejects_same_thread_during_compaction() {
-    let (_tmp, state, port) = start_slow_compaction_server_on_available_port().await;
-    let base = format!("http://127.0.0.1:{port}");
+    let server = start_slow_compaction_server_on_available_port().await;
+    let state = &server.state;
+    let port = server.addr.port();
+    let base = server.base.clone();
     let client = reqwest::Client::new();
-    let cookie = login_cookie(&client, &base).await;
-    let (_, thread_id) = create_project_and_thread(&state, &client, &base, &cookie).await;
-    let mut ws = connect_ws(port, &cookie).await;
+    let cookie = auth::login(&client, &base).await;
+    let (_, thread_id) = create_project_and_thread(state, &client, &base, &cookie).await;
+    let mut ws = ws::connect(([127, 0, 0, 1], port).into(), &cookie).await;
 
     ws.send(tokio_tungstenite::tungstenite::Message::Text(
         serde_json::to_string(&ClientMessage::Subscribe {
@@ -3203,12 +2936,14 @@ async fn send_input_rejects_same_thread_during_compaction() {
 
 #[tokio::test]
 async fn compact_context_streams_and_persists_compaction_turn() {
-    let (_tmp, state, port) = start_server_with_extra_config_on_available_port("").await;
-    let base = format!("http://127.0.0.1:{port}");
+    let server = start_server_with_extra_config_on_available_port("").await;
+    let state = &server.state;
+    let port = server.addr.port();
+    let base = server.base.clone();
     let client = reqwest::Client::new();
-    let cookie = login_cookie(&client, &base).await;
-    let (project_id, thread_id) = create_project_and_thread(&state, &client, &base, &cookie).await;
-    let mut ws = connect_ws(port, &cookie).await;
+    let cookie = auth::login(&client, &base).await;
+    let (project_id, thread_id) = create_project_and_thread(state, &client, &base, &cookie).await;
+    let mut ws = ws::connect(([127, 0, 0, 1], port).into(), &cookie).await;
 
     ws.send(tokio_tungstenite::tungstenite::Message::Text(
         serde_json::to_string(&ClientMessage::Subscribe {
@@ -3300,12 +3035,14 @@ async fn compact_context_streams_and_persists_compaction_turn() {
 /// the streamed/persisted id rather than the harness return value.
 #[tokio::test]
 async fn wire_turn_id_matches_persisted_turn_id() {
-    let (_tmp, state, port) = start_server_with_extra_config_on_available_port("").await;
-    let base = format!("http://127.0.0.1:{port}");
+    let server = start_server_with_extra_config_on_available_port("").await;
+    let state = &server.state;
+    let port = server.addr.port();
+    let base = server.base.clone();
     let client = reqwest::Client::new();
-    let cookie = login_cookie(&client, &base).await;
-    let (project_id, thread_id) = create_project_and_thread(&state, &client, &base, &cookie).await;
-    let mut ws = connect_ws(port, &cookie).await;
+    let cookie = auth::login(&client, &base).await;
+    let (project_id, thread_id) = create_project_and_thread(state, &client, &base, &cookie).await;
+    let mut ws = ws::connect(([127, 0, 0, 1], port).into(), &cookie).await;
 
     ws.send(tokio_tungstenite::tungstenite::Message::Text(
         serde_json::to_string(&ClientMessage::Subscribe {
@@ -3356,11 +3093,13 @@ async fn wire_turn_id_matches_persisted_turn_id() {
 
 #[tokio::test]
 async fn new_turn_start_replaces_stale_live_buffer_without_dropping_events() {
-    let (_tmp, state, port) = start_server_with_extra_config_on_available_port("").await;
-    let base = format!("http://127.0.0.1:{port}");
+    let server = start_server_with_extra_config_on_available_port("").await;
+    let state = &server.state;
+    let port = server.addr.port();
+    let base = server.base.clone();
     let client = reqwest::Client::new();
-    let cookie = login_cookie(&client, &base).await;
-    let (project_id, thread_id) = create_project_and_thread(&state, &client, &base, &cookie).await;
+    let cookie = auth::login(&client, &base).await;
+    let (project_id, thread_id) = create_project_and_thread(state, &client, &base, &cookie).await;
     let stale_turn = TurnId::new();
     state
         .registry
@@ -3368,7 +3107,7 @@ async fn new_turn_start_replaces_stale_live_buffer_without_dropping_events() {
         .await
         .unwrap()
         .replace_live_turn_for_test(stale_turn, Some(UserInput::text("stale interrupted turn")));
-    let mut ws = connect_ws(port, &cookie).await;
+    let mut ws = ws::connect(([127, 0, 0, 1], port).into(), &cookie).await;
 
     ws.send(tokio_tungstenite::tungstenite::Message::Text(
         serde_json::to_string(&ClientMessage::Subscribe {
@@ -3422,17 +3161,18 @@ async fn new_turn_start_replaces_stale_live_buffer_without_dropping_events() {
 
 #[tokio::test]
 async fn compact_context_does_not_block_turns_on_other_threads_or_projects() {
-    let (_tmp, state, port) = start_slow_compaction_server_on_available_port().await;
-    let base = format!("http://127.0.0.1:{port}");
+    let server = start_slow_compaction_server_on_available_port().await;
+    let state = &server.state;
+    let port = server.addr.port();
+    let base = server.base.clone();
     let client = reqwest::Client::new();
-    let cookie = login_cookie(&client, &base).await;
+    let cookie = auth::login(&client, &base).await;
     let (project_id, compacting_thread) =
-        create_project_and_thread(&state, &client, &base, &cookie).await;
+        create_project_and_thread(state, &client, &base, &cookie).await;
     let other_thread =
-        open_thread_with_resume(&state, &client, &base, &cookie, project_id, "other_thread").await;
-    let (_, other_project_thread) =
-        create_project_and_thread(&state, &client, &base, &cookie).await;
-    let mut ws = connect_ws(port, &cookie).await;
+        open_thread_with_resume(state, &client, &base, &cookie, project_id, "other_thread").await;
+    let (_, other_project_thread) = create_project_and_thread(state, &client, &base, &cookie).await;
+    let mut ws = ws::connect(([127, 0, 0, 1], port).into(), &cookie).await;
 
     for thread_id in [compacting_thread, other_thread, other_project_thread] {
         ws.send(tokio_tungstenite::tungstenite::Message::Text(
@@ -3541,14 +3281,16 @@ async fn compact_context_does_not_block_turns_on_other_threads_or_projects() {
 
 #[tokio::test]
 async fn inactive_thread_progress_sends_activity_without_full_event_subscription() {
-    let (_tmp, state, port) = start_slow_compaction_server_on_available_port().await;
-    let base = format!("http://127.0.0.1:{port}");
+    let server = start_slow_compaction_server_on_available_port().await;
+    let state = &server.state;
+    let port = server.addr.port();
+    let base = server.base.clone();
     let client = reqwest::Client::new();
-    let cookie = login_cookie(&client, &base).await;
+    let cookie = auth::login(&client, &base).await;
     let (project_id, active_thread) =
-        create_project_and_thread(&state, &client, &base, &cookie).await;
+        create_project_and_thread(state, &client, &base, &cookie).await;
     let inactive_thread = open_thread_with_resume(
-        &state,
+        state,
         &client,
         &base,
         &cookie,
@@ -3556,7 +3298,7 @@ async fn inactive_thread_progress_sends_activity_without_full_event_subscription
         "inactive_thread",
     )
     .await;
-    let mut ws = connect_ws(port, &cookie).await;
+    let mut ws = ws::connect(([127, 0, 0, 1], port).into(), &cookie).await;
 
     ws.send(tokio_tungstenite::tungstenite::Message::Text(
         serde_json::to_string(&ClientMessage::Subscribe {
@@ -3670,14 +3412,16 @@ async fn inactive_thread_progress_sends_activity_without_full_event_subscription
 #[tokio::test]
 async fn inactive_thread_requests_send_activity_and_route_responses() {
     let harness = Arc::new(ActivityHarness::default());
-    let (_tmp, state, port) = start_activity_server_on_available_port(harness.clone()).await;
-    let base = format!("http://127.0.0.1:{port}");
+    let server = start_activity_server_on_available_port(harness.clone()).await;
+    let state = &server.state;
+    let port = server.addr.port();
+    let base = server.base.clone();
     let client = reqwest::Client::new();
-    let cookie = login_cookie(&client, &base).await;
+    let cookie = auth::login(&client, &base).await;
     let (project_id, active_thread) =
-        create_project_and_thread(&state, &client, &base, &cookie).await;
+        create_project_and_thread(state, &client, &base, &cookie).await;
     let inactive_thread = open_thread_with_resume(
-        &state,
+        state,
         &client,
         &base,
         &cookie,
@@ -3685,7 +3429,7 @@ async fn inactive_thread_requests_send_activity_and_route_responses() {
         "inactive_requests",
     )
     .await;
-    let mut ws = connect_ws(port, &cookie).await;
+    let mut ws = ws::connect(([127, 0, 0, 1], port).into(), &cookie).await;
 
     ws.send(tokio_tungstenite::tungstenite::Message::Text(
         serde_json::to_string(&ClientMessage::Subscribe {
@@ -3810,13 +3554,15 @@ async fn inactive_thread_requests_send_activity_and_route_responses() {
 #[tokio::test]
 async fn approval_decision_broadcasts_resolution_to_other_tabs() {
     let harness = Arc::new(ActivityHarness::default());
-    let (_tmp, state, port) = start_activity_server_on_available_port(harness.clone()).await;
-    let base = format!("http://127.0.0.1:{port}");
+    let server = start_activity_server_on_available_port(harness.clone()).await;
+    let state = &server.state;
+    let port = server.addr.port();
+    let base = server.base.clone();
     let client = reqwest::Client::new();
-    let cookie = login_cookie(&client, &base).await;
-    let (_project_id, thread_id) = create_project_and_thread(&state, &client, &base, &cookie).await;
-    let mut first_ws = connect_ws(port, &cookie).await;
-    let mut second_ws = connect_ws(port, &cookie).await;
+    let cookie = auth::login(&client, &base).await;
+    let (_project_id, thread_id) = create_project_and_thread(state, &client, &base, &cookie).await;
+    let mut first_ws = ws::connect(([127, 0, 0, 1], port).into(), &cookie).await;
+    let mut second_ws = ws::connect(([127, 0, 0, 1], port).into(), &cookie).await;
 
     for ws in [&mut first_ws, &mut second_ws] {
         ws.send(tokio_tungstenite::tungstenite::Message::Text(
@@ -3871,12 +3617,14 @@ async fn approval_decision_broadcasts_resolution_to_other_tabs() {
 
 #[tokio::test]
 async fn compact_context_unsupported_harness_returns_structured_error() {
-    let (_tmp, state, port) = start_unsupported_compaction_server_on_available_port().await;
-    let base = format!("http://127.0.0.1:{port}");
+    let server = start_unsupported_compaction_server_on_available_port().await;
+    let state = &server.state;
+    let port = server.addr.port();
+    let base = server.base.clone();
     let client = reqwest::Client::new();
-    let cookie = login_cookie(&client, &base).await;
-    let (_, thread_id) = create_project_and_thread(&state, &client, &base, &cookie).await;
-    let mut ws = connect_ws(port, &cookie).await;
+    let cookie = auth::login(&client, &base).await;
+    let (_, thread_id) = create_project_and_thread(state, &client, &base, &cookie).await;
+    let mut ws = ws::connect(([127, 0, 0, 1], port).into(), &cookie).await;
 
     ws.send(tokio_tungstenite::tungstenite::Message::Text(
         serde_json::to_string(&ClientMessage::CompactContext { thread_id })
@@ -3899,11 +3647,12 @@ async fn compact_context_unsupported_harness_returns_structured_error() {
 
 #[tokio::test]
 async fn mcp_status_routes_surface_empty_replay_status_and_reload() {
-    let (_tmp, state, port) = start_server_with_extra_config_on_available_port("").await;
-    let base = format!("http://127.0.0.1:{port}");
+    let server = start_server_with_extra_config_on_available_port("").await;
+    let state = &server.state;
+    let base = server.base.clone();
     let client = reqwest::Client::new();
-    let cookie = login_cookie(&client, &base).await;
-    let (project_id, _) = create_project_and_thread(&state, &client, &base, &cookie).await;
+    let cookie = auth::login(&client, &base).await;
+    let (project_id, _) = create_project_and_thread(state, &client, &base, &cookie).await;
 
     let status: serde_json::Value = client
         .get(format!("{base}/api/projects/{project_id}/mcp"))
@@ -3934,10 +3683,10 @@ async fn mcp_status_routes_surface_empty_replay_status_and_reload() {
 
 #[tokio::test]
 async fn mcp_status_routes_surface_unsupported_capabilities_without_failing() {
-    let (_tmp, _state, port) = start_no_mcp_server_on_available_port().await;
-    let base = format!("http://127.0.0.1:{port}");
+    let server = start_no_mcp_server_on_available_port().await;
+    let base = server.base.clone();
     let client = reqwest::Client::new();
-    let cookie = login_cookie(&client, &base).await;
+    let cookie = auth::login(&client, &base).await;
     let project_id = create_project_only(&client, &base, &cookie).await;
 
     let status: serde_json::Value = client
@@ -3973,11 +3722,12 @@ async fn mcp_status_routes_surface_unsupported_capabilities_without_failing() {
 
 #[tokio::test]
 async fn mcp_oauth_login_rejects_empty_and_unsupported_requests() {
-    let (_tmp, state, port) = start_server_with_extra_config_on_available_port("").await;
-    let base = format!("http://127.0.0.1:{port}");
+    let server = start_server_with_extra_config_on_available_port("").await;
+    let state = &server.state;
+    let base = server.base.clone();
     let client = reqwest::Client::new();
-    let cookie = login_cookie(&client, &base).await;
-    let (project_id, _) = create_project_and_thread(&state, &client, &base, &cookie).await;
+    let cookie = auth::login(&client, &base).await;
+    let (project_id, _) = create_project_and_thread(state, &client, &base, &cookie).await;
 
     let empty = client
         .post(format!("{base}/api/projects/{project_id}/mcp/oauth-login"))
@@ -4008,11 +3758,12 @@ async fn mcp_oauth_login_rejects_empty_and_unsupported_requests() {
 
 #[tokio::test]
 async fn thread_archive_unarchive_updates_thread_summary() {
-    let (_tmp, state, port) = start_server_with_extra_config_on_available_port("").await;
-    let base = format!("http://127.0.0.1:{port}");
+    let server = start_server_with_extra_config_on_available_port("").await;
+    let state = &server.state;
+    let base = server.base.clone();
     let client = reqwest::Client::new();
-    let cookie = login_cookie(&client, &base).await;
-    let (project_id, thread_id) = create_project_and_thread(&state, &client, &base, &cookie).await;
+    let cookie = auth::login(&client, &base).await;
+    let (project_id, thread_id) = create_project_and_thread(state, &client, &base, &cookie).await;
 
     let archived: serde_json::Value = client
         .post(format!(
@@ -4057,11 +3808,12 @@ async fn thread_archive_unarchive_updates_thread_summary() {
 
 #[tokio::test]
 async fn thread_rename_updates_thread_summary_and_persistence() {
-    let (_tmp, state, port) = start_server_with_extra_config_on_available_port("").await;
-    let base = format!("http://127.0.0.1:{port}");
+    let server = start_server_with_extra_config_on_available_port("").await;
+    let state = &server.state;
+    let base = server.base.clone();
     let client = reqwest::Client::new();
-    let cookie = login_cookie(&client, &base).await;
-    let (project_id, thread_id) = create_project_and_thread(&state, &client, &base, &cookie).await;
+    let cookie = auth::login(&client, &base).await;
+    let (project_id, thread_id) = create_project_and_thread(state, &client, &base, &cookie).await;
 
     let renamed = client
         .patch(format!(
@@ -4121,16 +3873,17 @@ async fn thread_rename_updates_thread_summary_and_persistence() {
 #[tokio::test]
 async fn importing_subagent_thread_records_parent_and_reuses_native_child() {
     let harness = Arc::new(ActivityHarness::default());
-    let (_tmp, state, port) = start_activity_server_on_available_port(harness.clone()).await;
-    let base = format!("http://127.0.0.1:{port}");
+    let server = start_activity_server_on_available_port(harness.clone()).await;
+    let state = &server.state;
+    let base = server.base.clone();
     let client = reqwest::Client::new();
-    let cookie = login_cookie(&client, &base).await;
+    let cookie = auth::login(&client, &base).await;
     let project_id = create_project_only(&client, &base, &cookie).await;
 
     let parent_resp = client
         .post(format!("{base}/api/projects/{project_id}/threads"))
         .header("cookie", &cookie)
-        .json(&serde_json::json!({"thread_id": persist_primary_thread(&state.store, project_id, ThreadId::new(), "native-parent", fake_native_model()).await}))
+        .json(&serde_json::json!({"thread_id": fixtures::persist_primary_thread(&state.store, project_id, ThreadId::new(), "native-parent", fake_native_model()).await}))
         .send()
         .await
         .unwrap();
@@ -4157,7 +3910,7 @@ async fn importing_subagent_thread_records_parent_and_reuses_native_child() {
         )
         .await
         .unwrap();
-    let link_item_id = wait_for_live_item_id(&state, parent_id, "subagent_activity_").await;
+    let link_item_id = wait_for_live_item_id(state, parent_id, "subagent_activity_").await;
 
     let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
     let child_id = loop {
@@ -4289,16 +4042,17 @@ async fn importing_subagent_thread_records_parent_and_reuses_native_child() {
 async fn route_and_forwarder_import_same_native_child_once() {
     let harness = Arc::new(ActivityHarness::default());
     harness.hold_native_child_open();
-    let (_tmp, state, port) = start_activity_server_on_available_port(harness.clone()).await;
-    let base = format!("http://127.0.0.1:{port}");
+    let server = start_activity_server_on_available_port(harness.clone()).await;
+    let state = &server.state;
+    let base = server.base.clone();
     let client = reqwest::Client::new();
-    let cookie = login_cookie(&client, &base).await;
+    let cookie = auth::login(&client, &base).await;
     let project_id = create_project_only(&client, &base, &cookie).await;
 
     let parent_resp = client
         .post(format!("{base}/api/projects/{project_id}/threads"))
         .header("cookie", &cookie)
-        .json(&serde_json::json!({"thread_id": persist_primary_thread(&state.store, project_id, ThreadId::new(), "native-parent", fake_native_model()).await}))
+        .json(&serde_json::json!({"thread_id": fixtures::persist_primary_thread(&state.store, project_id, ThreadId::new(), "native-parent", fake_native_model()).await}))
         .send()
         .await
         .unwrap();
@@ -4329,7 +4083,7 @@ async fn route_and_forwarder_import_same_native_child_once() {
         .unwrap();
 
     harness.wait_for_native_child_open().await;
-    let link_item_id = wait_for_live_item_id(&state, parent_id, "subagent_activity_").await;
+    let link_item_id = wait_for_live_item_id(state, parent_id, "subagent_activity_").await;
 
     let blocked_delete = tokio::time::timeout(
         tokio::time::Duration::from_secs(6),
@@ -4417,16 +4171,18 @@ async fn route_and_forwarder_import_same_native_child_once() {
 #[tokio::test]
 async fn passive_subagent_command_start_streams_before_completion() {
     let harness = Arc::new(ActivityHarness::default());
-    let (_tmp, state, port) = start_activity_server_on_available_port(harness.clone()).await;
-    let base = format!("http://127.0.0.1:{port}");
+    let server = start_activity_server_on_available_port(harness.clone()).await;
+    let state = &server.state;
+    let port = server.addr.port();
+    let base = server.base.clone();
     let client = reqwest::Client::new();
-    let cookie = login_cookie(&client, &base).await;
+    let cookie = auth::login(&client, &base).await;
     let project_id = create_project_only(&client, &base, &cookie).await;
 
     let parent_resp = client
         .post(format!("{base}/api/projects/{project_id}/threads"))
         .header("cookie", &cookie)
-        .json(&serde_json::json!({"thread_id": persist_primary_thread(&state.store, project_id, ThreadId::new(), "native-parent", fake_native_model()).await}))
+        .json(&serde_json::json!({"thread_id": fixtures::persist_primary_thread(&state.store, project_id, ThreadId::new(), "native-parent", fake_native_model()).await}))
         .send()
         .await
         .unwrap();
@@ -4480,7 +4236,7 @@ async fn passive_subagent_command_start_streams_before_completion() {
 
     harness.wait_for_subscribers(child_id, 1).await;
 
-    let mut ws = connect_ws(port, &cookie).await;
+    let mut ws = ws::connect(([127, 0, 0, 1], port).into(), &cookie).await;
     ws.send(tokio_tungstenite::tungstenite::Message::Text(
         serde_json::to_string(&ClientMessage::Subscribe {
             thread_id: child_id,
@@ -4697,16 +4453,17 @@ async fn passive_subagent_command_start_streams_before_completion() {
 #[tokio::test]
 async fn collab_agent_spawn_start_imports_subagent_thread() {
     let harness = Arc::new(ActivityHarness::default());
-    let (_tmp, state, port) = start_activity_server_on_available_port(harness.clone()).await;
-    let base = format!("http://127.0.0.1:{port}");
+    let server = start_activity_server_on_available_port(harness.clone()).await;
+    let state = &server.state;
+    let base = server.base.clone();
     let client = reqwest::Client::new();
-    let cookie = login_cookie(&client, &base).await;
+    let cookie = auth::login(&client, &base).await;
     let project_id = create_project_only(&client, &base, &cookie).await;
 
     let parent_resp = client
         .post(format!("{base}/api/projects/{project_id}/threads"))
         .header("cookie", &cookie)
-        .json(&serde_json::json!({"thread_id": persist_primary_thread(&state.store, project_id, ThreadId::new(), "native-parent", fake_native_model()).await}))
+        .json(&serde_json::json!({"thread_id": fixtures::persist_primary_thread(&state.store, project_id, ThreadId::new(), "native-parent", fake_native_model()).await}))
         .send()
         .await
         .unwrap();
@@ -4798,16 +4555,18 @@ async fn collab_agent_spawn_start_imports_subagent_thread() {
 #[tokio::test]
 async fn collab_agent_spawn_uses_tool_input_prompt_when_link_prompt_is_missing() {
     let harness = Arc::new(ActivityHarness::default());
-    let (_tmp, state, port) = start_activity_server_on_available_port(harness.clone()).await;
-    let base = format!("http://127.0.0.1:{port}");
+    let server = start_activity_server_on_available_port(harness.clone()).await;
+    let state = &server.state;
+    let port = server.addr.port();
+    let base = server.base.clone();
     let client = reqwest::Client::new();
-    let cookie = login_cookie(&client, &base).await;
+    let cookie = auth::login(&client, &base).await;
     let project_id = create_project_only(&client, &base, &cookie).await;
 
     let parent_resp = client
         .post(format!("{base}/api/projects/{project_id}/threads"))
         .header("cookie", &cookie)
-        .json(&serde_json::json!({"thread_id": persist_primary_thread(&state.store, project_id, ThreadId::new(), "native-parent", fake_native_model()).await}))
+        .json(&serde_json::json!({"thread_id": fixtures::persist_primary_thread(&state.store, project_id, ThreadId::new(), "native-parent", fake_native_model()).await}))
         .send()
         .await
         .unwrap();
@@ -4860,7 +4619,7 @@ async fn collab_agent_spawn_uses_tool_input_prompt_when_link_prompt_is_missing()
     };
 
     harness.wait_for_subscribers(child.id, 1).await;
-    let mut ws = connect_ws(port, &cookie).await;
+    let mut ws = ws::connect(([127, 0, 0, 1], port).into(), &cookie).await;
     ws.send(tokio_tungstenite::tungstenite::Message::Text(
         serde_json::to_string(&ClientMessage::Subscribe {
             thread_id: child.id,
@@ -4915,16 +4674,17 @@ async fn collab_agent_spawn_uses_tool_input_prompt_when_link_prompt_is_missing()
 #[tokio::test]
 async fn passive_subagent_prompt_updates_when_spawn_metadata_arrives_late() {
     let harness = Arc::new(ActivityHarness::default());
-    let (_tmp, state, port) = start_activity_server_on_available_port(harness.clone()).await;
-    let base = format!("http://127.0.0.1:{port}");
+    let server = start_activity_server_on_available_port(harness.clone()).await;
+    let state = &server.state;
+    let base = server.base.clone();
     let client = reqwest::Client::new();
-    let cookie = login_cookie(&client, &base).await;
+    let cookie = auth::login(&client, &base).await;
     let project_id = create_project_only(&client, &base, &cookie).await;
 
     let parent_resp = client
         .post(format!("{base}/api/projects/{project_id}/threads"))
         .header("cookie", &cookie)
-        .json(&serde_json::json!({"thread_id": persist_primary_thread(&state.store, project_id, ThreadId::new(), "native-parent", fake_native_model()).await}))
+        .json(&serde_json::json!({"thread_id": fixtures::persist_primary_thread(&state.store, project_id, ThreadId::new(), "native-parent", fake_native_model()).await}))
         .send()
         .await
         .unwrap();
@@ -5019,16 +4779,18 @@ async fn passive_subagent_prompt_updates_when_spawn_metadata_arrives_late() {
 #[tokio::test]
 async fn server_resolved_subagent_link_uses_agent_name_prompt_and_turn() {
     let harness = Arc::new(ActivityHarness::default());
-    let (_tmp, state, port) = start_activity_server_on_available_port(harness.clone()).await;
-    let base = format!("http://127.0.0.1:{port}");
+    let server = start_activity_server_on_available_port(harness.clone()).await;
+    let state = &server.state;
+    let port = server.addr.port();
+    let base = server.base.clone();
     let client = reqwest::Client::new();
-    let cookie = login_cookie(&client, &base).await;
+    let cookie = auth::login(&client, &base).await;
     let project_id = create_project_only(&client, &base, &cookie).await;
 
     let parent_resp = client
         .post(format!("{base}/api/projects/{project_id}/threads"))
         .header("cookie", &cookie)
-        .json(&serde_json::json!({"thread_id": persist_primary_thread(&state.store, project_id, ThreadId::new(), "native-parent", fake_native_model()).await}))
+        .json(&serde_json::json!({"thread_id": fixtures::persist_primary_thread(&state.store, project_id, ThreadId::new(), "native-parent", fake_native_model()).await}))
         .send()
         .await
         .unwrap();
@@ -5055,7 +4817,7 @@ async fn server_resolved_subagent_link_uses_agent_name_prompt_and_turn() {
         )
         .await
         .unwrap();
-    let link_item_id = wait_for_live_item_id(&state, parent_id, "collab_spawn_").await;
+    let link_item_id = wait_for_live_item_id(state, parent_id, "collab_spawn_").await;
 
     let import_resp =
         open_subagent_link(&client, &base, &cookie, project_id, parent_id, link_item_id).await;
@@ -5073,7 +4835,7 @@ async fn server_resolved_subagent_link_uses_agent_name_prompt_and_turn() {
     assert_eq!(child.spawned_by_turn_id, Some(spawned_by_turn_id));
 
     harness.wait_for_subscribers(child_id, 1).await;
-    let mut ws = connect_ws(port, &cookie).await;
+    let mut ws = ws::connect(([127, 0, 0, 1], port).into(), &cookie).await;
     ws.send(tokio_tungstenite::tungstenite::Message::Text(
         serde_json::to_string(&ClientMessage::Subscribe {
             thread_id: child_id,
@@ -5152,15 +4914,16 @@ async fn server_resolved_subagent_link_uses_agent_name_prompt_and_turn() {
 #[tokio::test]
 async fn subagent_link_open_rejects_unknown_and_non_link_items() {
     let harness = Arc::new(ActivityHarness::default());
-    let (_tmp, state, port) = start_activity_server_on_available_port(harness.clone()).await;
-    let base = format!("http://127.0.0.1:{port}");
+    let server = start_activity_server_on_available_port(harness.clone()).await;
+    let state = &server.state;
+    let base = server.base.clone();
     let client = reqwest::Client::new();
-    let cookie = login_cookie(&client, &base).await;
+    let cookie = auth::login(&client, &base).await;
     let project_id = create_project_only(&client, &base, &cookie).await;
     let parent: serde_json::Value = client
         .post(format!("{base}/api/projects/{project_id}/threads"))
         .header("cookie", &cookie)
-        .json(&serde_json::json!({"thread_id": persist_primary_thread(&state.store, project_id, ThreadId::new(), "native-parent", fake_native_model()).await}))
+        .json(&serde_json::json!({"thread_id": fixtures::persist_primary_thread(&state.store, project_id, ThreadId::new(), "native-parent", fake_native_model()).await}))
         .send()
         .await
         .unwrap()
@@ -5188,7 +4951,7 @@ async fn subagent_link_open_rejects_unknown_and_non_link_items() {
         )
         .await
         .unwrap();
-    let plain_item_id = wait_for_live_item_id(&state, parent_id, "plain_activity_").await;
+    let plain_item_id = wait_for_live_item_id(state, parent_id, "plain_activity_").await;
 
     let non_link = open_subagent_link(
         &client,
@@ -5218,16 +4981,17 @@ async fn subagent_link_open_rejects_unknown_and_non_link_items() {
 async fn terminal_subagent_link_does_not_synthesize_a_fallback_turn() {
     let harness = Arc::new(ActivityHarness::default());
     harness.hold_native_child_open();
-    let (_tmp, state, port) = start_activity_server_on_available_port(harness.clone()).await;
-    let base = format!("http://127.0.0.1:{port}");
+    let server = start_activity_server_on_available_port(harness.clone()).await;
+    let state = &server.state;
+    let base = server.base.clone();
     let client = reqwest::Client::new();
-    let cookie = login_cookie(&client, &base).await;
+    let cookie = auth::login(&client, &base).await;
     let project_id = create_project_only(&client, &base, &cookie).await;
 
     let parent_resp = client
         .post(format!("{base}/api/projects/{project_id}/threads"))
         .header("cookie", &cookie)
-        .json(&serde_json::json!({"thread_id": persist_primary_thread(&state.store, project_id, ThreadId::new(), "native-parent", fake_native_model()).await}))
+        .json(&serde_json::json!({"thread_id": fixtures::persist_primary_thread(&state.store, project_id, ThreadId::new(), "native-parent", fake_native_model()).await}))
         .send()
         .await
         .unwrap();
@@ -5318,16 +5082,17 @@ async fn terminal_subagent_link_does_not_synthesize_a_fallback_turn() {
 #[tokio::test]
 async fn persisted_or_interrupted_subagent_keeps_one_event_owner() {
     let harness = Arc::new(ActivityHarness::default());
-    let (_tmp, state, port) = start_activity_server_on_available_port(harness.clone()).await;
-    let base = format!("http://127.0.0.1:{port}");
+    let server = start_activity_server_on_available_port(harness.clone()).await;
+    let state = &server.state;
+    let base = server.base.clone();
     let client = reqwest::Client::new();
-    let cookie = login_cookie(&client, &base).await;
+    let cookie = auth::login(&client, &base).await;
     let project_id = create_project_only(&client, &base, &cookie).await;
 
     let parent_resp = client
         .post(format!("{base}/api/projects/{project_id}/threads"))
         .header("cookie", &cookie)
-        .json(&serde_json::json!({"thread_id": persist_primary_thread(&state.store, project_id, ThreadId::new(), "native-parent", fake_native_model()).await}))
+        .json(&serde_json::json!({"thread_id": fixtures::persist_primary_thread(&state.store, project_id, ThreadId::new(), "native-parent", fake_native_model()).await}))
         .send()
         .await
         .unwrap();
@@ -5498,16 +5263,18 @@ async fn persisted_or_interrupted_subagent_keeps_one_event_owner() {
 async fn reverse_subagent_activity_preserves_parent_and_uses_one_forwarder() {
     install_registry_event_capture();
     let harness = Arc::new(ActivityHarness::default());
-    let (_tmp, state, port) = start_activity_server_on_available_port(harness.clone()).await;
-    let base = format!("http://127.0.0.1:{port}");
+    let server = start_activity_server_on_available_port(harness.clone()).await;
+    let state = &server.state;
+    let port = server.addr.port();
+    let base = server.base.clone();
     let client = reqwest::Client::new();
-    let cookie = login_cookie(&client, &base).await;
+    let cookie = auth::login(&client, &base).await;
     let project_id = create_project_only(&client, &base, &cookie).await;
 
     let parent_resp = client
         .post(format!("{base}/api/projects/{project_id}/threads"))
         .header("cookie", &cookie)
-        .json(&serde_json::json!({"thread_id": persist_primary_thread(&state.store, project_id, ThreadId::new(), "native-parent", fake_native_model()).await}))
+        .json(&serde_json::json!({"thread_id": fixtures::persist_primary_thread(&state.store, project_id, ThreadId::new(), "native-parent", fake_native_model()).await}))
         .send()
         .await
         .unwrap();
@@ -5561,7 +5328,7 @@ async fn reverse_subagent_activity_preserves_parent_and_uses_one_forwarder() {
     harness.wait_for_subscribers(child.id, 1).await;
     assert!(state.registry.thread_has_active_turn(parent_id).await);
 
-    let mut child_ws = connect_ws(port, &cookie).await;
+    let mut child_ws = ws::connect(([127, 0, 0, 1], port).into(), &cookie).await;
     child_ws
         .send(tokio_tungstenite::tungstenite::Message::Text(
             serde_json::to_string(&ClientMessage::Subscribe {
@@ -5765,16 +5532,17 @@ async fn reverse_subagent_activity_preserves_parent_and_uses_one_forwarder() {
 #[tokio::test]
 async fn route_rejects_native_child_with_a_different_parent() {
     let harness = Arc::new(ActivityHarness::default());
-    let (_tmp, state, port) = start_activity_server_on_available_port(harness).await;
-    let base = format!("http://127.0.0.1:{port}");
+    let server = start_activity_server_on_available_port(harness).await;
+    let state = &server.state;
+    let base = server.base.clone();
     let client = reqwest::Client::new();
-    let cookie = login_cookie(&client, &base).await;
+    let cookie = auth::login(&client, &base).await;
     let project_id = create_project_only(&client, &base, &cookie).await;
 
     let parent_resp = client
         .post(format!("{base}/api/projects/{project_id}/threads"))
         .header("cookie", &cookie)
-        .json(&serde_json::json!({"thread_id": persist_primary_thread(&state.store, project_id, ThreadId::new(), "native-parent", fake_native_model()).await}))
+        .json(&serde_json::json!({"thread_id": fixtures::persist_primary_thread(&state.store, project_id, ThreadId::new(), "native-parent", fake_native_model()).await}))
         .send()
         .await
         .unwrap();
@@ -5800,13 +5568,13 @@ async fn route_rejects_native_child_with_a_different_parent() {
         )
         .await
         .unwrap();
-    let item_id = wait_for_live_item_id(&state, parent_id, "foreign_subagent_activity_").await;
+    let item_id = wait_for_live_item_id(state, parent_id, "foreign_subagent_activity_").await;
 
     let import = open_subagent_link(&client, &base, &cookie, project_id, parent_id, item_id).await;
     assert_eq!(import.status(), 409);
     let thread_ids = state.store.list_threads(project_id).await.unwrap();
     assert_eq!(thread_ids.len(), 2);
-    let foreign = wait_for_native_thread(&state, project_id, "native-foreign-child").await;
+    let foreign = wait_for_native_thread(state, project_id, "native-foreign-child").await;
     assert_eq!(foreign.kind, giskard_core::ThreadKind::Orphan);
     assert_eq!(foreign.parent_thread_id, None);
 }
@@ -5814,16 +5582,17 @@ async fn route_rejects_native_child_with_a_different_parent() {
 #[tokio::test]
 async fn parent_deletion_cascades_to_all_descendants_leaf_first() {
     let harness = Arc::new(ActivityHarness::default());
-    let (_tmp, state, port) = start_activity_server_on_available_port(harness.clone()).await;
-    let base = format!("http://127.0.0.1:{port}");
+    let server = start_activity_server_on_available_port(harness.clone()).await;
+    let state = &server.state;
+    let base = server.base.clone();
     let client = reqwest::Client::new();
-    let cookie = login_cookie(&client, &base).await;
+    let cookie = auth::login(&client, &base).await;
     let project_id = create_project_only(&client, &base, &cookie).await;
 
     let parent: serde_json::Value = client
         .post(format!("{base}/api/projects/{project_id}/threads"))
         .header("cookie", &cookie)
-        .json(&serde_json::json!({"thread_id": persist_primary_thread(&state.store, project_id, ThreadId::new(), "native-parent", fake_native_model()).await}))
+        .json(&serde_json::json!({"thread_id": fixtures::persist_primary_thread(&state.store, project_id, ThreadId::new(), "native-parent", fake_native_model()).await}))
         .send()
         .await
         .unwrap()
@@ -5851,7 +5620,7 @@ async fn parent_deletion_cascades_to_all_descendants_leaf_first() {
         )
         .await
         .unwrap();
-    let child = wait_for_native_thread(&state, project_id, "native-collab-child").await;
+    let child = wait_for_native_thread(state, project_id, "native-collab-child").await;
     let child_id = child.id;
     harness.wait_for_subscribers(child_id, 1).await;
     let child_handle = state
@@ -5874,7 +5643,7 @@ async fn parent_deletion_cascades_to_all_descendants_leaf_first() {
         )
         .await
         .unwrap();
-    let grandchild = wait_for_native_thread(&state, project_id, "native-grandchild").await;
+    let grandchild = wait_for_native_thread(state, project_id, "native-grandchild").await;
     let grandchild_id = grandchild.id;
     harness.complete_turn(child_id, child_turn).await.unwrap();
     harness.complete_turn(parent_id, parent_turn).await.unwrap();
@@ -5937,16 +5706,17 @@ async fn parent_deletion_cascades_to_all_descendants_leaf_first() {
 #[tokio::test]
 async fn parent_deletion_rejects_active_descendant_before_deleting_anything() {
     let harness = Arc::new(ActivityHarness::default());
-    let (_tmp, state, port) = start_activity_server_on_available_port(harness.clone()).await;
-    let base = format!("http://127.0.0.1:{port}");
+    let server = start_activity_server_on_available_port(harness.clone()).await;
+    let state = &server.state;
+    let base = server.base.clone();
     let client = reqwest::Client::new();
-    let cookie = login_cookie(&client, &base).await;
+    let cookie = auth::login(&client, &base).await;
     let project_id = create_project_only(&client, &base, &cookie).await;
 
     let parent: serde_json::Value = client
         .post(format!("{base}/api/projects/{project_id}/threads"))
         .header("cookie", &cookie)
-        .json(&serde_json::json!({"thread_id": persist_primary_thread(&state.store, project_id, ThreadId::new(), "native-parent", fake_native_model()).await}))
+        .json(&serde_json::json!({"thread_id": fixtures::persist_primary_thread(&state.store, project_id, ThreadId::new(), "native-parent", fake_native_model()).await}))
         .send()
         .await
         .unwrap()
@@ -5974,7 +5744,7 @@ async fn parent_deletion_rejects_active_descendant_before_deleting_anything() {
         )
         .await
         .unwrap();
-    let child_file = wait_for_native_thread(&state, project_id, "native-collab-child").await;
+    let child_file = wait_for_native_thread(state, project_id, "native-collab-child").await;
     let child_id = child_file.id;
     harness.wait_for_subscribers(child_id, 1).await;
     harness.complete_turn(parent_id, parent_turn).await.unwrap();
@@ -6028,10 +5798,11 @@ async fn parent_deletion_rejects_active_descendant_before_deleting_anything() {
 
 #[tokio::test]
 async fn starting_thread_generates_title_from_first_prompt() {
-    let (_tmp, state, port) = start_server_with_extra_config_on_available_port("").await;
-    let base = format!("http://127.0.0.1:{port}");
+    let server = start_server_with_extra_config_on_available_port("").await;
+    let state = &server.state;
+    let base = server.base.clone();
     let client = reqwest::Client::new();
-    let cookie = login_cookie(&client, &base).await;
+    let cookie = auth::login(&client, &base).await;
     let project_id = create_project_only(&client, &base, &cookie).await;
 
     let started = client
@@ -6079,11 +5850,12 @@ async fn starting_thread_generates_title_from_first_prompt() {
 
 #[tokio::test]
 async fn thread_delete_removes_native_and_persisted_thread() {
-    let (_tmp, state, port) = start_server_with_extra_config_on_available_port("").await;
-    let base = format!("http://127.0.0.1:{port}");
+    let server = start_server_with_extra_config_on_available_port("").await;
+    let state = &server.state;
+    let base = server.base.clone();
     let client = reqwest::Client::new();
-    let cookie = login_cookie(&client, &base).await;
-    let (project_id, thread_id) = create_project_and_thread(&state, &client, &base, &cookie).await;
+    let cookie = auth::login(&client, &base).await;
+    let (project_id, thread_id) = create_project_and_thread(state, &client, &base, &cookie).await;
     assert_eq!(
         state
             .registry
@@ -6122,17 +5894,16 @@ async fn thread_delete_removes_native_and_persisted_thread() {
 #[tokio::test]
 async fn project_remove_shuts_down_harness_and_removes_giskard_data_only() {
     let harness = Arc::new(CountingOpenHarness::default());
-    let (tmp, state, port) = start_custom_server_with_extra_config_on_available_port(
-        Arc::new(CountingOpenFactory {
-            harness: harness.clone(),
-        }),
+    let server = start_custom_server_with_extra_config_on_available_port(
+        factory::shared(harness.clone()),
         "",
     )
     .await;
-    let base = format!("http://127.0.0.1:{port}");
+    let state = &server.state;
+    let base = server.base.clone();
     let client = reqwest::Client::new();
-    let cookie = login_cookie(&client, &base).await;
-    let source_dir = tmp.path().join("source-project");
+    let cookie = auth::login(&client, &base).await;
+    let source_dir = server.data_dir().join("source-project");
     tokio::fs::create_dir_all(&source_dir).await.unwrap();
 
     let project_resp = client
@@ -6155,7 +5926,7 @@ async fn project_remove_shuts_down_harness_and_removes_giskard_data_only() {
     let thread_resp = client
         .post(format!("{base}/api/projects/{project_id}/threads"))
         .header("cookie", &cookie)
-        .json(&serde_json::json!({"thread_id": persist_primary_thread(&state.store, project_id, ThreadId::new(), "th_remove_project", fake_native_model()).await}))
+        .json(&serde_json::json!({"thread_id": fixtures::persist_primary_thread(&state.store, project_id, ThreadId::new(), "th_remove_project", fake_native_model()).await}))
         .send()
         .await
         .unwrap();
@@ -6214,10 +5985,10 @@ async fn project_remove_shuts_down_harness_and_removes_giskard_data_only() {
 
 #[tokio::test]
 async fn project_remove_returns_not_found_for_missing_project() {
-    let (_tmp, _state, port) = start_server_with_extra_config_on_available_port("").await;
-    let base = format!("http://127.0.0.1:{port}");
+    let server = start_server_with_extra_config_on_available_port("").await;
+    let base = server.base.clone();
     let client = reqwest::Client::new();
-    let cookie = login_cookie(&client, &base).await;
+    let cookie = auth::login(&client, &base).await;
 
     let resp = client
         .delete(format!("{base}/api/projects/{}", ProjectId::new()))
@@ -6230,11 +6001,12 @@ async fn project_remove_returns_not_found_for_missing_project() {
 
 #[tokio::test]
 async fn thread_archive_and_delete_reject_active_turns() {
-    let (_tmp, state, port) = start_server_with_extra_config_on_available_port("").await;
-    let base = format!("http://127.0.0.1:{port}");
+    let server = start_server_with_extra_config_on_available_port("").await;
+    let state = &server.state;
+    let base = server.base.clone();
     let client = reqwest::Client::new();
-    let cookie = login_cookie(&client, &base).await;
-    let (project_id, thread_id) = create_project_and_thread(&state, &client, &base, &cookie).await;
+    let cookie = auth::login(&client, &base).await;
+    let (project_id, thread_id) = create_project_and_thread(state, &client, &base, &cookie).await;
     state
         .registry
         .thread_runtime(thread_id)
@@ -6266,11 +6038,12 @@ async fn thread_archive_and_delete_reject_active_turns() {
 
 #[tokio::test]
 async fn project_remove_rejects_active_turns() {
-    let (_tmp, state, port) = start_server_with_extra_config_on_available_port("").await;
-    let base = format!("http://127.0.0.1:{port}");
+    let server = start_server_with_extra_config_on_available_port("").await;
+    let state = &server.state;
+    let base = server.base.clone();
     let client = reqwest::Client::new();
-    let cookie = login_cookie(&client, &base).await;
-    let (project_id, thread_id) = create_project_and_thread(&state, &client, &base, &cookie).await;
+    let cookie = auth::login(&client, &base).await;
+    let (project_id, thread_id) = create_project_and_thread(state, &client, &base, &cookie).await;
     state
         .registry
         .thread_runtime(thread_id)
@@ -6299,11 +6072,12 @@ async fn project_remove_rejects_active_turns() {
 /// the running-command registry independently of the live buffer (§7 / `reject_thread_mutation_if_live`).
 #[tokio::test]
 async fn thread_archive_and_delete_reject_running_commands() {
-    let (_tmp, state, port) = start_server_with_extra_config_on_available_port("").await;
-    let base = format!("http://127.0.0.1:{port}");
+    let server = start_server_with_extra_config_on_available_port("").await;
+    let state = &server.state;
+    let base = server.base.clone();
     let client = reqwest::Client::new();
-    let cookie = login_cookie(&client, &base).await;
-    let (project_id, thread_id) = create_project_and_thread(&state, &client, &base, &cookie).await;
+    let cookie = auth::login(&client, &base).await;
+    let (project_id, thread_id) = create_project_and_thread(state, &client, &base, &cookie).await;
 
     // Track a running command without starting a turn, so only the running-command branch of the
     // guard can trip (not the live-turn branch).
@@ -6361,11 +6135,12 @@ async fn thread_archive_and_delete_reject_running_commands() {
 
 #[tokio::test]
 async fn project_remove_rejects_running_commands() {
-    let (_tmp, state, port) = start_server_with_extra_config_on_available_port("").await;
-    let base = format!("http://127.0.0.1:{port}");
+    let server = start_server_with_extra_config_on_available_port("").await;
+    let state = &server.state;
+    let base = server.base.clone();
     let client = reqwest::Client::new();
-    let cookie = login_cookie(&client, &base).await;
-    let (project_id, thread_id) = create_project_and_thread(&state, &client, &base, &cookie).await;
+    let cookie = auth::login(&client, &base).await;
+    let (project_id, thread_id) = create_project_and_thread(state, &client, &base, &cookie).await;
 
     let runtime = state.registry.thread_runtime(thread_id).await.unwrap();
     runtime.apply_event_for_test(
@@ -6414,41 +6189,29 @@ async fn project_remove_rejects_running_commands() {
 /// presets. Setting one thread's preset must not disturb the other's.
 #[tokio::test]
 async fn threads_in_a_project_keep_independent_permission_presets() {
-    let (_tmp, state, port) = start_server_with_extra_config_on_available_port("").await;
-    let base = format!("http://127.0.0.1:{port}");
-    let ws_base = format!("ws://127.0.0.1:{port}");
+    let server = start_server_with_extra_config_on_available_port("").await;
+    let state = &server.state;
+    let port = server.addr.port();
+    let base = server.base.clone();
     let client = reqwest::Client::new();
-    let cookie = login_cookie(&client, &base).await;
+    let cookie = auth::login(&client, &base).await;
     let project_id = create_project_only(&client, &base, &cookie).await;
     let thread_a =
-        open_thread_with_resume(&state, &client, &base, &cookie, project_id, "th_policy_a").await;
+        open_thread_with_resume(state, &client, &base, &cookie, project_id, "th_policy_a").await;
     let thread_b =
-        open_thread_with_resume(&state, &client, &base, &cookie, project_id, "th_policy_b").await;
+        open_thread_with_resume(state, &client, &base, &cookie, project_id, "th_policy_b").await;
 
     // New threads default to `ask_first`.
     assert_eq!(
-        load_policy(&state, project_id, thread_a).await,
+        load_policy(state, project_id, thread_a).await,
         PermissionPreset::AskFirst
     );
     assert_eq!(
-        load_policy(&state, project_id, thread_b).await,
+        load_policy(state, project_id, thread_b).await,
         PermissionPreset::AskFirst
     );
 
-    use tokio_tungstenite::tungstenite::http::Request;
-    let ws_request = Request::builder()
-        .uri(format!("{ws_base}/api/ws"))
-        .header("host", format!("127.0.0.1:{port}"))
-        .header("cookie", &cookie)
-        .header("upgrade", "websocket")
-        .header("connection", "upgrade")
-        .header("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ==")
-        .header("sec-websocket-version", "13")
-        .body(())
-        .unwrap();
-    let (mut ws, _) = tokio_tungstenite::connect_async(ws_request)
-        .await
-        .expect("WS connect");
+    let mut ws = ws::connect(([127, 0, 0, 1], port).into(), &cookie).await;
 
     // Give the two threads different presets.
     for (thread_id, policy) in [
@@ -6470,9 +6233,9 @@ async fn threads_in_a_project_keep_independent_permission_presets() {
 
     // Each thread retains its own preset; setting B did not overwrite A (which a project-scoped
     // preset would have done).
-    wait_for_policy(&state, project_id, thread_b, PermissionPreset::AutoApprove).await;
+    wait_for_policy(state, project_id, thread_b, PermissionPreset::AutoApprove).await;
     assert_eq!(
-        load_policy(&state, project_id, thread_a).await,
+        load_policy(state, project_id, thread_a).await,
         PermissionPreset::AskFirst
     );
 }
@@ -6485,7 +6248,7 @@ async fn open_thread_with_resume(
     project_id: ProjectId,
     resume: &str,
 ) -> ThreadId {
-    let thread_id = persist_primary_thread(
+    let thread_id = fixtures::persist_primary_thread(
         &state.store,
         project_id,
         ThreadId::new(),
@@ -6544,46 +6307,11 @@ async fn wait_for_policy(
 
 #[tokio::test]
 async fn subscribe_unknown_thread_returns_structured_error() {
-    let (_tmp, _state, port) = start_server_with_extra_config_on_available_port("").await;
-    let base = format!("http://127.0.0.1:{port}");
-    let ws_base = format!("ws://127.0.0.1:{port}");
+    let server = start_server_with_extra_config_on_available_port("").await;
+    let port = server.addr.port();
+    let cookie = server.cookie.clone();
 
-    let client = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .unwrap();
-
-    let resp = client
-        .post(format!("{base}/api/login"))
-        .json(&serde_json::json!({"password": "testpass"}))
-        .send()
-        .await
-        .unwrap();
-    let cookie = resp
-        .headers()
-        .get("set-cookie")
-        .unwrap()
-        .to_str()
-        .unwrap()
-        .split(';')
-        .next()
-        .unwrap()
-        .to_string();
-
-    use tokio_tungstenite::tungstenite::http::Request;
-    let ws_request = Request::builder()
-        .uri(format!("{ws_base}/api/ws"))
-        .header("host", format!("127.0.0.1:{port}"))
-        .header("cookie", &cookie)
-        .header("upgrade", "websocket")
-        .header("connection", "upgrade")
-        .header("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ==")
-        .header("sec-websocket-version", "13")
-        .body(())
-        .unwrap();
-    let (mut ws, _) = tokio_tungstenite::connect_async(ws_request)
-        .await
-        .expect("WS connect");
+    let mut ws = ws::connect(([127, 0, 0, 1], port).into(), &cookie).await;
 
     let tid = ThreadId::new();
     ws.send(tokio_tungstenite::tungstenite::Message::Text(
@@ -6605,31 +6333,14 @@ async fn subscribe_unknown_thread_returns_structured_error() {
 
 #[tokio::test]
 async fn websocket_accepts_ticket_without_cookie_header() {
-    let (_tmp, _state, port) = start_server_with_extra_config_on_available_port("").await;
-    let base = format!("http://127.0.0.1:{port}");
+    let server = start_server_with_extra_config_on_available_port("").await;
+    let port = server.addr.port();
+    let base = server.base.clone();
     let ws_base = format!("ws://127.0.0.1:{port}");
 
-    let client = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .unwrap();
+    let client = server.client.clone();
 
-    let resp = client
-        .post(format!("{base}/api/login"))
-        .json(&serde_json::json!({"password": "testpass"}))
-        .send()
-        .await
-        .unwrap();
-    let cookie = resp
-        .headers()
-        .get("set-cookie")
-        .unwrap()
-        .to_str()
-        .unwrap()
-        .split(';')
-        .next()
-        .unwrap()
-        .to_string();
+    let cookie = server.cookie.clone();
 
     let ticket_resp: serde_json::Value = client
         .get(format!("{base}/api/ws-ticket"))
@@ -6642,19 +6353,13 @@ async fn websocket_accepts_ticket_without_cookie_header() {
         .unwrap();
     let ticket = ticket_resp["ticket"].as_str().unwrap();
 
-    use tokio_tungstenite::tungstenite::http::Request;
-    let ws_request = Request::builder()
-        .uri(format!("{ws_base}/api/ws?ticket={ticket}"))
-        .header("host", format!("127.0.0.1:{port}"))
-        .header("upgrade", "websocket")
-        .header("connection", "upgrade")
-        .header("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ==")
-        .header("sec-websocket-version", "13")
-        .body(())
-        .unwrap();
-    let (mut ws, _) = tokio_tungstenite::connect_async(ws_request)
+    let stream = tokio::net::TcpStream::connect(("127.0.0.1", port))
         .await
-        .expect("WS connect with ticket");
+        .unwrap();
+    let (mut ws, _) =
+        tokio_tungstenite::client_async(format!("{ws_base}/api/ws?ticket={ticket}"), stream)
+            .await
+            .expect("WS connect with ticket");
 
     ws.send(tokio_tungstenite::tungstenite::Message::Text(
         serde_json::to_string(&ClientMessage::Ping).unwrap().into(),
@@ -6679,31 +6384,14 @@ async fn websocket_accepts_ticket_without_cookie_header() {
 
 #[tokio::test]
 async fn websocket_serializes_harness_error_events() {
-    let (_tmp, state, port) = start_server_with_extra_config_on_available_port("").await;
-    let base = format!("http://127.0.0.1:{port}");
-    let ws_base = format!("ws://127.0.0.1:{port}");
+    let server = start_server_with_extra_config_on_available_port("").await;
+    let state = &server.state;
+    let port = server.addr.port();
+    let base = server.base.clone();
 
-    let client = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .unwrap();
+    let client = server.client.clone();
 
-    let resp = client
-        .post(format!("{base}/api/login"))
-        .json(&serde_json::json!({"password": "testpass"}))
-        .send()
-        .await
-        .unwrap();
-    let cookie = resp
-        .headers()
-        .get("set-cookie")
-        .unwrap()
-        .to_str()
-        .unwrap()
-        .split(';')
-        .next()
-        .unwrap()
-        .to_string();
+    let cookie = server.cookie.clone();
 
     let resp = client
         .post(format!("{base}/api/projects"))
@@ -6724,7 +6412,7 @@ async fn websocket_serializes_harness_error_events() {
     let resp = client
         .post(format!("{base}/api/projects/{project_id}/threads"))
         .header("cookie", &cookie)
-        .json(&serde_json::json!({"thread_id": persist_primary_thread(&state.store, project_id.parse().unwrap(), ThreadId::new(), "th_test", fake_native_model()).await}))
+        .json(&serde_json::json!({"thread_id": fixtures::persist_primary_thread(&state.store, project_id.parse().unwrap(), ThreadId::new(), "th_test", fake_native_model()).await}))
         .send()
         .await
         .unwrap();
@@ -6735,20 +6423,7 @@ async fn websocket_serializes_harness_error_events() {
         .parse()
         .unwrap();
 
-    use tokio_tungstenite::tungstenite::http::Request;
-    let ws_request = Request::builder()
-        .uri(format!("{ws_base}/api/ws"))
-        .header("host", format!("127.0.0.1:{port}"))
-        .header("cookie", &cookie)
-        .header("upgrade", "websocket")
-        .header("connection", "upgrade")
-        .header("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ==")
-        .header("sec-websocket-version", "13")
-        .body(())
-        .unwrap();
-    let (mut ws, _) = tokio_tungstenite::connect_async(ws_request)
-        .await
-        .expect("WS connect");
+    let mut ws = ws::connect(([127, 0, 0, 1], port).into(), &cookie).await;
 
     ws.send(tokio_tungstenite::tungstenite::Message::Text(
         serde_json::to_string(&ClientMessage::Subscribe {
@@ -6813,31 +6488,14 @@ async fn websocket_serializes_harness_error_events() {
 
 #[tokio::test]
 async fn subscribe_reopens_persisted_thread() {
-    let (_tmp, state, port) = start_server_with_extra_config_on_available_port("").await;
-    let base = format!("http://127.0.0.1:{port}");
-    let ws_base = format!("ws://127.0.0.1:{port}");
+    let server = start_server_with_extra_config_on_available_port("").await;
+    let state = &server.state;
+    let port = server.addr.port();
+    let base = server.base.clone();
 
-    let client = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .unwrap();
+    let client = server.client.clone();
 
-    let resp = client
-        .post(format!("{base}/api/login"))
-        .json(&serde_json::json!({"password": "testpass"}))
-        .send()
-        .await
-        .unwrap();
-    let cookie = resp
-        .headers()
-        .get("set-cookie")
-        .unwrap()
-        .to_str()
-        .unwrap()
-        .split(';')
-        .next()
-        .unwrap()
-        .to_string();
+    let cookie = server.cookie.clone();
 
     let model = ModelRef {
         provider: "openai".into(),
@@ -6898,20 +6556,7 @@ async fn subscribe_reopens_persisted_thread() {
         .unwrap();
     assert!(state.registry.loaded_thread_binding(tid).await.is_none());
 
-    use tokio_tungstenite::tungstenite::http::Request;
-    let ws_request = Request::builder()
-        .uri(format!("{ws_base}/api/ws"))
-        .header("host", format!("127.0.0.1:{port}"))
-        .header("cookie", &cookie)
-        .header("upgrade", "websocket")
-        .header("connection", "upgrade")
-        .header("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ==")
-        .header("sec-websocket-version", "13")
-        .body(())
-        .unwrap();
-    let (mut ws, _) = tokio_tungstenite::connect_async(ws_request)
-        .await
-        .expect("WS connect");
+    let mut ws = ws::connect(([127, 0, 0, 1], port).into(), &cookie).await;
 
     ws.send(tokio_tungstenite::tungstenite::Message::Text(
         serde_json::to_string(&ClientMessage::Subscribe {
@@ -6957,14 +6602,12 @@ async fn subscribe_reopens_persisted_thread() {
 
 #[tokio::test]
 async fn persisted_thread_can_be_reopened_before_ws_send() {
-    let (_tmp, state, port) = start_server_with_extra_config_on_available_port("").await;
-    let base = format!("http://127.0.0.1:{port}");
-    let ws_base = format!("ws://127.0.0.1:{port}");
+    let server = start_server_with_extra_config_on_available_port("").await;
+    let state = &server.state;
+    let port = server.addr.port();
+    let base = server.base.clone();
 
-    let client = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .unwrap();
+    let client = server.client.clone();
 
     let resp = client
         .post(format!("{base}/api/login"))
@@ -6973,16 +6616,7 @@ async fn persisted_thread_can_be_reopened_before_ws_send() {
         .await
         .unwrap();
     assert!(resp.status().is_success());
-    let cookie = resp
-        .headers()
-        .get("set-cookie")
-        .unwrap()
-        .to_str()
-        .unwrap()
-        .split(';')
-        .next()
-        .unwrap()
-        .to_string();
+    let cookie = server.cookie.clone();
 
     let model = ModelRef {
         provider: "openai".into(),
@@ -7059,20 +6693,7 @@ async fn persisted_thread_can_be_reopened_before_ws_send() {
         Some(pid)
     );
 
-    use tokio_tungstenite::tungstenite::http::Request;
-    let ws_request = Request::builder()
-        .uri(format!("{ws_base}/api/ws"))
-        .header("host", format!("127.0.0.1:{port}"))
-        .header("cookie", &cookie)
-        .header("upgrade", "websocket")
-        .header("connection", "upgrade")
-        .header("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ==")
-        .header("sec-websocket-version", "13")
-        .body(())
-        .unwrap();
-    let (mut ws, _) = tokio_tungstenite::connect_async(ws_request)
-        .await
-        .expect("WS connect");
+    let mut ws = ws::connect(([127, 0, 0, 1], port).into(), &cookie).await;
 
     ws.send(tokio_tungstenite::tungstenite::Message::Text(
         serde_json::to_string(&ClientMessage::Subscribe {
@@ -7124,32 +6745,14 @@ async fn replayed_persisted_turn_events_are_not_duplicated() {
     let old_turn = TurnId::new();
     let new_turn = TurnId::new();
     let fixture = duplicate_history_fixture(tid, old_turn, new_turn);
-    let (_tmp, state, port) =
-        start_server_with_fixture_and_extra_config_on_available_port(fixture, "").await;
-    let base = format!("http://127.0.0.1:{port}");
-    let ws_base = format!("ws://127.0.0.1:{port}");
+    let server = start_server_with_fixture_and_extra_config_on_available_port(fixture, "").await;
+    let state = &server.state;
+    let port = server.addr.port();
+    let base = server.base.clone();
 
-    let client = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .unwrap();
+    let client = server.client.clone();
 
-    let resp = client
-        .post(format!("{base}/api/login"))
-        .json(&serde_json::json!({"password": "testpass"}))
-        .send()
-        .await
-        .unwrap();
-    let cookie = resp
-        .headers()
-        .get("set-cookie")
-        .unwrap()
-        .to_str()
-        .unwrap()
-        .split(';')
-        .next()
-        .unwrap()
-        .to_string();
+    let cookie = server.cookie.clone();
 
     let model = ModelRef {
         provider: "openai".into(),
@@ -7255,20 +6858,7 @@ async fn replayed_persisted_turn_events_are_not_duplicated() {
         .unwrap();
     assert_eq!(resp.status(), 200);
 
-    use tokio_tungstenite::tungstenite::http::Request;
-    let ws_request = Request::builder()
-        .uri(format!("{ws_base}/api/ws"))
-        .header("host", format!("127.0.0.1:{port}"))
-        .header("cookie", &cookie)
-        .header("upgrade", "websocket")
-        .header("connection", "upgrade")
-        .header("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ==")
-        .header("sec-websocket-version", "13")
-        .body(())
-        .unwrap();
-    let (mut ws, _) = tokio_tungstenite::connect_async(ws_request)
-        .await
-        .expect("WS connect");
+    let mut ws = ws::connect(([127, 0, 0, 1], port).into(), &cookie).await;
 
     ws.send(tokio_tungstenite::tungstenite::Message::Text(
         serde_json::to_string(&ClientMessage::Subscribe {
@@ -7356,32 +6946,14 @@ async fn replayed_persisted_turns_keep_reused_item_ids_separate() {
     let new_turn = TurnId::new();
     let shared_item_id = ItemId::new();
     let fixture = reused_item_id_across_turns_fixture(tid, old_turn, new_turn, shared_item_id);
-    let (_tmp, state, port) =
-        start_server_with_fixture_and_extra_config_on_available_port(fixture, "").await;
-    let base = format!("http://127.0.0.1:{port}");
-    let ws_base = format!("ws://127.0.0.1:{port}");
+    let server = start_server_with_fixture_and_extra_config_on_available_port(fixture, "").await;
+    let state = &server.state;
+    let port = server.addr.port();
+    let base = server.base.clone();
 
-    let client = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .unwrap();
+    let client = server.client.clone();
 
-    let resp = client
-        .post(format!("{base}/api/login"))
-        .json(&serde_json::json!({"password": "testpass"}))
-        .send()
-        .await
-        .unwrap();
-    let cookie = resp
-        .headers()
-        .get("set-cookie")
-        .unwrap()
-        .to_str()
-        .unwrap()
-        .split(';')
-        .next()
-        .unwrap()
-        .to_string();
+    let cookie = server.cookie.clone();
 
     let model = ModelRef {
         provider: "openai".into(),
@@ -7479,20 +7051,7 @@ async fn replayed_persisted_turns_keep_reused_item_ids_separate() {
         .unwrap();
     assert_eq!(resp.status(), 200);
 
-    use tokio_tungstenite::tungstenite::http::Request;
-    let ws_request = Request::builder()
-        .uri(format!("{ws_base}/api/ws"))
-        .header("host", format!("127.0.0.1:{port}"))
-        .header("cookie", &cookie)
-        .header("upgrade", "websocket")
-        .header("connection", "upgrade")
-        .header("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ==")
-        .header("sec-websocket-version", "13")
-        .body(())
-        .unwrap();
-    let (mut ws, _) = tokio_tungstenite::connect_async(ws_request)
-        .await
-        .expect("WS connect");
+    let mut ws = ws::connect(([127, 0, 0, 1], port).into(), &cookie).await;
 
     ws.send(tokio_tungstenite::tungstenite::Message::Text(
         serde_json::to_string(&ClientMessage::Subscribe {
@@ -7568,32 +7127,14 @@ async fn failed_turn_is_persisted_with_error_message() {
     let tid = ThreadId::new();
     let turn = TurnId::new();
     let fixture = failed_turn_fixture(tid, turn);
-    let (_tmp, state, port) =
-        start_server_with_fixture_and_extra_config_on_available_port(fixture, "").await;
-    let base = format!("http://127.0.0.1:{port}");
-    let ws_base = format!("ws://127.0.0.1:{port}");
+    let server = start_server_with_fixture_and_extra_config_on_available_port(fixture, "").await;
+    let state = &server.state;
+    let port = server.addr.port();
+    let base = server.base.clone();
 
-    let client = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .unwrap();
+    let client = server.client.clone();
 
-    let resp = client
-        .post(format!("{base}/api/login"))
-        .json(&serde_json::json!({"password": "testpass"}))
-        .send()
-        .await
-        .unwrap();
-    let cookie = resp
-        .headers()
-        .get("set-cookie")
-        .unwrap()
-        .to_str()
-        .unwrap()
-        .split(';')
-        .next()
-        .unwrap()
-        .to_string();
+    let cookie = server.cookie.clone();
 
     let resp = client
         .post(format!("{base}/api/projects"))
@@ -7612,7 +7153,7 @@ async fn failed_turn_is_persisted_with_error_message() {
         .to_string();
     let pid: ProjectId = project_id.parse().unwrap();
 
-    persist_primary_thread(&state.store, pid, tid, "th_fail", fake_native_model()).await;
+    fixtures::persist_primary_thread(&state.store, pid, tid, "th_fail", fake_native_model()).await;
     // Open the persisted thread to trigger the replay fixture.
     let resp = client
         .post(format!("{base}/api/projects/{project_id}/threads"))
@@ -7628,20 +7169,7 @@ async fn failed_turn_is_persisted_with_error_message() {
         .to_string();
     assert_eq!(thread_id, tid.to_string());
 
-    use tokio_tungstenite::tungstenite::http::Request;
-    let ws_request = Request::builder()
-        .uri(format!("{ws_base}/api/ws"))
-        .header("host", format!("127.0.0.1:{port}"))
-        .header("cookie", &cookie)
-        .header("upgrade", "websocket")
-        .header("connection", "upgrade")
-        .header("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ==")
-        .header("sec-websocket-version", "13")
-        .body(())
-        .unwrap();
-    let (mut ws, _) = tokio_tungstenite::connect_async(ws_request)
-        .await
-        .expect("WS connect");
+    let mut ws = ws::connect(([127, 0, 0, 1], port).into(), &cookie).await;
 
     ws.send(tokio_tungstenite::tungstenite::Message::Text(
         serde_json::to_string(&ClientMessage::Subscribe {
@@ -7716,31 +7244,13 @@ async fn notice_event_is_delivered_to_client() {
     let tid = ThreadId::new();
     let turn = TurnId::new();
     let fixture = notice_fixture(tid, turn);
-    let (_tmp, state, port) =
-        start_server_with_fixture_and_extra_config_on_available_port(fixture, "").await;
-    let base = format!("http://127.0.0.1:{port}");
-    let ws_base = format!("ws://127.0.0.1:{port}");
+    let server = start_server_with_fixture_and_extra_config_on_available_port(fixture, "").await;
+    let state = &server.state;
+    let port = server.addr.port();
+    let base = server.base.clone();
 
-    let client = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .unwrap();
-    let resp = client
-        .post(format!("{base}/api/login"))
-        .json(&serde_json::json!({"password": "testpass"}))
-        .send()
-        .await
-        .unwrap();
-    let cookie = resp
-        .headers()
-        .get("set-cookie")
-        .unwrap()
-        .to_str()
-        .unwrap()
-        .split(';')
-        .next()
-        .unwrap()
-        .to_string();
+    let client = server.client.clone();
+    let cookie = server.cookie.clone();
 
     let resp = client
         .post(format!("{base}/api/projects"))
@@ -7757,7 +7267,8 @@ async fn notice_event_is_delivered_to_client() {
         .unwrap()
         .to_string();
     let pid: ProjectId = project_id.parse().unwrap();
-    persist_primary_thread(&state.store, pid, tid, "th_notice", fake_native_model()).await;
+    fixtures::persist_primary_thread(&state.store, pid, tid, "th_notice", fake_native_model())
+        .await;
 
     let resp = client
         .post(format!("{base}/api/projects/{project_id}/threads"))
@@ -7768,20 +7279,7 @@ async fn notice_event_is_delivered_to_client() {
         .unwrap();
     assert_eq!(resp.status(), 200);
 
-    use tokio_tungstenite::tungstenite::http::Request;
-    let ws_request = Request::builder()
-        .uri(format!("{ws_base}/api/ws"))
-        .header("host", format!("127.0.0.1:{port}"))
-        .header("cookie", &cookie)
-        .header("upgrade", "websocket")
-        .header("connection", "upgrade")
-        .header("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ==")
-        .header("sec-websocket-version", "13")
-        .body(())
-        .unwrap();
-    let (mut ws, _) = tokio_tungstenite::connect_async(ws_request)
-        .await
-        .expect("WS connect");
+    let mut ws = ws::connect(([127, 0, 0, 1], port).into(), &cookie).await;
 
     ws.send(tokio_tungstenite::tungstenite::Message::Text(
         serde_json::to_string(&ClientMessage::Subscribe {
@@ -7844,30 +7342,13 @@ async fn open_thread_normalizes_stale_provider_from_configured_model() {
   context_window = 262144
   supports_reasoning_effort = true
 "#;
-    let (_tmp, state, port) = start_server_with_extra_config_on_available_port(extra_config).await;
-    let base = format!("http://127.0.0.1:{port}");
+    let server = start_server_with_extra_config_on_available_port(extra_config).await;
+    let state = &server.state;
+    let base = server.base.clone();
 
-    let client = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .unwrap();
+    let client = server.client.clone();
 
-    let resp = client
-        .post(format!("{base}/api/login"))
-        .json(&serde_json::json!({"password": "testpass"}))
-        .send()
-        .await
-        .unwrap();
-    let cookie = resp
-        .headers()
-        .get("set-cookie")
-        .unwrap()
-        .to_str()
-        .unwrap()
-        .split(';')
-        .next()
-        .unwrap()
-        .to_string();
+    let cookie = server.cookie.clone();
 
     let resp = client
         .post(format!("{base}/api/projects"))
@@ -7970,19 +7451,15 @@ async fn open_thread_normalization_reuses_live_handle() {
   supports_reasoning_effort = true
 "#;
     let harness = Arc::new(CountingOpenHarness::default());
-    let (_tmp, state, port) = start_custom_server_with_extra_config_on_available_port(
-        Arc::new(CountingOpenFactory {
-            harness: harness.clone(),
-        }),
+    let server = start_custom_server_with_extra_config_on_available_port(
+        factory::shared(harness.clone()),
         extra_config,
     )
     .await;
-    let base = format!("http://127.0.0.1:{port}");
-    let client = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .unwrap();
-    let cookie = login_cookie(&client, &base).await;
+    let state = &server.state;
+    let base = server.base.clone();
+    let client = server.client.clone();
+    let cookie = auth::login(&client, &base).await;
 
     let stale_model = ModelRef {
         provider: "openai".into(),
@@ -8068,13 +7545,12 @@ async fn open_thread_normalization_reuses_live_handle() {
 #[tokio::test]
 async fn concurrent_cold_opens_install_one_native_owner() {
     let harness = Arc::new(CountingOpenHarness::default());
-    let (_tmp, state, _port) = start_custom_server_with_extra_config_on_available_port(
-        Arc::new(CountingOpenFactory {
-            harness: harness.clone(),
-        }),
+    let server = start_custom_server_with_extra_config_on_available_port(
+        factory::shared(harness.clone()),
         "",
     )
     .await;
+    let state = &server.state;
     let project_id = ProjectId::new();
     state
         .store
@@ -8112,13 +7588,12 @@ async fn concurrent_cold_opens_install_one_native_owner() {
 #[tokio::test]
 async fn concurrent_subagent_cold_opens_install_one_native_owner() {
     let harness = Arc::new(CountingOpenHarness::default());
-    let (_tmp, state, _port) = start_custom_server_with_extra_config_on_available_port(
-        Arc::new(CountingOpenFactory {
-            harness: harness.clone(),
-        }),
+    let server = start_custom_server_with_extra_config_on_available_port(
+        factory::shared(harness.clone()),
         "",
     )
     .await;
+    let state = &server.state;
     let project_id = ProjectId::new();
     state
         .store
@@ -8185,19 +7660,14 @@ async fn concurrent_subagent_cold_opens_install_one_native_owner() {
 #[tokio::test]
 async fn removed_resume_field_is_rejected_before_harness_io() {
     let harness = Arc::new(CountingOpenHarness::default());
-    let (_tmp, _state, port) = start_custom_server_with_extra_config_on_available_port(
-        Arc::new(CountingOpenFactory {
-            harness: harness.clone(),
-        }),
+    let server = start_custom_server_with_extra_config_on_available_port(
+        factory::shared(harness.clone()),
         "",
     )
     .await;
-    let base = format!("http://127.0.0.1:{port}");
-    let client = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .unwrap();
-    let cookie = login_cookie(&client, &base).await;
+    let base = server.base.clone();
+    let client = server.client.clone();
+    let cookie = auth::login(&client, &base).await;
     let pid = create_project_only(&client, &base, &cookie).await;
 
     let resp = client
@@ -8234,19 +7704,15 @@ async fn start_thread_with_initial_message_uses_selected_provider_and_starts_tur
   supports_reasoning_effort = false
 "#;
     let harness = Arc::new(CountingOpenHarness::default());
-    let (_tmp, state, port) = start_custom_server_with_extra_config_on_available_port(
-        Arc::new(CountingOpenFactory {
-            harness: harness.clone(),
-        }),
+    let server = start_custom_server_with_extra_config_on_available_port(
+        factory::shared(harness.clone()),
         extra_config,
     )
     .await;
-    let base = format!("http://127.0.0.1:{port}");
-    let client = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .unwrap();
-    let cookie = login_cookie(&client, &base).await;
+    let state = &server.state;
+    let base = server.base.clone();
+    let client = server.client.clone();
+    let cookie = auth::login(&client, &base).await;
     let pid = create_project_only(&client, &base, &cookie).await;
 
     let proxy_model = ModelRef {
@@ -8306,19 +7772,15 @@ async fn start_thread_turn_rejection_cleans_up_new_thread() {
             "turns are not supported by this harness".into(),
         ))
         .await;
-    let (_tmp, state, port) = start_custom_server_with_extra_config_on_available_port(
-        Arc::new(CountingOpenFactory {
-            harness: harness.clone(),
-        }),
+    let server = start_custom_server_with_extra_config_on_available_port(
+        factory::shared(harness.clone()),
         "",
     )
     .await;
-    let base = format!("http://127.0.0.1:{port}");
-    let client = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .unwrap();
-    let cookie = login_cookie(&client, &base).await;
+    let state = &server.state;
+    let base = server.base.clone();
+    let client = server.client.clone();
+    let cookie = auth::login(&client, &base).await;
     let pid = create_project_only(&client, &base, &cookie).await;
 
     let resp = client
@@ -8363,20 +7825,17 @@ async fn select_model_rejects_provider_change_on_non_empty_thread() {
   supports_reasoning_effort = false
 "#;
     let harness = Arc::new(CountingOpenHarness::default());
-    let (_tmp, state, port) = start_custom_server_with_extra_config_on_available_port(
-        Arc::new(CountingOpenFactory {
-            harness: harness.clone(),
-        }),
+    let server = start_custom_server_with_extra_config_on_available_port(
+        factory::shared(harness.clone()),
         extra_config,
     )
     .await;
-    let base = format!("http://127.0.0.1:{port}");
-    let client = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .unwrap();
-    let cookie = login_cookie(&client, &base).await;
-    let (pid, tid) = create_project_and_thread(&state, &client, &base, &cookie).await;
+    let state = &server.state;
+    let port = server.addr.port();
+    let base = server.base.clone();
+    let client = server.client.clone();
+    let cookie = auth::login(&client, &base).await;
+    let (pid, tid) = create_project_and_thread(state, &client, &base, &cookie).await;
     let now = chrono::Utc::now();
     let openai_model = ModelRef {
         provider: "openai".into(),
@@ -8407,7 +7866,7 @@ async fn select_model_rejects_provider_change_on_non_empty_thread() {
         .await
         .unwrap();
 
-    let mut ws = connect_ws(port, &cookie).await;
+    let mut ws = ws::connect(([127, 0, 0, 1], port).into(), &cookie).await;
     let proxy_model = ModelRef {
         provider: "proxy".into(),
         model: "glm-5.2-workers-ai".into(),
@@ -8461,20 +7920,17 @@ async fn send_input_rejects_persisted_provider_mismatch_on_non_empty_thread() {
   supports_reasoning_effort = false
 "#;
     let harness = Arc::new(CountingOpenHarness::default());
-    let (_tmp, state, port) = start_custom_server_with_extra_config_on_available_port(
-        Arc::new(CountingOpenFactory {
-            harness: harness.clone(),
-        }),
+    let server = start_custom_server_with_extra_config_on_available_port(
+        factory::shared(harness.clone()),
         extra_config,
     )
     .await;
-    let base = format!("http://127.0.0.1:{port}");
-    let client = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .unwrap();
-    let cookie = login_cookie(&client, &base).await;
-    let (pid, tid) = create_project_and_thread(&state, &client, &base, &cookie).await;
+    let state = &server.state;
+    let port = server.addr.port();
+    let base = server.base.clone();
+    let client = server.client.clone();
+    let cookie = auth::login(&client, &base).await;
+    let (pid, tid) = create_project_and_thread(state, &client, &base, &cookie).await;
     let now = chrono::Utc::now();
     let openai_model = ModelRef {
         provider: "openai".into(),
@@ -8518,7 +7974,7 @@ async fn send_input_rejects_persisted_provider_mismatch_on_non_empty_thread() {
         .into_current()
         .unwrap();
 
-    let mut ws = connect_ws(port, &cookie).await;
+    let mut ws = ws::connect(([127, 0, 0, 1], port).into(), &cookie).await;
     ws.send(tokio_tungstenite::tungstenite::Message::Text(
         serde_json::to_string(&ClientMessage::SendInput {
             thread_id: tid,
@@ -8544,14 +8000,12 @@ async fn send_input_rejects_persisted_provider_mismatch_on_non_empty_thread() {
 
 #[tokio::test]
 async fn login_project_thread_message() {
-    let (_tmp, state, port) = start_server_with_extra_config_on_available_port("").await;
-    let base = format!("http://127.0.0.1:{port}");
-    let ws_base = format!("ws://127.0.0.1:{port}");
+    let server = start_server_with_extra_config_on_available_port("").await;
+    let state = &server.state;
+    let port = server.addr.port();
+    let base = server.base.clone();
 
-    let client = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .unwrap();
+    let client = server.client.clone();
 
     // 1. Login
     let resp = client
@@ -8563,16 +8017,7 @@ async fn login_project_thread_message() {
     assert!(resp.status().is_success());
 
     // Extract session cookie before consuming the body
-    let cookie_header = resp
-        .headers()
-        .get("set-cookie")
-        .unwrap()
-        .to_str()
-        .unwrap()
-        .split(';')
-        .next()
-        .unwrap()
-        .to_string();
+    let cookie_header = server.cookie.clone();
     let cookie_val = cookie_header;
 
     let body: serde_json::Value = resp.json().await.unwrap();
@@ -8605,7 +8050,7 @@ async fn login_project_thread_message() {
     assert_eq!(list["projects"].as_array().unwrap().len(), 1);
 
     let pid: ProjectId = project_id.parse().unwrap();
-    let seeded_thread = persist_primary_thread(
+    let seeded_thread = fixtures::persist_primary_thread(
         &state.store,
         pid,
         ThreadId::new(),
@@ -8626,20 +8071,7 @@ async fn login_project_thread_message() {
     let thread_id = thread_resp["thread_id"].as_str().unwrap().to_string();
 
     // 5. WebSocket: subscribe + send input + receive events
-    use tokio_tungstenite::tungstenite::http::Request;
-    let ws_request = Request::builder()
-        .uri(format!("{ws_base}/api/ws"))
-        .header("host", format!("127.0.0.1:{port}"))
-        .header("cookie", &cookie_val)
-        .header("upgrade", "websocket")
-        .header("connection", "upgrade")
-        .header("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ==")
-        .header("sec-websocket-version", "13")
-        .body(())
-        .unwrap();
-    let (mut ws, _) = tokio_tungstenite::connect_async(ws_request)
-        .await
-        .expect("WS connect");
+    let mut ws = ws::connect(([127, 0, 0, 1], port).into(), &cookie_val).await;
 
     // Subscribe
     let subscribe = serde_json::to_string(&ClientMessage::Subscribe {
@@ -8722,8 +8154,8 @@ async fn login_project_thread_message() {
 
 #[tokio::test]
 async fn auth_rejected_without_cookie() {
-    let (_tmp, _state, port) = start_server_with_extra_config_on_available_port("").await;
-    let base = format!("http://127.0.0.1:{port}");
+    let server = start_server_with_extra_config_on_available_port("").await;
+    let base = server.base.clone();
 
     let client = reqwest::Client::new();
 
@@ -8737,8 +8169,8 @@ async fn auth_rejected_without_cookie() {
 
 #[tokio::test]
 async fn login_rejected_wrong_password() {
-    let (_tmp, _state, port) = start_server_with_extra_config_on_available_port("").await;
-    let base = format!("http://127.0.0.1:{port}");
+    let server = start_server_with_extra_config_on_available_port("").await;
+    let base = server.base.clone();
 
     let client = reqwest::Client::new();
     let resp = client
@@ -8756,30 +8188,12 @@ async fn login_rejected_wrong_password() {
 /// rejects path-segment escapes (`..`, separators).
 #[tokio::test]
 async fn browse_mkdir_creates_directory_and_rejects_escapes() {
-    let (_tmp, _state, port) = start_server_with_extra_config_on_available_port("").await;
-    let base = format!("http://127.0.0.1:{port}");
+    let server = start_server_with_extra_config_on_available_port("").await;
+    let base = server.base.clone();
 
-    let client = reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .unwrap();
+    let client = server.client.clone();
 
-    let resp = client
-        .post(format!("{base}/api/login"))
-        .json(&serde_json::json!({"password": "testpass"}))
-        .send()
-        .await
-        .unwrap();
-    let cookie = resp
-        .headers()
-        .get("set-cookie")
-        .unwrap()
-        .to_str()
-        .unwrap()
-        .split(';')
-        .next()
-        .unwrap()
-        .to_string();
+    let cookie = server.cookie.clone();
 
     let parent = tempfile::TempDir::new().unwrap();
     let parent_path = parent.path().to_string_lossy().to_string();

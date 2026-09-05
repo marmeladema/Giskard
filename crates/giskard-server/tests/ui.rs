@@ -1,36 +1,19 @@
 //! Smoke test: the desktop UI page is served at `/`, is public, and is self-contained (§13).
 
-use std::sync::Arc;
+use giskard_core::HarnessError;
+use giskard_testenv::{TestServer, factory};
 
-use giskard_persist::store::ProjectConfig;
-use giskard_server::{AppState, HarnessFactory, build_app};
-
-struct NoFactory;
-#[async_trait::async_trait]
-impl HarnessFactory for NoFactory {
-    async fn create(
-        &self,
-        _c: &ProjectConfig,
-        _bootstrap: giskard_harness::HarnessBootstrap,
-    ) -> Result<Arc<dyn giskard_harness::AgentHarness>, giskard_core::HarnessError> {
-        Err(giskard_core::HarnessError::Spawn("unused".into()))
-    }
-}
-
-async fn start_ui_server() -> (tempfile::TempDir, u16) {
-    let tmp = tempfile::TempDir::new().unwrap();
-    let store = Arc::new(giskard_persist::PersistStore::new(tmp.path().to_path_buf()));
-    let state = AppState::new(store, Arc::new(NoFactory), (0..32u8).collect());
-    let app = build_app(state);
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let port = listener.local_addr().unwrap().port();
-    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-    (tmp, port)
+async fn start_ui_server() -> TestServer {
+    TestServer::builder(factory::failing(HarnessError::Spawn("unused".into())))
+        .unauthenticated()
+        .start()
+        .await
 }
 
 #[tokio::test]
 async fn index_page_is_served_and_public() {
-    let (_tmp, port) = start_ui_server().await;
+    let server = start_ui_server().await;
+    let port = server.addr.port();
 
     // No cookie: the page and its same-origin assets must load without authentication. The UI's
     // script/stylesheet are separate assets (CSP: `script-src 'self'`) served under content-hashed
@@ -1841,7 +1824,8 @@ fn browser_has_no_model_list_outside_a_project() {
 
 #[tokio::test]
 async fn version_meta_and_immutable_asset_caching() {
-    let (_tmp, port) = start_ui_server().await;
+    let server = start_ui_server().await;
+    let port = server.addr.port();
 
     // The index is served no-cache so it always revalidates and points at the current asset URLs.
     let index_resp = reqwest::get(format!("http://127.0.0.1:{port}/"))
@@ -3158,7 +3142,8 @@ fn browser_uses_service_worker_for_android_notifications() {
 
 #[tokio::test]
 async fn service_worker_is_served_from_root_no_cache() {
-    let (_tmp, port) = start_ui_server().await;
+    let server = start_ui_server().await;
+    let port = server.addr.port();
 
     // The worker must be reachable unauthenticated, at a stable root path, served no-cache and with
     // a JS content type — otherwise the browser refuses to register it.
