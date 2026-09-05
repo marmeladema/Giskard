@@ -1,28 +1,28 @@
-# S4 — A `giskard-testenv` crate for the server integration tests
+# S4a — A `giskard-testenv` crate for the server integration tests
 
 Implementation plan for step 4 of [`design-straightening-review.md`](design-straightening-review.md)
-(finding C6). Written against `main` at `36c42e8` (S3 merged); every file and line reference below
-was checked against that tree. Re-check them if the branch has moved.
+(finding C6). Written against `main` at `020a2ad` (S3b merged); every file and line reference
+below was checked against that tree. Re-check them if the branch has moved.
 
-Prerequisite: [`s3b-driver-event-sink.md`](s3b-driver-event-sink.md) lands first. It gives
-`AppState::new_with_config` a `driver_events: Arc<dyn DriverEventSink>` parameter, which
-`TestServerBuilder` threads through and which the crate's `driver` module uses.
+Builds on [`s3b-driver-event-sink.md`](s3b-driver-event-sink.md), landed in `020a2ad`: `AppState::new_with_config`
+takes a `driver_events: Arc<dyn DriverEventSink>` parameter (`src/app.rs:81-87`), which
+`TestServerBuilder` threads through and which the crate's `driver` module uses. S4b follows S4a.
 
 ## Goal
 
 Replace the scaffolding that every server integration test binary rebuilds for itself with one
 crate, `giskard-testenv`: password hashing, the config baseline, spawning the app on an ephemeral
 port, logging in, project and thread setup, the WebSocket handshake, and the replay fixtures. After
-S4 a new integration test starts with `TestServer::spawn(factory)` and gets an authenticated
+S4a a new integration test starts with `TestServer::spawn(factory)` and gets an authenticated
 client, a cookie, and a WebSocket in three calls. No test's assertions change; only how each test
 reaches the server.
 
 ## Scope
 
-S4 is the crate plus the migration of the *scaffolding* in all 21 test files. The fourteen
+S4a is the crate plus the migration of the *scaffolding* in all 21 test files. The fourteen
 hand-written `impl AgentHarness` fakes stay where they are, unchanged, and each is handed to the
 crate through a factory constructor. Unifying the fakes into one configurable `FakeHarness` is
-**S4b**, a separate plan written after S4 lands, for two reasons that the survey behind this plan
+**S4b**, a separate plan written after S4a lands, for two reasons that the survey behind this plan
 made concrete:
 
 - The fakes are not fourteen copies of one thing. Twelve of the fourteen share the same
@@ -31,7 +31,7 @@ made concrete:
   enum in `interrupt.rs`, four response-behaviour knobs in `server_requests.rs`, a provider
   rewrite in `provider_switch.rs`). Replacing them is behaviour design, not a move, and the tests
   they drive are the M0–M8 safety net.
-- What S4 removes is what is actually duplicated: 18 copies of the password hash, 35 app spawns,
+- What S4a removes is what is actually duplicated: 18 copies of the password hash, 35 app spawns,
   28 hand-rolled WebSocket handshakes, 36 inline cookie extractions, 28 `HarnessFactory` impls.
   The fakes' own boilerplate (their `subscribe` and `open_thread` bodies) is a few hundred lines
   and is better attacked once a shared fake exists to absorb it.
@@ -56,8 +56,8 @@ made concrete:
 | 21 integration test files, 24 671 lines, 199 `#[tokio::test]` + 27 `#[test]`; plus `tests/common/mod.rs` (17 lines, `fake_native_model`) and `tests/common/thread_fixture.rs` (50 lines, `persist_primary_thread`) | `crates/giskard-server/tests/` |
 | `common/mod.rs:1-6` documents why the shared module stays tiny: it is compiled into each binary that declares `mod common;`, so an item only some binaries use is dead code there, and the workspace denies warnings. A dev-dependency crate has no such constraint | `tests/common/mod.rs` |
 | `mod common;` in 9 files; `#[path = "common/thread_fixture.rs"] mod thread_fixture;` in 11 files (the 9 plus `model_refresh.rs:10`, `turn_controls.rs:4`) | grep |
-| The tests reach `giskard_server` through six symbols: `AppState`, `AppState::new` (35 call sites), `build_app`, `HarnessFactory` (19 files use the verbatim line `use giskard_server::{AppState, HarnessFactory, build_app};`), `auth::{SESSION_COOKIE, TokenPurpose, sign_token}` (`security.rs` only), `models::discover_models` (`model_refresh.rs` only), and the `worktree` module (`worktree.rs`, `worktree_threads.rs`) | grep; `src/lib.rs:27-28`; `src/app.rs:63-69`, `:112` |
-| `HarnessFactory` is a trait object: `async fn create(&self, config: &ProjectConfig, bootstrap: HarnessBootstrap) -> Result<Arc<dyn AgentHarness>, HarnessError>`; `HarnessBootstrap { known_threads: Vec<KnownThreadBinding { harness_thread_id, thread_id }> }` derives `Default` | `src/registry.rs:69-78`; `giskard-harness/src/lib.rs:346-355` |
+| The tests reach `giskard_server` through six symbols: `AppState`, `AppState::new` (35 call sites), `build_app`, `HarnessFactory` (19 files use the verbatim line `use giskard_server::{AppState, HarnessFactory, build_app};`), `auth::{SESSION_COOKIE, TokenPurpose, sign_token}` (`security.rs` only), `models::discover_models` (`model_refresh.rs` only), and the `worktree` module (`worktree.rs`, `worktree_threads.rs`) | grep; `src/lib.rs:27-31`; `src/app.rs:63-69`, `:121` |
+| `HarnessFactory` is a trait object: `async fn create(&self, config: &ProjectConfig, bootstrap: HarnessBootstrap) -> Result<Arc<dyn AgentHarness>, HarnessError>`; `HarnessBootstrap { known_threads: Vec<KnownThreadBinding { harness_thread_id, thread_id }> }` derives `Default` | `src/registry.rs:72-81`; `giskard-harness/src/lib.rs:346-355` |
 | 28 `impl HarnessFactory for` blocks in the tests (`e2e_smoke.rs` has 8, `project_models.rs` and `read_only_thread.rs` 2 each, the other 16 files 1 each). Their bodies fall into four shapes: clone a shared `Arc<Harness>` (8), build a fresh harness per call (12, two of which also seed a native-id table from `bootstrap.known_threads`: `e2e_smoke.rs:219`, `worktree_threads.rs:435`), wrap `ReplayHarness::from_fixture(self.fixture.clone())` (5: `diff_accumulation.rs:29-37`, `history_sync.rs:27-35`, `token_ledgers.rs:27-35`, `e2e_smoke.rs:137-145`, `turn_controls.rs:32-40`), or always fail (5: `code_overlay.rs:26` and `thread_lifecycle.rs:26` with `Spawn("dummy")`, `read_only_thread.rs:117` with `Spawn("unknown provider: cloudflare-litellm")`, `security.rs:17` with `Unsupported("no harness in security tests")`, `ui.rs:10` with `Spawn("unused")`) | read |
 | Password hashing: 12 `fn generate_password_hash` + 6 `fn password_hash`, all 18 byte-identical apart from the name: `Argon2::default().hash_password(password, &SaltString::generate(&mut OsRng))`. Every login sends `"testpass"` except the deliberate failures (`e2e_smoke.rs:8746` `"wrongpass"`, `security.rs:188, :200` `"wrong"`) | grep; `server_requests.rs:264-273` |
 | Config baseline written by every authenticated spawn: `[server] bind = "127.0.0.1:<port or 0>"`, `secure_cookies = false`, `[auth] password_hash = "<hash>"`, `session_days = 30`, then optional extra sections. 8 files interpolate the real port (bind the listener first); 13 write `:0`. `secure_cookies = false` is load-bearing: the cookie is otherwise `Secure` and never returns over plain HTTP. The server reads it through `PersistStore::load_config` from `<data_dir>/config.toml` | `worktree_threads.rs:494-503`; `giskard-persist/src/store.rs:585-590` |
@@ -103,7 +103,7 @@ test harness, so nothing gated by `#[cfg(test)]` in `giskard-server` (the `test_
 public symbols listed in the ground truth plus the two `#[doc(hidden)] pub fn *_for_test` hooks in
 `src/thread_runtime.rs:447-455`, and the crate uses only `AppState::new_with_config`, `build_app`,
 `HarnessFactory`, and the S3b sink types, all of them public. No `cfg(test)` gate in `giskard-server` is removed or
-loosened by S4: S3b made the driver seam an injected dependency precisely so that no feature or
+loosened by S4a: S3b made the driver seam an injected dependency precisely so that no feature or
 gate is needed.
 
 Why a crate and not `tests/common`: the dead-code constraint in `common/mod.rs:1-6`. A crate with
@@ -231,7 +231,7 @@ impl DriverProbe {
 ```
 
 This is the same shape as the server's unit-test probe, carrying the project id because one
-sink serves every project in a registry. S4 ships it; nothing in the 21 files uses it yet. S4b
+sink serves every project in a registry. S4a ships it; nothing in the 21 files uses it yet. S4b
 replaces the store-polling waits (`wait_for_native_thread` in `e2e_smoke.rs:2426`, 5 callers;
 `wait_for_subagent` in `worktree_threads.rs:788`, 4 callers) with it. The bound is 5 s to match
 the integration suite's other waits.
@@ -255,7 +255,7 @@ pub async fn expect_live_snapshot(ws: &mut TestWs) -> LiveTurnSnapshot;      // 
 ```
 
 `recv_until` is the skeleton the ~40 bespoke `wait_for_*` helpers share (`let deadline = …
-from_secs(5)` appears 105 times in the tests). S4 migrates only the duplicated ones
+from_secs(5)` appears 105 times in the tests). S4a migrates only the duplicated ones
 (`wait_for_ws_error` ×3, `wait_for_error` ×1, `wait_for_live_snapshot` ×2); the file-local ones
 stay as they are and may adopt `recv_until` in S4b. One behavioural note: `interrupt.rs:896`
 `unwrap`s a frame that fails to parse, the crate skips it; no test sends an unparsable frame.
