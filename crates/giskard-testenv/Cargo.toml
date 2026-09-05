@@ -1,0 +1,24 @@
+[package]
+name = "giskard-testenv"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+giskard-core = { workspace = true }
+giskard-harness = { workspace = true }
+giskard-harness-replay = { workspace = true }
+giskard-persist = { workspace = true }
+giskard-proto = { workspace = true }
+giskard-server = { workspace = true }
+tokio = { workspace = true }
+async-trait = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+tempfile = { workspace = true }
+axum = { workspace = true }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+argon2 = { workspace = true }
+futures-util = "0.3"
+tokio-tungstenite = "0.29"

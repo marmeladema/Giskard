@@ -1,10 +1,5 @@
 //! Regression coverage for Codex-style server-initiated browser requests.
 
-mod common;
-#[path = "common/thread_fixture.rs"]
-mod thread_fixture;
-
-use std::net::SocketAddr;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -12,7 +7,7 @@ use chrono::Utc;
 use futures_util::{SinkExt, StreamExt};
 use giskard_core::error::HarnessError;
 use giskard_core::event::AgentEvent;
-use giskard_core::ids::{ProjectId, ServerRequestId, ThreadId, TurnId};
+use giskard_core::ids::{ServerRequestId, ThreadId, TurnId};
 use giskard_core::model::ModelDescriptor;
 use giskard_core::server_request::{ServerRequest, ServerRequestResponse};
 use giskard_core::token::TokenUsage;
@@ -21,17 +16,10 @@ use giskard_core::user_input::UserInput;
 use giskard_harness::{
     AgentEventStream, AgentHarness, EventLog, HarnessCapabilities, OpenThreadOptions, ThreadHandle,
 };
-use giskard_persist::store::ProjectConfig;
 use giskard_proto::{ClientMessage, LiveTurnSnapshot, ServerMessage, WireAgentEvent};
-use giskard_server::{AppState, HarnessFactory, build_app};
+use giskard_testenv::{TestServer, TestWs, factory, ws};
 use tokio::sync::Mutex;
 use tokio::time::{Duration, Instant};
-
-use common::fake_native_model;
-use thread_fixture::persist_primary_thread;
-
-type TestWs =
-    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
 struct ServerRequestHarness {
     tx: Arc<EventLog>,
@@ -246,146 +234,39 @@ impl AgentHarness for ServerRequestHarness {
     }
 }
 
-struct ServerRequestFactory {
+struct TestApp {
+    server: TestServer,
     harness: Arc<ServerRequestHarness>,
+    thread_id: ThreadId,
 }
 
-#[async_trait]
-impl HarnessFactory for ServerRequestFactory {
-    async fn create(
-        &self,
-        _config: &ProjectConfig,
-        _bootstrap: giskard_harness::HarnessBootstrap,
-    ) -> Result<Arc<dyn AgentHarness>, HarnessError> {
-        Ok(self.harness.clone())
-    }
-}
-
-fn generate_password_hash(password: &str) -> String {
-    use argon2::password_hash::SaltString;
-    use argon2::{Argon2, PasswordHasher};
-    use rand::rngs::OsRng;
-    let salt = SaltString::generate(&mut OsRng);
-    Argon2::default()
-        .hash_password(password.as_bytes(), &salt)
-        .unwrap()
-        .to_string()
-}
-
-fn ws_text(msg: &ClientMessage) -> tokio_tungstenite::tungstenite::Message {
-    tokio_tungstenite::tungstenite::Message::Text(serde_json::to_string(msg).unwrap().into())
-}
-
-async fn spawn_test_app() -> (
-    tempfile::TempDir,
-    Arc<ServerRequestHarness>,
-    SocketAddr,
-    String,
-    ThreadId,
-) {
-    let tmp = tempfile::TempDir::new().unwrap();
-    let hash = generate_password_hash("testpass");
-    tokio::fs::write(
-        tmp.path().join("config.toml"),
-        format!(
-            "[server]\nbind = \"127.0.0.1:0\"\nsecure_cookies = false\n\n[auth]\npassword_hash = \"{hash}\"\nsession_days = 30\n"
-        ),
-    )
-    .await
-    .unwrap();
-
+async fn spawn_test_app() -> TestApp {
     let harness = Arc::new(ServerRequestHarness::new());
-    let store = Arc::new(giskard_persist::PersistStore::new(tmp.path().to_path_buf()));
-    let state = AppState::new(
-        store,
-        Arc::new(ServerRequestFactory {
-            harness: harness.clone(),
-        }),
-        (0..32u8).collect(),
-    );
-    let app = build_app(state.clone());
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
-        axum::serve(listener, app).await.unwrap();
-    });
-
-    let proj_dir = tempfile::TempDir::new().unwrap();
-    let pid = ProjectId::new();
-    state
-        .store
-        .create_project(pid, "proj", &proj_dir.path().to_string_lossy())
-        .await
-        .unwrap();
-
-    let client = reqwest::Client::new();
-    let cookie = {
-        let resp = client
-            .post(format!("http://{addr}/api/login"))
-            .json(&serde_json::json!({"password": "testpass"}))
-            .send()
-            .await
-            .unwrap();
-        resp.headers()
-            .get("set-cookie")
-            .unwrap()
-            .to_str()
-            .unwrap()
-            .split(';')
-            .next()
-            .unwrap()
-            .to_string()
-    };
-
-    let thread_id = persist_primary_thread(
-        &state.store,
-        pid,
-        ThreadId::new(),
-        "server_request_thread",
-        fake_native_model(),
-    )
-    .await;
-    client
-        .post(format!("http://{addr}/api/projects/{pid}/threads"))
-        .header("cookie", &cookie)
-        .json(&serde_json::json!({ "thread_id": thread_id }))
-        .send()
-        .await
-        .unwrap()
-        .error_for_status()
-        .unwrap();
-
-    (tmp, harness, addr, cookie, thread_id)
-}
-
-async fn connect_ws(addr: SocketAddr, cookie: &str) -> TestWs {
-    let ws_request = tokio_tungstenite::tungstenite::http::Request::builder()
-        .uri(format!("ws://{addr}/api/ws"))
-        .header("host", addr.to_string())
-        .header("cookie", cookie)
-        .header("upgrade", "websocket")
-        .header("connection", "upgrade")
-        .header("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ==")
-        .header("sec-websocket-version", "13")
-        .body(())
-        .unwrap();
-    let (ws, _) = tokio_tungstenite::connect_async(ws_request)
-        .await
-        .expect("WS connect");
-    ws
+    let server = TestServer::spawn(factory::shared(harness.clone())).await;
+    let project = server.create_project("proj").await;
+    let thread_id = server
+        .register_thread(project.id, "server_request_thread")
+        .await;
+    TestApp {
+        server,
+        harness,
+        thread_id,
+    }
 }
 
 #[tokio::test]
 async fn websocket_server_request_response_routes_to_harness() {
-    let (_tmp, harness, addr, cookie, thread_id) = spawn_test_app().await;
-    let mut ws = connect_ws(addr, &cookie).await;
-    ws.send(ws_text(&ClientMessage::Subscribe {
+    let app = spawn_test_app().await;
+    let harness = app.harness.clone();
+    let thread_id = app.thread_id;
+    let mut ws = app.server.ws().await;
+    ws.send(ws::text(&ClientMessage::Subscribe {
         thread_id,
         since: None,
     }))
     .await
     .unwrap();
-    ws.send(ws_text(&ClientMessage::SendInput {
+    ws.send(ws::text(&ClientMessage::SendInput {
         thread_id,
         text: "ask me".into(),
         attachments: Vec::new(),
@@ -394,7 +275,7 @@ async fn websocket_server_request_response_routes_to_harness() {
     .unwrap();
 
     wait_for_server_request(&mut ws).await;
-    ws.send(ws_text(&ClientMessage::ServerRequestResponse {
+    ws.send(ws::text(&ClientMessage::ServerRequestResponse {
         thread_id,
         request_id: "srv_1".into(),
         response: ServerRequestResponse::result(serde_json::json!({
@@ -416,15 +297,17 @@ async fn websocket_server_request_response_routes_to_harness() {
 
 #[tokio::test]
 async fn websocket_server_request_error_response_routes_to_harness() {
-    let (_tmp, harness, addr, cookie, thread_id) = spawn_test_app().await;
-    let mut ws = connect_ws(addr, &cookie).await;
-    ws.send(ws_text(&ClientMessage::Subscribe {
+    let app = spawn_test_app().await;
+    let harness = app.harness.clone();
+    let thread_id = app.thread_id;
+    let mut ws = app.server.ws().await;
+    ws.send(ws::text(&ClientMessage::Subscribe {
         thread_id,
         since: None,
     }))
     .await
     .unwrap();
-    ws.send(ws_text(&ClientMessage::SendInput {
+    ws.send(ws::text(&ClientMessage::SendInput {
         thread_id,
         text: "ask me".into(),
         attachments: Vec::new(),
@@ -433,7 +316,7 @@ async fn websocket_server_request_error_response_routes_to_harness() {
     .unwrap();
 
     wait_for_server_request(&mut ws).await;
-    ws.send(ws_text(&ClientMessage::ServerRequestResponse {
+    ws.send(ws::text(&ClientMessage::ServerRequestResponse {
         thread_id,
         request_id: "srv_1".into(),
         response: ServerRequestResponse::error(-32000, "cancelled"),
@@ -454,15 +337,17 @@ async fn websocket_server_request_error_response_routes_to_harness() {
 
 #[tokio::test]
 async fn websocket_server_request_response_failure_can_be_retried() {
-    let (_tmp, harness, addr, cookie, thread_id) = spawn_test_app().await;
-    let mut ws = connect_ws(addr, &cookie).await;
-    ws.send(ws_text(&ClientMessage::Subscribe {
+    let app = spawn_test_app().await;
+    let harness = app.harness.clone();
+    let thread_id = app.thread_id;
+    let mut ws = app.server.ws().await;
+    ws.send(ws::text(&ClientMessage::Subscribe {
         thread_id,
         since: None,
     }))
     .await
     .unwrap();
-    ws.send(ws_text(&ClientMessage::SendInput {
+    ws.send(ws::text(&ClientMessage::SendInput {
         thread_id,
         text: "ask me".into(),
         attachments: Vec::new(),
@@ -475,7 +360,7 @@ async fn websocket_server_request_response_failure_can_be_retried() {
         .fail_next_response(HarnessError::Protocol("temporary failure".into()))
         .await;
 
-    ws.send(ws_text(&ClientMessage::ServerRequestResponse {
+    ws.send(ws::text(&ClientMessage::ServerRequestResponse {
         thread_id,
         request_id: "srv_1".into(),
         response: ServerRequestResponse::result(serde_json::json!({
@@ -485,7 +370,7 @@ async fn websocket_server_request_response_failure_can_be_retried() {
     .await
     .unwrap();
 
-    let error = wait_for_ws_error(&mut ws).await;
+    let error = ws::expect_error(&mut ws).await;
     assert_eq!(error.code, "harness_protocol_error");
     assert_eq!(error.action.as_deref(), Some("server_request_response"));
     assert!(
@@ -496,7 +381,7 @@ async fn websocket_server_request_response_failure_can_be_retried() {
             .contains("temporary failure")
     );
 
-    ws.send(ws_text(&ClientMessage::ServerRequestResponse {
+    ws.send(ws::text(&ClientMessage::ServerRequestResponse {
         thread_id,
         request_id: "srv_1".into(),
         response: ServerRequestResponse::result(serde_json::json!({
@@ -518,11 +403,13 @@ async fn websocket_server_request_response_failure_can_be_retried() {
 
 #[tokio::test]
 async fn timed_out_server_request_response_republishes_pending_to_peer_tabs() {
-    let (_tmp, harness, addr, cookie, thread_id) = spawn_test_app().await;
-    let mut claimant = connect_ws(addr, &cookie).await;
-    let mut peer = connect_ws(addr, &cookie).await;
+    let app = spawn_test_app().await;
+    let harness = app.harness.clone();
+    let thread_id = app.thread_id;
+    let mut claimant = app.server.ws().await;
+    let mut peer = app.server.ws().await;
     for ws in [&mut claimant, &mut peer] {
-        ws.send(ws_text(&ClientMessage::Subscribe {
+        ws.send(ws::text(&ClientMessage::Subscribe {
             thread_id,
             since: None,
         }))
@@ -530,7 +417,7 @@ async fn timed_out_server_request_response_republishes_pending_to_peer_tabs() {
         .unwrap();
     }
     claimant
-        .send(ws_text(&ClientMessage::SendInput {
+        .send(ws::text(&ClientMessage::SendInput {
             thread_id,
             text: "ask me".into(),
             attachments: Vec::new(),
@@ -543,7 +430,7 @@ async fn timed_out_server_request_response_republishes_pending_to_peer_tabs() {
 
     harness.hang_next_response().await;
     claimant
-        .send(ws_text(&ClientMessage::ServerRequestResponse {
+        .send(ws::text(&ClientMessage::ServerRequestResponse {
             thread_id,
             request_id: "srv_1".into(),
             response: ServerRequestResponse::result(serde_json::json!({ "answers": ["Yes"] })),
@@ -553,7 +440,7 @@ async fn timed_out_server_request_response_republishes_pending_to_peer_tabs() {
 
     let responding = wait_for_request_state(&mut peer, "responding").await;
     assert_eq!(responding.revision, 2);
-    let error = wait_for_ws_error(&mut claimant).await;
+    let error = ws::expect_error(&mut claimant).await;
     assert_eq!(error.code, "harness_timeout");
     let rolled_back = wait_for_request_state(&mut peer, "pending").await;
     assert_eq!(rolled_back.revision, 3);
@@ -561,15 +448,16 @@ async fn timed_out_server_request_response_republishes_pending_to_peer_tabs() {
 
 #[tokio::test]
 async fn websocket_subscribe_replays_pending_server_request_snapshot() {
-    let (_tmp, _harness, addr, cookie, thread_id) = spawn_test_app().await;
-    let mut ws = connect_ws(addr, &cookie).await;
-    ws.send(ws_text(&ClientMessage::Subscribe {
+    let app = spawn_test_app().await;
+    let thread_id = app.thread_id;
+    let mut ws = app.server.ws().await;
+    ws.send(ws::text(&ClientMessage::Subscribe {
         thread_id,
         since: None,
     }))
     .await
     .unwrap();
-    ws.send(ws_text(&ClientMessage::SendInput {
+    ws.send(ws::text(&ClientMessage::SendInput {
         thread_id,
         text: "ask me".into(),
         attachments: Vec::new(),
@@ -579,16 +467,16 @@ async fn websocket_subscribe_replays_pending_server_request_snapshot() {
 
     wait_for_server_request(&mut ws).await;
 
-    let mut reconnect = connect_ws(addr, &cookie).await;
+    let mut reconnect = app.server.ws().await;
     reconnect
-        .send(ws_text(&ClientMessage::Subscribe {
+        .send(ws::text(&ClientMessage::Subscribe {
             thread_id,
             since: None,
         }))
         .await
         .unwrap();
 
-    let snapshot = wait_for_live_snapshot(&mut reconnect).await;
+    let snapshot = ws::expect_live_snapshot(&mut reconnect).await;
     assert_eq!(snapshot.thread_id, thread_id);
     // The outstanding server request is derived from `accumulated` plus
     // `answered_server_requests`, so the still-open one is reported as pending.
@@ -610,17 +498,19 @@ async fn websocket_subscribe_replays_pending_server_request_snapshot() {
 /// stale id to the harness, which errors — the same defect already fixed for approvals.
 #[tokio::test]
 async fn answered_server_request_is_not_pending_after_reconnect() {
-    let (_tmp, harness, addr, cookie, thread_id) = spawn_test_app().await;
+    let app = spawn_test_app().await;
+    let harness = app.harness.clone();
+    let thread_id = app.thread_id;
     harness.suppress_resolution().await;
 
-    let mut ws = connect_ws(addr, &cookie).await;
-    ws.send(ws_text(&ClientMessage::Subscribe {
+    let mut ws = app.server.ws().await;
+    ws.send(ws::text(&ClientMessage::Subscribe {
         thread_id,
         since: None,
     }))
     .await
     .unwrap();
-    ws.send(ws_text(&ClientMessage::SendInput {
+    ws.send(ws::text(&ClientMessage::SendInput {
         thread_id,
         text: "ask me".into(),
         attachments: Vec::new(),
@@ -629,7 +519,7 @@ async fn answered_server_request_is_not_pending_after_reconnect() {
     .unwrap();
     wait_for_server_request(&mut ws).await;
 
-    ws.send(ws_text(&ClientMessage::ServerRequestResponse {
+    ws.send(ws::text(&ClientMessage::ServerRequestResponse {
         thread_id,
         request_id: "srv_1".into(),
         response: ServerRequestResponse::result(serde_json::json!({ "answers": ["main"] })),
@@ -640,16 +530,16 @@ async fn answered_server_request_is_not_pending_after_reconnect() {
     let (answered_id, _) = harness.wait_for_response().await;
     assert_eq!(answered_id, ServerRequestId("srv_1".into()));
 
-    let mut reconnect = connect_ws(addr, &cookie).await;
+    let mut reconnect = app.server.ws().await;
     reconnect
-        .send(ws_text(&ClientMessage::Subscribe {
+        .send(ws::text(&ClientMessage::Subscribe {
             thread_id,
             since: None,
         }))
         .await
         .unwrap();
 
-    let snapshot = wait_for_live_snapshot(&mut reconnect).await;
+    let snapshot = ws::expect_live_snapshot(&mut reconnect).await;
     // The request is still replayed — its own row is what says it was answered, so the card renders
     // resolved instead of re-prompting.
     let rows = server_request_rows(&snapshot);
@@ -678,15 +568,17 @@ async fn answered_server_request_is_not_pending_after_reconnect() {
 
 #[tokio::test]
 async fn server_request_answer_succeeds_when_the_harness_resolves_first() {
-    let (_tmp, harness, addr, cookie, thread_id) = spawn_test_app().await;
-    let mut ws = connect_ws(addr, &cookie).await;
-    ws.send(ws_text(&ClientMessage::Subscribe {
+    let app = spawn_test_app().await;
+    let harness = app.harness.clone();
+    let thread_id = app.thread_id;
+    let mut ws = app.server.ws().await;
+    ws.send(ws::text(&ClientMessage::Subscribe {
         thread_id,
         since: None,
     }))
     .await
     .unwrap();
-    ws.send(ws_text(&ClientMessage::SendInput {
+    ws.send(ws::text(&ClientMessage::SendInput {
         thread_id,
         text: "ask me".into(),
         attachments: Vec::new(),
@@ -696,7 +588,7 @@ async fn server_request_answer_succeeds_when_the_harness_resolves_first() {
     wait_for_server_request(&mut ws).await;
 
     let gate = harness.resolve_before_reply().await;
-    ws.send(ws_text(&ClientMessage::ServerRequestResponse {
+    ws.send(ws::text(&ClientMessage::ServerRequestResponse {
         thread_id,
         request_id: "srv_1".into(),
         response: ServerRequestResponse::result(serde_json::json!({ "answers": ["Yes"] })),
@@ -718,19 +610,21 @@ async fn server_request_answer_succeeds_when_the_harness_resolves_first() {
 
 #[tokio::test]
 async fn harness_failure_after_a_native_resolution_leaves_the_request_resolved() {
-    let (_tmp, harness, addr, cookie, thread_id) = spawn_test_app().await;
-    let mut ws = connect_ws(addr, &cookie).await;
-    let mut peer = connect_ws(addr, &cookie).await;
+    let app = spawn_test_app().await;
+    let harness = app.harness.clone();
+    let thread_id = app.thread_id;
+    let mut ws = app.server.ws().await;
+    let mut peer = app.server.ws().await;
     for socket in [&mut ws, &mut peer] {
         socket
-            .send(ws_text(&ClientMessage::Subscribe {
+            .send(ws::text(&ClientMessage::Subscribe {
                 thread_id,
                 since: None,
             }))
             .await
             .unwrap();
     }
-    ws.send(ws_text(&ClientMessage::SendInput {
+    ws.send(ws::text(&ClientMessage::SendInput {
         thread_id,
         text: "ask me".into(),
         attachments: Vec::new(),
@@ -747,7 +641,7 @@ async fn harness_failure_after_a_native_resolution_leaves_the_request_resolved()
         .fail_next_response(HarnessError::Protocol("late failure".into()))
         .await;
     let gate = harness.resolve_before_reply().await;
-    ws.send(ws_text(&ClientMessage::ServerRequestResponse {
+    ws.send(ws::text(&ClientMessage::ServerRequestResponse {
         thread_id,
         request_id: "srv_1".into(),
         response: ServerRequestResponse::result(serde_json::json!({ "answers": ["Yes"] })),
@@ -763,7 +657,7 @@ async fn harness_failure_after_a_native_resolution_leaves_the_request_resolved()
     wait_for_notice(&mut ws, "resolution-fence").await;
     gate.send(()).unwrap();
 
-    let error = wait_for_ws_error(&mut ws).await;
+    let error = ws::expect_error(&mut ws).await;
     assert!(
         error
             .detail
@@ -774,14 +668,14 @@ async fn harness_failure_after_a_native_resolution_leaves_the_request_resolved()
     let resolved = wait_for_request_state(&mut peer, "resolved").await;
     assert_eq!(resolved.revision, 3);
 
-    ws.send(ws_text(&ClientMessage::ServerRequestResponse {
+    ws.send(ws::text(&ClientMessage::ServerRequestResponse {
         thread_id,
         request_id: "srv_1".into(),
         response: ServerRequestResponse::result(serde_json::json!({ "answers": ["again"] })),
     }))
     .await
     .unwrap();
-    let error = wait_for_ws_error(&mut ws).await;
+    let error = ws::expect_error(&mut ws).await;
     assert!(
         error
             .detail
@@ -793,11 +687,13 @@ async fn harness_failure_after_a_native_resolution_leaves_the_request_resolved()
 
 #[tokio::test]
 async fn timeout_after_a_native_resolution_republishes_resolved_to_peer_tabs() {
-    let (_tmp, harness, addr, cookie, thread_id) = spawn_test_app().await;
-    let mut claimant = connect_ws(addr, &cookie).await;
-    let mut peer = connect_ws(addr, &cookie).await;
+    let app = spawn_test_app().await;
+    let harness = app.harness.clone();
+    let thread_id = app.thread_id;
+    let mut claimant = app.server.ws().await;
+    let mut peer = app.server.ws().await;
     for ws in [&mut claimant, &mut peer] {
-        ws.send(ws_text(&ClientMessage::Subscribe {
+        ws.send(ws::text(&ClientMessage::Subscribe {
             thread_id,
             since: None,
         }))
@@ -805,7 +701,7 @@ async fn timeout_after_a_native_resolution_republishes_resolved_to_peer_tabs() {
         .unwrap();
     }
     claimant
-        .send(ws_text(&ClientMessage::SendInput {
+        .send(ws::text(&ClientMessage::SendInput {
             thread_id,
             text: "ask me".into(),
             attachments: Vec::new(),
@@ -821,7 +717,7 @@ async fn timeout_after_a_native_resolution_republishes_resolved_to_peer_tabs() {
     harness.hang_next_response().await;
     let gate = harness.resolve_before_reply().await;
     claimant
-        .send(ws_text(&ClientMessage::ServerRequestResponse {
+        .send(ws::text(&ClientMessage::ServerRequestResponse {
             thread_id,
             request_id: "srv_1".into(),
             response: ServerRequestResponse::result(serde_json::json!({ "answers": ["Yes"] })),
@@ -837,10 +733,10 @@ async fn timeout_after_a_native_resolution_republishes_resolved_to_peer_tabs() {
     wait_for_notice(&mut peer, "resolution-fence").await;
     gate.send(()).unwrap();
     assert_eq!(
-        wait_for_ws_error(&mut claimant).await.code,
+        ws::expect_error(&mut claimant).await.code,
         "harness_timeout"
     );
-    peer.send(ws_text(&ClientMessage::ServerRequestResponse {
+    peer.send(ws::text(&ClientMessage::ServerRequestResponse {
         thread_id,
         request_id: "srv_1".into(),
         response: ServerRequestResponse::result(serde_json::json!({ "answers": ["again"] })),
@@ -853,15 +749,17 @@ async fn timeout_after_a_native_resolution_republishes_resolved_to_peer_tabs() {
 
 #[tokio::test]
 async fn reconnect_after_a_native_resolution_during_a_claim_does_not_re_prompt() {
-    let (_tmp, harness, addr, cookie, thread_id) = spawn_test_app().await;
-    let mut ws = connect_ws(addr, &cookie).await;
-    ws.send(ws_text(&ClientMessage::Subscribe {
+    let app = spawn_test_app().await;
+    let harness = app.harness.clone();
+    let thread_id = app.thread_id;
+    let mut ws = app.server.ws().await;
+    ws.send(ws::text(&ClientMessage::Subscribe {
         thread_id,
         since: None,
     }))
     .await
     .unwrap();
-    ws.send(ws_text(&ClientMessage::SendInput {
+    ws.send(ws::text(&ClientMessage::SendInput {
         thread_id,
         text: "ask me".into(),
         attachments: Vec::new(),
@@ -871,7 +769,7 @@ async fn reconnect_after_a_native_resolution_during_a_claim_does_not_re_prompt()
     wait_for_server_request(&mut ws).await;
 
     let gate = harness.resolve_before_reply().await;
-    ws.send(ws_text(&ClientMessage::ServerRequestResponse {
+    ws.send(ws::text(&ClientMessage::ServerRequestResponse {
         thread_id,
         request_id: "srv_1".into(),
         response: ServerRequestResponse::result(serde_json::json!({ "answers": ["Yes"] })),
@@ -880,15 +778,15 @@ async fn reconnect_after_a_native_resolution_during_a_claim_does_not_re_prompt()
     .unwrap();
     wait_for_notice(&mut ws, "resolution-fence").await;
 
-    let mut reconnect = connect_ws(addr, &cookie).await;
+    let mut reconnect = app.server.ws().await;
     reconnect
-        .send(ws_text(&ClientMessage::Subscribe {
+        .send(ws::text(&ClientMessage::Subscribe {
             thread_id,
             since: None,
         }))
         .await
         .unwrap();
-    let snapshot = wait_for_live_snapshot(&mut reconnect).await;
+    let snapshot = ws::expect_live_snapshot(&mut reconnect).await;
     let rows = server_request_rows(&snapshot);
     let [(request, resolved)] = &rows[..] else {
         panic!("expected exactly one server request row, got {rows:?}");
@@ -907,15 +805,16 @@ async fn reconnect_after_a_native_resolution_during_a_claim_does_not_re_prompt()
 
 #[tokio::test]
 async fn websocket_unknown_server_request_response_surfaces_error() {
-    let (_tmp, _harness, addr, cookie, thread_id) = spawn_test_app().await;
-    let mut ws = connect_ws(addr, &cookie).await;
-    ws.send(ws_text(&ClientMessage::Subscribe {
+    let app = spawn_test_app().await;
+    let thread_id = app.thread_id;
+    let mut ws = app.server.ws().await;
+    ws.send(ws::text(&ClientMessage::Subscribe {
         thread_id,
         since: None,
     }))
     .await
     .unwrap();
-    ws.send(ws_text(&ClientMessage::ServerRequestResponse {
+    ws.send(ws::text(&ClientMessage::ServerRequestResponse {
         thread_id,
         request_id: "missing".into(),
         response: ServerRequestResponse::error(-32000, "missing"),
@@ -923,7 +822,7 @@ async fn websocket_unknown_server_request_response_surfaces_error() {
     .await
     .unwrap();
 
-    let error = wait_for_ws_error(&mut ws).await;
+    let error = ws::expect_error(&mut ws).await;
     assert_eq!(error.code, "harness_protocol_error");
     assert_eq!(error.action.as_deref(), Some("server_request_response"));
     assert!(error.message.contains("protocol error"));
@@ -963,22 +862,6 @@ async fn wait_for_notice(ws: &mut TestWs, expected_message: &str) {
         }
     }
     panic!("notice {expected_message:?} not observed");
-}
-
-async fn wait_for_ws_error(ws: &mut TestWs) -> giskard_proto::ErrorInfo {
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while Instant::now() < deadline {
-        match tokio::time::timeout(Duration::from_secs(1), ws.next()).await {
-            Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Text(text)))) => {
-                if let Ok(ServerMessage::Error { error }) = serde_json::from_str(&text) {
-                    return error;
-                }
-            }
-            Ok(Some(Ok(_))) => {}
-            _ => {}
-        }
-    }
-    panic!("error message not observed");
 }
 
 async fn wait_for_request_state(
@@ -1113,20 +996,4 @@ fn server_request_rows(snapshot: &LiveTurnSnapshot) -> Vec<(ServerRequest, bool)
             _ => None,
         })
         .collect()
-}
-
-async fn wait_for_live_snapshot(ws: &mut TestWs) -> giskard_proto::LiveTurnSnapshot {
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while Instant::now() < deadline {
-        match tokio::time::timeout(Duration::from_secs(1), ws.next()).await {
-            Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Text(text)))) => {
-                if let Ok(ServerMessage::LiveTurnSnapshot(snapshot)) = serde_json::from_str(&text) {
-                    return snapshot;
-                }
-            }
-            Ok(Some(Ok(_))) => {}
-            _ => {}
-        }
-    }
-    panic!("live turn snapshot not observed");
 }

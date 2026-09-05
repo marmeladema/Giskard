@@ -21,8 +21,8 @@ use giskard_core::user_input::UserInput;
 use giskard_harness::{
     AgentEventStream, AgentHarness, EventLog, HarnessCapabilities, OpenThreadOptions, ThreadHandle,
 };
-use giskard_persist::store::{ProjectConfig, ThreadGitWorkspace};
-use giskard_server::{AppState, HarnessFactory, build_app};
+use giskard_persist::store::ThreadGitWorkspace;
+use giskard_testenv::{TestProject, TestServer, factory, git, ws};
 use tokio::sync::Mutex;
 
 /// Saving a plan writes a file into the workspace and then offers it back as a link. For an
@@ -44,6 +44,7 @@ async fn a_plan_saved_from_an_isolated_thread_lands_in_its_worktree() {
     let started: serde_json::Value = serde_json::from_str(&body).unwrap();
     let thread_id: ThreadId = started["thread_id"].as_str().unwrap().parse().unwrap();
     let worktree = server
+        .server
         .state
         .store
         .load_thread(server.project_id, thread_id)
@@ -55,20 +56,7 @@ async fn a_plan_saved_from_an_isolated_thread_lands_in_its_worktree() {
         .unwrap();
     server.wait_until_idle(thread_id).await;
 
-    let port = server.base.rsplit(':').next().unwrap().to_string();
-    let request = tokio_tungstenite::tungstenite::http::Request::builder()
-        .uri(format!("ws://127.0.0.1:{port}/api/ws"))
-        .header("host", format!("127.0.0.1:{port}"))
-        .header("cookie", server.cookie.clone())
-        .header("upgrade", "websocket")
-        .header("connection", "upgrade")
-        .header("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ==")
-        .header("sec-websocket-version", "13")
-        .body(())
-        .unwrap();
-    let (mut ws, _) = tokio_tungstenite::connect_async(request)
-        .await
-        .expect("connect websocket");
+    let mut ws = server.server.ws().await;
     use futures_util::SinkExt;
     for message in [
         giskard_proto::ClientMessage::Subscribe {
@@ -103,7 +91,7 @@ async fn a_plan_saved_from_an_isolated_thread_lands_in_its_worktree() {
         "the worktree's copy must hold the plan"
     );
     assert!(
-        !server._project.path().join("docs/plan.md").exists(),
+        !server.project.dir.path().join("docs/plan.md").exists(),
         "nothing may be written into the project's checkout"
     );
 }
@@ -119,6 +107,7 @@ async fn file_reads_come_from_the_threads_own_worktree() {
     let started: serde_json::Value = serde_json::from_str(&body).unwrap();
     let thread_id: ThreadId = started["thread_id"].as_str().unwrap().parse().unwrap();
     let worktree = server
+        .server
         .state
         .store
         .load_thread(server.project_id, thread_id)
@@ -135,7 +124,11 @@ async fn file_reads_come_from_the_threads_own_worktree() {
         "fn agent() {}\n",
     )
     .unwrap();
-    std::fs::write(server._project.path().join("shared.rs"), "fn user() {}\n").unwrap();
+    std::fs::write(
+        server.project.dir.path().join("shared.rs"),
+        "fn user() {}\n",
+    )
+    .unwrap();
     // And a file that exists only in the worktree, which must be readable rather than a 404.
     std::fs::write(
         Path::new(&worktree.path).join("agent-only.rs"),
@@ -160,12 +153,13 @@ async fn file_reads_come_from_the_threads_own_worktree() {
     // A path that exists only in the worktree is also linkifiable, which it cannot be when
     // existence is checked against the project.
     let links: serde_json::Value = server
+        .server
         .client
         .post(format!(
             "{}/api/projects/{}/threads/{thread_id}/linkify",
-            server.base, server.project_id
+            server.server.base, server.project_id
         ))
-        .header("cookie", &server.cookie)
+        .header("cookie", &server.server.cookie)
         .json(&serde_json::json!({ "text": "see agent-only.rs for the fix" }))
         .send()
         .await
@@ -214,6 +208,7 @@ async fn an_unknown_git_strategy_is_refused_and_an_absent_one_is_an_ordinary_thr
     let thread_id: ThreadId = started["thread_id"].as_str().unwrap().parse().unwrap();
     assert!(
         server
+            .server
             .state
             .store
             .load_thread(server.project_id, thread_id)
@@ -429,141 +424,39 @@ impl AgentHarness for RecordingHarness {
     }
 }
 
-struct RecordingFactory(Arc<RecordingHarness>);
-
-#[async_trait::async_trait]
-impl HarnessFactory for RecordingFactory {
-    async fn create(
-        &self,
-        _config: &ProjectConfig,
-        bootstrap: giskard_harness::HarnessBootstrap,
-    ) -> Result<Arc<dyn AgentHarness>, HarnessError> {
-        let mut routes = self.0.native_routes.lock().unwrap();
+fn recording_factory(harness: Arc<RecordingHarness>) -> Arc<dyn giskard_server::HarnessFactory> {
+    factory::from_fn(move |_, bootstrap| {
+        let mut routes = harness.native_routes.lock().unwrap();
         for binding in bootstrap.known_threads {
             routes.insert(binding.harness_thread_id, binding.thread_id);
         }
         drop(routes);
-        Ok(self.0.clone())
-    }
-}
-
-fn generate_password_hash(password: &str) -> String {
-    use argon2::password_hash::SaltString;
-    use argon2::{Argon2, PasswordHasher};
-    use rand::rngs::OsRng;
-    let salt = SaltString::generate(&mut OsRng);
-    Argon2::default()
-        .hash_password(password.as_bytes(), &salt)
-        .unwrap()
-        .to_string()
-}
-
-fn git(dir: &Path, args: &[&str]) {
-    let output = Command::new("git")
-        .current_dir(dir)
-        .args(args)
-        .env("LC_ALL", "C")
-        .env("GIT_AUTHOR_NAME", "Test")
-        .env("GIT_AUTHOR_EMAIL", "test@example.invalid")
-        .env("GIT_COMMITTER_NAME", "Test")
-        .env("GIT_COMMITTER_EMAIL", "test@example.invalid")
-        .output()
-        .expect("run git");
-    assert!(
-        output.status.success(),
-        "git {args:?} failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+        Ok(harness.clone())
+    })
 }
 
 struct Harnessed {
-    _data: tempfile::TempDir,
-    _project: tempfile::TempDir,
-    state: AppState,
+    server: TestServer,
+    project: TestProject,
     harness: Arc<RecordingHarness>,
     project_id: ProjectId,
-    base: String,
-    cookie: String,
-    client: reqwest::Client,
 }
 
 /// A server whose single project is a real Git repository with one commit.
 async fn start(git_repo: bool) -> Harnessed {
-    let data = tempfile::TempDir::new().unwrap();
-    let hash = generate_password_hash("testpass");
-    // Bound before the config is written so the port is one the OS just handed out. A fixed port
-    // collides with whatever else `cargo test` is running in parallel, which shows up as an
-    // unrelated test failing on `AddrInUse`.
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let port = listener.local_addr().unwrap().port();
-    tokio::fs::write(
-        data.path().join("config.toml"),
-        format!(
-            "[server]\nbind = \"127.0.0.1:{port}\"\nsecure_cookies = false\n\n[auth]\npassword_hash = \"{hash}\"\nsession_days = 30\n"
-        ),
-    )
-    .await
-    .unwrap();
-
-    let project = tempfile::TempDir::new().unwrap();
-    if git_repo {
-        git(project.path(), &["init", "-q", "-b", "main"]);
-        std::fs::write(project.path().join("README.md"), "# project\n").unwrap();
-        git(project.path(), &["add", "README.md"]);
-        git(project.path(), &["commit", "-qm", "initial"]);
-    }
-
-    let store = Arc::new(giskard_persist::PersistStore::new(
-        data.path().to_path_buf(),
-    ));
     let harness = Arc::new(RecordingHarness::default());
-    let state = AppState::new(
-        store,
-        Arc::new(RecordingFactory(harness.clone())),
-        (0..32u8).collect(),
-    );
-    let app = build_app(state.clone());
-    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-
-    let project_id = ProjectId::new();
-    state
-        .store
-        .create_project(
-            project_id,
-            "worktree-test",
-            &project.path().to_string_lossy(),
-        )
-        .await
-        .unwrap();
-
-    let base = format!("http://127.0.0.1:{port}");
-    let client = reqwest::Client::new();
-    let login = client
-        .post(format!("{base}/api/login"))
-        .json(&serde_json::json!({ "password": "testpass" }))
-        .send()
-        .await
-        .unwrap();
-    let cookie = login
-        .headers()
-        .get("set-cookie")
-        .unwrap()
-        .to_str()
-        .unwrap()
-        .split(';')
-        .next()
-        .unwrap()
-        .to_string();
+    let server = TestServer::spawn(recording_factory(harness.clone())).await;
+    let project = server.create_project("worktree-test").await;
+    if git_repo {
+        git::init_repo_with_commit(project.dir.path());
+    }
+    let project_id = project.id;
 
     Harnessed {
-        _data: data,
-        _project: project,
-        state,
+        server,
+        project,
         harness,
         project_id,
-        base,
-        cookie,
-        client,
     }
 }
 
@@ -585,12 +478,13 @@ impl Harnessed {
             body["git_strategy"] = git_strategy;
         }
         let response = self
+            .server
             .client
             .post(format!(
                 "{}/api/projects/{}/threads/start",
-                self.base, self.project_id
+                self.server.base, self.project_id
             ))
-            .header("cookie", &self.cookie)
+            .header("cookie", &self.server.cookie)
             .json(&body)
             .send()
             .await
@@ -606,12 +500,13 @@ impl Harnessed {
         mode: &str,
     ) -> (reqwest::StatusCode, String) {
         let response = self
+            .server
             .client
             .post(format!(
                 "{}/api/projects/{}/threads/start",
-                self.base, self.project_id
+                self.server.base, self.project_id
             ))
-            .header("cookie", &self.cookie)
+            .header("cookie", &self.server.cookie)
             .json(&serde_json::json!({
                 "text": text,
                 "model_ref": {"provider": "openai", "model": "gpt-5.5", "reasoning_effort": null},
@@ -635,12 +530,13 @@ impl Harnessed {
         thread_id: ThreadId,
         path: &str,
     ) -> reqwest::Response {
-        self.client
+        self.server
+            .client
             .get(format!(
                 "{}/api/projects/{}/threads/{thread_id}/{kind}?path={path}",
-                self.base, self.project_id
+                self.server.base, self.project_id
             ))
-            .header("cookie", &self.cookie)
+            .header("cookie", &self.server.cookie)
             .send()
             .await
             .unwrap()
@@ -651,12 +547,13 @@ impl Harnessed {
     }
 
     async fn thread_summaries(&self) -> serde_json::Value {
-        self.client
+        self.server
+            .client
             .get(format!(
                 "{}/api/projects/{}/threads",
-                self.base, self.project_id
+                self.server.base, self.project_id
             ))
-            .header("cookie", &self.cookie)
+            .header("cookie", &self.server.cookie)
             .send()
             .await
             .unwrap()
@@ -669,6 +566,7 @@ impl Harnessed {
     /// activity: same project and model, no worktree record of its own.
     async fn persist_subagent(&self, parent: ThreadId) -> ThreadId {
         let mut file = self
+            .server
             .state
             .store
             .load_thread(self.project_id, parent)
@@ -682,7 +580,8 @@ impl Harnessed {
         file.parent_thread_id = Some(parent);
         file.kind = giskard_core::thread::ThreadKind::Subagent;
         file.git_workspace = None;
-        self.state
+        self.server
+            .state
             .store
             .save_thread(self.project_id, &file)
             .await
@@ -694,7 +593,13 @@ impl Harnessed {
     /// refuses a live thread.
     async fn wait_until_idle(&self, thread_id: ThreadId) {
         let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
-        while self.state.registry.thread_has_active_turn(thread_id).await {
+        while self
+            .server
+            .state
+            .registry
+            .thread_has_active_turn(thread_id)
+            .await
+        {
             assert!(
                 tokio::time::Instant::now() < deadline,
                 "the thread's first turn never completed"
@@ -707,6 +612,7 @@ impl Harnessed {
     /// answer for without breaking the whole fixture.
     async fn repoint_worktree(&self, thread_id: ThreadId, path: &str, repo_root: &str) {
         let mut file = self
+            .server
             .state
             .store
             .load_thread(self.project_id, thread_id)
@@ -721,7 +627,8 @@ impl Harnessed {
         worktree.path = path.to_string();
         worktree.repo_root = repo_root.to_string();
         file.git_workspace = Some(ThreadGitWorkspace::Worktree(worktree));
-        self.state
+        self.server
+            .state
             .store
             .save_thread(self.project_id, &file)
             .await
@@ -729,7 +636,8 @@ impl Harnessed {
     }
 
     async fn worktree_of(&self, thread_id: ThreadId) -> giskard_persist::store::ThreadWorktree {
-        self.state
+        self.server
+            .state
             .store
             .load_thread(self.project_id, thread_id)
             .await
@@ -742,24 +650,26 @@ impl Harnessed {
 
     async fn delete_thread(&self, thread_id: ThreadId, force: bool) -> reqwest::Response {
         let query = if force { "?force=true" } else { "" };
-        self.client
+        self.server
+            .client
             .delete(format!(
                 "{}/api/projects/{}/threads/{thread_id}{query}",
-                self.base, self.project_id
+                self.server.base, self.project_id
             ))
-            .header("cookie", &self.cookie)
+            .header("cookie", &self.server.cookie)
             .send()
             .await
             .unwrap()
     }
 
     async fn git_status_response(&self, thread_id: ThreadId) -> reqwest::Response {
-        self.client
+        self.server
+            .client
             .get(format!(
                 "{}/api/projects/{}/git/status?thread_id={thread_id}",
-                self.base, self.project_id
+                self.server.base, self.project_id
             ))
-            .header("cookie", &self.cookie)
+            .header("cookie", &self.server.cookie)
             .send()
             .await
             .unwrap()
@@ -769,12 +679,13 @@ impl Harnessed {
         let scope = thread_id
             .map(|id| format!("?thread_id={id}"))
             .unwrap_or_default();
-        self.client
+        self.server
+            .client
             .get(format!(
                 "{}/api/projects/{}/git/status{scope}",
-                self.base, self.project_id
+                self.server.base, self.project_id
             ))
-            .header("cookie", &self.cookie)
+            .header("cookie", &self.server.cookie)
             .send()
             .await
             .unwrap()
@@ -789,6 +700,7 @@ async fn wait_for_subagent(server: &Harnessed, parent: ThreadId) -> ThreadId {
     let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
     loop {
         for thread_id in server
+            .server
             .state
             .store
             .list_threads(server.project_id)
@@ -796,6 +708,7 @@ async fn wait_for_subagent(server: &Harnessed, parent: ThreadId) -> ThreadId {
             .unwrap()
         {
             let Some(thread) = server
+                .server
                 .state
                 .store
                 .load_thread(server.project_id, thread_id)
@@ -851,6 +764,7 @@ async fn a_thread_started_with_worktree_runs_in_it() {
     let thread_id: ThreadId = started["thread_id"].as_str().unwrap().parse().unwrap();
 
     let thread = server
+        .server
         .state
         .store
         .load_thread(server.project_id, thread_id)
@@ -885,7 +799,7 @@ async fn a_thread_started_with_worktree_runs_in_it() {
     assert!(
         !worktree
             .path
-            .starts_with(&server._project.path().to_string_lossy().to_string()),
+            .starts_with(&server.project.dir.path().to_string_lossy().to_string()),
         "the worktree must not be a sibling of the project directory"
     );
 }
@@ -900,6 +814,7 @@ async fn a_thread_started_without_the_flag_is_unchanged() {
     let thread_id: ThreadId = started["thread_id"].as_str().unwrap().parse().unwrap();
 
     let thread = server
+        .server
         .state
         .store
         .load_thread(server.project_id, thread_id)
@@ -909,7 +824,7 @@ async fn a_thread_started_without_the_flag_is_unchanged() {
     assert!(thread.git_workspace.is_none());
     assert_eq!(
         server.workspace_roots().await,
-        vec![server._project.path().to_string_lossy().to_string()]
+        vec![server.project.dir.path().to_string_lossy().to_string()]
     );
 }
 
@@ -932,6 +847,7 @@ async fn a_project_that_is_not_a_repository_fails_instead_of_falling_back() {
     );
     assert_eq!(
         server
+            .server
             .state
             .store
             .list_threads(server.project_id)
@@ -952,6 +868,7 @@ async fn reopening_an_isolated_thread_returns_to_its_worktree() {
     let started: serde_json::Value = serde_json::from_str(&body).unwrap();
     let thread_id: ThreadId = started["thread_id"].as_str().unwrap().parse().unwrap();
     let worktree_path = server
+        .server
         .state
         .store
         .load_thread(server.project_id, thread_id)
@@ -966,6 +883,7 @@ async fn reopening_an_isolated_thread_returns_to_its_worktree() {
     // A second server over the same data directory: the restart, with nothing in memory.
     let (restarted, base, cookie) = restart(&server).await;
     let response = server
+        .server
         .client
         .post(format!("{base}/api/projects/{}/threads", server.project_id))
         .header("cookie", &cookie)
@@ -998,7 +916,7 @@ async fn deleting_a_thread_removes_its_worktree_and_branch() {
     assert_eq!(response.status(), 204);
     assert!(!Path::new(&worktree.path).exists());
     assert!(
-        !branch_exists(server._project.path(), &worktree.branch),
+        !branch_exists(server.project.dir.path(), &worktree.branch),
         "the thread's branch outlived the thread that owned it"
     );
 }
@@ -1020,7 +938,7 @@ async fn deleting_a_thread_whose_worktree_vanished_still_clears_its_branch() {
 
     assert_eq!(response.status(), 204);
     assert!(
-        !branch_exists(server._project.path(), &worktree.branch),
+        !branch_exists(server.project.dir.path(), &worktree.branch),
         "the branch survived a worktree that was already gone"
     );
 }
@@ -1055,12 +973,13 @@ async fn deleting_a_thread_refuses_to_discard_work_without_confirmation() {
 
     // The card shows the same facts before asking, then confirms.
     let impact: serde_json::Value = server
+        .server
         .client
         .get(format!(
             "{}/api/projects/{}/threads/{thread_id}/deletion-impact",
-            server.base, server.project_id
+            server.server.base, server.project_id
         ))
-        .header("cookie", &server.cookie)
+        .header("cookie", &server.server.cookie)
         .send()
         .await
         .unwrap()
@@ -1092,8 +1011,8 @@ async fn deleting_a_thread_refuses_to_discard_commits_on_no_other_branch() {
     server.wait_until_idle(thread_id).await;
     let path = Path::new(&worktree.path);
     std::fs::write(path.join("committed.txt"), "work\n").unwrap();
-    git(path, &["add", "committed.txt"]);
-    git(path, &["commit", "-qm", "thread work"]);
+    git::run(path, &["add", "committed.txt"]);
+    git::run(path, &["commit", "-qm", "thread work"]);
 
     let refusal = server.delete_thread(thread_id, /*force*/ false).await;
 
@@ -1106,11 +1025,11 @@ async fn deleting_a_thread_refuses_to_discard_commits_on_no_other_branch() {
 
     // Parked on a branch of the agent's own, the same commit is no longer at risk — and that branch
     // survives the deletion, because it is the user's now.
-    git(path, &["branch", "agent/keep-this"]);
+    git::run(path, &["branch", "agent/keep-this"]);
     let response = server.delete_thread(thread_id, /*force*/ false).await;
     assert_eq!(response.status(), 204);
-    assert!(branch_exists(server._project.path(), "agent/keep-this"));
-    assert!(!branch_exists(server._project.path(), &worktree.branch));
+    assert!(branch_exists(server.project.dir.path(), "agent/keep-this"));
+    assert!(!branch_exists(server.project.dir.path(), &worktree.branch));
 }
 
 /// Deleting a project is a project-scope decision the user has already confirmed, so it sweeps the
@@ -1130,19 +1049,20 @@ async fn deleting_a_project_sweeps_its_worktrees() {
     .unwrap();
 
     let response = server
+        .server
         .client
         .delete(format!(
             "{}/api/projects/{}",
-            server.base, server.project_id
+            server.server.base, server.project_id
         ))
-        .header("cookie", &server.cookie)
+        .header("cookie", &server.server.cookie)
         .send()
         .await
         .unwrap();
 
     assert_eq!(response.status(), 204);
     assert!(!Path::new(&worktree.path).exists());
-    assert!(!branch_exists(server._project.path(), &worktree.branch));
+    assert!(!branch_exists(server.project.dir.path(), &worktree.branch));
 }
 
 /// The registry materializes a sub-agent the moment the parent's turn reports spawning one, and it
@@ -1206,20 +1126,8 @@ async fn reattaching_a_subagent_after_a_restart_uses_its_parents_worktree() {
         .lock()
         .await
         .replace("native-child".to_string());
-    let port = base.rsplit(':').next().unwrap().to_string();
-    let request = tokio_tungstenite::tungstenite::http::Request::builder()
-        .uri(format!("ws://127.0.0.1:{port}/api/ws"))
-        .header("host", format!("127.0.0.1:{port}"))
-        .header("cookie", cookie)
-        .header("upgrade", "websocket")
-        .header("connection", "upgrade")
-        .header("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ==")
-        .header("sec-websocket-version", "13")
-        .body(())
-        .unwrap();
-    let (mut ws, _) = tokio_tungstenite::connect_async(request)
-        .await
-        .expect("connect websocket");
+    let addr = base.trim_start_matches("http://").parse().unwrap();
+    let mut ws = ws::connect(addr, &cookie).await;
     use futures_util::SinkExt;
     for message in [
         giskard_proto::ClientMessage::Subscribe {
@@ -1276,12 +1184,13 @@ async fn opening_a_subagent_attaches_in_its_parents_worktree() {
     server.harness.opened_workspace_roots.lock().await.clear();
 
     let response = server
+        .server
         .client
         .post(format!(
             "{}/api/projects/{}/threads",
-            server.base, server.project_id
+            server.server.base, server.project_id
         ))
-        .header("cookie", &server.cookie)
+        .header("cookie", &server.server.cookie)
         .json(&serde_json::json!({ "thread_id": child }))
         .send()
         .await
@@ -1311,6 +1220,7 @@ async fn deleting_a_subagent_is_rejected_without_touching_its_parents_worktree()
     assert_eq!(response.status(), reqwest::StatusCode::CONFLICT);
     assert!(
         server
+            .server
             .state
             .store
             .load_thread(server.project_id, child)
@@ -1325,7 +1235,7 @@ async fn deleting_a_subagent_is_rejected_without_touching_its_parents_worktree()
         "the parent's checkout was removed with its sub-agent"
     );
     assert!(
-        branch_exists(server._project.path(), &worktree.branch),
+        branch_exists(server.project.dir.path(), &worktree.branch),
         "the parent's branch was deleted with its sub-agent"
     );
 }
@@ -1340,6 +1250,7 @@ async fn git_status_reads_the_threads_own_workspace() {
     let started: serde_json::Value = serde_json::from_str(&body).unwrap();
     let thread_id: ThreadId = started["thread_id"].as_str().unwrap().parse().unwrap();
     let worktree = server
+        .server
         .state
         .store
         .load_thread(server.project_id, thread_id)
@@ -1357,7 +1268,7 @@ async fn git_status_reads_the_threads_own_workspace() {
     )
     .unwrap();
     std::fs::write(
-        server._project.path().join("user-edit.txt"),
+        server.project.dir.path().join("user-edit.txt"),
         "written by the user\n",
     )
     .unwrap();
@@ -1408,12 +1319,13 @@ async fn deleting_a_thread_refuses_when_git_cannot_report_what_would_be_lost() {
         server.repoint_worktree(thread_id, &path, &repo_root).await;
 
         let impact = server
+            .server
             .client
             .get(format!(
                 "{}/api/projects/{}/threads/{thread_id}/deletion-impact",
-                server.base, server.project_id
+                server.server.base, server.project_id
             ))
-            .header("cookie", &server.cookie)
+            .header("cookie", &server.server.cookie)
             .send()
             .await
             .unwrap();
@@ -1433,6 +1345,7 @@ async fn deleting_a_thread_refuses_when_git_cannot_report_what_would_be_lost() {
         );
         assert!(
             server
+                .server
                 .state
                 .store
                 .load_thread(server.project_id, thread_id)
@@ -1466,7 +1379,7 @@ async fn a_thread_whose_worktree_cannot_be_removed_is_kept_so_the_delete_can_be_
 
     // Points at the project's own checkout: still a repository, so the impact probes answer
     // normally, but `git worktree remove` refuses a main working tree.
-    let project_root = server._project.path().to_string_lossy().into_owned();
+    let project_root = server.project.dir.path().to_string_lossy().into_owned();
     server
         .repoint_worktree(thread_id, &project_root, &worktree.repo_root)
         .await;
@@ -1480,6 +1393,7 @@ async fn a_thread_whose_worktree_cannot_be_removed_is_kept_so_the_delete_can_be_
     );
     assert!(
         server
+            .server
             .state
             .store
             .load_thread(server.project_id, thread_id)
@@ -1500,6 +1414,7 @@ async fn a_thread_whose_worktree_cannot_be_removed_is_kept_so_the_delete_can_be_
     );
     assert!(
         server
+            .server
             .state
             .store
             .load_thread(server.project_id, thread_id)
@@ -1519,6 +1434,7 @@ async fn a_subagent_reads_the_worktree_of_the_thread_that_owns_it() {
     let started: serde_json::Value = serde_json::from_str(&body).unwrap();
     let parent_id: ThreadId = started["thread_id"].as_str().unwrap().parse().unwrap();
     let worktree = server
+        .server
         .state
         .store
         .load_thread(server.project_id, parent_id)
@@ -1540,7 +1456,7 @@ async fn a_subagent_reads_the_worktree_of_the_thread_that_owns_it() {
     )
     .unwrap();
     std::fs::write(
-        server._project.path().join("user-edit.txt"),
+        server.project.dir.path().join("user-edit.txt"),
         "written by the user\n",
     )
     .unwrap();
@@ -1575,7 +1491,7 @@ async fn a_subagent_of_an_ordinary_thread_reads_the_project() {
     let child = server.persist_subagent(parent_id).await;
 
     std::fs::write(
-        server._project.path().join("user-edit.txt"),
+        server.project.dir.path().join("user-edit.txt"),
         "written by the user\n",
     )
     .unwrap();
@@ -1608,23 +1524,25 @@ async fn git_status_refuses_a_thread_from_another_project() {
 
     let other_project = ProjectId::new();
     server
+        .server
         .state
         .store
         .create_project(
             other_project,
             "other",
-            &server._project.path().to_string_lossy(),
+            &server.project.dir.path().to_string_lossy(),
         )
         .await
         .unwrap();
 
     let response = server
+        .server
         .client
         .get(format!(
             "{}/api/projects/{other_project}/git/status?thread_id={thread_id}",
-            server.base
+            server.server.base
         ))
-        .header("cookie", &server.cookie)
+        .header("cookie", &server.server.cookie)
         .send()
         .await
         .unwrap();
@@ -1643,6 +1561,7 @@ async fn subscribing_after_a_restart_attaches_in_the_worktree() {
     let started: serde_json::Value = serde_json::from_str(&body).unwrap();
     let thread_id: ThreadId = started["thread_id"].as_str().unwrap().parse().unwrap();
     let worktree_path = server
+        .server
         .state
         .store
         .load_thread(server.project_id, thread_id)
@@ -1655,20 +1574,8 @@ async fn subscribing_after_a_restart_attaches_in_the_worktree() {
         .path;
 
     let (restarted, base, cookie) = restart(&server).await;
-    let port = base.rsplit(':').next().unwrap().to_string();
-    let request = tokio_tungstenite::tungstenite::http::Request::builder()
-        .uri(format!("ws://127.0.0.1:{port}/api/ws"))
-        .header("host", format!("127.0.0.1:{port}"))
-        .header("cookie", cookie)
-        .header("upgrade", "websocket")
-        .header("connection", "upgrade")
-        .header("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ==")
-        .header("sec-websocket-version", "13")
-        .body(())
-        .unwrap();
-    let (mut ws, _) = tokio_tungstenite::connect_async(request)
-        .await
-        .expect("connect websocket");
+    let addr = base.trim_start_matches("http://").parse().unwrap();
+    let mut ws = ws::connect(addr, &cookie).await;
     use futures_util::SinkExt;
     ws.send(tokio_tungstenite::tungstenite::Message::Text(
         serde_json::to_string(&giskard_proto::ClientMessage::Subscribe {
@@ -1702,38 +1609,10 @@ async fn subscribing_after_a_restart_attaches_in_the_worktree() {
 /// Build a second server over the same data directory, as a restart would leave it: the persisted
 /// thread is all there is to go on.
 async fn restart(server: &Harnessed) -> (Arc<RecordingHarness>, String, String) {
-    let store = Arc::new(giskard_persist::PersistStore::new(
-        server._data.path().to_path_buf(),
-    ));
     let harness = Arc::new(RecordingHarness::default());
-    let state = AppState::new(
-        store,
-        Arc::new(RecordingFactory(harness.clone())),
-        (0..32u8).collect(),
-    );
-    let app = build_app(state.clone());
-    // An ephemeral port, not a fixed one: these tests run concurrently with every other test in the
-    // binary, and a hard-coded port makes a second restart in the same run fail with `AddrInUse`.
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let base = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
-    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-
-    let login = server
-        .client
-        .post(format!("{base}/api/login"))
-        .json(&serde_json::json!({ "password": "testpass" }))
-        .send()
-        .await
-        .unwrap();
-    let cookie = login
-        .headers()
-        .get("set-cookie")
-        .unwrap()
-        .to_str()
-        .unwrap()
-        .split(';')
-        .next()
-        .unwrap()
-        .to_string();
-    (harness, base, cookie)
+    let restarted = TestServer::builder(recording_factory(harness.clone()))
+        .data_dir(server.server.data_dir())
+        .start()
+        .await;
+    (harness, restarted.base.clone(), restarted.cookie.clone())
 }

@@ -1,11 +1,6 @@
 //! Regression coverage for live-turn and running-command control through the browser WebSocket
 //! protocol.
 
-mod common;
-#[path = "common/thread_fixture.rs"]
-mod thread_fixture;
-
-use std::net::SocketAddr;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -13,7 +8,7 @@ use chrono::Utc;
 use futures_util::{SinkExt, StreamExt};
 use giskard_core::error::HarnessError;
 use giskard_core::event::AgentEvent;
-use giskard_core::ids::{ApprovalId, ItemId, ProjectId, ServerRequestId, ThreadId, TurnId};
+use giskard_core::ids::{ApprovalId, ItemId, ServerRequestId, ThreadId, TurnId};
 use giskard_core::item::{
     CommandExecutionStart, Item, ItemDelta, ItemKind, ItemPayload, ItemStart,
 };
@@ -25,17 +20,10 @@ use giskard_core::user_input::UserInput;
 use giskard_harness::{
     AgentEventStream, AgentHarness, EventLog, HarnessCapabilities, OpenThreadOptions, ThreadHandle,
 };
-use giskard_persist::store::ProjectConfig;
-use giskard_proto::{ClientMessage, ErrorInfo, RunningTask, ServerMessage, WireAgentEvent};
-use giskard_server::{AppState, HarnessFactory, build_app};
+use giskard_proto::{ClientMessage, RunningTask, ServerMessage, WireAgentEvent};
+use giskard_testenv::{TestServer, TestWs, factory, ws};
 use tokio::sync::Mutex;
 use tokio::time::{Duration, Instant};
-
-use common::fake_native_model;
-use thread_fixture::persist_primary_thread;
-
-type TestWs =
-    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
 #[derive(Clone, Copy)]
 enum TerminateBehavior {
@@ -290,151 +278,28 @@ impl AgentHarness for InterruptHarness {
     }
 }
 
-struct InterruptFactory {
-    harness: Arc<InterruptHarness>,
-}
-
-#[async_trait]
-impl HarnessFactory for InterruptFactory {
-    async fn create(
-        &self,
-        _config: &ProjectConfig,
-        _bootstrap: giskard_harness::HarnessBootstrap,
-    ) -> Result<Arc<dyn AgentHarness>, HarnessError> {
-        Ok(self.harness.clone())
-    }
-}
-
-fn generate_password_hash(password: &str) -> String {
-    use argon2::password_hash::SaltString;
-    use argon2::{Argon2, PasswordHasher};
-    use rand::rngs::OsRng;
-    let salt = SaltString::generate(&mut OsRng);
-    Argon2::default()
-        .hash_password(password.as_bytes(), &salt)
-        .unwrap()
-        .to_string()
-}
-
-fn ws_text(msg: &ClientMessage) -> tokio_tungstenite::tungstenite::Message {
-    tokio_tungstenite::tungstenite::Message::Text(serde_json::to_string(msg).unwrap().into())
-}
-
 struct TestApp {
-    _store_dir: tempfile::TempDir,
-    _project_dir: tempfile::TempDir,
-    state: AppState,
+    server: TestServer,
     harness: Arc<InterruptHarness>,
-    addr: SocketAddr,
-    cookie: String,
     thread_id: ThreadId,
 }
 
 impl TestApp {
     async fn connect_ws(&self) -> TestWs {
-        connect_ws(self.addr, &self.cookie).await
+        self.server.ws().await
     }
 }
 
 async fn spawn_test_app() -> TestApp {
-    let tmp = tempfile::TempDir::new().unwrap();
-    let hash = generate_password_hash("testpass");
-    tokio::fs::write(
-        tmp.path().join("config.toml"),
-        format!(
-            "[server]\nbind = \"127.0.0.1:0\"\nsecure_cookies = false\n\n[auth]\npassword_hash = \"{hash}\"\nsession_days = 30\n"
-        ),
-    )
-    .await
-    .unwrap();
-
     let harness = Arc::new(InterruptHarness::new());
-    let store = Arc::new(giskard_persist::PersistStore::new(tmp.path().to_path_buf()));
-    let state = AppState::new(
-        store,
-        Arc::new(InterruptFactory {
-            harness: harness.clone(),
-        }),
-        (0..32u8).collect(),
-    );
-    let app = build_app(state.clone());
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
-        axum::serve(listener, app).await.unwrap();
-    });
-
-    let proj_dir = tempfile::TempDir::new().unwrap();
-    let pid = ProjectId::new();
-    state
-        .store
-        .create_project(pid, "proj", &proj_dir.path().to_string_lossy())
-        .await
-        .unwrap();
-
-    let client = reqwest::Client::new();
-    let cookie = {
-        let resp = client
-            .post(format!("http://{addr}/api/login"))
-            .json(&serde_json::json!({"password": "testpass"}))
-            .send()
-            .await
-            .unwrap();
-        resp.headers()
-            .get("set-cookie")
-            .unwrap()
-            .to_str()
-            .unwrap()
-            .split(';')
-            .next()
-            .unwrap()
-            .to_string()
-    };
-
-    let thread_id = persist_primary_thread(
-        &state.store,
-        pid,
-        ThreadId::new(),
-        "interrupt_thread",
-        fake_native_model(),
-    )
-    .await;
-    client
-        .post(format!("http://{addr}/api/projects/{pid}/threads"))
-        .header("cookie", &cookie)
-        .json(&serde_json::json!({ "thread_id": thread_id }))
-        .send()
-        .await
-        .unwrap()
-        .error_for_status()
-        .unwrap();
-
+    let server = TestServer::spawn(factory::shared(harness.clone())).await;
+    let project = server.create_project("proj").await;
+    let thread_id = server.register_thread(project.id, "interrupt_thread").await;
     TestApp {
-        _store_dir: tmp,
-        _project_dir: proj_dir,
-        state,
+        server,
         harness,
-        addr,
-        cookie,
         thread_id,
     }
-}
-
-async fn connect_ws(addr: SocketAddr, cookie: &str) -> TestWs {
-    let ws_request = tokio_tungstenite::tungstenite::http::Request::builder()
-        .uri(format!("ws://{addr}/api/ws"))
-        .header("host", addr.to_string())
-        .header("cookie", cookie)
-        .header("upgrade", "websocket")
-        .header("connection", "upgrade")
-        .header("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ==")
-        .header("sec-websocket-version", "13")
-        .body(())
-        .unwrap();
-    let (ws, _) = tokio_tungstenite::connect_async(ws_request)
-        .await
-        .expect("WS connect");
-    ws
 }
 
 #[tokio::test]
@@ -442,7 +307,7 @@ async fn server_shutdown_closes_websocket_with_away_frame() {
     let app = spawn_test_app().await;
     let mut ws = app.connect_ws().await;
 
-    app.state.shutdown.trigger();
+    app.server.state.shutdown.trigger();
 
     let frame = tokio::time::timeout(Duration::from_secs(2), async {
         loop {
@@ -471,13 +336,13 @@ async fn websocket_interrupt_reaches_live_harness_turn() {
     let mut ws = app.connect_ws().await;
     let thread_id = app.thread_id;
 
-    ws.send(ws_text(&ClientMessage::Subscribe {
+    ws.send(ws::text(&ClientMessage::Subscribe {
         thread_id,
         since: None,
     }))
     .await
     .unwrap();
-    ws.send(ws_text(&ClientMessage::SendInput {
+    ws.send(ws::text(&ClientMessage::SendInput {
         thread_id,
         text: "run for a while".into(),
         attachments: Vec::new(),
@@ -488,7 +353,7 @@ async fn websocket_interrupt_reaches_live_harness_turn() {
     app.harness.wait_until_active().await;
     wait_for_running_command(&mut ws).await;
 
-    ws.send(ws_text(&ClientMessage::Interrupt { thread_id }))
+    ws.send(ws::text(&ClientMessage::Interrupt { thread_id }))
         .await
         .unwrap();
     wait_for_interrupted_turn(&mut ws).await;
@@ -496,7 +361,7 @@ async fn websocket_interrupt_reaches_live_harness_turn() {
     app.harness.complete_command().await;
     wait_for_completed_command_after_interrupted_turn(&mut ws).await;
 
-    ws.send(ws_text(&ClientMessage::TerminateCommand {
+    ws.send(ws::text(&ClientMessage::TerminateCommand {
         thread_id,
         process_id: "proc_1".into(),
     }))
@@ -517,13 +382,13 @@ async fn websocket_interrupt_timeout_surfaces_error() {
     let mut ws = app.connect_ws().await;
     let thread_id = app.thread_id;
 
-    ws.send(ws_text(&ClientMessage::Subscribe {
+    ws.send(ws::text(&ClientMessage::Subscribe {
         thread_id,
         since: None,
     }))
     .await
     .unwrap();
-    ws.send(ws_text(&ClientMessage::SendInput {
+    ws.send(ws::text(&ClientMessage::SendInput {
         thread_id,
         text: "sleep".into(),
         attachments: Vec::new(),
@@ -532,11 +397,11 @@ async fn websocket_interrupt_timeout_surfaces_error() {
     .unwrap();
     app.harness.wait_until_active().await;
 
-    ws.send(ws_text(&ClientMessage::Interrupt { thread_id }))
+    ws.send(ws::text(&ClientMessage::Interrupt { thread_id }))
         .await
         .unwrap();
 
-    let error = wait_for_error(&mut ws, "interrupt", "harness_timeout").await;
+    let error = ws::expect_error_for(&mut ws, "interrupt", "harness_timeout").await;
     assert_eq!(error.thread_id, Some(thread_id));
     assert_eq!(app.harness.interrupted_threads().await, vec![thread_id]);
 }
@@ -547,13 +412,13 @@ async fn websocket_terminate_running_command_marks_terminating_until_terminal_ev
     let mut ws = app.connect_ws().await;
     let thread_id = app.thread_id;
 
-    ws.send(ws_text(&ClientMessage::Subscribe {
+    ws.send(ws::text(&ClientMessage::Subscribe {
         thread_id,
         since: None,
     }))
     .await
     .unwrap();
-    ws.send(ws_text(&ClientMessage::SendInput {
+    ws.send(ws::text(&ClientMessage::SendInput {
         thread_id,
         text: "run for a while".into(),
         attachments: Vec::new(),
@@ -564,7 +429,7 @@ async fn websocket_terminate_running_command_marks_terminating_until_terminal_ev
     app.harness.wait_until_active().await;
     wait_for_running_command(&mut ws).await;
 
-    ws.send(ws_text(&ClientMessage::TerminateCommand {
+    ws.send(ws::text(&ClientMessage::TerminateCommand {
         thread_id,
         process_id: "proc_1".into(),
     }))
@@ -574,6 +439,7 @@ async fn websocket_terminate_running_command_marks_terminating_until_terminal_ev
     app.harness.wait_until_terminated().await;
     wait_for_terminating_command(&mut ws).await;
     let snapshot = app
+        .server
         .state
         .registry
         .thread_runtime(thread_id)
@@ -587,7 +453,8 @@ async fn websocket_terminate_running_command_marks_terminating_until_terminal_ev
     app.harness.complete_command().await;
     wait_for_completed_command_after_interrupted_turn(&mut ws).await;
     assert!(
-        app.state
+        app.server
+            .state
             .registry
             .thread_runtime(thread_id)
             .await
@@ -605,14 +472,14 @@ async fn websocket_subscribe_replays_running_command_snapshot() {
     let thread_id = app.thread_id;
 
     first
-        .send(ws_text(&ClientMessage::Subscribe {
+        .send(ws::text(&ClientMessage::Subscribe {
             thread_id,
             since: None,
         }))
         .await
         .unwrap();
     first
-        .send(ws_text(&ClientMessage::SendInput {
+        .send(ws::text(&ClientMessage::SendInput {
             thread_id,
             text: "run for a while".into(),
             attachments: Vec::new(),
@@ -625,7 +492,7 @@ async fn websocket_subscribe_replays_running_command_snapshot() {
 
     let mut second = app.connect_ws().await;
     second
-        .send(ws_text(&ClientMessage::Subscribe {
+        .send(ws::text(&ClientMessage::Subscribe {
             thread_id,
             since: None,
         }))
@@ -685,13 +552,13 @@ async fn no_active_for_after_turn_command_clears_stale_snapshot(behavior: Termin
     let mut ws = app.connect_ws().await;
     let thread_id = app.thread_id;
 
-    ws.send(ws_text(&ClientMessage::Subscribe {
+    ws.send(ws::text(&ClientMessage::Subscribe {
         thread_id,
         since: None,
     }))
     .await
     .unwrap();
-    ws.send(ws_text(&ClientMessage::SendInput {
+    ws.send(ws::text(&ClientMessage::SendInput {
         thread_id,
         text: "run for a while".into(),
         attachments: Vec::new(),
@@ -702,12 +569,13 @@ async fn no_active_for_after_turn_command_clears_stale_snapshot(behavior: Termin
     app.harness.wait_until_active().await;
     wait_for_running_command(&mut ws).await;
 
-    ws.send(ws_text(&ClientMessage::Interrupt { thread_id }))
+    ws.send(ws::text(&ClientMessage::Interrupt { thread_id }))
         .await
         .unwrap();
     wait_for_interrupted_turn(&mut ws).await;
     assert!(
-        app.state
+        app.server
+            .state
             .registry
             .thread_runtime(thread_id)
             .await
@@ -717,7 +585,7 @@ async fn no_active_for_after_turn_command_clears_stale_snapshot(behavior: Termin
             .after_turn
     );
 
-    ws.send(ws_text(&ClientMessage::TerminateCommand {
+    ws.send(ws::text(&ClientMessage::TerminateCommand {
         thread_id,
         process_id: "proc_1".into(),
     }))
@@ -725,7 +593,8 @@ async fn no_active_for_after_turn_command_clears_stale_snapshot(behavior: Termin
     .unwrap();
 
     wait_for_empty_running_commands(&mut ws).await;
-    let warning = wait_for_error(&mut ws, "terminate_command", "harness_command_unmanaged").await;
+    let warning =
+        ws::expect_error_for(&mut ws, "terminate_command", "harness_command_unmanaged").await;
     assert_eq!(warning.severity, giskard_proto::ErrorSeverity::Warning);
     assert_eq!(warning.thread_id, Some(thread_id));
     assert_eq!(warning.process_id.as_deref(), Some("proc_1"));
@@ -733,7 +602,8 @@ async fn no_active_for_after_turn_command_clears_stale_snapshot(behavior: Termin
         detail.contains("may still be running in the harness environment")
     }));
     assert!(
-        app.state
+        app.server
+            .state
             .registry
             .thread_runtime(thread_id)
             .await
@@ -750,14 +620,14 @@ async fn websocket_terminate_unknown_thread_surfaces_error() {
     let mut ws = app.connect_ws().await;
     let unknown_thread = ThreadId::new();
 
-    ws.send(ws_text(&ClientMessage::TerminateCommand {
+    ws.send(ws::text(&ClientMessage::TerminateCommand {
         thread_id: unknown_thread,
         process_id: "proc_missing".into(),
     }))
     .await
     .unwrap();
 
-    let error = wait_for_error(&mut ws, "terminate_command", "thread_not_open").await;
+    let error = ws::expect_error_for(&mut ws, "terminate_command", "thread_not_open").await;
     assert_eq!(error.thread_id, Some(unknown_thread));
 }
 
@@ -767,13 +637,13 @@ async fn terminate_failure_preserves_snapshot(behavior: TerminateBehavior, expec
     let mut ws = app.connect_ws().await;
     let thread_id = app.thread_id;
 
-    ws.send(ws_text(&ClientMessage::Subscribe {
+    ws.send(ws::text(&ClientMessage::Subscribe {
         thread_id,
         since: None,
     }))
     .await
     .unwrap();
-    ws.send(ws_text(&ClientMessage::SendInput {
+    ws.send(ws::text(&ClientMessage::SendInput {
         thread_id,
         text: "run for a while".into(),
         attachments: Vec::new(),
@@ -784,17 +654,18 @@ async fn terminate_failure_preserves_snapshot(behavior: TerminateBehavior, expec
     app.harness.wait_until_active().await;
     wait_for_running_command(&mut ws).await;
 
-    ws.send(ws_text(&ClientMessage::TerminateCommand {
+    ws.send(ws::text(&ClientMessage::TerminateCommand {
         thread_id,
         process_id: "proc_1".into(),
     }))
     .await
     .unwrap();
 
-    let error = wait_for_error(&mut ws, "terminate_command", expected_code).await;
+    let error = ws::expect_error_for(&mut ws, "terminate_command", expected_code).await;
     assert_eq!(error.thread_id, Some(thread_id));
     assert_eq!(error.process_id.as_deref(), Some("proc_1"));
     let snapshot = app
+        .server
         .state
         .registry
         .thread_runtime(thread_id)
@@ -889,34 +760,6 @@ async fn wait_for_terminating_command(ws: &mut TestWs) -> RunningTask {
                 .find(|cmd| cmd.process_id.as_deref() == Some("proc_1") && cmd.terminating)
         {
             return cmd.clone();
-        }
-    }
-}
-
-async fn wait_for_error(ws: &mut TestWs, action: &str, code: &str) -> ErrorInfo {
-    let deadline = Instant::now() + Duration::from_secs(5);
-    loop {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            panic!("websocket error {code}/{action} was not observed");
-        }
-
-        let Some(Ok(msg)) = tokio::time::timeout(remaining, ws.next())
-            .await
-            .unwrap_or_else(|_| panic!("timed out waiting for websocket error"))
-        else {
-            continue;
-        };
-
-        let tokio_tungstenite::tungstenite::Message::Text(text) = msg else {
-            continue;
-        };
-        if let ServerMessage::Error { error } =
-            serde_json::from_str::<ServerMessage>(&text).unwrap()
-            && error.action.as_deref() == Some(action)
-            && error.code == code
-        {
-            return error;
         }
     }
 }

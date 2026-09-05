@@ -4,10 +4,6 @@
 //! so mid-thread model/effort changes take effect (§8.4/§8.5); (2) the thread's permission preset
 //! must reach the harness (§9). A capturing harness records every `TurnOverrides` it is handed.
 
-mod common;
-#[path = "common/thread_fixture.rs"]
-mod thread_fixture;
-
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 
@@ -24,13 +20,9 @@ use giskard_core::user_input::UserInput;
 use giskard_harness::{
     AgentEventStream, AgentHarness, EventLog, HarnessCapabilities, OpenThreadOptions, ThreadHandle,
 };
-use giskard_persist::store::ProjectConfig;
 use giskard_proto::ClientMessage;
-use giskard_server::{AppState, HarnessFactory, build_app};
+use giskard_testenv::{TestServer, factory, fixtures, ws};
 use tokio::sync::Mutex as TokioMutex;
-
-use common::fake_native_model;
-use thread_fixture::persist_primary_thread;
 
 /// Harness that records the overrides passed to `start_turn` and emits a trivial completed turn.
 struct CapturingHarness {
@@ -151,158 +143,42 @@ impl AgentHarness for CapturingHarness {
     }
 }
 
-struct CapFactory {
-    captured: Arc<TokioMutex<Vec<TurnOverrides>>>,
-    requested_models: Arc<StdMutex<Vec<ModelRef>>>,
-}
-
-impl CapFactory {
-    fn new(captured: Arc<TokioMutex<Vec<TurnOverrides>>>) -> Self {
-        Self {
-            captured,
-            requested_models: Arc::new(StdMutex::new(Vec::new())),
-        }
-    }
-}
-
-#[async_trait::async_trait]
-impl HarnessFactory for CapFactory {
-    async fn create(
-        &self,
-        _config: &ProjectConfig,
-        _bootstrap: giskard_harness::HarnessBootstrap,
-    ) -> Result<Arc<dyn AgentHarness>, HarnessError> {
-        Ok(Arc::new(CapturingHarness::with_requests(
-            self.captured.clone(),
-            self.requested_models.clone(),
-        )))
-    }
-}
-
-fn generate_password_hash(password: &str) -> String {
-    use argon2::password_hash::SaltString;
-    use argon2::{Argon2, PasswordHasher};
-    use rand::rngs::OsRng;
-    let salt = SaltString::generate(&mut OsRng);
-    Argon2::default()
-        .hash_password(password.as_bytes(), &salt)
-        .unwrap()
-        .to_string()
-}
-
-fn ws_text(msg: &ClientMessage) -> tokio_tungstenite::tungstenite::Message {
-    tokio_tungstenite::tungstenite::Message::Text(serde_json::to_string(msg).unwrap().into())
-}
-
 #[tokio::test]
 async fn send_input_snapshot_carries_model_effort_and_permission_preset() {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let port = listener.local_addr().unwrap().port();
     let captured = Arc::new(TokioMutex::new(Vec::<TurnOverrides>::new()));
-
-    // Server with a capturing harness.
-    let tmp = tempfile::TempDir::new().unwrap();
-    let hash = generate_password_hash("testpass");
-    tokio::fs::write(
-        tmp.path().join("config.toml"),
-        format!(
-            r#"
-[server]
-bind = "127.0.0.1:{port}"
-secure_cookies = false
-
-[auth]
-password_hash = "{hash}"
-session_days = 30
-
-[providers.openai]
+    let requested_models = Arc::new(StdMutex::new(Vec::new()));
+    let captured_for_factory = captured.clone();
+    let models_for_factory = requested_models.clone();
+    let factory = factory::from_fn(move |_, _| {
+        Ok(Arc::new(CapturingHarness::with_requests(
+            captured_for_factory.clone(),
+            models_for_factory.clone(),
+        )))
+    });
+    let server = TestServer::builder(factory)
+        .config(
+            r#"[providers.openai]
   [[providers.openai.models]]
   id = "gpt-5.5"
   context_window = 258400
   supports_reasoning_effort = true
-"#
-        ),
-    )
-    .await
-    .unwrap();
-
-    let store = Arc::new(giskard_persist::PersistStore::new(tmp.path().to_path_buf()));
-    let factory = Arc::new(CapFactory::new(captured.clone()));
-    let requested_models = factory.requested_models.clone();
-    let state = AppState::new(store, factory, (0..32u8).collect());
-    let app = build_app(state.clone());
-    tokio::spawn(async move {
-        axum::serve(listener, app).await.unwrap();
-    });
-
-    let proj_dir = tempfile::TempDir::new().unwrap();
-    let pid = giskard_core::ids::ProjectId::new();
-    state
-        .store
-        .create_project(pid, "proj", &proj_dir.path().to_string_lossy())
-        .await
-        .unwrap();
-
-    let client = reqwest::Client::new();
-    let cookie = {
-        let resp = client
-            .post(format!("http://127.0.0.1:{port}/api/login"))
-            .json(&serde_json::json!({"password": "testpass"}))
-            .send()
-            .await
-            .unwrap();
-        resp.headers()
-            .get("set-cookie")
-            .unwrap()
-            .to_str()
-            .unwrap()
-            .split(';')
-            .next()
-            .unwrap()
-            .to_string()
-    };
-
-    let thread_id = persist_primary_thread(
-        &state.store,
-        pid,
-        ThreadId::new(),
-        "th_cap",
-        fake_native_model(),
-    )
-    .await;
-    client
-        .post(format!(
-            "http://127.0.0.1:{port}/api/projects/{pid}/threads"
-        ))
-        .header("cookie", &cookie)
-        .json(&serde_json::json!({ "thread_id": thread_id }))
-        .send()
-        .await
-        .unwrap()
-        .error_for_status()
-        .unwrap();
-
+"#,
+        )
+        .start()
+        .await;
+    let project = server.create_project("proj").await;
+    let pid = project.id;
+    let thread_id = server.register_thread(pid, "th_cap").await;
     assert_eq!(
         requested_models.lock().unwrap().as_slice(),
-        &[fake_native_model()],
+        &[fixtures::fake_native_model()],
         "reopening a persisted thread passes its effective model"
     );
-    let ws_request = tokio_tungstenite::tungstenite::http::Request::builder()
-        .uri(format!("ws://127.0.0.1:{port}/api/ws"))
-        .header("host", format!("127.0.0.1:{port}"))
-        .header("cookie", &cookie)
-        .header("upgrade", "websocket")
-        .header("connection", "upgrade")
-        .header("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ==")
-        .header("sec-websocket-version", "13")
-        .body(())
-        .unwrap();
-    let (mut ws, _) = tokio_tungstenite::connect_async(ws_request)
-        .await
-        .expect("WS connect");
+    let state = &server.state;
+    let mut ws = server.ws().await;
 
     // Select a reasoning model with High effort (gpt-5.5 is declared in this test's config).
-    ws.send(ws_text(&ClientMessage::SelectModel {
+    ws.send(ws::text(&ClientMessage::SelectModel {
         thread_id,
         request_id: "select-model-1".into(),
         model_ref: ModelRef {
@@ -314,7 +190,7 @@ session_days = 30
     .await
     .unwrap();
     // Switch to Plan mode.
-    ws.send(ws_text(&ClientMessage::SwitchMode {
+    ws.send(ws::text(&ClientMessage::SwitchMode {
         thread_id,
         request_id: "switch-mode-1".into(),
         mode: Mode::Plan,
@@ -322,7 +198,7 @@ session_days = 30
     .await
     .unwrap();
     // First turn.
-    ws.send(ws_text(&ClientMessage::SendInput {
+    ws.send(ws::text(&ClientMessage::SendInput {
         thread_id,
         text: "plan it".into(),
         attachments: Vec::new(),
@@ -348,7 +224,7 @@ session_days = 30
     );
 
     // Now set the thread permission preset and send again.
-    ws.send(ws_text(&ClientMessage::SetPermissionPreset {
+    ws.send(ws::text(&ClientMessage::SetPermissionPreset {
         thread_id,
         request_id: "set-permission-1".into(),
         preset: PermissionPreset::FullAccess,
@@ -371,7 +247,7 @@ session_days = 30
         }
         tokio::time::sleep(tokio::time::Duration::from_millis(25)).await;
     }
-    ws.send(ws_text(&ClientMessage::SendInput {
+    ws.send(ws::text(&ClientMessage::SendInput {
         thread_id,
         text: "again".into(),
         attachments: Vec::new(),
@@ -388,7 +264,7 @@ session_days = 30
 
     // Clearing effort on the same model should mean "model default", not "restore the previous
     // remembered effort".
-    ws.send(ws_text(&ClientMessage::SelectModel {
+    ws.send(ws::text(&ClientMessage::SelectModel {
         thread_id,
         request_id: "select-model-2".into(),
         model_ref: ModelRef {
@@ -419,7 +295,7 @@ session_days = 30
         }
         tokio::time::sleep(tokio::time::Duration::from_millis(25)).await;
     }
-    ws.send(ws_text(&ClientMessage::SendInput {
+    ws.send(ws::text(&ClientMessage::SendInput {
         thread_id,
         text: "default effort".into(),
         attachments: Vec::new(),
