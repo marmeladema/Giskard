@@ -236,7 +236,7 @@ impl Hub {
         ) {
             debug!(
                 %thread_id,
-                event_kind = event_kind(&event),
+                event_kind = event.kind(),
                 "keeping internal-only harness event off the browser stream"
             );
             return;
@@ -257,24 +257,6 @@ impl Hub {
             },
         )
         .await;
-    }
-}
-
-fn event_kind(event: &AgentEvent) -> &'static str {
-    match event {
-        AgentEvent::ThreadOpened { .. } => "thread_opened",
-        AgentEvent::TurnStarted { .. } => "turn_started",
-        AgentEvent::TurnUsageUpdated { .. } => "turn_usage_updated",
-        AgentEvent::ItemStarted { .. } => "item_started",
-        AgentEvent::ItemDelta { .. } => "item_delta",
-        AgentEvent::ItemCompleted { .. } => "item_completed",
-        AgentEvent::DiffUpdated { .. } => "diff_updated",
-        AgentEvent::ApprovalRequested { .. } => "approval_requested",
-        AgentEvent::ServerRequestReceived { .. } => "server_request_received",
-        AgentEvent::ServerRequestResolved { .. } => "server_request_resolved",
-        AgentEvent::TurnCompleted { .. } => "turn_completed",
-        AgentEvent::Error { .. } => "error",
-        AgentEvent::Notice { .. } => "notice",
     }
 }
 

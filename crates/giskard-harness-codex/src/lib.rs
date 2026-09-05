@@ -1553,7 +1553,9 @@ impl ActiveTurn {
     }
 
     fn event_is_current_turn(&self, event: &AgentEvent) -> bool {
-        agent_event_turn(event).is_none_or(|turn| turn == self.acknowledged_turn)
+        event
+            .turn()
+            .is_none_or(|turn| turn == self.acknowledged_turn)
     }
 }
 
@@ -1689,7 +1691,7 @@ fn observe_pending_compaction(
     event: &AgentEvent,
 ) -> Option<u128> {
     let event_name = compaction_event_name(event)?;
-    let event_turn = agent_event_turn(event);
+    let event_turn = event.turn();
     let pending = pending_compactions.get_mut(&thread)?;
     let saw_turn_started_before = pending.saw_turn_started;
     let elapsed_ms = pending.started_at.elapsed().as_millis();
@@ -1720,24 +1722,6 @@ fn compaction_event_name(event: &AgentEvent) -> Option<&'static str> {
         }
         AgentEvent::TurnCompleted { .. } => Some("turn_completed"),
         _ => None,
-    }
-}
-
-fn agent_event_turn(event: &AgentEvent) -> Option<TurnId> {
-    match event {
-        AgentEvent::TurnStarted { turn, .. }
-        | AgentEvent::TurnUsageUpdated { turn, .. }
-        | AgentEvent::ItemStarted { turn, .. }
-        | AgentEvent::ItemDelta { turn, .. }
-        | AgentEvent::ItemCompleted { turn, .. }
-        | AgentEvent::DiffUpdated { turn, .. }
-        | AgentEvent::ApprovalRequested { turn, .. }
-        | AgentEvent::TurnCompleted { turn, .. } => Some(*turn),
-        AgentEvent::ServerRequestReceived { turn, .. }
-        | AgentEvent::ServerRequestResolved { turn, .. }
-        | AgentEvent::Error { turn, .. }
-        | AgentEvent::Notice { turn, .. } => *turn,
-        AgentEvent::ThreadOpened { .. } => None,
     }
 }
 
@@ -2269,28 +2253,10 @@ async fn broadcast_event<F: FnOnce() -> AgentEvent>(senders: &SenderMap, thread:
     let log = sender_for_thread(senders, thread);
     if let Some(log) = log {
         let event = f();
-        let event_kind = agent_event_kind(&event);
+        let event_kind = event.kind();
         if !log.append(event) {
             debug!(%thread, event_kind, "Codex event log was closed; dropping event");
         }
-    }
-}
-
-fn agent_event_kind(event: &AgentEvent) -> &'static str {
-    match event {
-        AgentEvent::ThreadOpened { .. } => "thread_opened",
-        AgentEvent::TurnStarted { .. } => "turn_started",
-        AgentEvent::TurnUsageUpdated { .. } => "turn_usage_updated",
-        AgentEvent::ItemStarted { .. } => "item_started",
-        AgentEvent::ItemDelta { .. } => "item_delta",
-        AgentEvent::ItemCompleted { .. } => "item_completed",
-        AgentEvent::DiffUpdated { .. } => "diff_updated",
-        AgentEvent::ApprovalRequested { .. } => "approval_requested",
-        AgentEvent::ServerRequestReceived { .. } => "server_request_received",
-        AgentEvent::ServerRequestResolved { .. } => "server_request_resolved",
-        AgentEvent::TurnCompleted { .. } => "turn_completed",
-        AgentEvent::Error { .. } => "error",
-        AgentEvent::Notice { .. } => "notice",
     }
 }
 
@@ -2381,27 +2347,9 @@ fn server_request_native_scope(
     }
 }
 
-fn event_thread(event: &AgentEvent) -> ThreadId {
-    match event {
-        AgentEvent::ThreadOpened { thread, .. }
-        | AgentEvent::TurnStarted { thread, .. }
-        | AgentEvent::TurnUsageUpdated { thread, .. }
-        | AgentEvent::ItemStarted { thread, .. }
-        | AgentEvent::ItemDelta { thread, .. }
-        | AgentEvent::ItemCompleted { thread, .. }
-        | AgentEvent::DiffUpdated { thread, .. }
-        | AgentEvent::ApprovalRequested { thread, .. }
-        | AgentEvent::ServerRequestReceived { thread, .. }
-        | AgentEvent::ServerRequestResolved { thread, .. }
-        | AgentEvent::TurnCompleted { thread, .. }
-        | AgentEvent::Error { thread, .. }
-        | AgentEvent::Notice { thread, .. } => *thread,
-    }
-}
-
 #[cfg(test)]
 fn event_belongs_to_stream(stream_thread: ThreadId, event: &AgentEvent) -> bool {
-    event_thread(event) == stream_thread
+    event.thread_id() == stream_thread
 }
 
 #[cfg(test)]
@@ -2411,7 +2359,7 @@ fn event_belongs_to_current_turn(
     event: &AgentEvent,
 ) -> bool {
     event_belongs_to_stream(stream_thread, event)
-        && agent_event_turn(event).is_none_or(|turn| turn == current_turn)
+        && event.turn().is_none_or(|turn| turn == current_turn)
 }
 
 #[cfg(test)]

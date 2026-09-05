@@ -279,7 +279,7 @@ impl AgentHarness for ReplayHarness {
             (opts.thread, Vec::new())
         };
         for event in &mut pending {
-            remap_event_thread(event, thread_id);
+            event.set_thread(thread_id);
         }
 
         let log = Arc::new(EventLog::new());
@@ -423,24 +423,6 @@ impl AgentHarness for ReplayHarness {
             return Ok(());
         }
         Ok(())
-    }
-}
-
-fn remap_event_thread(event: &mut AgentEvent, thread_id: ThreadId) {
-    match event {
-        AgentEvent::ThreadOpened { thread, .. }
-        | AgentEvent::TurnStarted { thread, .. }
-        | AgentEvent::TurnUsageUpdated { thread, .. }
-        | AgentEvent::ItemStarted { thread, .. }
-        | AgentEvent::ItemDelta { thread, .. }
-        | AgentEvent::ItemCompleted { thread, .. }
-        | AgentEvent::DiffUpdated { thread, .. }
-        | AgentEvent::ApprovalRequested { thread, .. }
-        | AgentEvent::ServerRequestReceived { thread, .. }
-        | AgentEvent::ServerRequestResolved { thread, .. }
-        | AgentEvent::TurnCompleted { thread, .. }
-        | AgentEvent::Error { thread, .. }
-        | AgentEvent::Notice { thread, .. } => *thread = thread_id,
     }
 }
 
@@ -629,7 +611,7 @@ mod tests {
 
         assert_eq!(events.len(), 6);
         for event in events {
-            assert_eq!(event_thread(&event), requested_thread);
+            assert_eq!(event.thread_id(), requested_thread);
         }
     }
 
@@ -656,23 +638,5 @@ mod tests {
         fixture.save(tmp.path()).unwrap();
         let loaded = ReplayFixture::load(tmp.path()).unwrap();
         assert_eq!(loaded.events.len(), fixture.events.len());
-    }
-
-    fn event_thread(event: &AgentEvent) -> ThreadId {
-        match event {
-            AgentEvent::ThreadOpened { thread, .. }
-            | AgentEvent::TurnStarted { thread, .. }
-            | AgentEvent::TurnUsageUpdated { thread, .. }
-            | AgentEvent::ItemStarted { thread, .. }
-            | AgentEvent::ItemDelta { thread, .. }
-            | AgentEvent::ItemCompleted { thread, .. }
-            | AgentEvent::DiffUpdated { thread, .. }
-            | AgentEvent::ApprovalRequested { thread, .. }
-            | AgentEvent::ServerRequestReceived { thread, .. }
-            | AgentEvent::ServerRequestResolved { thread, .. }
-            | AgentEvent::TurnCompleted { thread, .. }
-            | AgentEvent::Error { thread, .. }
-            | AgentEvent::Notice { thread, .. } => *thread,
-        }
     }
 }

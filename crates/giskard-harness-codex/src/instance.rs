@@ -462,7 +462,7 @@ where
                     )
                     .flatten()
                 {
-                    let thread = event_thread(&event);
+                    let thread = event.thread_id();
                     if let Some(active) = self.active_turns.get_mut(&thread) {
                         active.mark_server_message();
                         if let AgentEvent::TurnStarted { turn, .. } = &event
@@ -483,7 +483,7 @@ where
                         debug!(
                             %thread,
                             acknowledged_turn = display_opt(self.active_turns.get(&thread).map(|active| active.acknowledged_turn)),
-                            event_turn = display_opt(agent_event_turn(&event)),
+                            event_turn = display_opt(event.turn()),
                             "ignoring Codex turn completion for a non-current turn"
                         );
                     }
@@ -557,7 +557,7 @@ where
                     respond_unroutable_server_request(&mut self.client, &id, &request).await;
                     return MessageOutcome::Handled;
                 };
-                let thread = event_thread(&event);
+                let thread = event.thread_id();
                 if let Some(active) = self.active_turns.get_mut(&thread) {
                     active.mark_server_message();
                 }
