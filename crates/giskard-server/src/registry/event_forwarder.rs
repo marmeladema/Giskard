@@ -17,30 +17,6 @@ fn should_skip_duplicate_notice(
     !seen_notices.insert((*turn, message.clone()))
 }
 
-pub(super) fn event_turn_id(event: &AgentEvent) -> Option<TurnId> {
-    match event {
-        AgentEvent::TurnStarted { turn, .. }
-        | AgentEvent::TurnUsageUpdated { turn, .. }
-        | AgentEvent::ItemStarted { turn, .. }
-        | AgentEvent::ItemDelta { turn, .. }
-        | AgentEvent::ItemCompleted { turn, .. }
-        | AgentEvent::DiffUpdated { turn, .. }
-        | AgentEvent::ApprovalRequested { turn, .. }
-        | AgentEvent::TurnCompleted { turn, .. } => Some(*turn),
-        AgentEvent::ServerRequestReceived { turn, .. }
-        | AgentEvent::ServerRequestResolved { turn, .. } => *turn,
-        AgentEvent::ThreadOpened { .. }
-        | AgentEvent::Error { turn: None, .. }
-        | AgentEvent::Notice { turn: None, .. } => None,
-        AgentEvent::Error {
-            turn: Some(turn), ..
-        }
-        | AgentEvent::Notice {
-            turn: Some(turn), ..
-        } => Some(*turn),
-    }
-}
-
 fn event_item_identity(event: &AgentEvent) -> Option<(TurnId, &str, ItemId)> {
     match event {
         AgentEvent::ItemStarted { turn, item, .. } if !item.harness_item_id.is_empty() => {
@@ -97,33 +73,6 @@ fn track_item_identity(
     }
 }
 
-pub(super) fn event_kind(event: &AgentEvent) -> &'static str {
-    match event {
-        AgentEvent::ThreadOpened { .. } => "thread_opened",
-        AgentEvent::TurnStarted { .. } => "turn_started",
-        AgentEvent::TurnUsageUpdated { .. } => "turn_usage_updated",
-        AgentEvent::ItemStarted { .. } => "item_started",
-        AgentEvent::ItemDelta { .. } => "item_delta",
-        AgentEvent::ItemCompleted { .. } => "item_completed",
-        AgentEvent::DiffUpdated { .. } => "diff_updated",
-        AgentEvent::ApprovalRequested { .. } => "approval_requested",
-        AgentEvent::ServerRequestReceived { .. } => "server_request_received",
-        AgentEvent::ServerRequestResolved { .. } => "server_request_resolved",
-        AgentEvent::TurnCompleted { .. } => "turn_completed",
-        AgentEvent::Error { .. } => "error",
-        AgentEvent::Notice { .. } => "notice",
-    }
-}
-
-pub(super) fn event_item_id(event: &AgentEvent) -> Option<ItemId> {
-    match event {
-        AgentEvent::ItemStarted { item, .. } => Some(item.id),
-        AgentEvent::ItemDelta { item_id, .. } => Some(*item_id),
-        AgentEvent::ItemCompleted { item, .. } => Some(item.id),
-        _ => None,
-    }
-}
-
 fn event_item_delta_kind(event: &AgentEvent) -> Option<&'static str> {
     match event {
         AgentEvent::ItemDelta {
@@ -171,9 +120,9 @@ fn log_foreign_thread_event_drop(
         %project_id,
         %thread_id,
         %event_thread_id,
-        event_kind = event_kind(event),
-        event_turn_id = display_opt(event_turn_id(event)),
-        event_item_id = display_opt(event_item_id(event)),
+        event_kind = event.kind(),
+        event_turn_id = display_opt(event.turn()),
+        event_item_id = display_opt(event.item_id()),
         item_delta_kind = event_item_delta_kind(event),
         "dropping harness event for a different thread"
     );
@@ -209,8 +158,8 @@ fn log_cross_turn_event_drop(
         %thread_id,
         %owned_turn,
         %event_turn,
-        event_kind = event_kind(event),
-        event_item_id = display_opt(event_item_id(event)),
+        event_kind = event.kind(),
+        event_item_id = display_opt(event.item_id()),
         item_delta_kind = event_item_delta_kind(event),
         elapsed_ms,
         "dropping harness event for a different turn on the same thread"
@@ -1293,7 +1242,7 @@ impl ThreadEventForwarder {
             debug!(
                 %project_id,
                 %thread_id,
-                event_turn_id = display_opt(event_turn_id(&event)),
+                event_turn_id = display_opt(event.turn()),
                 "skipping duplicate harness notice"
             );
             return ForwarderControl::Continue;
@@ -1306,7 +1255,7 @@ impl ThreadEventForwarder {
                 %project_id,
                 %thread_id,
                 turn_id = %event_turn,
-                event_kind = event_kind(&event),
+                event_kind = event.kind(),
                 harness_item_id,
                 existing_item_id = %existing_item_id,
                 conflicting_item_id = %conflicting_item_id,
@@ -1315,7 +1264,7 @@ impl ThreadEventForwarder {
             return ForwarderControl::Continue;
         }
 
-        let event_turn = event_turn_id(&event);
+        let event_turn = event.turn();
         if let Some(owned) = self.turn.owned_turn {
             if let Some(turn) = event_turn {
                 // A command may outlive its persisted turn. Its terminal replacement must
@@ -1486,7 +1435,7 @@ impl ThreadEventForwarder {
                 debug!(
                     %thread_id,
                     event_sequence = display_opt(applied.sequence),
-                    event_kind = event_kind(&event),
+                    event_kind = event.kind(),
                     "applied late terminal event to thread runtime"
                 );
                 let changed = applied.tasks_changed;
@@ -1543,7 +1492,7 @@ impl ThreadEventForwarder {
             debug!(
                 %thread_id,
                 event_sequence = display_opt(applied.sequence),
-                event_kind = event_kind(&event),
+                event_kind = event.kind(),
                 "applied turnless agent event to thread runtime"
             );
             publish_applied_runtime_effects(&hub, thread_id, applied).await;
@@ -1774,7 +1723,7 @@ impl ThreadEventForwarder {
                     %thread_id,
                     %buffer_turn,
                     %existing_turn,
-                    event_kind = event_kind(&event),
+                    event_kind = event.kind(),
                     "not buffering an event for a different turn; live delivery and persistence continue"
                 );
                 append_to_live_buffer = false;
@@ -1807,7 +1756,7 @@ impl ThreadEventForwarder {
             debug!(
                 %thread_id,
                 event_sequence = display_opt(applied.sequence),
-                event_kind = event_kind(&event),
+                event_kind = event.kind(),
                 "applied agent event to thread runtime"
             );
             publish_applied_runtime_effects(&hub, thread_id, applied).await;
@@ -2622,7 +2571,7 @@ mod tests {
                 ProjectId::new(),
                 ThreadId::new(),
                 TurnId::new(),
-                event_turn_id(event).unwrap(),
+                event.turn().unwrap(),
                 event,
                 42,
             );
@@ -2641,7 +2590,7 @@ mod tests {
             },
         };
 
-        assert_eq!(event_item_id(&event), Some(item_id));
+        assert_eq!(event.item_id(), Some(item_id));
         assert_eq!(event_item_delta_kind(&event), Some("command_output"));
 
         let output = capture_cross_turn_warning(&event);

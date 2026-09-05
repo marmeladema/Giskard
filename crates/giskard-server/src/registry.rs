@@ -57,8 +57,7 @@ mod thread;
 
 use driver::{AttachOutcome, DriverHandle, Link, spawn_project_event_driver};
 use event_forwarder::{
-    ForwarderExitReason, event_item_id, event_kind, event_turn_id, forwarder_exit_reason_label,
-    log_metadata_only_event_rejection,
+    ForwarderExitReason, forwarder_exit_reason_label, log_metadata_only_event_rejection,
 };
 use project::{HarnessTransitions, LifecycleLock, ProjectAuthority, WeakLifecycleLock};
 pub(crate) use thread::ThreadAuthority;
@@ -1895,9 +1894,9 @@ async fn broadcast_event_with_user_input(
             user_input,
         },
         other => {
-            let event_kind = event_kind(&other);
-            let event_turn = event_turn_id(&other);
-            let event_item = event_item_id(&other);
+            let event_kind = other.kind();
+            let event_turn = other.turn();
+            let event_item = other.item_id();
             let Some(agent_event) = WireAgentEvent::from_agent_event(other) else {
                 log_metadata_only_event_rejection(
                     project_id, thread_id, event_kind, event_turn, event_item,
