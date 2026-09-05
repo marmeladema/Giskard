@@ -717,7 +717,6 @@ dependencies = [
  "giskard-persist",
  "giskard-proto",
  "giskard-server",
- "rand 0.8.6",
  "reqwest",
  "serde_json",
  "tempfile",

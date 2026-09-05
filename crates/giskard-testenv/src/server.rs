@@ -93,7 +93,7 @@ impl TestServer {
             .client
             .post(self.url("/api/projects"))
             .header("cookie", &self.cookie)
-            .json(&serde_json::json!({"name": name, "dir": dir, "workspace_root": null}))
+            .json(&serde_json::json!({"name": name, "dir": dir}))
             .send()
             .await
             .unwrap();
@@ -175,16 +175,24 @@ impl TestServerBuilder {
             .as_deref()
             .or_else(|| owned_data_dir.as_ref().map(TempDir::path))
             .unwrap();
-        if self.authenticated {
+        // A restart points `data_dir` at a directory whose `config.toml` an earlier server wrote;
+        // rewriting it would silently drop that server's extra sections. Write only when there is
+        // nothing to preserve.
+        let config_path = data_path.join("config.toml");
+        let write_config = self.authenticated && !config_path.exists();
+        assert!(
+            write_config || self.extra_config.is_empty(),
+            "config() would be ignored here: an unauthenticated server writes no config.toml, and \
+             a restart over an existing data directory keeps the config already in it"
+        );
+        if write_config {
             let hash = auth::password_hash(auth::PASSWORD);
             let config = format!(
                 "[server]\nbind = \"127.0.0.1:{}\"\nsecure_cookies = false\n\n[auth]\npassword_hash = \"{hash}\"\nsession_days = 30\n\n{}",
                 addr.port(),
                 self.extra_config
             );
-            tokio::fs::write(data_path.join("config.toml"), config)
-                .await
-                .unwrap();
+            tokio::fs::write(&config_path, config).await.unwrap();
         }
         let store = Arc::new(PersistStore::new(data_path.to_path_buf()));
         if let Some(seed) = self.seed {

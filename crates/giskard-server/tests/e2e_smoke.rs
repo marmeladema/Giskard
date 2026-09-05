@@ -6608,14 +6608,6 @@ async fn persisted_thread_can_be_reopened_before_ws_send() {
     let base = server.base.clone();
 
     let client = server.client.clone();
-
-    let resp = client
-        .post(format!("{base}/api/login"))
-        .json(&serde_json::json!({"password": "testpass"}))
-        .send()
-        .await
-        .unwrap();
-    assert!(resp.status().is_success());
     let cookie = server.cookie.clone();
 
     let model = ModelRef {
@@ -8017,8 +8009,16 @@ async fn login_project_thread_message() {
     assert!(resp.status().is_success());
 
     // Extract session cookie before consuming the body
-    let cookie_header = server.cookie.clone();
-    let cookie_val = cookie_header;
+    let cookie_val = resp
+        .headers()
+        .get("set-cookie")
+        .expect("login must set a session cookie")
+        .to_str()
+        .unwrap()
+        .split(';')
+        .next()
+        .unwrap()
+        .to_string();
 
     let body: serde_json::Value = resp.json().await.unwrap();
     assert_eq!(body["ok"], true);
