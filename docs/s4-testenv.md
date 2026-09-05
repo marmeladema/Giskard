@@ -4,6 +4,10 @@ Implementation plan for step 4 of [`design-straightening-review.md`](design-stra
 (finding C6). Written against `main` at `36c42e8` (S3 merged); every file and line reference below
 was checked against that tree. Re-check them if the branch has moved.
 
+Prerequisite: [`s3b-driver-event-sink.md`](s3b-driver-event-sink.md) lands first. It gives
+`AppState::new_with_config` a `driver_events: Arc<dyn DriverEventSink>` parameter, which
+`TestServerBuilder` threads through and which the crate's `driver` module uses.
+
 ## Goal
 
 Replace the scaffolding that every server integration test binary rebuilds for itself with one
@@ -36,8 +40,9 @@ made concrete:
 
 - No change to any test's assertions, to the messages it sends, or to the fakes' behaviour. The
   diff in each test file is deletions of helpers plus one-for-one replacements at call sites.
-- No change to `giskard-server`'s public API and no change to any `#[cfg(test)]` gate in it. The
-  crate uses exactly what the tests use today: `AppState::new`, `build_app`, `HarnessFactory`.
+- No change to `giskard-server`'s public API beyond what S3b landed, and no change to any
+  `#[cfg(test)]` gate in it. The crate uses `AppState::new_with_config`, `build_app`,
+  `HarnessFactory`, and the S3b `DriverEventSink` types.
 - No change to the unit-test fakes inside `crates/giskard-server/src` (five `impl AgentHarness`
   in `registry.rs`, `registry/driver.rs`, `registry/event_forwarder.rs`), nor to
   `giskard-server-replay`'s `ScriptedHarness`.
@@ -76,7 +81,7 @@ made concrete:
 `crates/giskard-testenv`, a workspace member, one library:
 
 ```
-src/lib.rs        pub mod auth; pub mod factory; pub mod fixtures; pub mod git; pub mod server; pub mod ws;
+src/lib.rs        pub mod auth; pub mod driver; pub mod factory; pub mod fixtures; pub mod git; pub mod server; pub mod ws;
                   pub use server::{TestProject, TestServer, TestServerBuilder}; pub use ws::TestWs;
 ```
 
@@ -93,13 +98,13 @@ name `TempDir`, `Message`, and `StreamExt` directly.
 What the crate can see in `giskard-server`: exactly what the integration tests see today. Both
 link the crate's ordinary build, and `cfg(test)` is only set when a crate is compiled as its own
 test harness, so nothing gated by `#[cfg(test)]` in `giskard-server` (the `test_logs` module at
-`src/lib.rs:24`, the S3 `driver_events` sink and probe) is reachable from `tests/` now or from
-`giskard-testenv` afterwards. The tests never needed any of it: their whole surface is the six
+`src/lib.rs:24`, the unit-test `probe` module in `src/registry/driver.rs`) is reachable from
+`tests/` now or from `giskard-testenv` afterwards. The tests never needed any of it: their whole surface is the six
 public symbols listed in the ground truth plus the two `#[doc(hidden)] pub fn *_for_test` hooks in
-`src/thread_runtime.rs:447-455`, and the crate uses only `AppState::new`, `build_app`, and
-`HarnessFactory`. No `cfg(test)` gate in `giskard-server` is removed or loosened by S4. If a later
-step wants a test-only hook shared with `giskard-testenv`, the mechanism is a cargo feature on
-`giskard-server` enabled from the dev-dependency, not `cfg(test)`; that is out of scope here.
+`src/thread_runtime.rs:447-455`, and the crate uses only `AppState::new_with_config`, `build_app`,
+`HarnessFactory`, and the S3b sink types, all of them public. No `cfg(test)` gate in `giskard-server` is removed or
+loosened by S4: S3b made the driver seam an injected dependency precisely so that no feature or
+gate is needed.
 
 Why a crate and not `tests/common`: the dead-code constraint in `common/mod.rs:1-6`. A crate with
 a dozen helpers, each used by a subset of 21 binaries, cannot live in a per-binary module under
@@ -176,6 +181,7 @@ impl TestServerBuilder {
     pub fn config(self, extra: &str) -> Self;        // appended after the baseline, as every extra_config is today
     pub fn unauthenticated(self) -> Self;            // no config.toml, no login; cookie stays ""
     pub fn data_dir(self, path: &Path) -> Self;      // start over an existing data directory (restart tests)
+    pub fn driver_events(self, sink: Arc<dyn DriverEventSink>) -> Self;   // default: LogDriverEventSink
     pub fn seed<F, Fut>(self, f: F) -> Self          // runs against the store before AppState::new
     where F: FnOnce(Arc<PersistStore>) -> Fut + Send + 'static, Fut: Future<Output = ()> + Send;
     pub async fn start(self) -> TestServer;
@@ -184,8 +190,9 @@ impl TestServerBuilder {
 
 `start` does, in this order: bind `127.0.0.1:0` and read the port; create the data `TempDir`
 (unless `data_dir` was given); unless `unauthenticated`, write `config.toml` with the baseline
-below and the real port; build the store; run `seed` if given; `AppState::new(store, factory,
-auth::session_key())`; `build_app`; `tokio::spawn(axum::serve(listener, app))`; build the client
+below and the real port; build the store; run `seed` if given; `AppState::new_with_config(store,
+factory, auth::session_key(), None, None, driver_events)` with `LogDriverEventSink` unless
+`driver_events` was called; `build_app`; `tokio::spawn(axum::serve(listener, app))`; build the client
 with `Policy::none()`; unless `unauthenticated`, `auth::login`.
 
 The baseline, byte-for-byte what `e2e_smoke.rs:2106-2118` and the others write, with the real
@@ -210,6 +217,24 @@ argue for; the tests that write `:0` today never read the value back, so they ar
 (`provider_switch.rs:298-305`, `read_only_thread.rs:239-242`). The store is path-based and reads
 lazily, so seeding after `start` through `server.store()` would also work, but `seed` keeps the
 order those tests chose and removes the question.
+
+### D4b. `driver`
+
+```rust
+pub struct DriverProbe(mpsc::UnboundedReceiver<(ProjectId, DriverEvent)>);
+pub fn probe() -> (Arc<dyn DriverEventSink>, DriverProbe);
+    // the sink logs through DriverEvent::log, then forwards a clone; build it before TestServer::builder
+impl DriverProbe {
+    pub async fn expect(&mut self, pred: impl Fn(&DriverEvent) -> bool) -> (ProjectId, DriverEvent);  // 5 s, discards non-matching, panics listing them
+    pub fn drain(&mut self) -> Vec<(ProjectId, DriverEvent)>;
+}
+```
+
+This is the same shape as the server's unit-test probe, carrying the project id because one
+sink serves every project in a registry. S4 ships it; nothing in the 21 files uses it yet. S4b
+replaces the store-polling waits (`wait_for_native_thread` in `e2e_smoke.rs:2426`, 5 callers;
+`wait_for_subagent` in `worktree_threads.rs:788`, 4 callers) with it. The bound is 5 s to match
+the integration suite's other waits.
 
 ### D5. `ws`
 
@@ -301,7 +326,7 @@ Two things the table implies and the implementer should not undo:
 | File | Change |
 | --- | --- |
 | `Cargo.toml` | `crates/giskard-testenv` in `members`; `giskard-testenv` in `[workspace.dependencies]` |
-| `crates/giskard-testenv/{Cargo.toml, src/lib.rs, src/auth.rs, src/factory.rs, src/fixtures.rs, src/git.rs, src/server.rs, src/ws.rs}` | new |
+| `crates/giskard-testenv/{Cargo.toml, src/lib.rs, src/auth.rs, src/driver.rs, src/factory.rs, src/fixtures.rs, src/git.rs, src/server.rs, src/ws.rs}` | new |
 | `crates/giskard-server/Cargo.toml` | `giskard-testenv = { workspace = true }` under `[dev-dependencies]` |
 | `crates/giskard-server/tests/common/` | deleted |
 | 20 of the 21 test files | per the migration table |
@@ -330,7 +355,7 @@ the server's suite.
 
 ## Order of work
 
-1. Create the crate with D2, D3, D5, D6, D7 and the unit tests; add the workspace and
+1. Create the crate with D2, D3, D4b, D5, D6, D7 and the unit tests; add the workspace and
    dev-dependency wiring. `cargo test -p giskard-testenv`.
 2. Add D4 and the smoke test. `cargo test -p giskard-testenv`.
 3. Migrate one small file end to end (`running_tasks.rs`, one test, 191 lines of preamble) and
