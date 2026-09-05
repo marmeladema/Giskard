@@ -42,6 +42,8 @@ test hooks that grew one atomic at a time. Every measurement below was taken on 
 
 ### A. Observation should be a seam, not a scattering of counters
 
+**Status: landed in S3.**
+
 **Now.** `RegistryShared` carries five `#[cfg(test)] AtomicUsize` fields
 (`discovery_records_processed`, `link_admissions_processed`, `deferred_link_requeues`,
 `failed_owner_removals_warned`, `teardown_owner_exits`), each incremented at one branch in the

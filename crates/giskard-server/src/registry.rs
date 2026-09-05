@@ -281,15 +281,7 @@ struct RegistryShared {
     threads: Arc<Mutex<ThreadIndex>>,
     background_tasks: Arc<RegistryTaskTracker>,
     #[cfg(test)]
-    discovery_records_processed: AtomicUsize,
-    #[cfg(test)]
-    link_admissions_processed: AtomicUsize,
-    #[cfg(test)]
-    deferred_link_requeues: AtomicUsize,
-    #[cfg(test)]
-    failed_owner_removals_warned: AtomicUsize,
-    #[cfg(test)]
-    teardown_owner_exits: AtomicUsize,
+    driver_events: driver::probe::DriverEventSink,
     hub: Arc<Hub>,
     runtime: Arc<ThreadRuntimeSupport>,
     store: Arc<PersistStore>,
@@ -424,15 +416,7 @@ impl RegistryShared {
             threads: Arc::new(Mutex::new(ThreadIndex::default())),
             background_tasks: Arc::new(RegistryTaskTracker::default()),
             #[cfg(test)]
-            discovery_records_processed: AtomicUsize::new(0),
-            #[cfg(test)]
-            link_admissions_processed: AtomicUsize::new(0),
-            #[cfg(test)]
-            deferred_link_requeues: AtomicUsize::new(0),
-            #[cfg(test)]
-            failed_owner_removals_warned: AtomicUsize::new(0),
-            #[cfg(test)]
-            teardown_owner_exits: AtomicUsize::new(0),
+            driver_events: driver::probe::DriverEventSink::default(),
             hub,
             runtime: Arc::new(ThreadRuntimeSupport::with_max_command_output_bytes(
                 max_command_output_bytes,
@@ -2537,19 +2521,23 @@ mod tests {
         .expect("discovered thread owner was not installed")
     }
 
-    async fn wait_for_discovery_records(registry: &super::HarnessRegistry, expected: usize) {
-        tokio::time::timeout(std::time::Duration::from_secs(2), async {
-            while registry
-                .shared
-                .discovery_records_processed
-                .load(Ordering::SeqCst)
-                < expected
-            {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("discovery consumer did not process the expected records");
+    async fn wait_for_discovery_records(
+        probe: &mut super::driver::probe::DriverProbe,
+        native_thread_ids: &[&str],
+    ) {
+        for native_thread_id in native_thread_ids {
+            probe
+                .expect(|event| {
+                    matches!(
+                        event,
+                        super::driver::DriverEvent::DiscoveryFinished {
+                            native_thread_id: event_native_thread_id,
+                            ..
+                        } if event_native_thread_id == native_thread_id
+                    )
+                })
+                .await;
+        }
     }
 
     async fn attach_test_primary(
@@ -2983,13 +2971,14 @@ mod tests {
             .get_or_create_harness(project, &config)
             .await
             .unwrap();
+        let mut probe = registry.shared.driver_events.observe();
         let harness = factory.harness.lock().unwrap().clone().unwrap();
         harness.announce(ThreadDiscovered {
             thread: primary,
             harness_thread_id: "native-primary".into(),
             parent_harness_thread_id: None,
         });
-        wait_for_discovery_records(&registry, 1).await;
+        wait_for_discovery_records(&mut probe, &["native-primary"]).await;
         let unchanged = store.load_thread(project, primary).await.unwrap().unwrap();
         assert_eq!(unchanged.kind, giskard_core::ThreadKind::Primary);
         assert!(registry.shared.coordinator(primary).await.is_none());
@@ -3019,6 +3008,7 @@ mod tests {
             .get_or_create_harness(project, &config)
             .await
             .unwrap();
+        let mut probe = registry.shared.driver_events.observe();
         let harness = factory.harness.lock().unwrap().clone().unwrap();
 
         store.delete_project(project).await.unwrap();
@@ -3028,7 +3018,7 @@ mod tests {
             harness_thread_id: "native-dropped".into(),
             parent_harness_thread_id: None,
         });
-        wait_for_discovery_records(&registry, 1).await;
+        wait_for_discovery_records(&mut probe, &["native-dropped"]).await;
         assert!(store.load_thread(project, dropped).await.unwrap().is_none());
         assert!(
             String::from_utf8(output.lock().unwrap().clone())
@@ -3048,7 +3038,7 @@ mod tests {
             harness_thread_id: "native-admitted".into(),
             parent_harness_thread_id: None,
         });
-        wait_for_discovery_records(&registry, 3).await;
+        wait_for_discovery_records(&mut probe, &["native-admitted", "native-dropped"]).await;
         let admitted_file = wait_for_thread(&store, project, admitted).await;
         assert_eq!(admitted_file.kind, giskard_core::ThreadKind::Orphan);
         wait_for_coordinator(&registry, admitted).await;

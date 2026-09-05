@@ -27,6 +27,186 @@ const DRIVER_COMMAND_CAPACITY: usize = 64;
 /// per crossing because it means the project cannot persist any native thread at all.
 const DEFERRED_ADMISSION_WARN_THRESHOLD: usize = 64;
 
+/// One decision the project event driver made.
+///
+/// Reported through `ProjectEventDriver::observe` at the point the decision is final and after
+/// any state it changed has been written, so an observer that sees the event may read the
+/// driver's effects. In production the event becomes the log line for that decision
+/// (`DriverEvent::log`); under `cfg(test)` it is also delivered to the test probe.
+#[derive(Debug, Clone)]
+pub(super) enum DriverEvent {
+    /// A discovered native thread's admission ran to completion, successfully or not.
+    DiscoveryFinished {
+        native_thread_id: String,
+        attempts: u32,
+        outcome: Result<Option<ThreadId>, HarnessError>,
+    },
+    /// A linked native thread's admission ran to completion, successfully or not.
+    LinkFinished {
+        native_thread_id: String,
+        parent_thread_id: ThreadId,
+        item_id: ItemId,
+        origin: &'static str,
+        attempts: u32,
+        outcome: Result<Option<ThreadId>, HarnessError>,
+    },
+    /// A reply-less link was kept in the deferred queue instead of being admitted.
+    LinkDeferred {
+        native_thread_id: String,
+        parent_thread_id: ThreadId,
+        origin: &'static str,
+        reason: DeferReason,
+    },
+    /// A reply-less link was discarded because its parent's thread file is gone.
+    LinkDropped {
+        native_thread_id: String,
+        parent_thread_id: ThreadId,
+        origin: &'static str,
+    },
+    /// An attach or a link with a caller was refused.
+    Refused { subject: RefusedSubject },
+    /// A live owner exited and the driver settled its coordinator.
+    OwnerExited {
+        thread_id: ThreadId,
+        reason: ForwarderExitReason,
+        disposition: OwnerExitDisposition,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum DeferReason {
+    /// The driver is quiesced; the link waits for a resume.
+    Quiesced,
+    /// The parent is detaching, failed, or not attached, and its thread file exists.
+    ParentNotLive,
+    /// The parent's thread file could not be read; the error text is kept for the log.
+    ParentUnreadable(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum RefusedSubject {
+    /// An attach arrived while the driver was quiesced.
+    AttachWhileQuiesced { thread_id: ThreadId },
+    /// A link with a caller arrived while the driver was quiesced.
+    LinkWhileQuiesced {
+        native_thread_id: String,
+        parent_thread_id: ThreadId,
+        origin: &'static str,
+    },
+    /// A link with a caller named a parent that has no live owner.
+    LinkWithoutLiveParent {
+        parent_thread_id: ThreadId,
+        origin: &'static str,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum OwnerExitDisposition {
+    /// A requested detach completed.
+    Detached,
+    /// The stream ended without a turn while the driver was quiesced (teardown).
+    TeardownExit,
+    /// An unexpected exit; the slot was cleared so the thread can be reopened.
+    FailedRemoved,
+    /// A persistence-blocked owner, retained as failed.
+    Retained,
+}
+
+impl DriverEvent {
+    /// The log line for this decision. Levels, messages, field names, field order, and field
+    /// formatting are those of the sites the lines moved from.
+    fn log(&self, project_id: ProjectId) {
+        match self {
+            Self::DiscoveryFinished {
+                native_thread_id,
+                attempts,
+                outcome: Err(error),
+            } => warn!(project_id = %project_id,
+                native_thread_id = native_thread_id.as_str(), %error,
+                attempt = attempts.saturating_add(1),
+                "failed to admit discovered native thread"),
+            Self::DiscoveryFinished { outcome: Ok(_), .. } => {}
+            Self::LinkFinished {
+                native_thread_id,
+                parent_thread_id,
+                item_id,
+                origin,
+                attempts,
+                outcome: Err(error),
+            } => warn!(project_id = %project_id, %parent_thread_id, %item_id, origin, %error,
+                %native_thread_id, attempt = attempts.saturating_add(1),
+                "failed to admit linked native thread"),
+            Self::LinkFinished { outcome: Ok(_), .. } => {}
+            Self::LinkDeferred {
+                native_thread_id,
+                parent_thread_id,
+                origin,
+                reason: DeferReason::Quiesced,
+            } => debug!(project_id = %project_id, %parent_thread_id, %native_thread_id, origin,
+                "deferring native identity link until the project resumes"),
+            Self::LinkDeferred {
+                native_thread_id,
+                parent_thread_id,
+                origin,
+                reason: DeferReason::ParentNotLive,
+            } => debug!(project_id = %project_id, %parent_thread_id, %native_thread_id, origin,
+                "deferring native identity link until its parent has a live owner"),
+            Self::LinkDeferred {
+                native_thread_id,
+                parent_thread_id,
+                origin,
+                reason: DeferReason::ParentUnreadable(error),
+            } => warn!(project_id = %project_id, %parent_thread_id, %native_thread_id, origin,
+                %error, "keeping deferred native identity link; its parent thread could not be read"),
+            Self::LinkDropped {
+                native_thread_id,
+                parent_thread_id,
+                origin,
+            } => warn!(project_id = %project_id, %parent_thread_id, %native_thread_id, origin,
+                "dropping native identity link because its parent thread no longer exists"),
+            Self::Refused {
+                subject: RefusedSubject::AttachWhileQuiesced { thread_id },
+            } => debug!(project_id = %project_id, %thread_id,
+                "refusing attach because the project is being deleted"),
+            Self::Refused {
+                subject:
+                    RefusedSubject::LinkWhileQuiesced {
+                        native_thread_id,
+                        parent_thread_id,
+                        origin,
+                    },
+            } => debug!(project_id = %project_id, %parent_thread_id, %native_thread_id, origin,
+                "refusing native identity link because the project is being deleted"),
+            Self::Refused {
+                subject:
+                    RefusedSubject::LinkWithoutLiveParent {
+                        parent_thread_id,
+                        origin,
+                    },
+            } => warn!(project_id = %project_id, %parent_thread_id, origin,
+                "refusing native identity link from a parent without a live owner"),
+            Self::OwnerExited {
+                thread_id,
+                reason,
+                disposition: OwnerExitDisposition::TeardownExit,
+            } => debug!(project_id = %project_id, %thread_id,
+                exit_reason = forwarder_exit_reason_label(*reason),
+                "event owner ended during project teardown"),
+            Self::OwnerExited {
+                thread_id,
+                reason,
+                disposition: OwnerExitDisposition::FailedRemoved,
+            } => warn!(project_id = %project_id, %thread_id,
+                exit_reason = forwarder_exit_reason_label(*reason),
+                "removed failed event owner so the thread can be reopened"),
+            Self::OwnerExited {
+                disposition: OwnerExitDisposition::Detached | OwnerExitDisposition::Retained,
+                ..
+            } => {}
+        }
+    }
+}
+
 #[derive(Clone)]
 pub(super) struct DriverHandle {
     tx: DriverSender,
@@ -269,6 +449,12 @@ fn is_teardown_exit(quiesced: bool, reason: ForwarderExitReason) -> bool {
 }
 
 impl ProjectEventDriver {
+    fn observe(&self, event: DriverEvent) {
+        event.log(self.project_id);
+        #[cfg(test)]
+        self.shared.driver_events.emit(event);
+    }
+
     async fn run(mut self) {
         let mut closed = false;
         loop {
@@ -336,9 +522,13 @@ impl ProjectEventDriver {
 
     async fn attach(&mut self, attach: Attach) {
         if self.quiesced {
+            let thread_id = attach.binding.handle.thread;
             let _ = attach.reply.send(Err(HarnessError::Protocol(
                 "project is being deleted".into(),
             )));
+            self.observe(DriverEvent::Refused {
+                subject: RefusedSubject::AttachWhileQuiesced { thread_id },
+            });
             return;
         }
         let thread_id = attach.binding.handle.thread;
@@ -440,13 +630,32 @@ impl ProjectEventDriver {
     async fn begin_link(&mut self, mut link: Link, attempts: u32) {
         if self.quiesced {
             if let Some(reply) = link.reply.take() {
+                let native_thread_id = link.info.native_thread_id.clone();
+                let parent_thread_id = link.parent_thread_id;
+                let origin = link.origin;
                 let _ = reply.send(Err(HarnessError::Protocol(
                     "project is being deleted".into(),
                 )));
+                self.observe(DriverEvent::Refused {
+                    subject: RefusedSubject::LinkWhileQuiesced {
+                        native_thread_id,
+                        parent_thread_id,
+                        origin,
+                    },
+                });
             } else {
                 // Forwarder-originated links have no waiting caller. Preserve them across a
                 // failed deletion just like discoveries whose cursor remains unconsumed.
+                let native_thread_id = link.info.native_thread_id.clone();
+                let parent_thread_id = link.parent_thread_id;
+                let origin = link.origin;
                 self.queue_deferred(Admission::Link(Box::new(link)), attempts);
+                self.observe(DriverEvent::LinkDeferred {
+                    native_thread_id,
+                    parent_thread_id,
+                    origin,
+                    reason: DeferReason::Quiesced,
+                });
             }
             return;
         }
@@ -461,9 +670,15 @@ impl ProjectEventDriver {
         };
         if !live {
             if let Some(reply) = link.reply.take() {
-                warn!(project_id = %self.project_id, parent_thread_id = %link.parent_thread_id,
-                    origin = link.origin, "refusing native identity link from a parent without a live owner");
+                let parent_thread_id = link.parent_thread_id;
+                let origin = link.origin;
                 let _ = reply.send(Ok(None));
+                self.observe(DriverEvent::Refused {
+                    subject: RefusedSubject::LinkWithoutLiveParent {
+                        parent_thread_id,
+                        origin,
+                    },
+                });
                 return;
             }
             // A reply-less link is the only record of the child's relationship. While the parent
@@ -476,32 +691,38 @@ impl ProjectEventDriver {
                 .await
             {
                 Ok(Some(_)) => {
-                    debug!(project_id = %self.project_id, parent_thread_id = %link.parent_thread_id,
-                        native_thread_id = %link.info.native_thread_id, origin = link.origin,
-                        "deferring native identity link until its parent has a live owner");
-                    #[cfg(test)]
-                    self.shared
-                        .deferred_link_requeues
-                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let native_thread_id = link.info.native_thread_id.clone();
+                    let parent_thread_id = link.parent_thread_id;
+                    let origin = link.origin;
                     self.queue_deferred(Admission::Link(Box::new(link)), attempts);
+                    self.observe(DriverEvent::LinkDeferred {
+                        native_thread_id,
+                        parent_thread_id,
+                        origin,
+                        reason: DeferReason::ParentNotLive,
+                    });
                 }
                 Ok(None) => {
-                    warn!(project_id = %self.project_id, parent_thread_id = %link.parent_thread_id,
-                        native_thread_id = %link.info.native_thread_id, origin = link.origin,
-                        "dropping native identity link because its parent thread no longer exists");
+                    self.observe(DriverEvent::LinkDropped {
+                        native_thread_id: link.info.native_thread_id,
+                        parent_thread_id: link.parent_thread_id,
+                        origin: link.origin,
+                    });
                 }
                 Err(error) => {
                     // The store could not say whether the parent exists. The link is the only
                     // record of the relationship, so keep it for the next driver event.
-                    warn!(project_id = %self.project_id, parent_thread_id = %link.parent_thread_id,
-                        native_thread_id = %link.info.native_thread_id, origin = link.origin,
-                        %error,
-                        "keeping deferred native identity link; its parent thread could not be read");
-                    #[cfg(test)]
-                    self.shared
-                        .deferred_link_requeues
-                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let native_thread_id = link.info.native_thread_id.clone();
+                    let parent_thread_id = link.parent_thread_id;
+                    let origin = link.origin;
+                    let reason = DeferReason::ParentUnreadable(error.to_string());
                     self.queue_deferred(Admission::Link(Box::new(link)), attempts);
+                    self.observe(DriverEvent::LinkDeferred {
+                        native_thread_id,
+                        parent_thread_id,
+                        origin,
+                        reason,
+                    });
                 }
             }
             return;
@@ -622,17 +843,16 @@ impl ProjectEventDriver {
     ) {
         match source {
             AdmissionSource::Discovery { retry, attempts } => {
-                #[cfg(test)]
-                self.shared
-                    .discovery_records_processed
-                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                if let Err(error) = result {
-                    warn!(project_id = %self.project_id,
-                        native_thread_id = retry.native_thread_id(), %error,
-                        attempt = attempts.saturating_add(1),
-                        "failed to admit discovered native thread");
+                let native_thread_id = retry.native_thread_id().to_owned();
+                let outcome = result.clone();
+                if result.is_err() {
                     self.defer_admission(retry, attempts);
                 }
+                self.observe(DriverEvent::DiscoveryFinished {
+                    native_thread_id,
+                    attempts,
+                    outcome,
+                });
             }
             AdmissionSource::Link {
                 retry,
@@ -643,21 +863,20 @@ impl ProjectEventDriver {
                 origin,
                 native_thread_id,
             } => {
-                #[cfg(test)]
-                self.shared
-                    .link_admissions_processed
-                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                if let Err(error) = &result {
-                    warn!(project_id = %self.project_id, %parent_thread_id, %item_id, origin, %error,
-                        %native_thread_id,
-                        attempt = attempts.saturating_add(1),
-                        "failed to admit linked native thread");
-                }
+                let outcome = result.clone();
                 if let Some(reply) = reply {
                     let _ = reply.send(result);
                 } else if let (Some(retry), Err(_)) = (retry, result) {
                     self.defer_admission(retry, attempts);
                 }
+                self.observe(DriverEvent::LinkFinished {
+                    native_thread_id,
+                    parent_thread_id,
+                    item_id,
+                    origin,
+                    attempts,
+                    outcome,
+                });
             }
         }
     }
@@ -747,35 +966,36 @@ impl ProjectEventDriver {
                     let _ = waiter.send(());
                 }
                 self.retry_parked(thread_id).await;
+                self.observe(DriverEvent::OwnerExited {
+                    thread_id,
+                    reason: exit.reason,
+                    disposition: OwnerExitDisposition::Detached,
+                });
             }
             OwnerExitOutcome::ClearFailed => {
                 if exit.authority.clear_coordinator_if(&exit.coordinator).await {
                     if is_teardown_exit(self.quiesced, exit.reason) {
-                        #[cfg(test)]
-                        self.shared
-                            .teardown_owner_exits
-                            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                        debug!(
-                            project_id = %self.project_id,
-                            %thread_id,
-                            exit_reason = forwarder_exit_reason_label(exit.reason),
-                            "event owner ended during project teardown"
-                        );
+                        self.observe(DriverEvent::OwnerExited {
+                            thread_id,
+                            reason: exit.reason,
+                            disposition: OwnerExitDisposition::TeardownExit,
+                        });
                     } else {
-                        #[cfg(test)]
-                        self.shared
-                            .failed_owner_removals_warned
-                            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                        warn!(
-                            project_id = %self.project_id,
-                            %thread_id,
-                            exit_reason = forwarder_exit_reason_label(exit.reason),
-                            "removed failed event owner so the thread can be reopened"
-                        );
+                        self.observe(DriverEvent::OwnerExited {
+                            thread_id,
+                            reason: exit.reason,
+                            disposition: OwnerExitDisposition::FailedRemoved,
+                        });
                     }
                 }
             }
-            OwnerExitOutcome::RetainFailed => {}
+            OwnerExitOutcome::RetainFailed => {
+                self.observe(DriverEvent::OwnerExited {
+                    thread_id,
+                    reason: exit.reason,
+                    disposition: OwnerExitDisposition::Retained,
+                });
+            }
         }
         self.start_deferred().await;
     }
@@ -792,6 +1012,73 @@ impl ProjectEventDriver {
         }
         for attach in retry {
             self.attach(attach).await;
+        }
+    }
+}
+
+#[cfg(test)]
+pub(super) mod probe {
+    use super::{DriverEvent, mpsc};
+
+    #[derive(Default)]
+    pub(in crate::registry) struct DriverEventSink(
+        std::sync::Mutex<Option<mpsc::UnboundedSender<DriverEvent>>>,
+    );
+
+    impl DriverEventSink {
+        /// Start observing. Replaces any earlier observer; events emitted before this call are
+        /// not replayed, so call it before triggering the behaviour under test.
+        pub(in crate::registry) fn observe(&self) -> DriverProbe {
+            let (sender, receiver) = mpsc::unbounded_channel();
+            *self.0.lock().unwrap() = Some(sender);
+            DriverProbe(receiver)
+        }
+
+        pub(super) fn emit(&self, event: DriverEvent) {
+            if let Some(sender) = self.0.lock().unwrap().as_ref() {
+                let _ = sender.send(event);
+            }
+        }
+    }
+
+    pub(in crate::registry) struct DriverProbe(mpsc::UnboundedReceiver<DriverEvent>);
+
+    impl DriverProbe {
+        /// The next event matching `pred`, discarding non-matching events before it. Panics
+        /// after 2 s, printing the events it discarded.
+        pub(in crate::registry) async fn expect(
+            &mut self,
+            pred: impl Fn(&DriverEvent) -> bool,
+        ) -> DriverEvent {
+            let mut discarded = Vec::new();
+            let received = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                loop {
+                    let event = self.0.recv().await?;
+                    if pred(&event) {
+                        return Some(event);
+                    }
+                    discarded.push(event);
+                }
+            })
+            .await;
+            match received {
+                Ok(Some(event)) => event,
+                Ok(None) => {
+                    panic!("driver event observer closed; discarded events: {discarded:?}")
+                }
+                Err(_) => {
+                    panic!("timed out waiting for driver event; discarded events: {discarded:?}")
+                }
+            }
+        }
+
+        /// Every event currently queued, without waiting.
+        pub(in crate::registry) fn drain(&mut self) -> Vec<DriverEvent> {
+            let mut events = Vec::new();
+            while let Ok(event) = self.0.try_recv() {
+                events.push(event);
+            }
+            events
         }
     }
 }
@@ -1002,6 +1289,58 @@ mod tests {
         (shared, harness, driver, project_id, store)
     }
 
+    fn observe(shared: &RegistryShared) -> probe::DriverProbe {
+        shared.driver_events.observe()
+    }
+
+    fn discovery_finished(native: &str) -> impl Fn(&DriverEvent) -> bool + '_ {
+        move |event| {
+            matches!(
+                event,
+                DriverEvent::DiscoveryFinished {
+                    native_thread_id,
+                    ..
+                } if native_thread_id == native
+            )
+        }
+    }
+
+    fn link_finished(native: &str) -> impl Fn(&DriverEvent) -> bool + '_ {
+        move |event| {
+            matches!(
+                event,
+                DriverEvent::LinkFinished {
+                    native_thread_id,
+                    ..
+                } if native_thread_id == native
+            )
+        }
+    }
+
+    fn deferred(native: &str) -> impl Fn(&DriverEvent) -> bool + '_ {
+        move |event| {
+            matches!(
+                event,
+                DriverEvent::LinkDeferred {
+                    native_thread_id,
+                    ..
+                } if native_thread_id == native
+            )
+        }
+    }
+
+    fn exited(disposition: OwnerExitDisposition) -> impl Fn(&DriverEvent) -> bool {
+        move |event| {
+            matches!(
+                event,
+                DriverEvent::OwnerExited {
+                    disposition: event_disposition,
+                    ..
+                } if *event_disposition == disposition
+            )
+        }
+    }
+
     async fn persist_thread(store: &PersistStore, project_id: ProjectId, thread_id: ThreadId) {
         store
             .create_project(project_id, "project", "/tmp/test")
@@ -1137,6 +1476,63 @@ mod tests {
         })
         .await
         .unwrap();
+    }
+
+    #[tokio::test]
+    async fn driver_events_are_emitted_after_their_effects() {
+        let (shared, harness, _driver, project_id, store) = setup();
+        let mut probe = observe(&shared);
+        store
+            .create_project(project_id, "project", "/tmp/test")
+            .await
+            .unwrap();
+        let discovered = ThreadId::new();
+        harness.announce(ThreadDiscovered {
+            thread: discovered,
+            harness_thread_id: "observed-discovery".into(),
+            parent_harness_thread_id: None,
+        });
+
+        probe.expect(discovery_finished("observed-discovery")).await;
+        assert!(load_thread(&store, project_id, discovered).await.is_some());
+        assert!(shared.coordinator(discovered).await.is_some());
+
+        harness.log(discovered).close();
+        probe
+            .expect(exited(OwnerExitDisposition::FailedRemoved))
+            .await;
+        assert!(shared.coordinator(discovered).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_refused_attach_is_observable() {
+        let (shared, _harness, driver, project_id, _store) = setup();
+        let mut probe = observe(&shared);
+        let thread_id = ThreadId::new();
+        driver.quiesce().await.unwrap();
+
+        let result = driver
+            .attach(
+                binding(project_id, thread_id, "native"),
+                ClassificationPhase::Primary,
+            )
+            .await;
+        assert!(matches!(
+            result,
+            Err(HarnessError::Protocol(message)) if message == "project is being deleted"
+        ));
+        probe
+            .expect(|event| {
+                matches!(
+                    event,
+                    DriverEvent::Refused {
+                        subject: RefusedSubject::AttachWhileQuiesced {
+                            thread_id: event_thread_id
+                        }
+                    } if *event_thread_id == thread_id
+                )
+            })
+            .await;
     }
 
     #[tokio::test]
@@ -1655,6 +2051,7 @@ mod tests {
     #[tokio::test]
     async fn a_discovery_after_link_reuses_the_existing_thread() {
         let (shared, harness, driver, project_id, store) = setup();
+        let mut probe = observe(&shared);
         let parent = ThreadId::new();
         persist_thread(&store, project_id, parent).await;
         attach_primary(&driver, project_id, parent, "native").await;
@@ -1667,7 +2064,7 @@ mod tests {
             harness_thread_id: "child-native".into(),
             parent_harness_thread_id: Some("native".into()),
         });
-        wait_until(|| shared.discovery_records_processed.load(Ordering::SeqCst) == 1).await;
+        probe.expect(discovery_finished("child-native")).await;
         assert!(Arc::ptr_eq(
             &before,
             &shared.coordinator(child).await.unwrap()
@@ -1883,6 +2280,7 @@ mod tests {
     #[tokio::test]
     async fn command_channel_close_does_not_abandon_inflight_discovery() {
         let (shared, harness, spawned_driver, project_id, _store) = setup();
+        let mut probe = observe(&shared);
         drop(spawned_driver);
         let (tx, rx) = mpsc::channel(1);
         let gate = Arc::new(tokio::sync::Notify::new());
@@ -1933,7 +2331,7 @@ mod tests {
         assert!(!task.is_finished());
         gate.notify_one();
 
-        wait_until(|| shared.discovery_records_processed.load(Ordering::SeqCst) == 1).await;
+        probe.expect(discovery_finished("discovered")).await;
         let authority = shared.thread_authority(discovered).await.unwrap();
         assert!(authority.coordinator().await.is_some());
         concrete_harness.log(discovered).close();
@@ -1965,6 +2363,7 @@ mod tests {
     #[tokio::test]
     async fn a_quiesced_driver_refuses_links_and_leaves_discoveries_unconsumed() {
         let (shared, harness, driver, project_id, store) = setup();
+        let mut probe = observe(&shared);
         let parent = ThreadId::new();
         persist_thread(&store, project_id, parent).await;
         attach_primary(&driver, project_id, parent, "native").await;
@@ -1974,18 +2373,27 @@ mod tests {
         assert!(
             matches!(response.await.unwrap(), Err(HarnessError::Protocol(message)) if message == "project is being deleted")
         );
+        probe
+            .expect(|event| {
+                matches!(
+                    event,
+                    DriverEvent::Refused {
+                        subject: RefusedSubject::LinkWhileQuiesced { native_thread_id, .. }
+                    } if native_thread_id == "child-native"
+                )
+            })
+            .await;
         let discovered = ThreadId::new();
         harness.announce(ThreadDiscovered {
             thread: discovered,
             harness_thread_id: "discovered".into(),
             parent_harness_thread_id: None,
         });
-        tokio::task::yield_now().await;
-        assert_eq!(shared.discovery_records_processed.load(Ordering::SeqCst), 0);
+        assert!(!probe.drain().iter().any(discovery_finished("discovered")));
         assert!(load_thread(&store, project_id, discovered).await.is_none());
 
         driver.resume().await.unwrap();
-        wait_until(|| shared.discovery_records_processed.load(Ordering::SeqCst) == 1).await;
+        probe.expect(discovery_finished("discovered")).await;
         let file = wait_for_thread(&store, project_id, discovered).await;
         assert_eq!(file.kind, giskard_core::thread::ThreadKind::Orphan);
     }
@@ -2050,6 +2458,7 @@ mod tests {
     #[tokio::test]
     async fn a_failed_discovery_is_retried_after_the_next_successful_admission() {
         let (shared, harness, driver, project_id, store) = setup();
+        let mut probe = observe(&shared);
         let parent = ThreadId::new();
         persist_thread(&store, project_id, parent).await;
         attach_primary(&driver, project_id, parent, "native").await;
@@ -2061,20 +2470,21 @@ mod tests {
             harness_thread_id: "deferred-discovery".into(),
             parent_harness_thread_id: None,
         });
-        wait_until(|| shared.discovery_records_processed.load(Ordering::SeqCst) == 1).await;
+        probe.expect(discovery_finished("deferred-discovery")).await;
         assert!(obstruction.is_file());
 
         tokio::fs::remove_file(obstruction).await.unwrap();
         let (request, response) = link(parent, "successful-child");
         driver.link(request).await.unwrap();
         assert!(response.await.unwrap().unwrap().is_some());
-        wait_until(|| shared.discovery_records_processed.load(Ordering::SeqCst) == 2).await;
+        probe.expect(discovery_finished("deferred-discovery")).await;
         assert!(load_thread(&store, project_id, discovered).await.is_some());
     }
 
     #[tokio::test]
     async fn a_failed_discovery_is_retried_after_an_attach() {
         let (shared, harness, driver, project_id, store) = setup();
+        let mut probe = observe(&shared);
         let discovered = ThreadId::new();
         let obstruction = obstruct_thread_creation(&store, project_id, discovered).await;
         harness.announce(ThreadDiscovered {
@@ -2082,18 +2492,23 @@ mod tests {
             harness_thread_id: "attach-retry-discovery".into(),
             parent_harness_thread_id: None,
         });
-        wait_until(|| shared.discovery_records_processed.load(Ordering::SeqCst) == 1).await;
+        probe
+            .expect(discovery_finished("attach-retry-discovery"))
+            .await;
         tokio::fs::remove_file(obstruction).await.unwrap();
         let primary = ThreadId::new();
         persist_thread(&store, project_id, primary).await;
         attach_primary(&driver, project_id, primary, "native-primary").await;
-        wait_until(|| shared.discovery_records_processed.load(Ordering::SeqCst) == 2).await;
+        probe
+            .expect(discovery_finished("attach-retry-discovery"))
+            .await;
         assert!(load_thread(&store, project_id, discovered).await.is_some());
     }
 
     #[tokio::test]
     async fn a_failed_discovery_is_retried_after_a_detached_owner_exits() {
         let (shared, harness, driver, project_id, store) = setup();
+        let mut probe = observe(&shared);
         let primary = ThreadId::new();
         persist_thread(&store, project_id, primary).await;
         attach_primary(&driver, project_id, primary, "native-primary").await;
@@ -2104,16 +2519,21 @@ mod tests {
             harness_thread_id: "detach-retry-discovery".into(),
             parent_harness_thread_id: None,
         });
-        wait_until(|| shared.discovery_records_processed.load(Ordering::SeqCst) == 1).await;
+        probe
+            .expect(discovery_finished("detach-retry-discovery"))
+            .await;
         tokio::fs::remove_file(obstruction).await.unwrap();
         driver.detach(primary).await;
-        wait_until(|| shared.discovery_records_processed.load(Ordering::SeqCst) == 2).await;
+        probe
+            .expect(discovery_finished("detach-retry-discovery"))
+            .await;
         assert!(load_thread(&store, project_id, discovered).await.is_some());
     }
 
     #[tokio::test]
     async fn a_failed_discovery_is_retried_after_an_owner_exit() {
         let (shared, harness, driver, project_id, store) = setup();
+        let mut probe = observe(&shared);
         let primary = ThreadId::new();
         persist_thread(&store, project_id, primary).await;
         attach_primary(&driver, project_id, primary, "native-primary").await;
@@ -2124,16 +2544,21 @@ mod tests {
             harness_thread_id: "exit-retry-discovery".into(),
             parent_harness_thread_id: None,
         });
-        wait_until(|| shared.discovery_records_processed.load(Ordering::SeqCst) == 1).await;
+        probe
+            .expect(discovery_finished("exit-retry-discovery"))
+            .await;
         tokio::fs::remove_file(obstruction).await.unwrap();
         harness.log(primary).close();
-        wait_until(|| shared.discovery_records_processed.load(Ordering::SeqCst) == 2).await;
+        probe
+            .expect(discovery_finished("exit-retry-discovery"))
+            .await;
         assert!(load_thread(&store, project_id, discovered).await.is_some());
     }
 
     #[tokio::test]
     async fn a_failed_discovery_is_never_dropped() {
         let (shared, harness, driver, project_id, store) = setup();
+        let mut probe = observe(&shared);
         let parent = ThreadId::new();
         persist_thread(&store, project_id, parent).await;
         attach_primary(&driver, project_id, parent, "native").await;
@@ -2145,29 +2570,32 @@ mod tests {
             harness_thread_id: "always-failing-discovery".into(),
             parent_harness_thread_id: None,
         });
-        wait_until(|| shared.discovery_records_processed.load(Ordering::SeqCst) == 1).await;
+        probe
+            .expect(discovery_finished("always-failing-discovery"))
+            .await;
 
         for index in 0..4 {
             let (request, response) = link(parent, &format!("successful-child-{index}"));
             driver.link(request).await.unwrap();
             assert!(response.await.unwrap().unwrap().is_some());
-            let expected_attempts = index + 2;
-            wait_until(|| {
-                shared.discovery_records_processed.load(Ordering::SeqCst) == expected_attempts
-            })
-            .await;
+            probe
+                .expect(discovery_finished("always-failing-discovery"))
+                .await;
         }
         tokio::fs::remove_file(obstruction).await.unwrap();
         let (request, response) = link(parent, "successful-child-final");
         driver.link(request).await.unwrap();
         assert!(response.await.unwrap().unwrap().is_some());
-        wait_until(|| shared.discovery_records_processed.load(Ordering::SeqCst) == 6).await;
+        probe
+            .expect(discovery_finished("always-failing-discovery"))
+            .await;
         assert!(load_thread(&store, project_id, discovered).await.is_some());
     }
 
     #[tokio::test]
     async fn deferred_admissions_are_deduplicated_by_native_id() {
         let (shared, harness, driver, project_id, store) = setup();
+        let mut probe = observe(&shared);
         let first = ThreadId::new();
         let second = ThreadId::new();
         let first_obstruction = obstruct_thread_creation(&store, project_id, first).await;
@@ -2178,16 +2606,20 @@ mod tests {
                 harness_thread_id: "duplicate-native".into(),
                 parent_harness_thread_id: None,
             });
-            let expected = if thread == first { 1 } else { 2 };
-            wait_until(|| shared.discovery_records_processed.load(Ordering::SeqCst) == expected)
-                .await;
+            probe.expect(discovery_finished("duplicate-native")).await;
         }
         tokio::fs::remove_file(first_obstruction).await.unwrap();
         tokio::fs::remove_file(second_obstruction).await.unwrap();
         let primary = ThreadId::new();
         persist_thread(&store, project_id, primary).await;
         attach_primary(&driver, project_id, primary, "native-primary").await;
-        wait_until(|| shared.discovery_records_processed.load(Ordering::SeqCst) == 3).await;
+        probe.expect(discovery_finished("duplicate-native")).await;
+        assert!(
+            !probe
+                .drain()
+                .iter()
+                .any(discovery_finished("duplicate-native"))
+        );
         let mut matching = 0;
         for thread in store.list_threads(project_id).await.unwrap() {
             if store
@@ -2205,6 +2637,7 @@ mod tests {
     #[tokio::test]
     async fn a_deferred_link_is_not_downgraded_by_a_discovery() {
         let (shared, harness, driver, project_id, store) = setup();
+        let mut probe = observe(&shared);
         let parent = ThreadId::new();
         persist_thread(&store, project_id, parent).await;
         attach_primary(&driver, project_id, parent, "native-primary").await;
@@ -2224,7 +2657,7 @@ mod tests {
             harness_thread_id: "shared-native".into(),
             parent_harness_thread_id: None,
         });
-        wait_until(|| shared.discovery_records_processed.load(Ordering::SeqCst) == 1).await;
+        probe.expect(discovery_finished("shared-native")).await;
 
         tokio::fs::remove_file(linked_obstruction).await.unwrap();
         tokio::fs::remove_file(discovered_obstruction)
@@ -2243,6 +2676,7 @@ mod tests {
     #[tokio::test]
     async fn a_failing_retry_does_not_spin() {
         let (shared, harness, driver, project_id, store) = setup();
+        let mut probe = observe(&shared);
         let parent = ThreadId::new();
         persist_thread(&store, project_id, parent).await;
         attach_primary(&driver, project_id, parent, "native-primary").await;
@@ -2253,23 +2687,35 @@ mod tests {
             harness_thread_id: "non-spinning-discovery".into(),
             parent_harness_thread_id: None,
         });
-        wait_until(|| shared.discovery_records_processed.load(Ordering::SeqCst) == 1).await;
+        probe
+            .expect(discovery_finished("non-spinning-discovery"))
+            .await;
         let (request, response) = link(parent, "successful-child");
         driver.link(request).await.unwrap();
         assert!(response.await.unwrap().unwrap().is_some());
-        wait_until(|| shared.discovery_records_processed.load(Ordering::SeqCst) == 2).await;
+        probe
+            .expect(discovery_finished("non-spinning-discovery"))
+            .await;
         let claim_calls = harness.claim_calls.load(Ordering::SeqCst);
         driver.quiesce().await.unwrap();
-        assert_eq!(shared.discovery_records_processed.load(Ordering::SeqCst), 2);
+        assert!(
+            !probe
+                .drain()
+                .iter()
+                .any(discovery_finished("non-spinning-discovery"))
+        );
         assert!(obstruction.is_file());
         assert_eq!(harness.claim_calls.load(Ordering::SeqCst), claim_calls);
         driver.resume().await.unwrap();
-        wait_until(|| shared.discovery_records_processed.load(Ordering::SeqCst) == 3).await;
+        probe
+            .expect(discovery_finished("non-spinning-discovery"))
+            .await;
     }
 
     #[tokio::test]
     async fn the_deferred_queue_keeps_every_distinct_native_id() {
         let (shared, harness, driver, project_id, store) = setup();
+        let mut probe = observe(&shared);
         let mut records = Vec::new();
         for index in 0..=DEFERRED_ADMISSION_WARN_THRESHOLD {
             let thread = ThreadId::new();
@@ -2277,25 +2723,22 @@ mod tests {
             let native = format!("unbounded-native-{index}");
             harness.announce(ThreadDiscovered {
                 thread,
-                harness_thread_id: native,
+                harness_thread_id: native.clone(),
                 parent_harness_thread_id: None,
             });
-            wait_until(|| shared.discovery_records_processed.load(Ordering::SeqCst) == index + 1)
-                .await;
-            records.push((thread, obstruction));
+            probe.expect(discovery_finished(&native)).await;
+            records.push((thread, obstruction, native));
         }
-        for (_, obstruction) in &records {
+        for (_, obstruction, _) in &records {
             tokio::fs::remove_file(obstruction).await.unwrap();
         }
         let primary = ThreadId::new();
         persist_thread(&store, project_id, primary).await;
         attach_primary(&driver, project_id, primary, "native-primary").await;
-        wait_until(|| {
-            shared.discovery_records_processed.load(Ordering::SeqCst)
-                == (DEFERRED_ADMISSION_WARN_THRESHOLD + 1) * 2
-        })
-        .await;
-        for (thread, _) in &records {
+        for (_, _, native) in &records {
+            probe.expect(discovery_finished(native)).await;
+        }
+        for (thread, _, _) in &records {
             assert!(load_thread(&store, project_id, *thread).await.is_some());
         }
     }
@@ -2303,6 +2746,7 @@ mod tests {
     #[tokio::test]
     async fn a_deferred_link_survives_its_parent_detaching_and_is_admitted_on_reattach() {
         let (shared, harness, driver, project_id, store) = setup();
+        let mut probe = observe(&shared);
         let parent = ThreadId::new();
         persist_thread(&store, project_id, parent).await;
         attach_primary(&driver, project_id, parent, "native").await;
@@ -2313,20 +2757,20 @@ mod tests {
         let (mut request, _response) = link(parent, "deferred-child");
         request.reply = None;
         driver.link(request).await.unwrap();
-        wait_until(|| shared.link_admissions_processed.load(Ordering::SeqCst) == 1).await;
+        probe.expect(link_finished("deferred-child")).await;
         assert!(obstruction.is_file());
 
         // The parent's owner exit wakes the queue while the parent is not live; the link must
         // be kept, not retried against a detached parent and not dropped.
         driver.detach(parent).await;
         wait_for_no_coordinator(&shared, parent).await;
-        wait_until(|| shared.deferred_link_requeues.load(Ordering::SeqCst) == 1).await;
-        assert_eq!(shared.link_admissions_processed.load(Ordering::SeqCst), 1);
+        probe.expect(deferred("deferred-child")).await;
+        assert!(!probe.drain().iter().any(link_finished("deferred-child")));
         assert!(obstruction.is_file());
 
         tokio::fs::remove_file(obstruction).await.unwrap();
         attach_primary(&driver, project_id, parent, "native").await;
-        wait_until(|| shared.link_admissions_processed.load(Ordering::SeqCst) == 2).await;
+        probe.expect(link_finished("deferred-child")).await;
         let file = wait_for_thread(&store, project_id, child).await;
         assert_eq!(file.kind, giskard_core::thread::ThreadKind::Subagent);
         assert_eq!(file.parent_thread_id, Some(parent));
@@ -2335,6 +2779,7 @@ mod tests {
     #[tokio::test]
     async fn a_deferred_link_is_dropped_once_its_parent_thread_is_gone() {
         let (shared, harness, driver, project_id, store) = setup();
+        let mut probe = observe(&shared);
         let parent = ThreadId::new();
         persist_thread(&store, project_id, parent).await;
         attach_primary(&driver, project_id, parent, "native").await;
@@ -2345,11 +2790,16 @@ mod tests {
         let (mut request, _response) = link(parent, "orphaned-child");
         request.reply = None;
         driver.link(request).await.unwrap();
-        wait_until(|| shared.link_admissions_processed.load(Ordering::SeqCst) == 1).await;
+        probe.expect(link_finished("orphaned-child")).await;
 
         store.delete_thread(project_id, parent).await.unwrap();
         driver.detach(parent).await;
         wait_for_no_coordinator(&shared, parent).await;
+        probe
+            .expect(|event| {
+                matches!(event, DriverEvent::LinkDropped { native_thread_id, .. } if native_thread_id == "orphaned-child")
+            })
+            .await;
         tokio::fs::remove_file(obstruction).await.unwrap();
 
         // Two more wakes with nothing queued: the link was dropped, not kept.
@@ -2357,8 +2807,7 @@ mod tests {
         attach_primary(&driver, project_id, primary, "native-primary").await;
         driver.detach(primary).await;
         wait_for_no_coordinator(&shared, primary).await;
-        tokio::task::yield_now().await;
-        assert_eq!(shared.link_admissions_processed.load(Ordering::SeqCst), 1);
+        assert!(!probe.drain().iter().any(link_finished("orphaned-child")));
         assert!(load_thread(&store, project_id, child).await.is_none());
     }
 
@@ -2392,6 +2841,7 @@ mod tests {
     #[tokio::test]
     async fn an_unrelated_owner_exit_under_quiesce_still_warns() {
         let (shared, harness, driver, project_id, store) = setup();
+        let mut probe = observe(&shared);
         let thread_id = ThreadId::new();
         persist_thread(&store, project_id, thread_id).await;
         attach_primary(&driver, project_id, thread_id, "native").await;
@@ -2403,14 +2853,22 @@ mod tests {
             turn: TurnId::new(),
         }));
         log.close();
-        wait_until(|| shared.failed_owner_removals_warned.load(Ordering::SeqCst) == 1).await;
+        probe
+            .expect(exited(OwnerExitDisposition::FailedRemoved))
+            .await;
         assert!(shared.coordinator(thread_id).await.is_none());
-        assert_eq!(shared.teardown_owner_exits.load(Ordering::SeqCst), 0);
+        assert!(
+            !probe
+                .drain()
+                .iter()
+                .any(exited(OwnerExitDisposition::TeardownExit))
+        );
     }
 
     #[tokio::test]
     async fn a_deferred_link_is_kept_when_its_parent_cannot_be_read() {
         let (shared, harness, driver, project_id, store) = setup();
+        let mut probe = observe(&shared);
         let parent = ThreadId::new();
         persist_thread(&store, project_id, parent).await;
         attach_primary(&driver, project_id, parent, "native").await;
@@ -2421,7 +2879,7 @@ mod tests {
         let (mut request, _response) = link(parent, "unreadable-parent-child");
         request.reply = None;
         driver.link(request).await.unwrap();
-        wait_until(|| shared.link_admissions_processed.load(Ordering::SeqCst) == 1).await;
+        probe.expect(link_finished("unreadable-parent-child")).await;
 
         // Make the parent's metadata unreadable with an I/O error, not corrupt JSON: the store
         // quarantines corrupt JSON on first read, after which the parent would read as absent.
@@ -2439,14 +2897,19 @@ mod tests {
 
         driver.detach(parent).await;
         wait_for_no_coordinator(&shared, parent).await;
-        wait_until(|| shared.deferred_link_requeues.load(Ordering::SeqCst) == 1).await;
-        assert_eq!(shared.link_admissions_processed.load(Ordering::SeqCst), 1);
+        probe.expect(deferred("unreadable-parent-child")).await;
+        assert!(
+            !probe
+                .drain()
+                .iter()
+                .any(link_finished("unreadable-parent-child"))
+        );
 
         tokio::fs::remove_dir(&parent_json).await.unwrap();
         tokio::fs::rename(&backup, &parent_json).await.unwrap();
         tokio::fs::remove_file(obstruction).await.unwrap();
         attach_primary(&driver, project_id, parent, "native").await;
-        wait_until(|| shared.link_admissions_processed.load(Ordering::SeqCst) == 2).await;
+        probe.expect(link_finished("unreadable-parent-child")).await;
         let file = wait_for_thread(&store, project_id, child).await;
         assert_eq!(file.kind, giskard_core::thread::ThreadKind::Subagent);
     }
@@ -2454,6 +2917,7 @@ mod tests {
     #[tokio::test]
     async fn an_ineligible_link_at_the_head_does_not_block_an_eligible_one_behind_it() {
         let (shared, harness, driver, project_id, store) = setup();
+        let mut probe = observe(&shared);
         let offline_parent = ThreadId::new();
         let live_parent = ThreadId::new();
         persist_thread(&store, project_id, offline_parent).await;
@@ -2479,11 +2943,11 @@ mod tests {
         let (mut request, _) = link(offline_parent, "offline-child");
         request.reply = None;
         driver.link(request).await.unwrap();
-        wait_until(|| shared.link_admissions_processed.load(Ordering::SeqCst) == 1).await;
+        probe.expect(link_finished("offline-child")).await;
         let (mut request, _) = link(live_parent, "live-child");
         request.reply = None;
         driver.link(request).await.unwrap();
-        wait_until(|| shared.link_admissions_processed.load(Ordering::SeqCst) == 2).await;
+        probe.expect(link_finished("live-child")).await;
 
         // One wake: the offline parent's owner exit. Its link is requeued; the live parent's
         // link must be retried in the same wake, not left for a later event.
@@ -2491,8 +2955,8 @@ mod tests {
         driver.detach(offline_parent).await;
         // The live child's successful admission wakes the queue again and requeues the offline
         // link a second time, so only "at least once" is stable here.
-        wait_until(|| shared.deferred_link_requeues.load(Ordering::SeqCst) >= 1).await;
-        wait_until(|| shared.link_admissions_processed.load(Ordering::SeqCst) == 3).await;
+        probe.expect(deferred("offline-child")).await;
+        probe.expect(link_finished("live-child")).await;
         let file = wait_for_thread(&store, project_id, live_child).await;
         assert_eq!(file.kind, giskard_core::thread::ThreadKind::Subagent);
         assert_eq!(file.parent_thread_id, Some(live_parent));
@@ -2502,6 +2966,7 @@ mod tests {
     #[tokio::test]
     async fn a_failed_discovery_is_retried_after_a_detach_with_no_owner() {
         let (shared, harness, driver, project_id, store) = setup();
+        let mut probe = observe(&shared);
         persist_thread(&store, project_id, ThreadId::new()).await;
         let discovered = ThreadId::new();
         let obstruction = obstruct_thread_creation(&store, project_id, discovered).await;
@@ -2510,37 +2975,54 @@ mod tests {
             harness_thread_id: "ownerless-detach-discovery".into(),
             parent_harness_thread_id: None,
         });
-        wait_until(|| shared.discovery_records_processed.load(Ordering::SeqCst) == 1).await;
+        probe
+            .expect(discovery_finished("ownerless-detach-discovery"))
+            .await;
         tokio::fs::remove_file(obstruction).await.unwrap();
         driver.detach(ThreadId::new()).await;
-        wait_until(|| shared.discovery_records_processed.load(Ordering::SeqCst) == 2).await;
+        probe
+            .expect(discovery_finished("ownerless-detach-discovery"))
+            .await;
         assert!(load_thread(&store, project_id, discovered).await.is_some());
     }
 
     #[tokio::test]
     async fn an_owner_ending_during_teardown_is_not_a_warning() {
         let (shared, harness, driver, project_id, _store) = setup();
+        let mut probe = observe(&shared);
         let thread_id = ThreadId::new();
         attach_primary(&driver, project_id, thread_id, "native").await;
         driver.quiesce().await.unwrap();
         harness.log(thread_id).close();
-        wait_until(|| shared.teardown_owner_exits.load(Ordering::SeqCst) == 1).await;
+        probe
+            .expect(exited(OwnerExitDisposition::TeardownExit))
+            .await;
         assert!(shared.coordinator(thread_id).await.is_none());
-        assert_eq!(
-            shared.failed_owner_removals_warned.load(Ordering::SeqCst),
-            0
+        assert!(
+            !probe
+                .drain()
+                .iter()
+                .any(exited(OwnerExitDisposition::FailedRemoved))
         );
     }
 
     #[tokio::test]
     async fn an_owner_ending_outside_teardown_still_warns() {
         let (shared, harness, driver, project_id, _store) = setup();
+        let mut probe = observe(&shared);
         let thread_id = ThreadId::new();
         attach_primary(&driver, project_id, thread_id, "native").await;
         harness.log(thread_id).close();
-        wait_until(|| shared.failed_owner_removals_warned.load(Ordering::SeqCst) == 1).await;
+        probe
+            .expect(exited(OwnerExitDisposition::FailedRemoved))
+            .await;
         assert!(shared.coordinator(thread_id).await.is_none());
-        assert_eq!(shared.teardown_owner_exits.load(Ordering::SeqCst), 0);
+        assert!(
+            !probe
+                .drain()
+                .iter()
+                .any(exited(OwnerExitDisposition::TeardownExit))
+        );
     }
 
     #[tokio::test]
@@ -2573,6 +3055,7 @@ mod tests {
     #[tokio::test]
     async fn a_resume_retries_deferred_admissions() {
         let (shared, harness, driver, project_id, store) = setup();
+        let mut probe = observe(&shared);
         persist_thread(&store, project_id, ThreadId::new()).await;
         let discovered = ThreadId::new();
         let obstruction = obstruct_thread_creation(&store, project_id, discovered).await;
@@ -2581,12 +3064,12 @@ mod tests {
             harness_thread_id: "resume-discovery".into(),
             parent_harness_thread_id: None,
         });
-        wait_until(|| shared.discovery_records_processed.load(Ordering::SeqCst) == 1).await;
+        probe.expect(discovery_finished("resume-discovery")).await;
         driver.quiesce().await.unwrap();
         tokio::fs::remove_file(obstruction).await.unwrap();
         driver.resume().await.unwrap();
 
-        wait_until(|| shared.discovery_records_processed.load(Ordering::SeqCst) == 2).await;
+        probe.expect(discovery_finished("resume-discovery")).await;
         assert!(load_thread(&store, project_id, discovered).await.is_some());
     }
 
