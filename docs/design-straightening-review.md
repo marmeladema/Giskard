@@ -95,6 +95,12 @@ struct NativeTurnState {
 turns: HashMap<NativeTurnKey, NativeTurnState>,
 ```
 
+**Status: landed in S2, with the grouping corrected by lifetime.** `turn_ids` remains separate
+because it has harness lifetime and preserves identity for late command completion;
+`file_change_previews` and `running_commands` also remain separate because their keys and cleanup
+sites differ. `NativeTurnState` groups only usage, emitted usage, model, and invalid-window warning
+state, which are removed together at turn completion or thread cleanup.
+
 One map, one `ENTITY-AUTHORITY-EXCEPTION` comment instead of six, one `remove` on completion,
 and `clear_active_turn` becomes a single `retain`. The usage handler stops doing five lookups on
 the same key. This is mechanical and the mapper's 86 functions do not change signature.
@@ -102,6 +108,10 @@ the same key. This is mechanical and the mapper's 86 functions do not change sig
 **B2. `ThreadRuntimeEntry` per-item outputs.** `command_outputs`, `tool_outputs`, and
 `persisted_command_output_versions` are three maps keyed by `(TurnId, ItemId)` that are always
 read and written for the same item. Fold them into one `HashMap<(TurnId, ItemId), ItemOutputs>`.
+
+**Status: landed in S2, with the grouping corrected by lifetime.** `ItemOutputs` groups only live
+command and tool outputs, which are pruned at turn completion. The persisted command-output version
+cache remains separate because durable-output routes need it after the turn has persisted.
 
 **B3. `RegistryShared` is two things.** It holds the identity indexes and the harness transition
 gate (registry concerns) and also five service handles (`hub`, `runtime`, `store`,
@@ -248,7 +258,7 @@ Each step is one PR that stands alone on `main`, mechanical first:
 | # | Change | Kind | Size (non-test lines) |
 | --- | --- | --- | --- |
 | 1 | C1 `AgentEvent` accessors; delete the ten copies — **landed in S1** | mechanical | −150 |
-| 2 | B1 `NativeTurnState`; B2 `ItemOutputs` | mechanical | −120 |
+| 2 | B1 `NativeTurnState`; B2 `ItemOutputs` — **landed in S2** | mechanical | −120 |
 | 3 | A `DriverEvent` seam; delete the five counters | contract for tests only | ±80 |
 | 4 | C6 test-support crate; migrate the server integration tests to it | tests only | −3000 |
 | 5 | C3 `Hub::publish(Outbound)` | one seam | ±100 |

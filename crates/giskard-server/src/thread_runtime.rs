@@ -39,6 +39,20 @@ pub(crate) struct ThreadRuntimeSupport {
 }
 
 #[derive(Default)]
+/// Per-thread runtime state, grouped by lifetime:
+/// - the in-flight turn, cleared for the completed turn in `settle_completed_turn`:
+///   `captured_diffs` (per turn, slot model: turn-level and per-item paths evolve
+///   independently), `item_outputs` (per item, one command and one tool output at most),
+///   `live`, and the resolved `requests` of that turn;
+/// - the thread's owner and clocks, cleared only with the entry: `active_turn`,
+///   `lifecycle_revision`, `event_sequence`, `task_revision`;
+/// - caches for persisted turns, cleared only with the entry:
+///   `persisted_command_output_versions`;
+/// - `tasks`, which outlive turns because a command may finish after its turn persisted.
+///
+/// A new per-item value that ends with the turn goes in `ItemOutputs`; a new per-turn
+/// value that has slot or sharing semantics goes next to `captured_diffs`; anything that
+/// survives completion gets its own field and its own cleanup site.
 pub(crate) struct ThreadRuntimeEntry {
     active_turn: Option<ActiveTurnOwner>,
     lifecycle_revision: u64,
@@ -48,8 +62,7 @@ pub(crate) struct ThreadRuntimeEntry {
     live: LiveTurnState,
     tasks: RunningTaskState,
     captured_diffs: HashMap<TurnId, ActiveCapturedDiffs>,
-    command_outputs: HashMap<(TurnId, ItemId), RuntimeCommandOutput>,
-    tool_outputs: HashMap<(TurnId, ItemId), RuntimeToolOutput>,
+    item_outputs: HashMap<(TurnId, ItemId), ItemOutputs>,
     persisted_command_output_versions: HashMap<(TurnId, ItemId), String>,
 }
 
@@ -112,6 +125,37 @@ pub(crate) struct RuntimeCommandOutput {
 pub(crate) struct RuntimeToolOutput {
     pub bytes: Vec<u8>,
     pub descriptor: giskard_proto::WireToolOutput,
+}
+
+/// The live, authoritative outputs of one completed item while its turn is in flight.
+#[derive(Default)]
+struct ItemOutputs {
+    command: Option<RuntimeCommandOutput>,
+    tool: Option<RuntimeToolOutput>,
+}
+
+impl ItemOutputs {
+    fn is_empty(&self) -> bool {
+        self.command.is_none() && self.tool.is_none()
+    }
+}
+
+impl ThreadRuntimeEntry {
+    fn set_command_output(&mut self, key: (TurnId, ItemId), output: Option<RuntimeCommandOutput>) {
+        let outputs = self.item_outputs.entry(key).or_default();
+        outputs.command = output;
+        if outputs.is_empty() {
+            self.item_outputs.remove(&key);
+        }
+    }
+
+    fn set_tool_output(&mut self, key: (TurnId, ItemId), output: Option<RuntimeToolOutput>) {
+        let outputs = self.item_outputs.entry(key).or_default();
+        outputs.tool = output;
+        if outputs.is_empty() {
+            self.item_outputs.remove(&key);
+        }
+    }
 }
 
 pub(crate) struct PreparedItemOutput {
@@ -553,9 +597,9 @@ impl ThreadRuntimeSupport {
         };
         let entry = lock_unpoison(&entry, "thread runtime entry");
         entry
-            .command_outputs
+            .item_outputs
             .get(&(turn_id, item_id))
-            .cloned()
+            .and_then(|outputs| outputs.command.clone())
             .map_or(
                 RuntimeCommandOutputLookup::Missing,
                 RuntimeCommandOutputLookup::Found,
@@ -572,10 +616,14 @@ impl ThreadRuntimeSupport {
             return RuntimeToolOutputLookup::Missing;
         };
         let entry = lock_unpoison(&entry, "thread runtime entry");
-        entry.tool_outputs.get(&(turn_id, item_id)).cloned().map_or(
-            RuntimeToolOutputLookup::Missing,
-            RuntimeToolOutputLookup::Found,
-        )
+        entry
+            .item_outputs
+            .get(&(turn_id, item_id))
+            .and_then(|outputs| outputs.tool.clone())
+            .map_or(
+                RuntimeToolOutputLookup::Missing,
+                RuntimeToolOutputLookup::Found,
+            )
     }
 
     pub(crate) fn remove_tool_output(
@@ -587,9 +635,7 @@ impl ThreadRuntimeSupport {
         let Some(entry) = self.existing_entry(authority) else {
             return;
         };
-        lock_unpoison(&entry, "thread runtime entry")
-            .tool_outputs
-            .remove(&(turn_id, item_id));
+        lock_unpoison(&entry, "thread runtime entry").set_tool_output((turn_id, item_id), None);
     }
 
     pub(crate) fn remove_command_output(
@@ -601,9 +647,7 @@ impl ThreadRuntimeSupport {
         let Some(entry) = self.existing_entry(authority) else {
             return;
         };
-        lock_unpoison(&entry, "thread runtime entry")
-            .command_outputs
-            .remove(&(turn_id, item_id));
+        lock_unpoison(&entry, "thread runtime entry").set_command_output((turn_id, item_id), None);
     }
 
     pub(crate) fn persisted_command_output_version_permit(
@@ -1080,10 +1124,7 @@ impl ThreadRuntimeSupport {
                 if let Some(completed_turn) = completed_turn {
                     entry.captured_diffs.remove(&completed_turn);
                     entry
-                        .command_outputs
-                        .retain(|(turn_id, _), _| *turn_id != completed_turn);
-                    entry
-                        .tool_outputs
+                        .item_outputs
                         .retain(|(turn_id, _), _| *turn_id != completed_turn);
                 }
                 entry.requests.retain(|_, record| {
@@ -1474,11 +1515,11 @@ fn update_command_output_authority(entry: &mut ThreadRuntimeEntry, turn_id: Turn
         ..
     } = &item.payload
     else {
-        entry.command_outputs.remove(&(turn_id, item.id));
+        entry.set_command_output((turn_id, item.id), None);
         return;
     };
     if status.as_deref().is_some_and(command_status_is_running) {
-        entry.command_outputs.remove(&(turn_id, item.id));
+        entry.set_command_output((turn_id, item.id), None);
         return;
     }
     let Ok(descriptor) = giskard_persist::command_output_descriptor(
@@ -1493,18 +1534,18 @@ fn update_command_output_authority(entry: &mut ThreadRuntimeEntry, turn_id: Turn
             item_id = %item.id,
             "completed command output has inconsistent truncation metadata"
         );
-        entry.command_outputs.remove(&(turn_id, item.id));
+        entry.set_command_output((turn_id, item.id), None);
         return;
     };
-    entry.command_outputs.insert(
+    entry.set_command_output(
         (turn_id, item.id),
-        RuntimeCommandOutput {
+        Some(RuntimeCommandOutput {
             output: output.clone(),
             output_truncated: *output_truncated,
             original_bytes: descriptor.original_bytes,
             original_lines: descriptor.original_lines,
             version: command_output_version(output),
-        },
+        }),
     );
 }
 
@@ -1604,29 +1645,18 @@ fn update_prepared_item_output_authority(
     prepared: PreparedItemOutput,
 ) {
     let key = (prepared.turn_id, prepared.item_id);
-    match prepared.command_runtime {
-        Some(runtime) => {
-            entry.command_outputs.insert(key, runtime);
-        }
-        None => {
-            if prepared.command_item && prepared.command_descriptor.is_none() {
-                tracing::error!(
-                    turn_id = %prepared.turn_id,
-                    item_id = %prepared.item_id,
-                    "completed command output has inconsistent truncation metadata"
-                );
-            }
-            entry.command_outputs.remove(&key);
-        }
+    if prepared.command_runtime.is_none()
+        && prepared.command_item
+        && prepared.command_descriptor.is_none()
+    {
+        tracing::error!(
+            turn_id = %prepared.turn_id,
+            item_id = %prepared.item_id,
+            "completed command output has inconsistent truncation metadata"
+        );
     }
-    match prepared.tool_runtime {
-        Some(runtime) => {
-            entry.tool_outputs.insert(key, runtime);
-        }
-        None => {
-            entry.tool_outputs.remove(&key);
-        }
-    }
+    entry.set_command_output(key, prepared.command_runtime);
+    entry.set_tool_output(key, prepared.tool_runtime);
 }
 
 fn update_tool_output_authority(
@@ -1637,25 +1667,23 @@ fn update_tool_output_authority(
 ) {
     let key = (turn_id, item.id);
     let ItemPayload::ToolCall { output, status, .. } = &item.payload else {
-        entry.tool_outputs.remove(&key);
+        entry.set_tool_output(key, None);
         return;
     };
     if status
         .as_deref()
         .is_some_and(giskard_core::item::tool_status_is_running)
     {
-        entry.tool_outputs.remove(&key);
+        entry.set_tool_output(key, None);
         return;
     }
     let Some(output) = output else {
-        entry.tool_outputs.remove(&key);
+        entry.set_tool_output(key, None);
         return;
     };
     match giskard_core::item::serialize_tool_output(output) {
         Ok((bytes, descriptor)) => {
-            entry
-                .tool_outputs
-                .insert(key, RuntimeToolOutput { bytes, descriptor });
+            entry.set_tool_output(key, Some(RuntimeToolOutput { bytes, descriptor }));
         }
         Err(error) => {
             let project_id = entry
@@ -1671,7 +1699,7 @@ fn update_tool_output_authority(
                 %error,
                 "could not serialize completed tool output"
             );
-            entry.tool_outputs.remove(&key);
+            entry.set_tool_output(key, None);
         }
     }
 }
@@ -3584,6 +3612,88 @@ mod tests {
             runtime.command_output(&authority, turn, item_id),
             RuntimeCommandOutputLookup::Missing
         ));
+    }
+
+    #[test]
+    fn item_outputs_entry_is_dropped_when_both_outputs_are_cleared() {
+        let runtime = ThreadRuntimeSupport::new();
+        let thread = ThreadId::new();
+        let (_project, authority, _lease) = reserve_test_turn(&runtime, thread);
+        let turn = TurnId::new();
+        let command_item_id = ItemId::new();
+        runtime.apply_event(
+            &authority,
+            &AgentEvent::ItemCompleted {
+                thread,
+                turn,
+                item: Item {
+                    id: command_item_id,
+                    harness_item_id: "command".into(),
+                    payload: ItemPayload::CommandExecution {
+                        command: "printf output".into(),
+                        cwd: "/tmp".into(),
+                        output: "output".into(),
+                        output_truncated: false,
+                        output_original_bytes: None,
+                        output_original_lines: None,
+                        exit_code: Some(0),
+                        status: Some("completed".into()),
+                        process_id: None,
+                        duration_ms: None,
+                    },
+                    created_at: Utc::now(),
+                },
+            },
+            true,
+        );
+        let entry = runtime.existing_entry(&authority).unwrap();
+        assert!(
+            lock_unpoison(&entry, "thread runtime entry")
+                .item_outputs
+                .contains_key(&(turn, command_item_id))
+        );
+        runtime.remove_command_output(&authority, turn, command_item_id);
+        assert!(
+            !lock_unpoison(&entry, "thread runtime entry")
+                .item_outputs
+                .contains_key(&(turn, command_item_id))
+        );
+
+        let tool_item_id = ItemId::new();
+        runtime.apply_event(
+            &authority,
+            &AgentEvent::ItemCompleted {
+                thread,
+                turn,
+                item: Item {
+                    id: tool_item_id,
+                    harness_item_id: "tool".into(),
+                    payload: ItemPayload::ToolCall {
+                        name: "lookup".into(),
+                        input: serde_json::json!({}),
+                        output: Some(serde_json::Value::Null),
+                        server: Some("mcp".into()),
+                        status: Some("completed".into()),
+                        metadata: None,
+                        subagent: None,
+                        error: None,
+                    },
+                    created_at: Utc::now(),
+                },
+            },
+            true,
+        );
+        assert!(
+            lock_unpoison(&entry, "thread runtime entry")
+                .item_outputs
+                .contains_key(&(turn, tool_item_id))
+        );
+        runtime.remove_tool_output(&authority, turn, tool_item_id);
+        assert!(
+            !lock_unpoison(&entry, "thread runtime entry")
+                .item_outputs
+                .contains_key(&(turn, tool_item_id))
+        );
     }
 
     #[test]
