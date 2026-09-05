@@ -34,9 +34,9 @@ of polling a count. Production behaviour, logging, and the driver's public API d
 | `HarnessError` derives `Clone` | `crates/giskard-core/src/error.rs:7` |
 | `Admission::native_thread_id()` exists; `AdmissionSource::Link` carries `native_thread_id: String`, `parent_thread_id`, `item_id`, `origin` | `registry/admission.rs:25-32`; `driver.rs:76-91` |
 | Every test that reads a counter lives in `driver.rs`'s `mod tests` (54 field accesses across 21 tests: 38 `wait_until` on a counter, 9 direct `assert_eq!`/`load` reads) plus one helper in `registry.rs` tests, `wait_for_discovery_records` (`:2540-2552`, one field access) | measured on the base tree |
-| Driver tests get their `Arc<RegistryShared>` from `setup()` (`driver.rs:945-969`), which spawns the driver; registry tests reach it as `registry.shared` | |
+| Driver tests get their `Arc<RegistryShared>` from `setup()` (`driver.rs:977-1003`), which spawns the driver; registry tests reach it as `registry.shared` | |
 | Three tests build `ProjectEventDriver` as a struct literal (`:1257`, `:1350`, `:1898`); the struct gains no field in this step, so they do not change | |
-| `wait_until` is a 2 s `timeout` around a `yield_now` loop | `driver.rs:1104-1112` |
+| `wait_until` is a 2 s `timeout` around a `yield_now` loop | `driver.rs:1132-1140` |
 
 ## Design
 
@@ -230,7 +230,7 @@ trigger, using `drain` after the attach reply.
 
 `registry.rs` tests: `wait_for_discovery_records(registry, expected)` (`:2540-2552`) becomes a
 probe obtained from `registry.shared.driver_events.observe()` before the announcement, awaiting
-`finished(Discovery, ..)` once per expected record. It has one caller (`:2529` area); update it.
+`finished(Discovery, ..)` once per expected record. It has three callers (`:2992`, `:3031`, `:3051`); each installs the probe before its announcement and awaits the expected number of `finished(Discovery, ..)` events.
 
 No test's assertions about files, coordinators, claims, or replies change. The `is_teardown_exit`
 unit test and the three struct-literal tests are untouched.
