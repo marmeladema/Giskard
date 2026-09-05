@@ -44,6 +44,10 @@ test hooks that grew one atomic at a time. Every measurement below was taken on 
 
 **Status: landed in S3.**
 
+S3b makes the observation seam an injected `DriverEventSink` dependency. Production registries
+install the logging sink, while tests may supply a probe without a `cfg(test)` field on
+`RegistryShared`.
+
 **Now.** `RegistryShared` carries five `#[cfg(test)] AtomicUsize` fields
 (`discovery_records_processed`, `link_admissions_processed`, `deferred_link_requeues`,
 `failed_owner_removals_warned`, `teardown_owner_exits`), each incremented at one branch in the

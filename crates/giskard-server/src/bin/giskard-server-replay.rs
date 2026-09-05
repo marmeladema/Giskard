@@ -42,7 +42,7 @@ use giskard_harness::{
     OpenThreadOptions, ThreadHandle,
 };
 use giskard_persist::store::ProjectConfig;
-use giskard_server::{AppState, HarnessFactory, build_app};
+use giskard_server::{AppState, HarnessFactory, LogDriverEventSink, build_app};
 
 mod common;
 
@@ -1111,6 +1111,7 @@ async fn run(
         session_key.to_vec(),
         Some(&config.viz),
         Some(&config.retention),
+        Arc::new(LogDriverEventSink),
     );
     let registry = state.registry.clone();
     let app_shutdown = state.shutdown.clone();

@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use giskard_core::error::{HarnessError, PersistError};
 use giskard_persist::Config;
 use giskard_persist::store::ProjectConfig;
-use giskard_server::{AppState, HarnessFactory, build_app};
+use giskard_server::{AppState, HarnessFactory, LogDriverEventSink, build_app};
 use tracing::{error, info, warn};
 use tracing_subscriber::prelude::*;
 
@@ -307,6 +307,7 @@ async fn run(
         session_key,
         Some(&viz),
         Some(&retention),
+        Arc::new(LogDriverEventSink),
     );
     let registry = state.registry.clone();
     let app_shutdown = state.shutdown.clone();

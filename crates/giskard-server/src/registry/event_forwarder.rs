@@ -635,7 +635,7 @@ fn external_turn_defaults(
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) enum ForwarderExitReason {
+pub enum ForwarderExitReason {
     StreamEndedRecovered,
     StreamEndedWithoutTurn,
     PersistenceBlocked,

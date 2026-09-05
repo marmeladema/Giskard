@@ -56,9 +56,12 @@ mod project;
 mod thread;
 
 use driver::{AttachOutcome, DriverHandle, Link, spawn_project_event_driver};
-use event_forwarder::{
-    ForwarderExitReason, forwarder_exit_reason_label, log_metadata_only_event_rejection,
+pub use driver::{
+    DeferReason, DriverEvent, DriverEventSink, LogDriverEventSink, OwnerExitDisposition,
+    RefusedSubject,
 };
+pub use event_forwarder::ForwarderExitReason;
+use event_forwarder::{forwarder_exit_reason_label, log_metadata_only_event_rejection};
 use project::{HarnessTransitions, LifecycleLock, ProjectAuthority, WeakLifecycleLock};
 pub(crate) use thread::ThreadAuthority;
 use thread::{
@@ -280,8 +283,7 @@ struct RegistryShared {
     harness_transitions: Arc<HarnessTransitions>,
     threads: Arc<Mutex<ThreadIndex>>,
     background_tasks: Arc<RegistryTaskTracker>,
-    #[cfg(test)]
-    driver_events: driver::probe::DriverEventSink,
+    driver_events: Arc<dyn DriverEventSink>,
     hub: Arc<Hub>,
     runtime: Arc<ThreadRuntimeSupport>,
     store: Arc<PersistStore>,
@@ -400,6 +402,23 @@ impl RegistryShared {
             giskard_persist::config::RetentionConfig::DEFAULT_MAX_COMMAND_OUTPUT_BYTES,
             store,
             ledger,
+            Arc::new(LogDriverEventSink),
+        )
+    }
+
+    #[cfg(test)]
+    fn new_with_driver_events(
+        hub: Arc<Hub>,
+        store: Arc<PersistStore>,
+        ledger: LedgerHandle,
+        driver_events: Arc<dyn DriverEventSink>,
+    ) -> Self {
+        Self::new_with_max_command_output_bytes(
+            hub,
+            giskard_persist::config::RetentionConfig::DEFAULT_MAX_COMMAND_OUTPUT_BYTES,
+            store,
+            ledger,
+            driver_events,
         )
     }
 
@@ -408,6 +427,7 @@ impl RegistryShared {
         max_command_output_bytes: usize,
         store: Arc<PersistStore>,
         ledger: LedgerHandle,
+        driver_events: Arc<dyn DriverEventSink>,
     ) -> Self {
         let thread_metadata = Arc::new(ThreadMetadataService::new(store.clone(), hub.clone()));
         Self {
@@ -415,8 +435,7 @@ impl RegistryShared {
             harness_transitions: Arc::new(HarnessTransitions::new()),
             threads: Arc::new(Mutex::new(ThreadIndex::default())),
             background_tasks: Arc::new(RegistryTaskTracker::default()),
-            #[cfg(test)]
-            driver_events: driver::probe::DriverEventSink::default(),
+            driver_events,
             hub,
             runtime: Arc::new(ThreadRuntimeSupport::with_max_command_output_bytes(
                 max_command_output_bytes,
@@ -569,6 +588,25 @@ impl HarnessRegistry {
         }
     }
 
+    #[cfg(test)]
+    fn new_with_driver_events(
+        factory: Arc<dyn HarnessFactory>,
+        hub: Arc<Hub>,
+        store: Arc<PersistStore>,
+        ledger: LedgerHandle,
+        driver_events: Arc<dyn DriverEventSink>,
+    ) -> Self {
+        Self {
+            shared: Arc::new(RegistryShared::new_with_driver_events(
+                hub,
+                store,
+                ledger,
+                driver_events,
+            )),
+            factory,
+        }
+    }
+
     /// Constructs the registry-owned runtime support with the configured output limit.
     pub(crate) fn new_with_max_command_output_bytes(
         factory: Arc<dyn HarnessFactory>,
@@ -576,6 +614,7 @@ impl HarnessRegistry {
         max_command_output_bytes: usize,
         store: Arc<PersistStore>,
         ledger: LedgerHandle,
+        driver_events: Arc<dyn DriverEventSink>,
     ) -> Self {
         Self {
             shared: Arc::new(RegistryShared::new_with_max_command_output_bytes(
@@ -583,6 +622,7 @@ impl HarnessRegistry {
                 max_command_output_bytes,
                 store,
                 ledger,
+                driver_events,
             )),
             factory,
         }
@@ -2475,17 +2515,23 @@ mod tests {
 
     async fn discovery_registry(
         store: Arc<PersistStore>,
-    ) -> (Arc<super::HarnessRegistry>, Arc<DiscoveryFactory>) {
+    ) -> (
+        Arc<super::HarnessRegistry>,
+        Arc<DiscoveryFactory>,
+        Arc<super::driver::probe::ProbeSink>,
+    ) {
         let factory = Arc::new(DiscoveryFactory {
             harness: StdMutex::new(None),
         });
-        let registry = Arc::new(super::HarnessRegistry::new(
+        let sink = Arc::new(super::driver::probe::ProbeSink::default());
+        let registry = Arc::new(super::HarnessRegistry::new_with_driver_events(
             factory.clone(),
             Arc::new(Hub::new()),
             store.clone(),
             ledger::spawn(store),
+            sink.clone(),
         ));
-        (registry, factory)
+        (registry, factory, sink)
     }
 
     async fn wait_for_thread(
@@ -2642,7 +2688,7 @@ mod tests {
             )
             .await
             .unwrap();
-        let (registry, factory) = discovery_registry(store).await;
+        let (registry, factory, _sink) = discovery_registry(store).await;
         registry
             .get_or_create_harness(project, &config)
             .await
@@ -2708,7 +2754,7 @@ mod tests {
             )
             .await
             .unwrap();
-        let (registry, factory) = discovery_registry(store).await;
+        let (registry, factory, _sink) = discovery_registry(store).await;
         registry
             .get_or_create_harness(project, &config)
             .await
@@ -2776,7 +2822,7 @@ mod tests {
             )
             .await
             .unwrap();
-        let (registry, factory) = discovery_registry(store).await;
+        let (registry, factory, _sink) = discovery_registry(store).await;
         registry
             .get_or_create_harness(project, &config)
             .await
@@ -2819,7 +2865,7 @@ mod tests {
             )
             .await
             .unwrap();
-        let (registry, factory) = discovery_registry(store).await;
+        let (registry, factory, _sink) = discovery_registry(store).await;
         registry
             .get_or_create_harness(project, &config)
             .await
@@ -2855,7 +2901,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let store = Arc::new(PersistStore::new(tmp.path().to_path_buf()));
         let (project, config) = create_test_project(&store, "discovered-orphan").await;
-        let (registry, factory) = discovery_registry(store.clone()).await;
+        let (registry, factory, _sink) = discovery_registry(store.clone()).await;
         registry
             .get_or_create_harness(project, &config)
             .await
@@ -2966,12 +3012,12 @@ mod tests {
             )
             .await
             .unwrap();
-        let (registry, factory) = discovery_registry(store.clone()).await;
+        let (registry, factory, sink) = discovery_registry(store.clone()).await;
         registry
             .get_or_create_harness(project, &config)
             .await
             .unwrap();
-        let mut probe = registry.shared.driver_events.observe();
+        let mut probe = sink.probe();
         let harness = factory.harness.lock().unwrap().clone().unwrap();
         harness.announce(ThreadDiscovered {
             thread: primary,
@@ -3003,12 +3049,12 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let store = Arc::new(PersistStore::new(tmp.path().to_path_buf()));
         let (project, config) = create_test_project(&store, "discovery-recovery").await;
-        let (registry, factory) = discovery_registry(store.clone()).await;
+        let (registry, factory, sink) = discovery_registry(store.clone()).await;
         registry
             .get_or_create_harness(project, &config)
             .await
             .unwrap();
-        let mut probe = registry.shared.driver_events.observe();
+        let mut probe = sink.probe();
         let harness = factory.harness.lock().unwrap().clone().unwrap();
 
         store.delete_project(project).await.unwrap();
@@ -3053,7 +3099,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let store = Arc::new(PersistStore::new(tmp.path().to_path_buf()));
         let (project, config) = create_test_project(&store, "discovery-shutdown").await;
-        let (registry, _) = discovery_registry(store).await;
+        let (registry, _, _sink) = discovery_registry(store).await;
         registry
             .get_or_create_harness(project, &config)
             .await
