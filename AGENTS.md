@@ -40,6 +40,8 @@ port from the still-open listener with `local_addr()`, and pass that listener di
 server. Do not probe and rebind a free port. Fixed ports are permitted only for fixture/config
 values that do not open sockets or for explicitly isolated infrastructure such as container-local
 test services.
+Integration tests build their server through `giskard-testenv`'s `TestServer`, which binds port 0
+for them.
 
 ```bash
 # Build all crates

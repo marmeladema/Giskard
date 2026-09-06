@@ -9,26 +9,8 @@ use std::process::Command;
 
 use giskard_persist::store::ThreadWorktree;
 use giskard_server::worktree;
+use giskard_testenv::git;
 use tempfile::TempDir;
-
-fn git(dir: &Path, args: &[&str]) -> std::process::Output {
-    let output = Command::new("git")
-        .current_dir(dir)
-        .args(args)
-        .env("LC_ALL", "C")
-        .env("GIT_AUTHOR_NAME", "Test")
-        .env("GIT_AUTHOR_EMAIL", "test@example.invalid")
-        .env("GIT_COMMITTER_NAME", "Test")
-        .env("GIT_COMMITTER_EMAIL", "test@example.invalid")
-        .output()
-        .expect("run git");
-    assert!(
-        output.status.success(),
-        "git {args:?} failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    output
-}
 
 fn stdout(output: &std::process::Output) -> String {
     String::from_utf8_lossy(&output.stdout).trim().to_string()
@@ -38,10 +20,10 @@ fn stdout(output: &std::process::Output) -> String {
 fn repo_with_commit(tmp: &TempDir) -> std::path::PathBuf {
     let repo = tmp.path().join("project");
     std::fs::create_dir_all(&repo).unwrap();
-    git(&repo, &["init", "-q", "-b", "main"]);
+    git::run(&repo, &["init", "-q", "-b", "main"]);
     std::fs::write(repo.join("tracked.txt"), "committed\n").unwrap();
-    git(&repo, &["add", "tracked.txt"]);
-    git(&repo, &["commit", "-qm", "initial"]);
+    git::run(&repo, &["add", "tracked.txt"]);
+    git::run(&repo, &["commit", "-qm", "initial"]);
     repo
 }
 
@@ -49,7 +31,7 @@ fn repo_with_commit(tmp: &TempDir) -> std::path::PathBuf {
 async fn create_checks_out_the_branch_and_records_the_git_directories() {
     let tmp = TempDir::new().unwrap();
     let repo = repo_with_commit(&tmp);
-    let head = stdout(&git(&repo, &["rev-parse", "HEAD"]));
+    let head = stdout(&git::run(&repo, &["rev-parse", "HEAD"]));
     let path = tmp.path().join("wt");
 
     let wt = worktree::create(&repo, &path, "giskard/worktree-01test")
@@ -58,7 +40,7 @@ async fn create_checks_out_the_branch_and_records_the_git_directories() {
 
     assert!(path.join("tracked.txt").is_file());
     assert_eq!(
-        stdout(&git(&path, &["branch", "--show-current"])),
+        stdout(&git::run(&path, &["branch", "--show-current"])),
         "giskard/worktree-01test"
     );
     assert_eq!(wt.base_commit.as_deref(), Some(head.as_str()));
@@ -82,7 +64,7 @@ async fn create_succeeds_in_a_repository_with_no_commits() {
     let tmp = TempDir::new().unwrap();
     let repo = tmp.path().join("empty");
     std::fs::create_dir_all(&repo).unwrap();
-    git(&repo, &["init", "-q", "-b", "main"]);
+    git::run(&repo, &["init", "-q", "-b", "main"]);
 
     let wt = worktree::create(&repo, &tmp.path().join("wt"), "giskard/worktree-01empty")
         .await
@@ -113,7 +95,7 @@ async fn create_refuses_a_directory_that_is_not_a_repository() {
 async fn create_fails_and_names_the_branch_when_it_already_exists() {
     let tmp = TempDir::new().unwrap();
     let repo = repo_with_commit(&tmp);
-    git(&repo, &["branch", "giskard/worktree-01taken"]);
+    git::run(&repo, &["branch", "giskard/worktree-01taken"]);
 
     let error = worktree::create(&repo, &tmp.path().join("wt"), "giskard/worktree-01taken")
         .await
@@ -146,7 +128,7 @@ async fn create_carries_committed_state_only() {
         "the worktree holds the committed content, not the checkout's edit"
     );
     assert!(!path.join("untracked.txt").exists());
-    assert_eq!(stdout(&git(&path, &["status", "--porcelain"])), "");
+    assert_eq!(stdout(&git::run(&path, &["status", "--porcelain"])), "");
 }
 
 #[tokio::test]
@@ -179,10 +161,10 @@ async fn a_rename_counts_as_one_uncommitted_change() {
     let wt = worktree::create(&repo, &path, "giskard/worktree-01rename")
         .await
         .unwrap();
-    git(&path, &["mv", "tracked.txt", "renamed.txt"]);
+    git::run(&path, &["mv", "tracked.txt", "renamed.txt"]);
 
     assert_eq!(
-        stdout(&git(&path, &["status", "--porcelain=v2"]))
+        stdout(&git::run(&path, &["status", "--porcelain=v2"]))
             .lines()
             .count(),
         1,
@@ -213,8 +195,8 @@ async fn ignored_files_do_not_block_removal_or_count_as_changes() {
     let tmp = TempDir::new().unwrap();
     let repo = repo_with_commit(&tmp);
     std::fs::write(repo.join(".gitignore"), "target/\n").unwrap();
-    git(&repo, &["add", ".gitignore"]);
-    git(&repo, &["commit", "-qm", "ignore build output"]);
+    git::run(&repo, &["add", ".gitignore"]);
+    git::run(&repo, &["commit", "-qm", "ignore build output"]);
     let path = tmp.path().join("wt");
     let wt = worktree::create(&repo, &path, "giskard/worktree-01ignored")
         .await
@@ -244,10 +226,13 @@ async fn delete_branch_reports_the_commit_it_pointed_at() {
         .expect("git reports the commit");
 
     assert!(
-        stdout(&git(&repo, &["rev-parse", "HEAD"])).starts_with(&sha),
+        stdout(&git::run(&repo, &["rev-parse", "HEAD"])).starts_with(&sha),
         "the reported sha must be the branch tip, got {sha}"
     );
-    assert_eq!(stdout(&git(&repo, &["branch", "--list", &wt.branch])), "");
+    assert_eq!(
+        stdout(&git::run(&repo, &["branch", "--list", &wt.branch])),
+        ""
+    );
 }
 
 /// Branches the agent made are the user's now: deleting the thread's own branch leaves them alone,
@@ -260,15 +245,15 @@ async fn deleting_the_thread_branch_leaves_agent_branches_alone() {
     let wt = worktree::create(&repo, &path, "giskard/worktree-01keep")
         .await
         .unwrap();
-    git(&path, &["switch", "-qc", "agent/idea"]);
+    git::run(&path, &["switch", "-qc", "agent/idea"]);
     std::fs::write(path.join("idea.txt"), "work\n").unwrap();
-    git(&path, &["add", "idea.txt"]);
-    git(&path, &["commit", "-qm", "agent work"]);
+    git::run(&path, &["add", "idea.txt"]);
+    git::run(&path, &["commit", "-qm", "agent work"]);
 
     // `+` is git marking a branch checked out in another worktree — which is exactly what this
     // asserts: the branch exists in the shared repository, seen from the project's checkout.
     assert_eq!(
-        stdout(&git(&repo, &["branch", "--list", "agent/idea"])),
+        stdout(&git::run(&repo, &["branch", "--list", "agent/idea"])),
         "+ agent/idea",
         "a branch created inside the worktree is visible from the project checkout immediately"
     );
@@ -276,9 +261,12 @@ async fn deleting_the_thread_branch_leaves_agent_branches_alone() {
     worktree::remove(&wt, false).await.unwrap();
     worktree::delete_branch(&wt).await.unwrap();
 
-    assert!(!stdout(&git(&repo, &["branch", "--list", "agent/idea"])).is_empty());
+    assert!(!stdout(&git::run(&repo, &["branch", "--list", "agent/idea"])).is_empty());
     assert_eq!(
-        stdout(&git(&repo, &["log", "-1", "--format=%s", "agent/idea"])),
+        stdout(&git::run(
+            &repo,
+            &["log", "-1", "--format=%s", "agent/idea"]
+        )),
         "agent work"
     );
 }
@@ -294,8 +282,8 @@ async fn lost_work_counts_only_commits_that_exist_nowhere_else() {
         .await
         .unwrap();
     std::fs::write(unique_path.join("only-here.txt"), "unique\n").unwrap();
-    git(&unique_path, &["add", "only-here.txt"]);
-    git(&unique_path, &["commit", "-qm", "unique work"]);
+    git::run(&unique_path, &["add", "only-here.txt"]);
+    git::run(&unique_path, &["commit", "-qm", "unique work"]);
 
     // A branch whose commit the agent also parked on a branch of its own: nothing would be lost.
     let parked_path = tmp.path().join("wt-parked");
@@ -303,9 +291,9 @@ async fn lost_work_counts_only_commits_that_exist_nowhere_else() {
         .await
         .unwrap();
     std::fs::write(parked_path.join("kept.txt"), "kept\n").unwrap();
-    git(&parked_path, &["add", "kept.txt"]);
-    git(&parked_path, &["commit", "-qm", "work the user keeps"]);
-    git(&parked_path, &["branch", "agent/keep-this"]);
+    git::run(&parked_path, &["add", "kept.txt"]);
+    git::run(&parked_path, &["commit", "-qm", "work the user keeps"]);
+    git::run(&parked_path, &["branch", "agent/keep-this"]);
 
     assert_eq!(
         worktree::commits_reachable_from_nowhere_else(&unique)
@@ -343,10 +331,10 @@ async fn a_branch_the_agent_renamed_costs_nothing_rather_than_failing_the_probe(
         .await
         .unwrap();
     std::fs::write(path.join("work.txt"), "work\n").unwrap();
-    git(&path, &["add", "work.txt"]);
-    git(&path, &["commit", "-qm", "work"]);
+    git::run(&path, &["add", "work.txt"]);
+    git::run(&path, &["commit", "-qm", "work"]);
     // What the agent does when it gives its work a name of its own.
-    git(&path, &["branch", "-m", "agent/renamed"]);
+    git::run(&path, &["branch", "-m", "agent/renamed"]);
 
     assert_eq!(
         worktree::commits_reachable_from_nowhere_else(&wt)
@@ -375,7 +363,7 @@ async fn a_deletion_that_reports_no_commit_still_succeeds() {
     // A branch cannot be a symbolic ref and a checkout at once, so the recorded name is swapped for
     // one after the fact. Everything else about the worktree is what Git actually produced.
     let branch = "giskard/worktree-01symlink";
-    git(
+    git::run(
         &repo,
         &[
             "symbolic-ref",
@@ -393,9 +381,9 @@ async fn a_deletion_that_reports_no_commit_still_succeeds() {
         None,
         "the ref a symbolic branch pointed at is not the commit it pointed at"
     );
-    assert_eq!(stdout(&git(&repo, &["branch", "--list", branch])), "");
+    assert_eq!(stdout(&git::run(&repo, &["branch", "--list", branch])), "");
     assert!(
-        !stdout(&git(&repo, &["branch", "--list", "main"])).is_empty(),
+        !stdout(&git::run(&repo, &["branch", "--list", "main"])).is_empty(),
         "deleting the symbolic ref must not take the branch it pointed at"
     );
 }
@@ -413,20 +401,23 @@ async fn removing_a_worktree_leaves_the_commits_made_in_it_on_their_branch() {
         .await
         .unwrap();
     std::fs::write(path.join("kept.txt"), "committed in the thread\n").unwrap();
-    git(&path, &["add", "kept.txt"]);
-    git(&path, &["commit", "-qm", "thread work"]);
-    let committed = stdout(&git(&path, &["rev-parse", "HEAD"]));
+    git::run(&path, &["add", "kept.txt"]);
+    git::run(&path, &["commit", "-qm", "thread work"]);
+    let committed = stdout(&git::run(&path, &["rev-parse", "HEAD"]));
 
     worktree::remove(&wt, false).await.expect("remove");
 
     assert!(!path.exists());
     assert_eq!(
-        stdout(&git(&repo, &["rev-parse", &wt.branch])),
+        stdout(&git::run(&repo, &["rev-parse", &wt.branch])),
         committed,
         "the branch still points at the commit made in the removed checkout"
     );
     assert_eq!(
-        stdout(&git(&repo, &["show", &format!("{}:kept.txt", wt.branch)])),
+        stdout(&git::run(
+            &repo,
+            &["show", &format!("{}:kept.txt", wt.branch)]
+        )),
         "committed in the thread",
         "and the content is readable from the project's own checkout"
     );
@@ -444,8 +435,8 @@ async fn a_project_inside_a_repository_works_in_the_matching_subdirectory() {
     let project = repo.join("packages/api");
     std::fs::create_dir_all(&project).unwrap();
     std::fs::write(project.join("service.rs"), "fn serve() {}\n").unwrap();
-    git(&repo, &["add", "packages"]);
-    git(&repo, &["commit", "-qm", "add the package"]);
+    git::run(&repo, &["add", "packages"]);
+    git::run(&repo, &["commit", "-qm", "add the package"]);
     let path = tmp.path().join("wt");
 
     let wt = worktree::create(&project, &path, "giskard/worktree-01sub")
@@ -496,7 +487,7 @@ async fn an_untracked_project_directory_cannot_be_isolated() {
         "the half-created checkout must be rolled back"
     );
     assert!(
-        stdout(&git(
+        stdout(&git::run(
             &repo,
             &["branch", "--list", "giskard/worktree-01scratch"]
         ))
@@ -513,7 +504,7 @@ async fn worktree_of_a_worktree_records_the_canonical_repository() {
     let tmp = TempDir::new().unwrap();
     let canonical = repo_with_commit(&tmp);
     let project = tmp.path().join("project-as-worktree");
-    git(
+    git::run(
         &canonical,
         &[
             "worktree",
@@ -577,7 +568,10 @@ async fn removal_de_registers_a_worktree_whose_directory_disappeared() {
         .await
         .expect("delete the branch");
 
-    assert_eq!(stdout(&git(&repo, &["branch", "--list", &wt.branch])), "");
+    assert_eq!(
+        stdout(&git::run(&repo, &["branch", "--list", &wt.branch])),
+        ""
+    );
 }
 
 fn git_status(dir: &Path, args: &[&str]) -> std::process::ExitStatus {
@@ -603,7 +597,7 @@ async fn prune_forgets_a_worktree_whose_directory_was_deleted() {
     // Without this the check below could pass for a path Git never printed in the first place —
     // it compares a string, and a temporary directory behind a symlink resolves differently.
     assert!(
-        stdout(&git(&repo, &["worktree", "list"])).contains(&*path.to_string_lossy()),
+        stdout(&git::run(&repo, &["worktree", "list"])).contains(&*path.to_string_lossy()),
         "the fixture must leave the worktree registered, or the assertion below proves nothing"
     );
 
@@ -613,7 +607,7 @@ async fn prune_forgets_a_worktree_whose_directory_was_deleted() {
     // temporary directory's name is random, so a looser match decides on whatever it happens to
     // contain.
     assert!(
-        !stdout(&git(&repo, &["worktree", "list"])).contains(&*path.to_string_lossy()),
+        !stdout(&git::run(&repo, &["worktree", "list"])).contains(&*path.to_string_lossy()),
         "a worktree whose directory is gone must not stay listed"
     );
 }

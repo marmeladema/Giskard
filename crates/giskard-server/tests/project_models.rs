@@ -9,11 +9,11 @@ use axum::{Router, response::Json as AxumJson, routing::get};
 use futures::SinkExt;
 use giskard_core::ids::ProjectId;
 use giskard_core::model::{Effort, ModelDescriptor, ModelRef};
-use giskard_harness::{AgentHarness, HarnessProvider};
+use giskard_harness::HarnessProvider;
 use giskard_harness_replay::ReplayHarness;
-use giskard_persist::store::ProjectConfig;
 use giskard_proto::ClientMessage;
-use giskard_server::{AppState, HarnessFactory, build_app};
+use giskard_server::HarnessFactory;
+use giskard_testenv::{TestServer, factory};
 
 /// The provider table these tests' harnesses report, standing in for Codex's `[model_providers]`:
 /// `openai` with no endpoint, and `mock` pointing at the discovery stub.
@@ -34,47 +34,6 @@ fn harness_providers(mock_addr: &str) -> Vec<HarnessProvider> {
     ]
 }
 
-/// A factory whose harness advertises a fixed model catalog (standing in for Codex `model/list`).
-struct CatalogFactory {
-    models: Vec<ModelDescriptor>,
-    providers: Vec<HarnessProvider>,
-}
-
-#[async_trait::async_trait]
-impl HarnessFactory for CatalogFactory {
-    async fn create(
-        &self,
-        _config: &ProjectConfig,
-        _bootstrap: giskard_harness::HarnessBootstrap,
-    ) -> Result<Arc<dyn AgentHarness>, giskard_core::HarnessError> {
-        Ok(Arc::new(
-            ReplayHarness::new()
-                .with_models(self.models.clone())
-                .with_providers(self.providers.clone()),
-        ))
-    }
-}
-
-/// A factory whose harness advertises `model_listing` but fails every catalog query.
-struct FailingCatalogFactory {
-    providers: Vec<HarnessProvider>,
-}
-
-#[async_trait::async_trait]
-impl HarnessFactory for FailingCatalogFactory {
-    async fn create(
-        &self,
-        _config: &ProjectConfig,
-        _bootstrap: giskard_harness::HarnessBootstrap,
-    ) -> Result<Arc<dyn AgentHarness>, giskard_core::HarnessError> {
-        Ok(Arc::new(
-            ReplayHarness::new()
-                .with_failing_models("model/list boom")
-                .with_providers(self.providers.clone()),
-        ))
-    }
-}
-
 fn catalog_model(model: &str, name: &str, efforts: &[&str]) -> ModelDescriptor {
     ModelDescriptor {
         provider: String::new(), // Codex `model/list` is provider-agnostic.
@@ -87,73 +46,16 @@ fn catalog_model(model: &str, name: &str, efforts: &[&str]) -> ModelDescriptor {
     }
 }
 
-fn password_hash(password: &str) -> String {
-    use argon2::password_hash::SaltString;
-    use argon2::{Argon2, PasswordHasher};
-    use rand::rngs::OsRng;
-    let salt = SaltString::generate(&mut OsRng);
-    Argon2::default()
-        .hash_password(password.as_bytes(), &salt)
-        .unwrap()
-        .to_string()
-}
-
-async fn login(base: &str) -> (reqwest::Client, String) {
-    let client = reqwest::Client::new();
-    let resp = client
-        .post(format!("{base}/api/login"))
-        .json(&serde_json::json!({"password": "testpass"}))
-        .send()
-        .await
-        .unwrap();
-    let cookie = resp
-        .headers()
-        .get("set-cookie")
-        .unwrap()
-        .to_str()
-        .unwrap()
-        .split(';')
-        .next()
-        .unwrap()
-        .to_string();
-    (client, cookie)
-}
-
-async fn connect_ws(
-    base: &str,
-    cookie: &str,
-) -> tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>> {
-    use tokio_tungstenite::tungstenite::http::Request;
-
-    let ws_base = base.replacen("http://", "ws://", 1);
-    let host = base.trim_start_matches("http://");
-    let request = Request::builder()
-        .uri(format!("{ws_base}/api/ws"))
-        .header("host", host)
-        .header("cookie", cookie)
-        .header("upgrade", "websocket")
-        .header("connection", "upgrade")
-        .header("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ==")
-        .header("sec-websocket-version", "13")
-        .body(())
-        .unwrap();
-    tokio_tungstenite::connect_async(request).await.unwrap().0
+struct Fixture {
+    server: TestServer,
+    project_id: ProjectId,
 }
 
 /// Start a mock discovery provider + a server with the given harness factory (config: `openai`
 /// declares `gpt-5.5`; a `model_listing` `mock` provider discovers `glm-5.2`), log in, and create a
 /// project. Returns the request base, an authenticated client + cookie, the project id, and the
 /// TempDir (kept alive by the caller).
-async fn spawn_project(
-    make_factory: impl FnOnce(&str) -> Arc<dyn HarnessFactory>,
-) -> (
-    String,
-    reqwest::Client,
-    String,
-    ProjectId,
-    tempfile::TempDir,
-    Arc<giskard_persist::PersistStore>,
-) {
+async fn spawn_project(make_factory: impl FnOnce(&str) -> Arc<dyn HarnessFactory>) -> Fixture {
     let mock = Router::new().route(
         "/models",
         get(|| async { AxumJson(serde_json::json!({ "data": [ { "id": "glm-5.2" } ] })) }),
@@ -161,26 +63,9 @@ async fn spawn_project(
     let mock_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let mock_addr = mock_listener.local_addr().unwrap();
     tokio::spawn(async move { axum::serve(mock_listener, mock).await.unwrap() });
-    let factory = make_factory(&mock_addr.to_string());
-
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let port = listener.local_addr().unwrap().port();
-
-    let tmp = tempfile::TempDir::new().unwrap();
-    let hash = password_hash("testpass");
-    tokio::fs::write(
-        tmp.path().join("config.toml"),
-        format!(
-            r#"
-[server]
-bind = "127.0.0.1:{port}"
-secure_cookies = false
-
-[auth]
-password_hash = "{hash}"
-session_days = 30
-
-[providers.openai]
+    let server = TestServer::builder(make_factory(&mock_addr.to_string()))
+        .config(
+            r#"[providers.openai]
   [[providers.openai.models]]
   id = "gpt-5.5"
   display_name = "GPT-5.5"
@@ -189,39 +74,14 @@ session_days = 30
 
 [providers.mock]
 model_listing = true
-"#
-        ),
-    )
-    .await
-    .unwrap();
-
-    let store = Arc::new(giskard_persist::PersistStore::new(tmp.path().to_path_buf()));
-    let state = AppState::new(store.clone(), factory, (0..32u8).collect());
-    let app = build_app(state);
-    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-
-    let base = format!("http://127.0.0.1:{port}");
-    let (client, cookie) = login(&base).await;
-
-    let project_id: ProjectId = client
-        .post(format!("{base}/api/projects"))
-        .header("cookie", &cookie)
-        .json(&serde_json::json!({
-            "name": "proj",
-            "dir": "/tmp/giskard-project-models-test",
-        }))
-        .send()
-        .await
-        .unwrap()
-        .json::<serde_json::Value>()
-        .await
-        .unwrap()["id"]
-        .as_str()
-        .unwrap()
-        .parse()
-        .unwrap();
-
-    (base, client, cookie, project_id, tmp, store)
+"#,
+        )
+        .start()
+        .await;
+    let project_id = server
+        .create_project_via_api("proj", "/tmp/giskard-project-models-test")
+        .await;
+    Fixture { server, project_id }
 }
 
 #[tokio::test]
@@ -232,13 +92,21 @@ async fn project_models_compose_discovery_and_harness_catalog() {
         catalog_model("gpt-5.5", "Catalog GPT (should not win)", &["low", "high"]),
         catalog_model("glm-5.2", "GLM 5.2 Pro", &["medium", "high"]),
     ];
-    let (base, client, cookie, project_id, _tmp, _store) = spawn_project(|mock_addr| {
-        Arc::new(CatalogFactory {
-            models,
-            providers: harness_providers(mock_addr),
+    let fixture = spawn_project(|mock_addr| {
+        let providers = harness_providers(mock_addr);
+        factory::from_fn(move |_, _| {
+            Ok(Arc::new(
+                ReplayHarness::new()
+                    .with_models(models.clone())
+                    .with_providers(providers.clone()),
+            ))
         })
     })
     .await;
+    let base = fixture.server.base.clone();
+    let client = fixture.server.client.clone();
+    let cookie = fixture.server.cookie.clone();
+    let project_id = fixture.project_id;
 
     let body: serde_json::Value = client
         .get(format!("{base}/api/projects/{project_id}/models"))
@@ -291,12 +159,21 @@ async fn project_models_degrade_when_harness_catalog_query_fails() {
     // Harness advertises model_listing but every `list_models` call errors. The overlay is
     // best-effort, so the endpoint must still return the config + discovery list — just without the
     // harness's names/efforts — rather than failing the request.
-    let (base, client, cookie, project_id, _tmp, _store) = spawn_project(|mock_addr| {
-        Arc::new(FailingCatalogFactory {
-            providers: harness_providers(mock_addr),
+    let fixture = spawn_project(|mock_addr| {
+        let providers = harness_providers(mock_addr);
+        factory::from_fn(move |_, _| {
+            Ok(Arc::new(
+                ReplayHarness::new()
+                    .with_failing_models("model/list boom")
+                    .with_providers(providers.clone()),
+            ))
         })
     })
     .await;
+    let base = fixture.server.base.clone();
+    let client = fixture.server.client.clone();
+    let cookie = fixture.server.cookie.clone();
+    let project_id = fixture.project_id;
 
     let resp = client
         .get(format!("{base}/api/projects/{project_id}/models"))
@@ -345,13 +222,22 @@ async fn project_models_degrade_when_harness_catalog_query_fails() {
 #[tokio::test]
 async fn catalog_effort_survives_new_thread_creation() {
     let models = vec![catalog_model("glm-5.2", "GLM 5.2 Pro", &["medium", "high"])];
-    let (base, client, cookie, project_id, _tmp, store) = spawn_project(|mock_addr| {
-        Arc::new(CatalogFactory {
-            models,
-            providers: harness_providers(mock_addr),
+    let fixture = spawn_project(|mock_addr| {
+        let providers = harness_providers(mock_addr);
+        factory::from_fn(move |_, _| {
+            Ok(Arc::new(
+                ReplayHarness::new()
+                    .with_models(models.clone())
+                    .with_providers(providers.clone()),
+            ))
         })
     })
     .await;
+    let base = fixture.server.base.clone();
+    let client = fixture.server.client.clone();
+    let cookie = fixture.server.cookie.clone();
+    let project_id = fixture.project_id;
+    let store = fixture.server.store().clone();
 
     // Populate the same project catalog that drives the browser picker.
     let catalog = client
@@ -395,7 +281,7 @@ async fn catalog_effort_survives_new_thread_creation() {
         Some("high")
     );
 
-    let mut ws = connect_ws(&base, &cookie).await;
+    let mut ws = fixture.server.ws().await;
     ws.send(tokio_tungstenite::tungstenite::Message::Text(
         serde_json::to_string(&ClientMessage::SelectModel {
             thread_id,
@@ -457,13 +343,22 @@ async fn draft_default_model_comes_from_the_live_catalog() {
     default_marked.is_default = true;
     let models = vec![catalog_model("gpt-5.5", "GPT-5.5", &[]), default_marked];
 
-    let (base, client, cookie, project_id, _tmp, store) = spawn_project(|mock_addr| {
-        Arc::new(CatalogFactory {
-            models,
-            providers: harness_providers(mock_addr),
+    let fixture = spawn_project(|mock_addr| {
+        let providers = harness_providers(mock_addr);
+        factory::from_fn(move |_, _| {
+            Ok(Arc::new(
+                ReplayHarness::new()
+                    .with_models(models.clone())
+                    .with_providers(providers.clone()),
+            ))
         })
     })
     .await;
+    let base = fixture.server.base.clone();
+    let client = fixture.server.client.clone();
+    let cookie = fixture.server.cookie.clone();
+    let project_id = fixture.project_id;
+    let store = fixture.server.store().clone();
 
     let project: serde_json::Value = client
         .get(format!("{base}/api/projects/{project_id}"))
@@ -514,13 +409,21 @@ async fn unmarked_catalog_exposes_no_default_and_falls_back_to_first() {
         catalog_model("gpt-5.5", "GPT-5.5", &[]),
         catalog_model("glm-5.2", "GLM 5.2", &["high"]),
     ];
-    let (base, client, cookie, project_id, _tmp, _store) = spawn_project(|mock_addr| {
-        Arc::new(CatalogFactory {
-            models,
-            providers: harness_providers(mock_addr),
+    let fixture = spawn_project(|mock_addr| {
+        let providers = harness_providers(mock_addr);
+        factory::from_fn(move |_, _| {
+            Ok(Arc::new(
+                ReplayHarness::new()
+                    .with_models(models.clone())
+                    .with_providers(providers.clone()),
+            ))
         })
     })
     .await;
+    let base = fixture.server.base.clone();
+    let client = fixture.server.client.clone();
+    let cookie = fixture.server.cookie.clone();
+    let project_id = fixture.project_id;
 
     let catalog: serde_json::Value = client
         .get(format!("{base}/api/projects/{project_id}/models"))

@@ -1,223 +1,36 @@
 //! WebSocket history sync integration tests: paginated history load, resync deltas vs. full-page
 //! fallback on reconnect, and a structured error when persisted history is corrupt.
 
-use std::sync::Arc;
-
-use chrono::Utc;
 use futures_util::{SinkExt, StreamExt};
-use giskard_core::event::AgentEvent;
-use giskard_core::ids::{ItemId, ProjectId, ThreadId, TurnId};
-use giskard_core::item::{Item, ItemKind, ItemPayload, ItemStart};
-use giskard_core::token::TokenUsage;
-use giskard_core::turn::{TurnStatus, TurnStatusKind};
-use giskard_harness::AgentHarness;
-use giskard_harness_replay::{ReplayFixture, ReplayHarness};
-use giskard_persist::store::ProjectConfig;
+use giskard_core::ids::{ProjectId, ThreadId, TurnId};
 use giskard_proto::{ClientMessage, ErrorSeverity, ServerMessage};
-use giskard_server::{AppState, HarnessFactory, build_app};
+use giskard_testenv::{TestProject, TestServer, factory, fixtures};
 
-use common::fake_native_model;
-use thread_fixture::persist_primary_thread;
-
-struct DiffFactory {
-    fixture: ReplayFixture,
-}
-
-#[async_trait::async_trait]
-impl HarnessFactory for DiffFactory {
-    async fn create(
-        &self,
-        _config: &ProjectConfig,
-        _bootstrap: giskard_harness::HarnessBootstrap,
-    ) -> Result<Arc<dyn AgentHarness>, giskard_core::HarnessError> {
-        Ok(Arc::new(ReplayHarness::from_fixture(self.fixture.clone())))
-    }
-}
-
-fn make_fixture() -> ReplayFixture {
-    let thread = ThreadId::new();
-    let turn = TurnId::new();
-    let item = ItemId::new();
-    let now = Utc::now();
-    ReplayFixture::from_events(vec![
-        AgentEvent::ThreadOpened {
-            thread,
-            harness_thread_id: "th_tok".into(),
-        },
-        AgentEvent::TurnStarted { thread, turn },
-        AgentEvent::ItemStarted {
-            thread,
-            turn,
-            item: ItemStart {
-                id: item,
-                harness_item_id: "it_1".into(),
-                kind: ItemKind::AgentMessage,
-                command: None,
-                tool: None,
-            },
-        },
-        AgentEvent::ItemCompleted {
-            thread,
-            turn,
-            item: Item {
-                id: item,
-                harness_item_id: "it_1".into(),
-                payload: ItemPayload::AgentMessage {
-                    text: "done".into(),
-                },
-                created_at: now,
-            },
-        },
-        AgentEvent::TurnCompleted {
-            thread,
-            turn,
-            usage: TokenUsage::new(100, 50),
-            status: TurnStatus {
-                kind: TurnStatusKind::Completed,
-                message: None,
-            },
-        },
-    ])
-}
-
-fn make_turn(text: &str) -> giskard_core::turn::Turn {
-    let now = Utc::now();
-    giskard_core::turn::Turn {
-        id: TurnId::new(),
-        user_input: giskard_core::user_input::UserInput::text(text),
-        items: vec![Item {
-            id: ItemId::new(),
-            harness_item_id: String::new(),
-            payload: ItemPayload::AgentMessage {
-                text: text.to_string(),
-            },
-            created_at: now,
-        }],
-        model: giskard_core::turn::TurnModel::Known(giskard_core::model::ModelRef {
-            provider: "openai".into(),
-            model: "gpt-5.5".into(),
-            reasoning_effort: None,
-        }),
-        mode: giskard_core::turn::TurnMode::Known(giskard_core::turn::Mode::Build),
-        status: TurnStatus {
-            kind: TurnStatusKind::Completed,
-            message: None,
-        },
-        usage: TokenUsage::new(1, 1),
-        diffs: vec![],
-        started_at: now,
-        completed_at: Some(now),
-    }
-}
-
-fn password_hash(password: &str) -> String {
-    use argon2::password_hash::SaltString;
-    use argon2::{Argon2, PasswordHasher};
-    use rand::rngs::OsRng;
-    let salt = SaltString::generate(&mut OsRng);
-    Argon2::default()
-        .hash_password(password.as_bytes(), &salt)
-        .unwrap()
-        .to_string()
-}
-
-async fn login(base: &str) -> (reqwest::Client, String) {
-    let client = reqwest::Client::new();
-    let resp = client
-        .post(format!("{base}/api/login"))
-        .json(&serde_json::json!({"password": "testpass"}))
-        .send()
-        .await
-        .unwrap();
-    let cookie = resp
-        .headers()
-        .get("set-cookie")
-        .unwrap()
-        .to_str()
-        .unwrap()
-        .split(';')
-        .next()
-        .unwrap()
-        .to_string();
-    (client, cookie)
-}
-
-async fn ws_connect(
-    port: u16,
-    cookie: &str,
-) -> tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>> {
-    let req = tokio_tungstenite::tungstenite::http::Request::builder()
-        .uri(format!("ws://127.0.0.1:{port}/api/ws"))
-        .header("host", format!("127.0.0.1:{port}"))
-        .header("cookie", cookie)
-        .header("upgrade", "websocket")
-        .header("connection", "upgrade")
-        .header("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ==")
-        .header("sec-websocket-version", "13")
-        .body(())
-        .unwrap();
-    tokio_tungstenite::connect_async(req).await.unwrap().0
+async fn setup(extra: &str) -> (TestServer, TestProject, ThreadId) {
+    let server = TestServer::builder(factory::fixture(fixtures::completed_turn_fixture()))
+        .config(extra)
+        .start()
+        .await;
+    let project = server.create_project("proj").await;
+    let tid = server
+        .register_thread(project.id, fixtures::COMPLETED_TURN_HARNESS_THREAD_ID)
+        .await;
+    (server, project, tid)
 }
 
 #[tokio::test]
 async fn history_pagination_over_http() {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let port = listener.local_addr().unwrap().port();
-    let tmp = tempfile::TempDir::new().unwrap();
-    let hash = password_hash("testpass");
-    // Small page sizes so 5 seeded turns paginate: initial 2, page 2.
-    tokio::fs::write(
-        tmp.path().join("config.toml"),
-        format!(
-            "[server]\nbind=\"127.0.0.1:{port}\"\nsecure_cookies=false\n\n[auth]\npassword_hash=\"{hash}\"\nsession_days=30\n\n[history]\ninitial=2\npage=2\n"
-        ),
-    )
-    .await
-    .unwrap();
-
-    let store = Arc::new(giskard_persist::PersistStore::new(tmp.path().to_path_buf()));
-    let state = AppState::new(
-        store,
-        Arc::new(DiffFactory {
-            fixture: make_fixture(),
-        }),
-        (0..32u8).collect(),
-    );
-    let app = build_app(state.clone());
-    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-
-    let base = format!("http://127.0.0.1:{port}");
-    let (client, cookie) = login(&base).await;
-
-    let proj_dir = tempfile::TempDir::new().unwrap();
-    let pid = ProjectId::new();
-    state
-        .store
-        .create_project(pid, "proj", &proj_dir.path().to_string_lossy())
-        .await
-        .unwrap();
+    let (server, project, tid) = setup("[history]\ninitial=2\npage=2\n").await;
+    let state = &server.state;
+    let client = server.client.clone();
+    let cookie = server.cookie.clone();
+    let base = server.base.clone();
+    let pid = project.id;
 
     // Open (register) the thread, then seed 5 turns directly into the authoritative history.
-    let tid = persist_primary_thread(
-        &state.store,
-        pid,
-        ThreadId::new(),
-        "th_tok",
-        fake_native_model(),
-    )
-    .await;
-    client
-        .post(format!("{base}/api/projects/{pid}/threads"))
-        .header("cookie", &cookie)
-        .json(&serde_json::json!({"thread_id": tid}))
-        .send()
-        .await
-        .unwrap()
-        .error_for_status()
-        .unwrap();
     let mut ids = Vec::new();
     for i in 0..5 {
-        let t = make_turn(&format!("turn {i}"));
+        let t = fixtures::completed_turn(&format!("turn {i}"), fixtures::fake_native_model());
         ids.push(t.id.to_string());
         state.store.append_turn(pid, tid, &t).await.unwrap();
     }
@@ -307,62 +120,12 @@ async fn history_pagination_over_http() {
 /// after it, and a stale `since` falls back to a bounded reset delta.
 #[tokio::test]
 async fn resync_delta_over_websocket() {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let port = listener.local_addr().unwrap().port();
-    let tmp = tempfile::TempDir::new().unwrap();
-    let hash = password_hash("testpass");
-    // initial=2 so the stale-cursor fallback returns a bounded page we can assert on.
-    tokio::fs::write(
-        tmp.path().join("config.toml"),
-        format!(
-            "[server]\nbind=\"127.0.0.1:{port}\"\nsecure_cookies=false\n\n[auth]\npassword_hash=\"{hash}\"\nsession_days=30\n\n[history]\ninitial=2\npage=2\n"
-        ),
-    )
-    .await
-    .unwrap();
-
-    let store = Arc::new(giskard_persist::PersistStore::new(tmp.path().to_path_buf()));
-    let state = AppState::new(
-        store,
-        Arc::new(DiffFactory {
-            fixture: make_fixture(),
-        }),
-        (0..32u8).collect(),
-    );
-    let app = build_app(state.clone());
-    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-
-    let base = format!("http://127.0.0.1:{port}");
-    let (client, cookie) = login(&base).await;
-
-    let proj_dir = tempfile::TempDir::new().unwrap();
-    let pid = ProjectId::new();
-    state
-        .store
-        .create_project(pid, "proj", &proj_dir.path().to_string_lossy())
-        .await
-        .unwrap();
-
-    let tid = persist_primary_thread(
-        &state.store,
-        pid,
-        ThreadId::new(),
-        "th_tok",
-        fake_native_model(),
-    )
-    .await;
-    client
-        .post(format!("{base}/api/projects/{pid}/threads"))
-        .header("cookie", &cookie)
-        .json(&serde_json::json!({"thread_id": tid}))
-        .send()
-        .await
-        .unwrap()
-        .error_for_status()
-        .unwrap();
+    let (server, project, tid) = setup("[history]\ninitial=2\npage=2\n").await;
+    let state = &server.state;
+    let pid = project.id;
     let mut ids = Vec::new();
     for i in 0..5 {
-        let t = make_turn(&format!("turn {i}"));
+        let t = fixtures::completed_turn(&format!("turn {i}"), fixtures::fake_native_model());
         ids.push(t.id.to_string());
         state.store.append_turn(pid, tid, &t).await.unwrap();
     }
@@ -391,7 +154,7 @@ async fn resync_delta_over_websocket() {
     }
 
     // A fresh subscription receives bounded bootstrap history, not an HTTP pagination response.
-    let mut fresh_ws = ws_connect(port, &cookie).await;
+    let mut fresh_ws = server.ws().await;
     fresh_ws
         .send(tokio_tungstenite::tungstenite::Message::Text(
             serde_json::to_string(&ClientMessage::Subscribe {
@@ -412,7 +175,7 @@ async fn resync_delta_over_websocket() {
     assert_eq!(turns[1]["id"].as_str().unwrap(), ids[4]);
 
     // Resolvable cursor (ids[2]) → HistoryDelta with only the turns after it: ids[3], ids[4].
-    let mut ws = ws_connect(port, &cookie).await;
+    let mut ws = server.ws().await;
     let cursor: TurnId = ids[2].parse().unwrap();
     ws.send(tokio_tungstenite::tungstenite::Message::Text(
         serde_json::to_string(&ClientMessage::Subscribe {
@@ -432,8 +195,9 @@ async fn resync_delta_over_websocket() {
     assert_eq!(turns[1]["id"].as_str().unwrap(), ids[4]);
 
     // Stale cursor → bounded reset delta (initial=2 → last two).
-    let bogus: TurnId = make_turn("never persisted").id;
-    let mut ws2 = ws_connect(port, &cookie).await;
+    let bogus: TurnId =
+        fixtures::completed_turn("never persisted", fixtures::fake_native_model()).id;
+    let mut ws2 = server.ws().await;
     ws2.send(tokio_tungstenite::tungstenite::Message::Text(
         serde_json::to_string(&ClientMessage::Subscribe {
             thread_id: tid,
@@ -456,63 +220,17 @@ async fn resync_delta_over_websocket() {
 
 #[tokio::test]
 async fn subscribe_corrupt_history_returns_structured_error() {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let port = listener.local_addr().unwrap().port();
-    let tmp = tempfile::TempDir::new().unwrap();
-    let hash = password_hash("testpass");
-    tokio::fs::write(
-        tmp.path().join("config.toml"),
-        format!(
-            "[server]\nbind=\"127.0.0.1:{port}\"\nsecure_cookies=false\n\n[auth]\npassword_hash=\"{hash}\"\nsession_days=30\n"
-        ),
-    )
-    .await
-    .unwrap();
-
-    let store = Arc::new(giskard_persist::PersistStore::new(tmp.path().to_path_buf()));
-    let state = AppState::new(
-        store,
-        Arc::new(DiffFactory {
-            fixture: make_fixture(),
-        }),
-        (0..32u8).collect(),
-    );
-    let app = build_app(state.clone());
-    tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-
-    let base = format!("http://127.0.0.1:{port}");
-    let (client, cookie) = login(&base).await;
-
-    let proj_dir = tempfile::TempDir::new().unwrap();
-    let pid = ProjectId::new();
-    state
-        .store
-        .create_project(pid, "proj", &proj_dir.path().to_string_lossy())
-        .await
-        .unwrap();
-
-    let tid = persist_primary_thread(
-        &state.store,
-        pid,
-        ThreadId::new(),
-        "th_tok",
-        fake_native_model(),
-    )
-    .await;
-    client
-        .post(format!("{base}/api/projects/{pid}/threads"))
-        .header("cookie", &cookie)
-        .json(&serde_json::json!({"thread_id": tid}))
-        .send()
-        .await
-        .unwrap()
-        .error_for_status()
-        .unwrap();
+    let (server, project, tid) = setup("").await;
+    let pid = project.id;
 
     // A bad **interior** line of the history index is real corruption, not a torn final append.
-    let valid_turn = serde_json::to_string(&make_turn("valid after corrupt line")).unwrap();
-    let history_path = tmp
-        .path()
+    let valid_turn = serde_json::to_string(&fixtures::completed_turn(
+        "valid after corrupt line",
+        fixtures::fake_native_model(),
+    ))
+    .unwrap();
+    let history_path = server
+        .data_dir()
         .join("projects")
         .join(pid.to_string())
         .join("threads")
@@ -522,17 +240,7 @@ async fn subscribe_corrupt_history_returns_structured_error() {
         .await
         .unwrap();
 
-    let ws_req = tokio_tungstenite::tungstenite::http::Request::builder()
-        .uri(format!("ws://127.0.0.1:{port}/api/ws"))
-        .header("host", format!("127.0.0.1:{port}"))
-        .header("cookie", &cookie)
-        .header("upgrade", "websocket")
-        .header("connection", "upgrade")
-        .header("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ==")
-        .header("sec-websocket-version", "13")
-        .body(())
-        .unwrap();
-    let (mut ws, _) = tokio_tungstenite::connect_async(ws_req).await.unwrap();
+    let mut ws = server.ws().await;
 
     ws.send(tokio_tungstenite::tungstenite::Message::Text(
         serde_json::to_string(&ClientMessage::Subscribe {
@@ -571,6 +279,3 @@ async fn subscribe_corrupt_history_returns_structured_error() {
 
     panic!("subscribe did not return a structured persistence error");
 }
-mod common;
-#[path = "common/thread_fixture.rs"]
-mod thread_fixture;

@@ -1,45 +1,9 @@
 //! Integration tests for the hardening surface: login throttling, token domain separation,
 //! sliding sessions, security headers, and browse-root confinement of project creation.
 
-use std::sync::Arc;
-
-use async_trait::async_trait;
 use giskard_core::error::HarnessError;
-use giskard_persist::store::ProjectConfig;
 use giskard_server::auth::{SESSION_COOKIE, TokenPurpose, sign_token};
-use giskard_server::{AppState, HarnessFactory, build_app};
-
-/// These tests never start a harness: project creation and every endpoint under test are pure
-/// HTTP + persistence paths.
-struct NoHarnessFactory;
-
-#[async_trait]
-impl HarnessFactory for NoHarnessFactory {
-    async fn create(
-        &self,
-        _config: &ProjectConfig,
-        _bootstrap: giskard_harness::HarnessBootstrap,
-    ) -> Result<Arc<dyn giskard_harness::AgentHarness>, HarnessError> {
-        Err(HarnessError::Unsupported(
-            "no harness in security tests".into(),
-        ))
-    }
-}
-
-fn generate_password_hash(password: &str) -> String {
-    use argon2::password_hash::SaltString;
-    use argon2::{Argon2, PasswordHasher};
-    use rand::rngs::OsRng;
-    let salt = SaltString::generate(&mut OsRng);
-    Argon2::default()
-        .hash_password(password.as_bytes(), &salt)
-        .unwrap()
-        .to_string()
-}
-
-fn session_key() -> Vec<u8> {
-    (0..32u8).collect()
-}
+use giskard_testenv::{TestServer, auth, factory};
 
 /// Pull an attribute value (up to the next `"`) that follows `start` — used to read the served,
 /// content-hashed asset URLs (`/app.<hash>.js`) out of the index HTML.
@@ -51,67 +15,20 @@ fn attr_after(html: &str, start: &str) -> String {
 
 /// Start a server on an ephemeral port with the given extra config sections appended to a
 /// baseline `[server]`/`[auth]` config (password: "testpass").
-async fn start_server(extra_config: &str) -> (tempfile::TempDir, String) {
-    let tmp = tempfile::TempDir::new().unwrap();
-    let hash = generate_password_hash("testpass");
-    let config_toml = format!(
-        r#"
-[server]
-bind = "127.0.0.1:0"
-secure_cookies = false
-
-[auth]
-password_hash = "{hash}"
-session_days = 30
-
-{extra_config}
-"#
-    );
-    tokio::fs::write(tmp.path().join("config.toml"), config_toml)
-        .await
-        .unwrap();
-
-    let store = Arc::new(giskard_persist::PersistStore::new(tmp.path().to_path_buf()));
-    let state = AppState::new(store, Arc::new(NoHarnessFactory), session_key());
-    let app = build_app(state);
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
-        axum::serve(listener, app).await.unwrap();
-    });
-    (tmp, format!("http://{addr}"))
-}
-
-fn client() -> reqwest::Client {
-    reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .build()
-        .unwrap()
-}
-
-async fn login(client: &reqwest::Client, base: &str) -> String {
-    let resp = client
-        .post(format!("{base}/api/login"))
-        .json(&serde_json::json!({"password": "testpass"}))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), 200);
-    resp.headers()
-        .get("set-cookie")
-        .expect("login must set a session cookie")
-        .to_str()
-        .unwrap()
-        .split(';')
-        .next()
-        .unwrap()
-        .to_string()
+async fn start_server(extra_config: &str) -> TestServer {
+    TestServer::builder(factory::failing(HarnessError::Unsupported(
+        "no harness in security tests".into(),
+    )))
+    .config(extra_config)
+    .start()
+    .await
 }
 
 #[tokio::test]
 async fn security_headers_are_set_on_all_responses() {
-    let (_tmp, base) = start_server("").await;
-    let client = client();
+    let server = start_server("").await;
+    let base = server.base.clone();
+    let client = server.client.clone();
 
     // The script/stylesheet live at content-hashed URLs; read the current ones from the index.
     let index = client
@@ -147,8 +64,11 @@ async fn security_headers_are_set_on_all_responses() {
 
 #[tokio::test]
 async fn index_page_has_no_inline_script() {
-    let (_tmp, base) = start_server("").await;
-    let body = client()
+    let server = start_server("").await;
+    let base = server.base.clone();
+    let body = server
+        .client
+        .clone()
         .get(format!("{base}/"))
         .send()
         .await
@@ -178,8 +98,9 @@ async fn index_page_has_no_inline_script() {
 
 #[tokio::test]
 async fn login_locks_out_after_repeated_failures() {
-    let (_tmp, base) = start_server("").await;
-    let client = client();
+    let server = start_server("").await;
+    let base = server.base.clone();
+    let client = server.client.clone();
 
     // The first failures are tolerated (typos) and answered with an in-band `ok: false`.
     for _ in 0..4 {
@@ -226,9 +147,10 @@ async fn login_locks_out_after_repeated_failures() {
 
 #[tokio::test]
 async fn ws_ticket_is_not_a_session_and_vice_versa() {
-    let (_tmp, base) = start_server("").await;
-    let client = client();
-    let cookie = login(&client, &base).await;
+    let server = start_server("").await;
+    let base = server.base.clone();
+    let client = server.client.clone();
+    let cookie = auth::login(&client, &base).await;
     let session_token = cookie
         .strip_prefix(&format!("{SESSION_COOKIE}="))
         .unwrap()
@@ -278,8 +200,11 @@ async fn ws_ticket_is_not_a_session_and_vice_versa() {
 
 #[tokio::test]
 async fn cookie_max_age_follows_session_days() {
-    let (_tmp, base) = start_server("").await;
-    let resp = client()
+    let server = start_server("").await;
+    let base = server.base.clone();
+    let resp = server
+        .client
+        .clone()
         .post(format!("{base}/api/login"))
         .json(&serde_json::json!({"password": "testpass"}))
         .send()
@@ -300,11 +225,12 @@ async fn cookie_max_age_follows_session_days() {
 
 #[tokio::test]
 async fn session_is_renewed_past_the_lifetime_midpoint() {
-    let (_tmp, base) = start_server("").await;
-    let client = client();
+    let server = start_server("").await;
+    let base = server.base.clone();
+    let client = server.client.clone();
 
     // A fresh session (full lifetime remaining) must not be re-issued on every request.
-    let cookie = login(&client, &base).await;
+    let cookie = auth::login(&client, &base).await;
     let resp = client
         .get(format!("{base}/api/projects"))
         .header("cookie", &cookie)
@@ -316,7 +242,8 @@ async fn session_is_renewed_past_the_lifetime_midpoint() {
 
     // A valid session in the second half of its lifetime gets a refreshed cookie.
     let nearly_expired = chrono::Utc::now().timestamp() as u64 + 3600;
-    let old_token = sign_token(TokenPurpose::Session, nearly_expired, &session_key()).unwrap();
+    let old_token =
+        sign_token(TokenPurpose::Session, nearly_expired, &auth::session_key()).unwrap();
     let resp = client
         .get(format!("{base}/api/projects"))
         .header("cookie", format!("{SESSION_COOKIE}={old_token}"))
@@ -340,9 +267,10 @@ async fn create_project_is_confined_to_browse_roots() {
     let denied = tempfile::TempDir::new().unwrap();
     let allowed_path = allowed.path().canonicalize().unwrap();
     let extra = format!("[browse]\nroots = [{:?}]\n", allowed_path.to_str().unwrap());
-    let (_tmp, base) = start_server(&extra).await;
-    let client = client();
-    let cookie = login(&client, &base).await;
+    let server = start_server(&extra).await;
+    let base = server.base.clone();
+    let client = server.client.clone();
+    let cookie = auth::login(&client, &base).await;
 
     let create = |dir: String| {
         let client = client.clone();

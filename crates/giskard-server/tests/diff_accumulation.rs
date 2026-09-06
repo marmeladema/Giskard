@@ -1,40 +1,17 @@
 //! Diff-accumulation integration test: `DiffUpdated` events fold into `Turn.diffs` (deduplicated by
 //! path, keeping the latest) and are persisted with the completed turn.
 
-use std::sync::Arc;
-
 use chrono::Utc;
 use futures_util::SinkExt;
 use giskard_core::diff::{DiffHunk, DiffLine, FileDiff};
 use giskard_core::event::AgentEvent;
-use giskard_core::ids::{ItemId, ProjectId, ThreadId, TurnId};
+use giskard_core::ids::{ItemId, ThreadId, TurnId};
 use giskard_core::item::{FileChangeEntry, FileChangeKind, Item, ItemKind, ItemPayload, ItemStart};
 use giskard_core::token::TokenUsage;
 use giskard_core::turn::{TurnStatus, TurnStatusKind};
-use giskard_harness::AgentHarness;
-use giskard_harness_replay::{ReplayFixture, ReplayHarness};
-use giskard_persist::store::ProjectConfig;
+use giskard_harness_replay::ReplayFixture;
 use giskard_proto::ClientMessage;
-use giskard_server::{AppState, HarnessFactory, build_app};
-
-use common::fake_native_model;
-use thread_fixture::persist_primary_thread;
-
-/// Harness factory that wraps a replay harness with a diff-containing fixture.
-struct DiffFactory {
-    fixture: ReplayFixture,
-}
-
-#[async_trait::async_trait]
-impl HarnessFactory for DiffFactory {
-    async fn create(
-        &self,
-        _config: &ProjectConfig,
-        _bootstrap: giskard_harness::HarnessBootstrap,
-    ) -> Result<Arc<dyn AgentHarness>, giskard_core::HarnessError> {
-        Ok(Arc::new(ReplayHarness::from_fixture(self.fixture.clone())))
-    }
-}
+use giskard_testenv::{TestServer, factory};
 
 /// Build a fixture that emits two `DiffUpdated` events for the same file
 /// (simulating incremental diff updates) plus one for a second file.
@@ -158,17 +135,6 @@ fn make_diff_fixture() -> ReplayFixture {
     ])
 }
 
-fn generate_password_hash(password: &str) -> String {
-    use argon2::password_hash::SaltString;
-    use argon2::{Argon2, PasswordHasher};
-    use rand::rngs::OsRng;
-    let salt = SaltString::generate(&mut OsRng);
-    Argon2::default()
-        .hash_password(password.as_bytes(), &salt)
-        .unwrap()
-        .to_string()
-}
-
 /// DiffUpdated events should be accumulated into Turn.diffs and persisted.
 ///
 /// Two diffs for the same path (`src/main.rs`) should be deduplicated to the
@@ -176,98 +142,15 @@ fn generate_password_hash(password: &str) -> String {
 /// separate entry.
 #[tokio::test]
 async fn diff_accumulation_persists_turn_diffs() {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let port = listener.local_addr().unwrap().port();
-    let tmp = tempfile::TempDir::new().unwrap();
-    let hash = generate_password_hash("testpass");
-    let config_toml = format!(
-        r#"
-[server]
-bind = "127.0.0.1:{port}"
-secure_cookies = false
-
-[auth]
-password_hash = "{hash}"
-session_days = 30
-"#
-    );
-    tokio::fs::write(tmp.path().join("config.toml"), config_toml)
-        .await
-        .unwrap();
-
-    let store = Arc::new(giskard_persist::PersistStore::new(tmp.path().to_path_buf()));
-    let session_key: Vec<u8> = (0..32u8).collect();
-    let factory = Arc::new(DiffFactory {
-        fixture: make_diff_fixture(),
-    });
-    let state = AppState::new(store.clone(), factory, session_key);
-    let app = build_app(state.clone());
-    tokio::spawn(async move {
-        axum::serve(listener, app).await.unwrap();
-    });
-
-    let proj_dir = tempfile::TempDir::new().unwrap();
-    let proj_dir_path = proj_dir.path().to_string_lossy().to_string();
-    let pid = ProjectId::new();
-    state
-        .store
-        .create_project(pid, "diff-test", &proj_dir_path)
-        .await
-        .unwrap();
-
-    let http_client = reqwest::Client::new();
-    let cookie = {
-        let resp = http_client
-            .post(format!("http://127.0.0.1:{port}/api/login"))
-            .json(&serde_json::json!({"password": "testpass"}))
-            .send()
-            .await
-            .unwrap();
-        resp.headers()
-            .get("set-cookie")
-            .unwrap()
-            .to_str()
-            .unwrap()
-            .split(';')
-            .next()
-            .unwrap()
-            .to_string()
-    };
-
-    let thread_id = persist_primary_thread(
-        &state.store,
-        pid,
-        ThreadId::new(),
-        "th_diff",
-        fake_native_model(),
-    )
-    .await;
-    http_client
-        .post(format!(
-            "http://127.0.0.1:{port}/api/projects/{pid}/threads"
-        ))
-        .header("cookie", &cookie)
-        .json(&serde_json::json!({"thread_id": thread_id}))
-        .send()
-        .await
-        .unwrap()
-        .error_for_status()
-        .unwrap();
-
-    let ws_base = format!("ws://127.0.0.1:{port}");
-    let ws_request = tokio_tungstenite::tungstenite::http::Request::builder()
-        .uri(format!("{ws_base}/api/ws"))
-        .header("host", format!("127.0.0.1:{port}"))
-        .header("cookie", &cookie)
-        .header("upgrade", "websocket")
-        .header("connection", "upgrade")
-        .header("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ==")
-        .header("sec-websocket-version", "13")
-        .body(())
-        .unwrap();
-    let (mut ws, _) = tokio_tungstenite::connect_async(ws_request)
-        .await
-        .expect("WS connect");
+    let server = TestServer::spawn(factory::fixture(make_diff_fixture())).await;
+    let project = server.create_project("diff-test").await;
+    let pid = project.id;
+    let thread_id = server.register_thread(pid, "th_diff").await;
+    let state = &server.state;
+    let http_client = &server.client;
+    let cookie = server.cookie.clone();
+    let port = server.addr.port();
+    let mut ws = server.ws().await;
 
     ws.send(tokio_tungstenite::tungstenite::Message::Text(
         serde_json::to_string(&ClientMessage::Subscribe {
@@ -382,7 +265,8 @@ session_days = 30
             );
 
             let raw_payload = tokio::fs::read_to_string(
-                tmp.path()
+                server
+                    .data_dir()
                     .join("projects")
                     .join(pid.to_string())
                     .join("threads")
@@ -405,6 +289,3 @@ session_days = 30
         tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
     }
 }
-mod common;
-#[path = "common/thread_fixture.rs"]
-mod thread_fixture;

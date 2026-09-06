@@ -677,6 +677,7 @@ dependencies = [
  "giskard-harness-replay",
  "giskard-persist",
  "giskard-proto",
+ "giskard-testenv",
  "hmac",
  "indexmap",
  "pulldown-cmark",
@@ -699,6 +700,28 @@ dependencies = [
  "tracing-appender",
  "tracing-subscriber",
  "two-face",
+]
+
+[[package]]
+name = "giskard-testenv"
+version = "0.1.0"
+dependencies = [
+ "argon2",
+ "async-trait",
+ "axum",
+ "chrono",
+ "futures-util",
+ "giskard-core",
+ "giskard-harness",
+ "giskard-harness-replay",
+ "giskard-persist",
+ "giskard-proto",
+ "giskard-server",
+ "reqwest",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tokio-tungstenite",
 ]
 
 [[package]]

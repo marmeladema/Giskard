@@ -6,35 +6,23 @@
 //! which errored. This test drives the real WebSocket API: raise an approval, answer it, reconnect,
 //! and assert the snapshot reports it as answered (not pending).
 
-mod common;
-#[path = "common/thread_fixture.rs"]
-mod thread_fixture;
-
-use std::net::SocketAddr;
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use giskard_core::approval::{ApprovalDecision, ApprovalKind, ApprovalRequest};
 use giskard_core::error::HarnessError;
 use giskard_core::event::AgentEvent;
-use giskard_core::ids::{ApprovalId, ProjectId, ThreadId, TurnId};
+use giskard_core::ids::{ApprovalId, ThreadId, TurnId};
 use giskard_core::model::ModelDescriptor;
 use giskard_core::turn::TurnOverrides;
 use giskard_core::user_input::UserInput;
 use giskard_harness::{
     AgentEventStream, AgentHarness, EventLog, HarnessCapabilities, OpenThreadOptions, ThreadHandle,
 };
-use giskard_persist::store::ProjectConfig;
 use giskard_proto::{ClientMessage, ServerMessage, WireAgentEvent};
-use giskard_server::{AppState, HarnessFactory, build_app};
+use giskard_testenv::{TestServer, TestWs, factory, ws};
 use tokio::sync::Mutex;
 use tokio::time::{Duration, Instant};
-
-use common::fake_native_model;
-use thread_fixture::persist_primary_thread;
-
-type TestWs =
-    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
 
 const APPROVAL_ID: &str = "ap_reconnect_1";
 const SERVER_REQUEST_ID: &str = "req_reconnect_1";
@@ -185,148 +173,38 @@ impl AgentHarness for ApprovalHarness {
     }
 }
 
-struct ApprovalFactory {
+struct TestApp {
+    server: TestServer,
     harness: Arc<ApprovalHarness>,
+    thread_id: ThreadId,
 }
 
-#[async_trait]
-impl HarnessFactory for ApprovalFactory {
-    async fn create(
-        &self,
-        _config: &ProjectConfig,
-        _bootstrap: giskard_harness::HarnessBootstrap,
-    ) -> Result<Arc<dyn AgentHarness>, HarnessError> {
-        Ok(self.harness.clone())
-    }
-}
-
-fn generate_password_hash(password: &str) -> String {
-    use argon2::password_hash::SaltString;
-    use argon2::{Argon2, PasswordHasher};
-    use rand::rngs::OsRng;
-    let salt = SaltString::generate(&mut OsRng);
-    Argon2::default()
-        .hash_password(password.as_bytes(), &salt)
-        .unwrap()
-        .to_string()
-}
-
-fn ws_text(msg: &ClientMessage) -> tokio_tungstenite::tungstenite::Message {
-    tokio_tungstenite::tungstenite::Message::Text(serde_json::to_string(msg).unwrap().into())
-}
-
-async fn spawn_test_app() -> (
-    tempfile::TempDir,
-    Arc<ApprovalHarness>,
-    SocketAddr,
-    String,
-    ThreadId,
-) {
-    let tmp = tempfile::TempDir::new().unwrap();
-    let hash = generate_password_hash("testpass");
-    tokio::fs::write(
-        tmp.path().join("config.toml"),
-        format!(
-            "[server]\nbind = \"127.0.0.1:0\"\nsecure_cookies = false\n\n[auth]\npassword_hash = \"{hash}\"\nsession_days = 30\n"
-        ),
-    )
-    .await
-    .unwrap();
-
+async fn spawn_test_app() -> TestApp {
     let harness = Arc::new(ApprovalHarness::new());
-    let store = Arc::new(giskard_persist::PersistStore::new(tmp.path().to_path_buf()));
-    let state = AppState::new(
-        store,
-        Arc::new(ApprovalFactory {
-            harness: harness.clone(),
-        }),
-        (0..32u8).collect(),
-    );
-    let app = build_app(state.clone());
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let addr = listener.local_addr().unwrap();
-    tokio::spawn(async move {
-        axum::serve(listener, app).await.unwrap();
-    });
-
-    let proj_dir = tempfile::TempDir::new().unwrap();
-    let pid = ProjectId::new();
-    state
-        .store
-        .create_project(pid, "proj", &proj_dir.path().to_string_lossy())
-        .await
-        .unwrap();
-
-    let client = reqwest::Client::new();
-    let cookie = {
-        let resp = client
-            .post(format!("http://{addr}/api/login"))
-            .json(&serde_json::json!({"password": "testpass"}))
-            .send()
-            .await
-            .unwrap();
-        resp.headers()
-            .get("set-cookie")
-            .unwrap()
-            .to_str()
-            .unwrap()
-            .split(';')
-            .next()
-            .unwrap()
-            .to_string()
-    };
-
-    let thread_id = persist_primary_thread(
-        &state.store,
-        pid,
-        ThreadId::new(),
-        "approval_thread",
-        fake_native_model(),
-    )
-    .await;
-    client
-        .post(format!("http://{addr}/api/projects/{pid}/threads"))
-        .header("cookie", &cookie)
-        .json(&serde_json::json!({ "thread_id": thread_id }))
-        .send()
-        .await
-        .unwrap()
-        .error_for_status()
-        .unwrap();
-
-    (tmp, harness, addr, cookie, thread_id)
-}
-
-async fn connect_ws(addr: SocketAddr, cookie: &str) -> TestWs {
-    let ws_request = tokio_tungstenite::tungstenite::http::Request::builder()
-        .uri(format!("ws://{addr}/api/ws"))
-        .header("host", addr.to_string())
-        .header("cookie", cookie)
-        .header("upgrade", "websocket")
-        .header("connection", "upgrade")
-        .header("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ==")
-        .header("sec-websocket-version", "13")
-        .body(())
-        .unwrap();
-    let (ws, _) = tokio_tungstenite::connect_async(ws_request)
-        .await
-        .expect("WS connect");
-    ws
+    let server = TestServer::spawn(factory::shared(harness.clone())).await;
+    let project = server.create_project("proj").await;
+    let thread_id = server.register_thread(project.id, "approval_thread").await;
+    TestApp {
+        server,
+        harness,
+        thread_id,
+    }
 }
 
 #[tokio::test]
 async fn answered_approval_is_not_pending_after_reconnect() {
     use futures_util::SinkExt;
 
-    let (_tmp, _harness, addr, cookie, thread_id) = spawn_test_app().await;
-    let mut ws = connect_ws(addr, &cookie).await;
-    ws.send(ws_text(&ClientMessage::Subscribe {
+    let app = spawn_test_app().await;
+    let thread_id = app.thread_id;
+    let mut ws = app.server.ws().await;
+    ws.send(ws::text(&ClientMessage::Subscribe {
         thread_id,
         since: None,
     }))
     .await
     .unwrap();
-    ws.send(ws_text(&ClientMessage::SendInput {
+    ws.send(ws::text(&ClientMessage::SendInput {
         thread_id,
         text: "please".into(),
         attachments: vec![],
@@ -338,7 +216,7 @@ async fn answered_approval_is_not_pending_after_reconnect() {
     wait_for_approval(&mut ws).await;
 
     // Answer it.
-    ws.send(ws_text(&ClientMessage::ApprovalDecision {
+    ws.send(ws::text(&ClientMessage::ApprovalDecision {
         thread_id,
         request_id: APPROVAL_ID.into(),
         decision: ApprovalDecision::Accept,
@@ -352,16 +230,16 @@ async fn answered_approval_is_not_pending_after_reconnect() {
     wait_for_approval_request_state(&mut ws, "resolved").await;
 
     // Reconnect with a fresh socket, as a browser reload would.
-    let mut reconnect = connect_ws(addr, &cookie).await;
+    let mut reconnect = app.server.ws().await;
     reconnect
-        .send(ws_text(&ClientMessage::Subscribe {
+        .send(ws::text(&ClientMessage::Subscribe {
             thread_id,
             since: None,
         }))
         .await
         .unwrap();
 
-    let snapshot = wait_for_live_snapshot(&mut reconnect).await;
+    let snapshot = ws::expect_live_snapshot(&mut reconnect).await;
     assert_eq!(snapshot.thread_id, thread_id);
     // The answered approval must NOT be re-surfaced as actionable. The client derives the
     // outstanding set from `accumulated` plus `answered_approvals`, so the answered approval is
@@ -430,15 +308,16 @@ async fn wait_for_approval(ws: &mut TestWs) {
 async fn pending_approval_is_replayed_to_a_client_that_connects_later() {
     use futures_util::SinkExt;
 
-    let (_tmp, _harness, addr, cookie, thread_id) = spawn_test_app().await;
-    let mut ws = connect_ws(addr, &cookie).await;
-    ws.send(ws_text(&ClientMessage::Subscribe {
+    let app = spawn_test_app().await;
+    let thread_id = app.thread_id;
+    let mut ws = app.server.ws().await;
+    ws.send(ws::text(&ClientMessage::Subscribe {
         thread_id,
         since: None,
     }))
     .await
     .unwrap();
-    ws.send(ws_text(&ClientMessage::SendInput {
+    ws.send(ws::text(&ClientMessage::SendInput {
         thread_id,
         text: "please".into(),
         attachments: vec![],
@@ -448,7 +327,7 @@ async fn pending_approval_is_replayed_to_a_client_that_connects_later() {
     wait_for_approval(&mut ws).await;
 
     // A second browser connects while the approval is still outstanding, and never subscribes.
-    let mut latecomer = connect_ws(addr, &cookie).await;
+    let mut latecomer = app.server.ws().await;
     let overview = wait_for_runtime_overview(&mut latecomer).await;
     let mine = overview
         .threads
@@ -469,7 +348,7 @@ async fn pending_approval_is_replayed_to_a_client_that_connects_later() {
 
     // Answer both, then connect again: neither is outstanding any more, so neither may be replayed.
     // Re-alerting for something the user already dealt with is worse than silence.
-    ws.send(ws_text(&ClientMessage::ApprovalDecision {
+    ws.send(ws::text(&ClientMessage::ApprovalDecision {
         thread_id,
         request_id: APPROVAL_ID.into(),
         decision: ApprovalDecision::Accept,
@@ -477,7 +356,7 @@ async fn pending_approval_is_replayed_to_a_client_that_connects_later() {
     .await
     .unwrap();
     wait_for_approval_request_state(&mut ws, "resolved").await;
-    ws.send(ws_text(&ClientMessage::ServerRequestResponse {
+    ws.send(ws::text(&ClientMessage::ServerRequestResponse {
         thread_id,
         request_id: SERVER_REQUEST_ID.into(),
         response: giskard_proto::ServerRequestResponse::result(serde_json::json!("main")),
@@ -486,7 +365,7 @@ async fn pending_approval_is_replayed_to_a_client_that_connects_later() {
     .unwrap();
     wait_for_server_request_resolved(&mut ws).await;
 
-    let mut after_answer = connect_ws(addr, &cookie).await;
+    let mut after_answer = app.server.ws().await;
     let replayed = wait_for_runtime_overview(&mut after_answer).await;
     assert!(
         !replayed
@@ -516,11 +395,13 @@ async fn pending_approval_is_replayed_to_a_client_that_connects_later() {
 async fn timed_out_approval_republishes_pending_to_peer_tabs() {
     use futures_util::SinkExt;
 
-    let (_tmp, harness, addr, cookie, thread_id) = spawn_test_app().await;
-    let mut claimant = connect_ws(addr, &cookie).await;
-    let mut peer = connect_ws(addr, &cookie).await;
+    let app = spawn_test_app().await;
+    let harness = app.harness.clone();
+    let thread_id = app.thread_id;
+    let mut claimant = app.server.ws().await;
+    let mut peer = app.server.ws().await;
     for ws in [&mut claimant, &mut peer] {
-        ws.send(ws_text(&ClientMessage::Subscribe {
+        ws.send(ws::text(&ClientMessage::Subscribe {
             thread_id,
             since: None,
         }))
@@ -528,7 +409,7 @@ async fn timed_out_approval_republishes_pending_to_peer_tabs() {
         .unwrap();
     }
     claimant
-        .send(ws_text(&ClientMessage::SendInput {
+        .send(ws::text(&ClientMessage::SendInput {
             thread_id,
             text: "please".into(),
             attachments: Vec::new(),
@@ -541,7 +422,7 @@ async fn timed_out_approval_republishes_pending_to_peer_tabs() {
 
     harness.hang_next_approval().await;
     claimant
-        .send(ws_text(&ClientMessage::ApprovalDecision {
+        .send(ws::text(&ClientMessage::ApprovalDecision {
             thread_id,
             request_id: APPROVAL_ID.into(),
             decision: ApprovalDecision::Accept,
@@ -551,7 +432,7 @@ async fn timed_out_approval_republishes_pending_to_peer_tabs() {
 
     let responding = wait_for_approval_request_state(&mut peer, "responding").await;
     assert_eq!(responding.revision, 2);
-    let error = wait_for_ws_error(&mut claimant).await;
+    let error = ws::expect_error(&mut claimant).await;
     assert_eq!(error.code, "harness_timeout");
     let rolled_back = wait_for_approval_request_state(&mut peer, "pending").await;
     assert_eq!(rolled_back.revision, 3);
@@ -580,21 +461,6 @@ async fn wait_for_approval_request_state(
         }
     }
     panic!("approval request state {expected} not observed");
-}
-
-async fn wait_for_ws_error(ws: &mut TestWs) -> giskard_proto::ErrorInfo {
-    use futures_util::StreamExt;
-
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while Instant::now() < deadline {
-        if let Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Text(text)))) =
-            tokio::time::timeout(Duration::from_secs(1), ws.next()).await
-            && let Ok(ServerMessage::Error { error }) = serde_json::from_str(&text)
-        {
-            return error;
-        }
-    }
-    panic!("websocket error not observed");
 }
 
 async fn wait_for_server_request_resolved(ws: &mut TestWs) {
@@ -633,21 +499,4 @@ async fn wait_for_runtime_overview(ws: &mut TestWs) -> giskard_proto::ThreadRunt
         }
     }
     panic!("runtime overview not observed");
-}
-
-async fn wait_for_live_snapshot(ws: &mut TestWs) -> giskard_proto::LiveTurnSnapshot {
-    use futures_util::StreamExt;
-    let deadline = Instant::now() + Duration::from_secs(5);
-    while Instant::now() < deadline {
-        match tokio::time::timeout(Duration::from_secs(1), ws.next()).await {
-            Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Text(text)))) => {
-                if let Ok(ServerMessage::LiveTurnSnapshot(snapshot)) = serde_json::from_str(&text) {
-                    return snapshot;
-                }
-            }
-            Ok(Some(Ok(_))) => {}
-            _ => {}
-        }
-    }
-    panic!("live turn snapshot not observed");
 }

@@ -1,17 +1,13 @@
 //! End-to-end coverage: a running tool/MCP call surfaces in the `RunningTasks` snapshot through the
 //! real server path (registry forward → broadcast → WebSocket), the same way commands do (TK1).
 
-mod common;
-#[path = "common/thread_fixture.rs"]
-mod thread_fixture;
-
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use futures_util::{SinkExt, StreamExt};
 use giskard_core::error::HarnessError;
 use giskard_core::event::AgentEvent;
-use giskard_core::ids::{ApprovalId, ItemId, ServerRequestId, ThreadId, TurnId};
+use giskard_core::ids::{ApprovalId, ItemId, ServerRequestId, TurnId};
 use giskard_core::item::{ItemKind, ItemStart, ToolCallStart};
 use giskard_core::model::ModelDescriptor;
 use giskard_core::server_request::ServerRequestResponse;
@@ -20,14 +16,10 @@ use giskard_core::user_input::UserInput;
 use giskard_harness::{
     AgentEventStream, AgentHarness, EventLog, HarnessCapabilities, OpenThreadOptions, ThreadHandle,
 };
-use giskard_persist::store::ProjectConfig;
 use giskard_proto::{ClientMessage, ServerMessage, TaskKind};
-use giskard_server::{AppState, HarnessFactory, build_app};
+use giskard_testenv::{TestServer, factory, ws};
 use tokio::sync::Mutex;
 use tokio::time::{Duration, Instant};
-
-use common::fake_native_model;
-use thread_fixture::persist_primary_thread;
 
 /// Harness that, on `start_turn`, emits `TurnStarted` + an in-progress tool `ItemStarted` and
 /// leaves the turn open (the tool blocks the turn), so the server keeps a running tool task.
@@ -161,123 +153,20 @@ impl AgentHarness for ToolHarness {
     }
 }
 
-struct ToolFactory;
-
-#[async_trait::async_trait]
-impl HarnessFactory for ToolFactory {
-    async fn create(
-        &self,
-        _config: &ProjectConfig,
-        _bootstrap: giskard_harness::HarnessBootstrap,
-    ) -> Result<Arc<dyn AgentHarness>, HarnessError> {
-        Ok(Arc::new(ToolHarness::new()))
-    }
-}
-
-fn generate_password_hash(password: &str) -> String {
-    use argon2::password_hash::SaltString;
-    use argon2::{Argon2, PasswordHasher};
-    use rand::rngs::OsRng;
-    let salt = SaltString::generate(&mut OsRng);
-    Argon2::default()
-        .hash_password(password.as_bytes(), &salt)
-        .unwrap()
-        .to_string()
-}
-
-fn ws_text(msg: &ClientMessage) -> tokio_tungstenite::tungstenite::Message {
-    tokio_tungstenite::tungstenite::Message::Text(serde_json::to_string(msg).unwrap().into())
-}
-
 #[tokio::test]
 async fn running_tool_call_surfaces_in_running_tasks_snapshot() {
-    let tmp = tempfile::TempDir::new().unwrap();
-    let hash = generate_password_hash("testpass");
-    tokio::fs::write(
-        tmp.path().join("config.toml"),
-        format!(
-            "[server]\nbind = \"127.0.0.1:0\"\nsecure_cookies = false\n\n[auth]\npassword_hash = \"{hash}\"\nsession_days = 30\n"
-        ),
-    )
-    .await
-    .unwrap();
+    let server = TestServer::spawn(factory::from_fn(|_, _| Ok(Arc::new(ToolHarness::new())))).await;
+    let project = server.create_project("tool-proj").await;
+    let thread_id = server.register_thread(project.id, "th_tool").await;
+    let mut ws = server.ws().await;
 
-    let store = Arc::new(giskard_persist::PersistStore::new(tmp.path().to_path_buf()));
-    let state = AppState::new(store, Arc::new(ToolFactory), (0..32u8).collect());
-    let app = build_app(state.clone());
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let port = listener.local_addr().unwrap().port();
-    tokio::spawn(async move {
-        axum::serve(listener, app).await.unwrap();
-    });
-
-    let base = format!("http://127.0.0.1:{port}");
-    let client = reqwest::Client::new();
-    let cookie = {
-        let resp = client
-            .post(format!("{base}/api/login"))
-            .json(&serde_json::json!({"password": "testpass"}))
-            .send()
-            .await
-            .unwrap();
-        resp.headers()
-            .get("set-cookie")
-            .unwrap()
-            .to_str()
-            .unwrap()
-            .split(';')
-            .next()
-            .unwrap()
-            .to_string()
-    };
-
-    let proj_dir = tempfile::TempDir::new().unwrap();
-    let pid = giskard_core::ids::ProjectId::new();
-    state
-        .store
-        .create_project(pid, "tool-proj", &proj_dir.path().to_string_lossy())
-        .await
-        .unwrap();
-
-    let thread_id = persist_primary_thread(
-        &state.store,
-        pid,
-        ThreadId::new(),
-        "th_tool",
-        fake_native_model(),
-    )
-    .await;
-    client
-        .post(format!("{base}/api/projects/{pid}/threads"))
-        .header("cookie", &cookie)
-        .json(&serde_json::json!({ "thread_id": thread_id }))
-        .send()
-        .await
-        .unwrap()
-        .error_for_status()
-        .unwrap();
-
-    let ws_request = tokio_tungstenite::tungstenite::http::Request::builder()
-        .uri(format!("ws://127.0.0.1:{port}/api/ws"))
-        .header("host", format!("127.0.0.1:{port}"))
-        .header("cookie", &cookie)
-        .header("upgrade", "websocket")
-        .header("connection", "upgrade")
-        .header("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ==")
-        .header("sec-websocket-version", "13")
-        .body(())
-        .unwrap();
-    let (mut ws, _) = tokio_tungstenite::connect_async(ws_request)
-        .await
-        .expect("WS connect");
-
-    ws.send(ws_text(&ClientMessage::Subscribe {
+    ws.send(ws::text(&ClientMessage::Subscribe {
         thread_id,
         since: None,
     }))
     .await
     .unwrap();
-    ws.send(ws_text(&ClientMessage::SendInput {
+    ws.send(ws::text(&ClientMessage::SendInput {
         thread_id,
         text: "search wikipedia".into(),
         attachments: Vec::new(),
@@ -311,7 +200,7 @@ async fn running_tool_call_surfaces_in_running_tasks_snapshot() {
         }
     };
 
-    ws.send(ws_text(&ClientMessage::Interrupt { thread_id }))
+    ws.send(ws::text(&ClientMessage::Interrupt { thread_id }))
         .await
         .unwrap();
 
@@ -336,7 +225,8 @@ async fn running_tool_call_surfaces_in_running_tasks_snapshot() {
             && tasks.iter().all(|task| task.item_id != tool_item_id)
         {
             assert!(
-                state
+                server
+                    .state
                     .registry
                     .thread_runtime(thread_id)
                     .await
