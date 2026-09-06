@@ -5,77 +5,45 @@
 use std::sync::Arc;
 
 use futures_util::{SinkExt, StreamExt};
-use giskard_core::ids::{ProjectId, ThreadId, TurnId};
+use giskard_core::ids::{ProjectId, ThreadId};
 use giskard_core::model::ModelRef;
-use giskard_harness_replay::ReplayHarness;
 use giskard_proto::ClientMessage;
 use giskard_server::HarnessFactory;
+use giskard_testenv::fake::{self, FakeCore, FakeHarness, Script, caps};
 use giskard_testenv::{TestServer, factory, fixtures};
 
-struct AttachFails {
-    inner: ReplayHarness,
+struct AttachFailsScript {
+    providers: Option<Vec<giskard_harness::HarnessProvider>>,
 }
 
 #[async_trait::async_trait]
-impl giskard_harness::AgentHarness for AttachFails {
+impl Script for AttachFailsScript {
     fn capabilities(&self) -> giskard_harness::HarnessCapabilities {
-        self.inner.capabilities()
-    }
-    async fn list_models(
-        &self,
-    ) -> Result<Vec<giskard_core::model::ModelDescriptor>, giskard_core::HarnessError> {
-        self.inner.list_models().await
+        giskard_harness::HarnessCapabilities {
+            provider_listing: self.providers.is_some(),
+            ..caps::REPLAY
+        }
     }
     async fn list_providers(
         &self,
     ) -> Result<Vec<giskard_harness::HarnessProvider>, giskard_core::HarnessError> {
-        self.inner.list_providers().await
+        Ok(self.providers.clone().unwrap_or_default())
     }
     async fn open_thread(
         &self,
-        _opts: giskard_harness::OpenThreadOptions,
+        _core: &FakeCore,
+        _opts: &giskard_harness::OpenThreadOptions,
     ) -> Result<giskard_harness::ThreadHandle, giskard_core::HarnessError> {
         Err(giskard_core::HarnessError::Spawn(
             "unknown provider: cloudflare-litellm".into(),
         ))
     }
-    fn subscribe(
-        &self,
-        thread: &giskard_harness::ThreadHandle,
-    ) -> giskard_harness::AgentEventStream {
-        self.inner.subscribe(thread)
-    }
-    async fn interrupt(
-        &self,
-        thread: &giskard_harness::ThreadHandle,
-    ) -> Result<(), giskard_core::HarnessError> {
-        self.inner.interrupt(thread).await
-    }
-    async fn shutdown(&self) -> Result<(), giskard_core::HarnessError> {
-        self.inner.shutdown().await
-    }
-    async fn start_turn(
-        &self,
-        thread: &giskard_harness::ThreadHandle,
-        input: giskard_core::user_input::UserInput,
-        overrides: giskard_core::turn::TurnOverrides,
-    ) -> Result<TurnId, giskard_core::HarnessError> {
-        self.inner.start_turn(thread, input, overrides).await
-    }
-    async fn respond_approval(
-        &self,
-        req: giskard_core::ids::ApprovalId,
-        decision: giskard_core::approval::ApprovalDecision,
-    ) -> Result<(), giskard_core::HarnessError> {
-        self.inner.respond_approval(req, decision).await
-    }
-    async fn respond_server_request(
-        &self,
-        req: giskard_core::ids::ServerRequestId,
-        response: giskard_core::server_request::ServerRequestResponse,
-    ) -> Result<(), giskard_core::HarnessError> {
-        self.inner.respond_server_request(req, response).await
-    }
+}
+
+fn attach_fails_factory(
+    providers: Option<Vec<giskard_harness::HarnessProvider>>,
+) -> Arc<dyn HarnessFactory> {
+    fake::factory(FakeHarness::new(AttachFailsScript { providers }))
 }
 
 /// A model referencing a provider that no longer exists in config.
@@ -139,15 +107,7 @@ async fn a_provider_the_harness_does_not_know_is_named_as_the_cause() {
             base_url: None,
             auth: None,
         }];
-        let advertises = true;
-        factory::from_fn(move |_, _| {
-            let inner = if advertises {
-                ReplayHarness::new().with_providers(providers.clone())
-            } else {
-                ReplayHarness::new()
-            };
-            Ok(Arc::new(AttachFails { inner }))
-        })
+        attach_fails_factory(Some(providers))
     })
     .await;
 
@@ -164,19 +124,7 @@ async fn a_provider_the_harness_does_not_know_is_named_as_the_cause() {
 /// believed, the same way the catalog refresh checks it (§8.2).
 #[tokio::test]
 async fn an_empty_table_from_a_harness_without_the_capability_convicts_nobody() {
-    let (open, _server, _tmp) = open_read_only_thread({
-        let providers = Vec::new();
-        let advertises = false;
-        factory::from_fn(move |_, _| {
-            let inner = if advertises {
-                ReplayHarness::new().with_providers(providers.clone())
-            } else {
-                ReplayHarness::new()
-            };
-            Ok(Arc::new(AttachFails { inner }))
-        })
-    })
-    .await;
+    let (open, _server, _tmp) = open_read_only_thread(attach_fails_factory(None)).await;
 
     // Positive assertions first: `unwrap_or_default()` yields "" for a missing warning, and ""
     // satisfies the negative assertion below — so on its own it would stay green if the warning

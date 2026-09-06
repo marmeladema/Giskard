@@ -8,20 +8,16 @@ use chrono::Utc;
 use futures_util::{SinkExt, StreamExt};
 use giskard_core::error::HarnessError;
 use giskard_core::event::AgentEvent;
-use giskard_core::ids::{ApprovalId, ItemId, ServerRequestId, ThreadId, TurnId};
+use giskard_core::ids::{ItemId, ThreadId, TurnId};
 use giskard_core::item::{
     CommandExecutionStart, Item, ItemDelta, ItemKind, ItemPayload, ItemStart,
 };
-use giskard_core::model::ModelDescriptor;
-use giskard_core::server_request::ServerRequestResponse;
 use giskard_core::token::TokenUsage;
-use giskard_core::turn::{TurnOverrides, TurnStatus, TurnStatusKind};
-use giskard_core::user_input::UserInput;
-use giskard_harness::{
-    AgentEventStream, AgentHarness, EventLog, HarnessCapabilities, OpenThreadOptions, ThreadHandle,
-};
+use giskard_core::turn::{TurnStatus, TurnStatusKind};
+use giskard_harness::ThreadHandle;
 use giskard_proto::{ClientMessage, RunningTask, ServerMessage, WireAgentEvent};
-use giskard_testenv::{TestServer, TestWs, factory, ws};
+use giskard_testenv::fake::{self, Call, FakeCore, FakeHarness, Script, TurnCall};
+use giskard_testenv::{TestServer, TestWs, ws};
 use tokio::sync::Mutex;
 use tokio::time::{Duration, Instant};
 
@@ -34,153 +30,79 @@ enum TerminateBehavior {
     Unsupported,
 }
 
-struct InterruptHarness {
-    tx: Arc<EventLog>,
+struct InterruptScript {
     active: Mutex<Option<(ThreadId, TurnId)>>,
     command: Mutex<Option<(ThreadId, TurnId, ItemId)>>,
-    interrupted: Mutex<Vec<ThreadId>>,
     interrupt_delay: Mutex<Option<Duration>>,
-    terminated: Mutex<Vec<String>>,
     terminate_behavior: Mutex<TerminateBehavior>,
 }
 
-impl InterruptHarness {
+impl InterruptScript {
     fn new() -> Self {
-        let tx = Arc::new(EventLog::new());
         Self {
-            tx,
             active: Mutex::new(None),
             command: Mutex::new(None),
-            interrupted: Mutex::new(Vec::new()),
             interrupt_delay: Mutex::new(None),
-            terminated: Mutex::new(Vec::new()),
             terminate_behavior: Mutex::new(TerminateBehavior::Succeed),
         }
-    }
-
-    async fn wait_until_active(&self) {
-        let deadline = Instant::now() + Duration::from_secs(5);
-        loop {
-            if self.active.lock().await.is_some() {
-                return;
-            }
-            if Instant::now() >= deadline {
-                panic!("turn did not become active");
-            }
-            tokio::time::sleep(Duration::from_millis(25)).await;
-        }
-    }
-
-    async fn interrupted_threads(&self) -> Vec<ThreadId> {
-        self.interrupted.lock().await.clone()
     }
 
     async fn set_interrupt_delay(&self, delay: Duration) {
         *self.interrupt_delay.lock().await = Some(delay);
     }
 
-    async fn terminated_processes(&self) -> Vec<String> {
-        self.terminated.lock().await.clone()
-    }
-
-    async fn wait_until_terminated(&self) {
-        let deadline = Instant::now() + Duration::from_secs(5);
-        loop {
-            if !self.terminated.lock().await.is_empty() {
-                return;
-            }
-            if Instant::now() >= deadline {
-                panic!("command termination did not reach harness");
-            }
-            tokio::time::sleep(Duration::from_millis(25)).await;
-        }
-    }
-
     async fn set_terminate_behavior(&self, behavior: TerminateBehavior) {
         *self.terminate_behavior.lock().await = behavior;
     }
 
-    async fn complete_command(&self) {
+    async fn complete_command(&self, core: &FakeCore) {
         let Some((thread, turn, item_id)) = *self.command.lock().await else {
             panic!("command did not start");
         };
-        let _ = self.tx.append(AgentEvent::ItemCompleted {
+        core.append(
             thread,
-            turn,
-            item: Item {
-                id: item_id,
-                harness_item_id: "cmd1".into(),
-                payload: ItemPayload::CommandExecution {
-                    command: "sleep 60".into(),
-                    cwd: "/tmp/project".into(),
-                    output: "started\nfinished".into(),
-                    output_truncated: false,
-                    output_original_bytes: None,
-                    output_original_lines: None,
-                    exit_code: Some(0),
-                    status: Some("completed".into()),
-                    process_id: Some("proc_1".into()),
-                    duration_ms: Some(60_000),
+            AgentEvent::ItemCompleted {
+                thread,
+                turn,
+                item: Item {
+                    id: item_id,
+                    harness_item_id: "cmd1".into(),
+                    payload: ItemPayload::CommandExecution {
+                        command: "sleep 60".into(),
+                        cwd: "/tmp/project".into(),
+                        output: "started\nfinished".into(),
+                        output_truncated: false,
+                        output_original_bytes: None,
+                        output_original_lines: None,
+                        exit_code: Some(0),
+                        status: Some("completed".into()),
+                        process_id: Some("proc_1".into()),
+                        duration_ms: Some(60_000),
+                    },
+                    created_at: Utc::now(),
                 },
-                created_at: Utc::now(),
             },
-        });
+        );
     }
 }
 
 #[async_trait]
-impl AgentHarness for InterruptHarness {
-    fn capabilities(&self) -> HarnessCapabilities {
-        HarnessCapabilities {
-            live_approvals: true,
-            plan_build_modes: true,
-            per_turn_model: true,
-            reasoning_effort: true,
-            structured_diffs: true,
-            resumable_threads: true,
-            model_listing: false,
-            provider_listing: false,
-            token_usage: true,
-            mcp_status: false,
-            mcp_reload: false,
-            mcp_oauth_login: false,
-            context_compaction: false,
-        }
+impl Script for InterruptScript {
+    fn native_thread_id(&self, _thread: ThreadId) -> String {
+        "interrupt_harness".into()
     }
 
-    async fn list_models(&self) -> Result<Vec<ModelDescriptor>, HarnessError> {
-        Ok(vec![])
-    }
-
-    async fn open_thread(&self, opts: OpenThreadOptions) -> Result<ThreadHandle, HarnessError> {
-        let thread = opts.thread;
-        Ok(ThreadHandle {
-            resumed_model: Some(opts.initial_model.clone()),
-            ..ThreadHandle::opened(
-                thread,
-                opts.resume.unwrap_or_else(|| "interrupt_harness".into()),
-                opts.workspace_root.clone(),
-            )
-        })
-    }
-
-    async fn start_turn(
-        &self,
-        thread: &ThreadHandle,
-        _input: UserInput,
-        _overrides: TurnOverrides,
-    ) -> Result<TurnId, HarnessError> {
-        let turn = TurnId::new();
-        *self.active.lock().await = Some((thread.thread, turn));
-        let _ = self.tx.append(AgentEvent::TurnStarted {
-            thread: thread.thread,
-            turn,
+    async fn start_turn(&self, _core: &FakeCore, call: &TurnCall) -> Result<(), HarnessError> {
+        *self.active.lock().await = Some((call.thread, call.turn));
+        call.log.append(AgentEvent::TurnStarted {
+            thread: call.thread,
+            turn: call.turn,
         });
         let command_item = ItemId::new();
-        *self.command.lock().await = Some((thread.thread, turn, command_item));
-        let _ = self.tx.append(AgentEvent::ItemStarted {
-            thread: thread.thread,
-            turn,
+        *self.command.lock().await = Some((call.thread, call.turn, command_item));
+        call.log.append(AgentEvent::ItemStarted {
+            thread: call.thread,
+            turn: call.turn,
             item: ItemStart {
                 id: command_item,
                 harness_item_id: "cmd1".into(),
@@ -195,39 +117,18 @@ impl AgentHarness for InterruptHarness {
                 tool: None,
             },
         });
-        let _ = self.tx.append(AgentEvent::ItemDelta {
-            thread: thread.thread,
-            turn,
+        call.log.append(AgentEvent::ItemDelta {
+            thread: call.thread,
+            turn: call.turn,
             item_id: command_item,
             delta: ItemDelta::CommandOutput {
                 chunk: "started".into(),
             },
         });
-        Ok(turn)
-    }
-
-    fn subscribe(&self, _thread: &ThreadHandle) -> AgentEventStream {
-        AgentEventStream::new(self.tx.reader())
-    }
-
-    async fn respond_approval(
-        &self,
-        _req: ApprovalId,
-        _decision: giskard_core::approval::ApprovalDecision,
-    ) -> Result<(), HarnessError> {
         Ok(())
     }
 
-    async fn respond_server_request(
-        &self,
-        _req: ServerRequestId,
-        _response: ServerRequestResponse,
-    ) -> Result<(), HarnessError> {
-        Ok(())
-    }
-
-    async fn interrupt(&self, thread: &ThreadHandle) -> Result<(), HarnessError> {
-        self.interrupted.lock().await.push(thread.thread);
+    async fn interrupt(&self, core: &FakeCore, thread: &ThreadHandle) -> Result<(), HarnessError> {
         if let Some(delay) = *self.interrupt_delay.lock().await {
             tokio::time::sleep(delay).await;
         }
@@ -238,24 +139,27 @@ impl AgentHarness for InterruptHarness {
             .take()
             .map(|(_, turn)| turn)
             .unwrap_or_default();
-        let _ = self.tx.append(AgentEvent::TurnCompleted {
-            thread: thread.thread,
-            turn,
-            usage: TokenUsage::default(),
-            status: TurnStatus {
-                kind: TurnStatusKind::Interrupted,
-                message: Some("Interrupted by user.".into()),
+        core.append(
+            thread.thread,
+            AgentEvent::TurnCompleted {
+                thread: thread.thread,
+                turn,
+                usage: TokenUsage::default(),
+                status: TurnStatus {
+                    kind: TurnStatusKind::Interrupted,
+                    message: Some("Interrupted by user.".into()),
+                },
             },
-        });
+        );
         Ok(())
     }
 
     async fn terminate_command(
         &self,
+        _core: &FakeCore,
         _thread: &ThreadHandle,
-        process_id: &str,
+        _process_id: &str,
     ) -> Result<(), HarnessError> {
-        self.terminated.lock().await.push(process_id.to_owned());
         match *self.terminate_behavior.lock().await {
             TerminateBehavior::Succeed => Ok(()),
             TerminateBehavior::NoActiveCommand => Err(HarnessError::Transport(
@@ -272,15 +176,11 @@ impl AgentHarness for InterruptHarness {
             )),
         }
     }
-
-    async fn shutdown(&self) -> Result<(), HarnessError> {
-        Ok(())
-    }
 }
 
 struct TestApp {
     server: TestServer,
-    harness: Arc<InterruptHarness>,
+    harness: Arc<FakeHarness<InterruptScript>>,
     thread_id: ThreadId,
 }
 
@@ -291,8 +191,8 @@ impl TestApp {
 }
 
 async fn spawn_test_app() -> TestApp {
-    let harness = Arc::new(InterruptHarness::new());
-    let server = TestServer::spawn(factory::shared(harness.clone())).await;
+    let harness = FakeHarness::new(InterruptScript::new());
+    let server = TestServer::spawn(fake::factory(harness.clone())).await;
     let project = server.create_project("proj").await;
     let thread_id = server.register_thread(project.id, "interrupt_thread").await;
     TestApp {
@@ -300,6 +200,36 @@ async fn spawn_test_app() -> TestApp {
         harness,
         thread_id,
     }
+}
+
+async fn wait_until_active(core: &FakeCore) {
+    core.wait_for_call(|call| matches!(call, Call::StartTurn { .. }).then_some(()))
+        .await;
+}
+
+async fn wait_until_terminated(core: &FakeCore) {
+    core.wait_for_call(|call| matches!(call, Call::TerminateCommand { .. }).then_some(()))
+        .await;
+}
+
+fn interrupted_threads(core: &FakeCore) -> Vec<ThreadId> {
+    core.calls()
+        .iter()
+        .filter_map(|call| match call {
+            Call::Interrupt { thread } => Some(*thread),
+            _ => None,
+        })
+        .collect()
+}
+
+fn terminated_processes(core: &FakeCore) -> Vec<String> {
+    core.calls()
+        .iter()
+        .filter_map(|call| match call {
+            Call::TerminateCommand { process_id, .. } => Some(process_id.clone()),
+            _ => None,
+        })
+        .collect()
 }
 
 #[tokio::test]
@@ -350,7 +280,7 @@ async fn websocket_interrupt_reaches_live_harness_turn() {
     .await
     .unwrap();
 
-    app.harness.wait_until_active().await;
+    wait_until_active(&app.harness.core).await;
     wait_for_running_command(&mut ws).await;
 
     ws.send(ws::text(&ClientMessage::Interrupt { thread_id }))
@@ -358,7 +288,7 @@ async fn websocket_interrupt_reaches_live_harness_turn() {
         .unwrap();
     wait_for_interrupted_turn(&mut ws).await;
 
-    app.harness.complete_command().await;
+    app.harness.script.complete_command(&app.harness.core).await;
     wait_for_completed_command_after_interrupted_turn(&mut ws).await;
 
     ws.send(ws::text(&ClientMessage::TerminateCommand {
@@ -368,15 +298,16 @@ async fn websocket_interrupt_reaches_live_harness_turn() {
     .await
     .unwrap();
 
-    app.harness.wait_until_terminated().await;
-    assert_eq!(app.harness.terminated_processes().await, vec!["proc_1"]);
-    assert_eq!(app.harness.interrupted_threads().await, vec![thread_id]);
+    wait_until_terminated(&app.harness.core).await;
+    assert_eq!(terminated_processes(&app.harness.core), vec!["proc_1"]);
+    assert_eq!(interrupted_threads(&app.harness.core), vec![thread_id]);
 }
 
 #[tokio::test]
 async fn websocket_interrupt_timeout_surfaces_error() {
     let app = spawn_test_app().await;
     app.harness
+        .script
         .set_interrupt_delay(Duration::from_secs(10))
         .await;
     let mut ws = app.connect_ws().await;
@@ -395,7 +326,7 @@ async fn websocket_interrupt_timeout_surfaces_error() {
     }))
     .await
     .unwrap();
-    app.harness.wait_until_active().await;
+    wait_until_active(&app.harness.core).await;
 
     ws.send(ws::text(&ClientMessage::Interrupt { thread_id }))
         .await
@@ -403,7 +334,7 @@ async fn websocket_interrupt_timeout_surfaces_error() {
 
     let error = ws::expect_error_for(&mut ws, "interrupt", "harness_timeout").await;
     assert_eq!(error.thread_id, Some(thread_id));
-    assert_eq!(app.harness.interrupted_threads().await, vec![thread_id]);
+    assert_eq!(interrupted_threads(&app.harness.core), vec![thread_id]);
 }
 
 #[tokio::test]
@@ -426,7 +357,7 @@ async fn websocket_terminate_running_command_marks_terminating_until_terminal_ev
     .await
     .unwrap();
 
-    app.harness.wait_until_active().await;
+    wait_until_active(&app.harness.core).await;
     wait_for_running_command(&mut ws).await;
 
     ws.send(ws::text(&ClientMessage::TerminateCommand {
@@ -436,7 +367,7 @@ async fn websocket_terminate_running_command_marks_terminating_until_terminal_ev
     .await
     .unwrap();
 
-    app.harness.wait_until_terminated().await;
+    wait_until_terminated(&app.harness.core).await;
     wait_for_terminating_command(&mut ws).await;
     let snapshot = app
         .server
@@ -450,7 +381,7 @@ async fn websocket_terminate_running_command_marks_terminating_until_terminal_ev
     assert_eq!(snapshot.len(), 1);
     assert!(snapshot[0].terminating);
 
-    app.harness.complete_command().await;
+    app.harness.script.complete_command(&app.harness.core).await;
     wait_for_completed_command_after_interrupted_turn(&mut ws).await;
     assert!(
         app.server
@@ -487,7 +418,7 @@ async fn websocket_subscribe_replays_running_command_snapshot() {
         .await
         .unwrap();
 
-    app.harness.wait_until_active().await;
+    wait_until_active(&app.harness.core).await;
     wait_for_running_command(&mut first).await;
 
     let mut second = app.connect_ws().await;
@@ -548,7 +479,7 @@ async fn websocket_no_active_turn_for_after_turn_clears_stale_snapshot() {
 
 async fn no_active_for_after_turn_command_clears_stale_snapshot(behavior: TerminateBehavior) {
     let app = spawn_test_app().await;
-    app.harness.set_terminate_behavior(behavior).await;
+    app.harness.script.set_terminate_behavior(behavior).await;
     let mut ws = app.connect_ws().await;
     let thread_id = app.thread_id;
 
@@ -566,7 +497,7 @@ async fn no_active_for_after_turn_command_clears_stale_snapshot(behavior: Termin
     .await
     .unwrap();
 
-    app.harness.wait_until_active().await;
+    wait_until_active(&app.harness.core).await;
     wait_for_running_command(&mut ws).await;
 
     ws.send(ws::text(&ClientMessage::Interrupt { thread_id }))
@@ -633,7 +564,7 @@ async fn websocket_terminate_unknown_thread_surfaces_error() {
 
 async fn terminate_failure_preserves_snapshot(behavior: TerminateBehavior, expected_code: &str) {
     let app = spawn_test_app().await;
-    app.harness.set_terminate_behavior(behavior).await;
+    app.harness.script.set_terminate_behavior(behavior).await;
     let mut ws = app.connect_ws().await;
     let thread_id = app.thread_id;
 
@@ -651,7 +582,7 @@ async fn terminate_failure_preserves_snapshot(behavior: TerminateBehavior, expec
     .await
     .unwrap();
 
-    app.harness.wait_until_active().await;
+    wait_until_active(&app.harness.core).await;
     wait_for_running_command(&mut ws).await;
 
     ws.send(ws::text(&ClientMessage::TerminateCommand {

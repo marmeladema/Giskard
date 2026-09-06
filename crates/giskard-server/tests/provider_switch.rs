@@ -6,15 +6,13 @@
 use std::sync::Arc;
 
 use giskard_core::error::HarnessError;
-use giskard_core::ids::{ProjectId, ThreadId, TurnId};
-use giskard_core::model::{ModelDescriptor, ModelRef};
-use giskard_harness::{
-    AgentEventStream, AgentHarness, EventLog, HarnessCapabilities, OpenThreadOptions, ThreadHandle,
-};
+use giskard_core::ids::{ProjectId, ThreadId};
+use giskard_core::model::ModelRef;
+use giskard_harness::{HarnessCapabilities, OpenThreadOptions, ThreadHandle};
 use giskard_persist::store::{ThreadGitWorkspace, ThreadWorktree};
 use giskard_proto::ClientMessage;
-use giskard_testenv::{TestServer, factory, fixtures, ws};
-use tokio::sync::Mutex;
+use giskard_testenv::fake::{self, Call, FakeCore, FakeHarness, Script};
+use giskard_testenv::{TestServer, fixtures, ws};
 
 const DEAD_PROVIDER: &str = "cloudflare-litellm";
 const NEW_PROVIDER: &str = "opencodex";
@@ -38,27 +36,25 @@ model_listing = false
 /// Opens fail for the removed provider; for any other provider the open succeeds and the handle
 /// reports an effective model — either an echo of the request, or `report_provider` to simulate
 /// Codex ignoring the override (the loaded-thread rejoin behavior the verification must catch).
-struct SwitchHarness {
+struct SwitchScript {
     report_provider: Option<String>,
-    opened_workspace_roots: Arc<Mutex<Vec<String>>>,
-    events: Arc<EventLog>,
 }
 
 #[async_trait::async_trait]
-impl AgentHarness for SwitchHarness {
+impl Script for SwitchScript {
     fn capabilities(&self) -> HarnessCapabilities {
         HarnessCapabilities::default()
     }
 
-    async fn list_models(&self) -> Result<Vec<ModelDescriptor>, HarnessError> {
-        Ok(Vec::new())
+    fn native_thread_id(&self, _thread: ThreadId) -> String {
+        "fresh".into()
     }
 
-    async fn open_thread(&self, opts: OpenThreadOptions) -> Result<ThreadHandle, HarnessError> {
-        self.opened_workspace_roots
-            .lock()
-            .await
-            .push(opts.workspace_root.to_string_lossy().into_owned());
+    async fn open_thread(
+        &self,
+        core: &FakeCore,
+        opts: &OpenThreadOptions,
+    ) -> Result<ThreadHandle, HarnessError> {
         // Echo the requested model as the effective model a real harness reports from its record.
         let mut effective = opts.initial_model.clone();
         if effective.provider == DEAD_PROVIDER {
@@ -71,32 +67,22 @@ impl AgentHarness for SwitchHarness {
         if let Some(provider) = &self.report_provider {
             effective.provider = provider.clone();
         }
-        let thread = opts.thread;
-        Ok(ThreadHandle {
-            resumed_model: Some(effective),
-            ..ThreadHandle::opened(
-                thread,
-                opts.resume.unwrap_or_else(|| "fresh".into()),
-                opts.workspace_root.clone(),
-            )
-        })
+        let mut handle = core.opened(opts, self.native_thread_id(opts.thread));
+        handle.resumed_model = Some(effective);
+        Ok(handle)
     }
 
     async fn start_turn(
         &self,
-        _thread: &ThreadHandle,
-        _input: giskard_core::user_input::UserInput,
-        _overrides: giskard_core::turn::TurnOverrides,
-    ) -> Result<TurnId, HarnessError> {
+        _core: &FakeCore,
+        _call: &giskard_testenv::fake::TurnCall,
+    ) -> Result<(), HarnessError> {
         Err(HarnessError::Unsupported("no turns in this test".into()))
-    }
-
-    fn subscribe(&self, _thread: &ThreadHandle) -> AgentEventStream {
-        AgentEventStream::new(self.events.reader())
     }
 
     async fn respond_approval(
         &self,
+        _core: &FakeCore,
         _req: giskard_core::ids::ApprovalId,
         _decision: giskard_core::approval::ApprovalDecision,
     ) -> Result<(), HarnessError> {
@@ -107,18 +93,19 @@ impl AgentHarness for SwitchHarness {
 
     async fn respond_server_request(
         &self,
+        _core: &FakeCore,
         _req: giskard_core::ids::ServerRequestId,
         _response: giskard_core::server_request::ServerRequestResponse,
     ) -> Result<(), HarnessError> {
         Err(HarnessError::Unsupported("no requests in this test".into()))
     }
 
-    async fn interrupt(&self, _thread: &ThreadHandle) -> Result<(), HarnessError> {
+    async fn interrupt(
+        &self,
+        _core: &FakeCore,
+        _thread: &ThreadHandle,
+    ) -> Result<(), HarnessError> {
         Err(HarnessError::Unsupported("no turns in this test".into()))
-    }
-
-    async fn shutdown(&self) -> Result<(), HarnessError> {
-        Ok(())
     }
 }
 
@@ -142,7 +129,7 @@ struct Fixture {
     server: TestServer,
     pid: ProjectId,
     tid: ThreadId,
-    opened_workspace_roots: Arc<Mutex<Vec<String>>>,
+    harness: Arc<FakeHarness<SwitchScript>>,
     _proj_dir: tempfile::TempDir,
     _worktree_dir: Option<tempfile::TempDir>,
 }
@@ -173,19 +160,9 @@ async fn start_server_inner(report_provider: Option<String>, seed_worktree: bool
             git_dir: "/repo/.git/worktrees/test".into(),
         })
     });
-    let opened_workspace_roots = Arc::new(Mutex::new(Vec::new()));
-    let events = Arc::new(EventLog::new());
-    let roots = opened_workspace_roots.clone();
-    let factory_events = events.clone();
-    let factory = factory::from_fn(move |_, _| {
-        Ok(Arc::new(SwitchHarness {
-            report_provider: report_provider.clone(),
-            opened_workspace_roots: roots.clone(),
-            events: factory_events.clone(),
-        }))
-    });
+    let harness = FakeHarness::new(SwitchScript { report_provider });
     let project_path = proj_dir.path().to_string_lossy().into_owned();
-    let server = TestServer::builder(factory)
+    let server = TestServer::builder(fake::factory(harness.clone()))
         .config(NEW_PROVIDER_TOML)
         .seed(move |store| async move {
             store
@@ -215,7 +192,7 @@ async fn start_server_inner(report_provider: Option<String>, seed_worktree: bool
         server,
         pid,
         tid,
-        opened_workspace_roots,
+        harness,
         _proj_dir: proj_dir,
         _worktree_dir: worktree_dir,
     }
@@ -345,7 +322,18 @@ async fn cold_provider_switch_reopens_worktree_thread_in_its_worktree() {
     .await
     .expect("thread state under the new provider");
 
-    let opened_roots = srv.opened_workspace_roots.lock().await.clone();
+    let opened_roots = srv
+        .harness
+        .core
+        .calls()
+        .iter()
+        .filter_map(|call| match call {
+            Call::Open { workspace_root, .. } => {
+                Some(workspace_root.to_string_lossy().into_owned())
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
     assert_eq!(
         opened_roots,
         vec![worktree_root.clone(), worktree_root],

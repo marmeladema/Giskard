@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::time::Duration;
 
-use giskard_core::ids::ProjectId;
+use giskard_core::ids::{ProjectId, ThreadId};
 use giskard_server::{DriverEvent, DriverEventSink};
 use tokio::sync::mpsc;
 
@@ -25,6 +25,61 @@ pub fn probe() -> (Arc<dyn DriverEventSink>, DriverProbe) {
 }
 
 impl DriverProbe {
+    /// The next admission of `harness_thread_id` that installed a thread.
+    pub async fn expect_admitted(&mut self, harness_thread_id: &str) -> ThreadId {
+        let (_, event) = self
+            .expect(|event| match event {
+                DriverEvent::DiscoveryFinished {
+                    native_thread_id, ..
+                }
+                | DriverEvent::LinkFinished {
+                    native_thread_id, ..
+                } => native_thread_id == harness_thread_id,
+                _ => false,
+            })
+            .await;
+        match event {
+            DriverEvent::DiscoveryFinished {
+                outcome: Ok(Some(thread)),
+                ..
+            }
+            | DriverEvent::LinkFinished {
+                outcome: Ok(Some(thread)),
+                ..
+            } => thread,
+            DriverEvent::DiscoveryFinished { outcome, .. }
+            | DriverEvent::LinkFinished { outcome, .. } => {
+                panic!("admission for {harness_thread_id:?} did not install a thread: {outcome:?}")
+            }
+            _ => unreachable!("expect predicate only accepts admission events"),
+        }
+    }
+
+    /// The next link admission under `parent` that installed a child.
+    pub async fn expect_child_of(&mut self, parent: ThreadId) -> ThreadId {
+        let (_, event) = self
+            .expect(|event| {
+                matches!(event, DriverEvent::LinkFinished { parent_thread_id, .. } if *parent_thread_id == parent)
+            })
+            .await;
+        match event {
+            DriverEvent::LinkFinished {
+                outcome: Ok(Some(thread)),
+                ..
+            } => thread,
+            DriverEvent::LinkFinished {
+                native_thread_id,
+                outcome,
+                ..
+            } => {
+                panic!(
+                    "link admission for {native_thread_id:?} under {parent} did not install a thread: {outcome:?}"
+                )
+            }
+            _ => unreachable!("expect predicate only accepts link events"),
+        }
+    }
+
     pub async fn expect(
         &mut self,
         pred: impl Fn(&DriverEvent) -> bool,

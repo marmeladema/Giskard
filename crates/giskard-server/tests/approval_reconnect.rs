@@ -10,17 +10,12 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use giskard_core::approval::{ApprovalDecision, ApprovalKind, ApprovalRequest};
-use giskard_core::error::HarnessError;
 use giskard_core::event::AgentEvent;
 use giskard_core::ids::{ApprovalId, ThreadId, TurnId};
-use giskard_core::model::ModelDescriptor;
-use giskard_core::turn::TurnOverrides;
-use giskard_core::user_input::UserInput;
-use giskard_harness::{
-    AgentEventStream, AgentHarness, EventLog, HarnessCapabilities, OpenThreadOptions, ThreadHandle,
-};
 use giskard_proto::{ClientMessage, ServerMessage, WireAgentEvent};
-use giskard_testenv::{TestServer, TestWs, factory, ws};
+use giskard_testenv::fake::{self, FakeCore, FakeHarness, Script, TurnCall};
+use giskard_testenv::{TestServer, TestWs, ws};
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::Mutex;
 use tokio::time::{Duration, Instant};
 
@@ -29,80 +24,43 @@ const SERVER_REQUEST_ID: &str = "req_reconnect_1";
 
 /// A harness that raises a single approval and keeps the turn in-flight forever (never sends
 /// `TurnCompleted`), so the live buffer is still present when the reconnect snapshot is taken.
-struct ApprovalHarness {
-    tx: Arc<EventLog>,
+struct ApprovalScript {
     active: Mutex<Option<(ThreadId, TurnId)>>,
-    answered: Mutex<Vec<(ApprovalId, ApprovalDecision)>>,
-    hang_next_approval: Mutex<bool>,
+    hang_next_approval: AtomicBool,
 }
 
-impl ApprovalHarness {
+impl ApprovalScript {
     fn new() -> Self {
-        let tx = Arc::new(EventLog::new());
         Self {
-            tx,
             active: Mutex::new(None),
-            answered: Mutex::new(Vec::new()),
-            hang_next_approval: Mutex::new(false),
+            hang_next_approval: AtomicBool::new(false),
         }
     }
 
-    async fn hang_next_approval(&self) {
-        *self.hang_next_approval.lock().await = true;
+    fn hang_next_approval(&self) {
+        self.hang_next_approval.store(true, Ordering::SeqCst);
     }
 }
 
 #[async_trait]
-impl AgentHarness for ApprovalHarness {
-    fn capabilities(&self) -> HarnessCapabilities {
-        HarnessCapabilities {
-            live_approvals: true,
-            plan_build_modes: true,
-            per_turn_model: true,
-            reasoning_effort: true,
-            structured_diffs: true,
-            resumable_threads: true,
-            model_listing: false,
-            provider_listing: false,
-            token_usage: true,
-            mcp_status: false,
-            mcp_reload: false,
-            mcp_oauth_login: false,
-            context_compaction: false,
-        }
-    }
-
-    async fn list_models(&self) -> Result<Vec<ModelDescriptor>, HarnessError> {
-        Ok(vec![])
-    }
-
-    async fn open_thread(&self, opts: OpenThreadOptions) -> Result<ThreadHandle, HarnessError> {
-        let thread = opts.thread;
-        Ok(ThreadHandle {
-            resumed_model: Some(opts.initial_model.clone()),
-            ..ThreadHandle::opened(
-                thread,
-                opts.resume.unwrap_or_else(|| "approval_harness".into()),
-                opts.workspace_root.clone(),
-            )
-        })
+impl Script for ApprovalScript {
+    fn native_thread_id(&self, _thread: ThreadId) -> String {
+        "approval_harness".into()
     }
 
     async fn start_turn(
         &self,
-        thread: &ThreadHandle,
-        _input: UserInput,
-        _overrides: TurnOverrides,
-    ) -> Result<TurnId, HarnessError> {
-        let turn = TurnId::new();
-        *self.active.lock().await = Some((thread.thread, turn));
-        let _ = self.tx.append(AgentEvent::TurnStarted {
-            thread: thread.thread,
-            turn,
+        _core: &FakeCore,
+        call: &TurnCall,
+    ) -> Result<(), giskard_core::HarnessError> {
+        *self.active.lock().await = Some((call.thread, call.turn));
+        call.log.append(AgentEvent::TurnStarted {
+            thread: call.thread,
+            turn: call.turn,
         });
-        let _ = self.tx.append(AgentEvent::ApprovalRequested {
-            thread: thread.thread,
-            turn,
+        call.log.append(AgentEvent::ApprovalRequested {
+            thread: call.thread,
+            turn: call.turn,
             request: ApprovalRequest {
                 id: ApprovalId(APPROVAL_ID.into()),
                 kind: ApprovalKind::CommandExecution {
@@ -116,9 +74,9 @@ impl AgentHarness for ApprovalHarness {
         });
         // A non-approval server request blocks the turn the same way an approval does, and is just
         // as invisible to a browser that was not connected, so the connect replay carries both.
-        let _ = self.tx.append(AgentEvent::ServerRequestReceived {
-            thread: thread.thread,
-            turn: Some(turn),
+        call.log.append(AgentEvent::ServerRequestReceived {
+            thread: call.thread,
+            turn: Some(call.turn),
             request: giskard_core::server_request::ServerRequest {
                 id: giskard_core::ids::ServerRequestId(SERVER_REQUEST_ID.into()),
                 method: "requestUserInput".into(),
@@ -126,62 +84,53 @@ impl AgentHarness for ApprovalHarness {
                 received_at: chrono::Utc::now(),
             },
         });
-        Ok(turn)
-    }
-
-    fn subscribe(&self, _thread: &ThreadHandle) -> AgentEventStream {
-        AgentEventStream::new(self.tx.reader())
+        Ok(())
     }
 
     async fn respond_approval(
         &self,
+        _core: &FakeCore,
         req: ApprovalId,
         decision: ApprovalDecision,
-    ) -> Result<(), HarnessError> {
-        if std::mem::take(&mut *self.hang_next_approval.lock().await) {
+    ) -> Result<(), giskard_core::HarnessError> {
+        if self.hang_next_approval.swap(false, Ordering::SeqCst) {
             std::future::pending::<()>().await;
         }
-        // Record the routed decision but leave the turn in-flight so the reconnect still has a live
-        // buffer to snapshot.
-        self.answered.lock().await.push((req, decision));
+        let _ = (req, decision);
         Ok(())
     }
 
     async fn respond_server_request(
         &self,
+        core: &FakeCore,
         req: giskard_core::ids::ServerRequestId,
         _response: giskard_core::server_request::ServerRequestResponse,
-    ) -> Result<(), HarnessError> {
+    ) -> Result<(), giskard_core::HarnessError> {
         // Mirror a real harness: answering the request resolves it, which is what clears it from the
         // live buffer. Without this it would stay outstanding and keep being replayed.
         if let Some((thread, turn)) = *self.active.lock().await {
-            let _ = self.tx.append(AgentEvent::ServerRequestResolved {
+            core.append(
                 thread,
-                turn: Some(turn),
-                request_id: req,
-            });
+                AgentEvent::ServerRequestResolved {
+                    thread,
+                    turn: Some(turn),
+                    request_id: req,
+                },
+            );
         }
-        Ok(())
-    }
-
-    async fn interrupt(&self, _thread: &ThreadHandle) -> Result<(), HarnessError> {
-        Ok(())
-    }
-
-    async fn shutdown(&self) -> Result<(), HarnessError> {
         Ok(())
     }
 }
 
 struct TestApp {
     server: TestServer,
-    harness: Arc<ApprovalHarness>,
+    harness: Arc<FakeHarness<ApprovalScript>>,
     thread_id: ThreadId,
 }
 
 async fn spawn_test_app() -> TestApp {
-    let harness = Arc::new(ApprovalHarness::new());
-    let server = TestServer::spawn(factory::shared(harness.clone())).await;
+    let harness = FakeHarness::new(ApprovalScript::new());
+    let server = TestServer::spawn(fake::factory(harness.clone())).await;
     let project = server.create_project("proj").await;
     let thread_id = server.register_thread(project.id, "approval_thread").await;
     TestApp {
@@ -420,7 +369,7 @@ async fn timed_out_approval_republishes_pending_to_peer_tabs() {
     let pending = wait_for_approval_request_state(&mut peer, "pending").await;
     assert_eq!(pending.revision, 1);
 
-    harness.hang_next_approval().await;
+    harness.script.hang_next_approval();
     claimant
         .send(ws::text(&ClientMessage::ApprovalDecision {
             thread_id,

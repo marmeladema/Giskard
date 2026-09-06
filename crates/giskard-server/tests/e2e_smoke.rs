@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex as StdMutex, OnceLock};
 
@@ -17,14 +16,14 @@ use giskard_core::server_request::{ServerRequest, ServerRequestResponse};
 use giskard_core::token::TokenUsage;
 use giskard_core::turn::{Mode, PermissionPreset, TurnOverrides, TurnStatus, TurnStatusKind};
 use giskard_core::user_input::UserInput;
-use giskard_harness::{
-    AgentEventStream, AgentHarness, EventLog, HarnessCapabilities, OpenThreadOptions, ThreadHandle,
-};
+use giskard_harness::{AgentHarness, HarnessCapabilities, OpenThreadOptions, ThreadHandle};
 use giskard_harness_replay::ReplayFixture;
 use giskard_proto::{
     ClientMessage, ErrorSeverity, RequestKind, RuntimeTurnState, ServerMessage, WireAgentEvent,
 };
 use giskard_server::AppState;
+use giskard_testenv::driver::{self, DriverProbe};
+use giskard_testenv::fake::{self, Call, FakeCore, FakeHarness, Gate, Script, TurnCall, caps};
 use giskard_testenv::{TestServer, auth, factory, fixtures, ws};
 use tracing::Subscriber;
 use tracing_subscriber::Layer;
@@ -124,112 +123,71 @@ fn captured_registry_events(project_id: ProjectId) -> Vec<CapturedRegistryEvent>
         .collect()
 }
 
-struct NoMcpHarness;
+struct NoMcpScript;
 
-#[derive(Default)]
-struct UnsupportedCompactionHarness {
-    threads: tokio::sync::Mutex<HashMap<ThreadId, Arc<EventLog>>>,
+struct UnsupportedCompactionScript;
+
+struct SlowCompactionScript {
+    compaction: Gate,
 }
 
-#[derive(Default)]
-struct SlowCompactionHarness {
-    threads: tokio::sync::Mutex<HashMap<ThreadId, Arc<EventLog>>>,
-    compact_calls: AtomicUsize,
-    hold_compaction: AtomicBool,
-    release_compaction: AtomicBool,
+struct SlowStartScript {
+    first_start: Gate,
+    first_seen: AtomicBool,
 }
 
-struct SlowStartHarness {
-    threads: tokio::sync::Mutex<HashMap<ThreadId, Arc<EventLog>>>,
-    start_calls: AtomicUsize,
-    hold_first_start: AtomicBool,
-    release_first_start: AtomicBool,
-}
-
-#[derive(Default)]
-struct ActivityHarness {
-    threads: tokio::sync::Mutex<HashMap<ThreadId, Arc<EventLog>>>,
-    native_routes: tokio::sync::Mutex<HashMap<String, ThreadId>>,
-    resumed_native_ids: tokio::sync::Mutex<Vec<String>>,
-    claims: tokio::sync::Mutex<Vec<(String, ThreadId)>>,
-    hold_native_child_open: AtomicBool,
-    native_child_open_started: AtomicBool,
-    release_native_child_open: AtomicBool,
-    deleted_harness_thread_ids: tokio::sync::Mutex<Vec<String>>,
-    approval_responses: tokio::sync::Mutex<Vec<(ApprovalId, ApprovalDecision)>>,
-    server_responses: tokio::sync::Mutex<Vec<(ServerRequestId, ServerRequestResponse)>>,
+struct ActivityScript {
+    /// Holds the open/claim of the two native-child ids while a test arranges a race.
+    child_open: Gate,
     pending_approvals: tokio::sync::Mutex<HashMap<ApprovalId, (ThreadId, TurnId)>>,
     pending_server_requests: tokio::sync::Mutex<HashMap<ServerRequestId, (ThreadId, TurnId)>>,
 }
 
+impl Default for ActivityScript {
+    fn default() -> Self {
+        Self {
+            child_open: Gate::open(),
+            pending_approvals: Default::default(),
+            pending_server_requests: Default::default(),
+        }
+    }
+}
+
 #[derive(Default)]
-struct CountingOpenHarness {
-    threads: tokio::sync::Mutex<HashMap<ThreadId, Arc<EventLog>>>,
-    open_calls: AtomicUsize,
-    claim_calls: AtomicUsize,
-    start_calls: AtomicUsize,
-    delete_calls: AtomicUsize,
-    shutdown_calls: AtomicUsize,
-    /// What each `open_thread` requested.
-    opened_models: tokio::sync::Mutex<Vec<ModelRef>>,
-    started_models: tokio::sync::Mutex<Vec<Option<ModelRef>>>,
-    started_inputs: tokio::sync::Mutex<Vec<String>>,
+struct CountingScript {
+    /// Claims that found no log for the thread, which is what the old fake counted.
+    new_claims: AtomicUsize,
     start_error: tokio::sync::Mutex<Option<HarnessError>>,
 }
 
-impl SlowCompactionHarness {
-    fn held() -> Self {
+impl SlowCompactionScript {
+    fn open() -> Self {
         Self {
-            hold_compaction: AtomicBool::new(true),
-            ..Self::default()
+            compaction: Gate::open(),
         }
     }
 
-    async fn wait_for_compact_calls(&self, expected: usize) {
-        let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
-        while self.compact_calls.load(Ordering::SeqCst) < expected {
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "timed out waiting for {expected} compact_thread calls"
-            );
-            tokio::task::yield_now().await;
+    fn held() -> Self {
+        Self {
+            compaction: Gate::held(),
         }
     }
 
     fn release_compaction(&self) {
-        self.release_compaction.store(true, Ordering::SeqCst);
+        self.compaction.release();
     }
 }
 
-impl SlowStartHarness {
+impl SlowStartScript {
     fn new() -> Self {
         Self {
-            threads: tokio::sync::Mutex::new(HashMap::new()),
-            start_calls: AtomicUsize::new(0),
-            hold_first_start: AtomicBool::new(true),
-            release_first_start: AtomicBool::new(false),
+            first_start: Gate::held(),
+            first_seen: AtomicBool::new(false),
         }
-    }
-
-    async fn wait_for_start_calls(&self, expected: usize) {
-        let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
-        loop {
-            if self.start_calls.load(Ordering::SeqCst) >= expected {
-                return;
-            }
-            if tokio::time::Instant::now() >= deadline {
-                panic!("timed out waiting for {expected} start_turn calls");
-            }
-            tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
-        }
-    }
-
-    fn start_calls(&self) -> usize {
-        self.start_calls.load(Ordering::SeqCst)
     }
 
     fn release_first_start(&self) {
-        self.release_first_start.store(true, Ordering::SeqCst);
+        self.first_start.release();
     }
 }
 
@@ -244,326 +202,278 @@ fn attested_native_parent(harness_thread_id: &str) -> Option<String> {
     }
 }
 
-impl ActivityHarness {
-    async fn resumed_native_ids(&self) -> Vec<String> {
-        self.resumed_native_ids.lock().await.clone()
-    }
-
-    /// Native identity claims, which replaced `thread/resume` for provider-owned children.
-    async fn claims(&self) -> Vec<(String, ThreadId)> {
-        self.claims.lock().await.clone()
-    }
-
+impl ActivityScript {
     fn hold_native_child_open(&self) {
-        self.hold_native_child_open.store(true, Ordering::SeqCst);
-    }
-
-    async fn wait_for_native_child_open(&self) {
-        let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
-        while !self.native_child_open_started.load(Ordering::SeqCst) {
-            if tokio::time::Instant::now() >= deadline {
-                panic!("native child open did not start");
-            }
-            tokio::task::yield_now().await;
-        }
+        self.child_open.hold();
     }
 
     fn release_native_child_open(&self) {
-        self.release_native_child_open.store(true, Ordering::SeqCst);
-    }
-
-    async fn deleted_harness_thread_ids(&self) -> Vec<String> {
-        self.deleted_harness_thread_ids.lock().await.clone()
-    }
-
-    async fn wait_for_approval_response(&self) -> (ApprovalId, ApprovalDecision) {
-        let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
-        loop {
-            if let Some(response) = self.approval_responses.lock().await.first().cloned() {
-                return response;
-            }
-            if tokio::time::Instant::now() >= deadline {
-                panic!("approval response did not reach harness");
-            }
-            tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
-        }
-    }
-
-    async fn wait_for_server_response(&self) -> (ServerRequestId, ServerRequestResponse) {
-        let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
-        loop {
-            if let Some(response) = self.server_responses.lock().await.first().cloned() {
-                return response;
-            }
-            if tokio::time::Instant::now() >= deadline {
-                panic!("server request response did not reach harness");
-            }
-            tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
-        }
-    }
-
-    async fn complete_turn(&self, thread: ThreadId, turn: TurnId) -> Result<(), HarnessError> {
-        let Some(sender) = self.threads.lock().await.get(&thread).cloned() else {
-            return Err(HarnessError::ThreadNotFound(thread));
-        };
-        let _ = sender.append(AgentEvent::TurnCompleted {
-            thread,
-            turn,
-            usage: TokenUsage::default(),
-            status: TurnStatus {
-                kind: TurnStatusKind::Completed,
-                message: None,
-            },
-        });
-        Ok(())
-    }
-
-    async fn wait_for_subscribers(&self, thread: ThreadId, expected: usize) {
-        let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
-        loop {
-            if let Some(sender) = self.threads.lock().await.get(&thread)
-                && sender.reader_count() >= expected
-            {
-                return;
-            }
-            if tokio::time::Instant::now() >= deadline {
-                panic!("timed out waiting for {expected} subscribers on {thread}");
-            }
-            tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
-        }
-    }
-
-    async fn wait_for_subscriber_count(&self, thread: ThreadId, expected: usize) {
-        let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
-        loop {
-            let count = self
-                .threads
-                .lock()
-                .await
-                .get(&thread)
-                .map(|log| log.reader_count())
-                .unwrap_or_default();
-            if count == expected {
-                return;
-            }
-            if tokio::time::Instant::now() >= deadline {
-                panic!(
-                    "timed out waiting for {expected} subscribers on {thread}; observed {count}"
-                );
-            }
-            tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
-        }
-    }
-
-    async fn emit_external_turn(
-        &self,
-        thread: ThreadId,
-        text: &str,
-    ) -> Result<TurnId, HarnessError> {
-        let Some(sender) = self.threads.lock().await.get(&thread).cloned() else {
-            return Err(HarnessError::ThreadNotFound(thread));
-        };
-        let turn = TurnId::new();
-        let item = Item {
-            id: ItemId::new(),
-            harness_item_id: format!("external_{turn}"),
-            payload: ItemPayload::AgentMessage {
-                text: text.to_string(),
-            },
-            created_at: chrono::Utc::now(),
-        };
-        let _ = sender.append(AgentEvent::TurnStarted { thread, turn });
-        tokio::task::yield_now().await;
-        let _ = sender.append(AgentEvent::ItemCompleted { thread, turn, item });
-        tokio::task::yield_now().await;
-        let _ = sender.append(AgentEvent::TurnCompleted {
-            thread,
-            turn,
-            usage: TokenUsage::default(),
-            status: TurnStatus {
-                kind: TurnStatusKind::Completed,
-                message: None,
-            },
-        });
-        Ok(turn)
-    }
-
-    /// An externally started child turn whose transcript names another native thread — the reverse
-    /// link shape. A sub-agent is read-only, so this arrives as provider-owned native work rather
-    /// than through `start_turn`.
-    async fn emit_external_reverse_activity(
-        &self,
-        thread: ThreadId,
-        target_harness_thread_id: &str,
-    ) -> Result<TurnId, HarnessError> {
-        let Some(sender) = self.threads.lock().await.get(&thread).cloned() else {
-            return Err(HarnessError::ThreadNotFound(thread));
-        };
-        let turn = TurnId::new();
-        let item = Item {
-            id: ItemId::new(),
-            harness_item_id: format!("reverse_parent_activity_{turn}"),
-            payload: ItemPayload::Activity {
-                title: "Sub-agent interacted".into(),
-                detail: Some(format!("/root ({target_harness_thread_id})")),
-                metadata: None,
-                subagent: Some(SubagentLink {
-                    harness_thread_id: target_harness_thread_id.to_string(),
-                    path: Some("/root".into()),
-                    initial_prompt: None,
-                    action: SubagentAction::Interacted,
-                    status: None,
-                    message: None,
-                }),
-            },
-            created_at: chrono::Utc::now(),
-        };
-        let _ = sender.append(AgentEvent::TurnStarted { thread, turn });
-        tokio::task::yield_now().await;
-        let _ = sender.append(AgentEvent::ItemCompleted { thread, turn, item });
-        tokio::task::yield_now().await;
-        let _ = sender.append(AgentEvent::TurnCompleted {
-            thread,
-            turn,
-            usage: TokenUsage::default(),
-            status: TurnStatus {
-                kind: TurnStatusKind::Completed,
-                message: None,
-            },
-        });
-        Ok(turn)
-    }
-
-    async fn emit_external_turn_without_completion(
-        &self,
-        thread: ThreadId,
-        text: &str,
-    ) -> Result<TurnId, HarnessError> {
-        let Some(sender) = self.threads.lock().await.get(&thread).cloned() else {
-            return Err(HarnessError::ThreadNotFound(thread));
-        };
-        let turn = TurnId::new();
-        let item = Item {
-            id: ItemId::new(),
-            harness_item_id: format!("external_{turn}"),
-            payload: ItemPayload::AgentMessage {
-                text: text.to_string(),
-            },
-            created_at: chrono::Utc::now(),
-        };
-        let _ = sender.append(AgentEvent::TurnStarted { thread, turn });
-        tokio::task::yield_now().await;
-        let _ = sender.append(AgentEvent::ItemCompleted { thread, turn, item });
-        Ok(turn)
-    }
-
-    async fn emit_external_command_without_completion(
-        &self,
-        thread: ThreadId,
-        command: &str,
-    ) -> Result<(TurnId, ItemId), HarnessError> {
-        let Some(sender) = self.threads.lock().await.get(&thread).cloned() else {
-            return Err(HarnessError::ThreadNotFound(thread));
-        };
-        let turn = TurnId::new();
-        let item_id = ItemId::new();
-        let _ = sender.append(AgentEvent::TurnStarted { thread, turn });
-        tokio::task::yield_now().await;
-        let _ = sender.append(AgentEvent::ItemStarted {
-            thread,
-            turn,
-            item: ItemStart {
-                id: item_id,
-                harness_item_id: format!("external_command_{turn}"),
-                kind: ItemKind::CommandExecution,
-                command: Some(CommandExecutionStart {
-                    command: command.to_string(),
-                    cwd: "/tmp/subagent-command".into(),
-                    status: Some("in_progress".into()),
-                    process_id: Some(format!("process_{turn}")),
-                    started_at_ms: None,
-                }),
-                tool: None,
-            },
-        });
-        Ok((turn, item_id))
-    }
-
-    async fn complete_external_command(
-        &self,
-        thread: ThreadId,
-        turn: TurnId,
-        item_id: ItemId,
-        command: &str,
-    ) -> Result<(), HarnessError> {
-        let Some(sender) = self.threads.lock().await.get(&thread).cloned() else {
-            return Err(HarnessError::ThreadNotFound(thread));
-        };
-        let _ = sender.append(AgentEvent::ItemCompleted {
-            thread,
-            turn,
-            item: Item {
-                id: item_id,
-                harness_item_id: format!("external_command_{turn}"),
-                payload: ItemPayload::CommandExecution {
-                    command: command.to_string(),
-                    cwd: "/tmp/subagent-command".into(),
-                    output: String::new(),
-                    output_truncated: false,
-                    output_original_bytes: None,
-                    output_original_lines: None,
-                    exit_code: Some(0),
-                    status: Some("completed".into()),
-                    process_id: Some(format!("process_{turn}")),
-                    duration_ms: Some(30_000),
-                },
-                created_at: chrono::Utc::now(),
-            },
-        });
-        Ok(())
+        self.child_open.release();
     }
 }
 
-impl CountingOpenHarness {
-    fn open_calls(&self) -> usize {
-        self.open_calls.load(Ordering::SeqCst)
-    }
+fn resumed_native_ids(core: &FakeCore) -> Vec<String> {
+    core.calls()
+        .into_iter()
+        .filter_map(|c| match c {
+            Call::Open { resume, .. } => resume,
+            _ => None,
+        })
+        .collect()
+}
 
-    fn claim_calls(&self) -> usize {
-        self.claim_calls.load(Ordering::SeqCst)
-    }
+/// Native identity claims, which replaced `thread/resume` for provider-owned children.
+fn claims(core: &FakeCore) -> Vec<(String, ThreadId)> {
+    core.calls()
+        .into_iter()
+        .filter_map(|c| match c {
+            Call::Claim {
+                harness_thread_id,
+                thread,
+                ..
+            } => Some((harness_thread_id, thread)),
+            _ => None,
+        })
+        .collect()
+}
 
-    async fn opened_models(&self) -> Vec<ModelRef> {
-        self.opened_models.lock().await.clone()
-    }
+fn deleted_harness_thread_ids(core: &FakeCore) -> Vec<String> {
+    core.calls()
+        .into_iter()
+        .filter_map(|c| match c {
+            Call::DeleteThread {
+                harness_thread_id, ..
+            } => Some(harness_thread_id),
+            _ => None,
+        })
+        .collect()
+}
 
-    fn start_calls(&self) -> usize {
-        self.start_calls.load(Ordering::SeqCst)
-    }
+async fn wait_for_approval_response(core: &FakeCore) -> (ApprovalId, ApprovalDecision) {
+    core.wait_for_call(|call| match call {
+        Call::RespondApproval { request, decision } => Some((request.clone(), decision.clone())),
+        _ => None,
+    })
+    .await
+}
 
-    fn delete_calls(&self) -> usize {
-        self.delete_calls.load(Ordering::SeqCst)
-    }
+async fn wait_for_server_response(core: &FakeCore) -> (ServerRequestId, ServerRequestResponse) {
+    core.wait_for_call(|call| match call {
+        Call::RespondServerRequest { request, response } => {
+            Some((request.clone(), response.clone()))
+        }
+        _ => None,
+    })
+    .await
+}
 
-    fn shutdown_calls(&self) -> usize {
-        self.shutdown_calls.load(Ordering::SeqCst)
-    }
+async fn emit_external_turn(
+    core: &FakeCore,
+    thread: ThreadId,
+    text: &str,
+) -> Result<TurnId, HarnessError> {
+    let Some(log) = core.try_log(thread) else {
+        return Err(HarnessError::ThreadNotFound(thread));
+    };
+    let turn = TurnId::new();
+    let item = Item {
+        id: ItemId::new(),
+        harness_item_id: format!("external_{turn}"),
+        payload: ItemPayload::AgentMessage {
+            text: text.to_string(),
+        },
+        created_at: chrono::Utc::now(),
+    };
+    log.append(AgentEvent::TurnStarted { thread, turn });
+    tokio::task::yield_now().await;
+    log.append(AgentEvent::ItemCompleted { thread, turn, item });
+    tokio::task::yield_now().await;
+    core.complete_turn(thread, turn);
+    Ok(turn)
+}
 
-    async fn started_models(&self) -> Vec<Option<ModelRef>> {
-        self.started_models.lock().await.clone()
-    }
+/// An externally started child turn whose transcript names another native thread — the reverse
+/// link shape. A sub-agent is read-only, so this arrives as provider-owned native work rather
+/// than through `start_turn`.
+async fn emit_external_reverse_activity(
+    core: &FakeCore,
+    thread: ThreadId,
+    target_harness_thread_id: &str,
+) -> Result<TurnId, HarnessError> {
+    let Some(log) = core.try_log(thread) else {
+        return Err(HarnessError::ThreadNotFound(thread));
+    };
+    let turn = TurnId::new();
+    let item = Item {
+        id: ItemId::new(),
+        harness_item_id: format!("reverse_parent_activity_{turn}"),
+        payload: ItemPayload::Activity {
+            title: "Sub-agent interacted".into(),
+            detail: Some(format!("/root ({target_harness_thread_id})")),
+            metadata: None,
+            subagent: Some(SubagentLink {
+                harness_thread_id: target_harness_thread_id.to_string(),
+                path: Some("/root".into()),
+                initial_prompt: None,
+                action: SubagentAction::Interacted,
+                status: None,
+                message: None,
+            }),
+        },
+        created_at: chrono::Utc::now(),
+    };
+    log.append(AgentEvent::TurnStarted { thread, turn });
+    tokio::task::yield_now().await;
+    log.append(AgentEvent::ItemCompleted { thread, turn, item });
+    tokio::task::yield_now().await;
+    core.complete_turn(thread, turn);
+    Ok(turn)
+}
 
-    async fn started_inputs(&self) -> Vec<String> {
-        self.started_inputs.lock().await.clone()
-    }
+async fn emit_external_turn_without_completion(
+    core: &FakeCore,
+    thread: ThreadId,
+    text: &str,
+) -> Result<TurnId, HarnessError> {
+    let Some(log) = core.try_log(thread) else {
+        return Err(HarnessError::ThreadNotFound(thread));
+    };
+    let turn = TurnId::new();
+    let item = Item {
+        id: ItemId::new(),
+        harness_item_id: format!("external_{turn}"),
+        payload: ItemPayload::AgentMessage {
+            text: text.to_string(),
+        },
+        created_at: chrono::Utc::now(),
+    };
+    log.append(AgentEvent::TurnStarted { thread, turn });
+    tokio::task::yield_now().await;
+    log.append(AgentEvent::ItemCompleted { thread, turn, item });
+    Ok(turn)
+}
 
+async fn emit_external_command_without_completion(
+    core: &FakeCore,
+    thread: ThreadId,
+    command: &str,
+) -> Result<(TurnId, ItemId), HarnessError> {
+    let Some(log) = core.try_log(thread) else {
+        return Err(HarnessError::ThreadNotFound(thread));
+    };
+    let turn = TurnId::new();
+    let item_id = ItemId::new();
+    log.append(AgentEvent::TurnStarted { thread, turn });
+    tokio::task::yield_now().await;
+    log.append(AgentEvent::ItemStarted {
+        thread,
+        turn,
+        item: ItemStart {
+            id: item_id,
+            harness_item_id: format!("external_command_{turn}"),
+            kind: ItemKind::CommandExecution,
+            command: Some(CommandExecutionStart {
+                command: command.to_string(),
+                cwd: "/tmp/subagent-command".into(),
+                status: Some("in_progress".into()),
+                process_id: Some(format!("process_{turn}")),
+                started_at_ms: None,
+            }),
+            tool: None,
+        },
+    });
+    Ok((turn, item_id))
+}
+
+async fn complete_external_command(
+    core: &FakeCore,
+    thread: ThreadId,
+    turn: TurnId,
+    item_id: ItemId,
+    command: &str,
+) -> Result<(), HarnessError> {
+    let Some(log) = core.try_log(thread) else {
+        return Err(HarnessError::ThreadNotFound(thread));
+    };
+    log.append(AgentEvent::ItemCompleted {
+        thread,
+        turn,
+        item: Item {
+            id: item_id,
+            harness_item_id: format!("external_command_{turn}"),
+            payload: ItemPayload::CommandExecution {
+                command: command.to_string(),
+                cwd: "/tmp/subagent-command".into(),
+                output: String::new(),
+                output_truncated: false,
+                output_original_bytes: None,
+                output_original_lines: None,
+                exit_code: Some(0),
+                status: Some("completed".into()),
+                process_id: Some(format!("process_{turn}")),
+                duration_ms: Some(30_000),
+            },
+            created_at: chrono::Utc::now(),
+        },
+    });
+    Ok(())
+}
+
+impl CountingScript {
     async fn fail_start_with(&self, error: HarnessError) {
         *self.start_error.lock().await = Some(error);
     }
 }
 
+fn open_calls(core: &FakeCore) -> usize {
+    core.count(|c| matches!(c, Call::Open { .. }))
+}
+
+fn start_calls(core: &FakeCore) -> usize {
+    core.count(|c| matches!(c, Call::StartTurn { .. }))
+}
+
+fn delete_calls(core: &FakeCore) -> usize {
+    core.count(|c| matches!(c, Call::DeleteThread { .. }))
+}
+
+fn shutdown_calls(core: &FakeCore) -> usize {
+    core.count(|c| matches!(c, Call::Shutdown))
+}
+
+/// What each `open_thread` requested.
+fn opened_models(core: &FakeCore) -> Vec<ModelRef> {
+    core.calls()
+        .into_iter()
+        .filter_map(|c| match c {
+            Call::Open { model, .. } => Some(model),
+            _ => None,
+        })
+        .collect()
+}
+
+fn started_models(core: &FakeCore) -> Vec<Option<ModelRef>> {
+    core.calls()
+        .into_iter()
+        .filter_map(|c| match c {
+            Call::StartTurn { overrides, .. } => Some(overrides.model),
+            _ => None,
+        })
+        .collect()
+}
+
+fn started_inputs(core: &FakeCore) -> Vec<String> {
+    core.calls()
+        .into_iter()
+        .filter_map(|c| match c {
+            Call::StartTurn { input, .. } => Some(input.as_text().unwrap_or_default().to_string()),
+            _ => None,
+        })
+        .collect()
+}
+
 #[async_trait::async_trait]
-impl AgentHarness for UnsupportedCompactionHarness {
+impl Script for UnsupportedCompactionScript {
     fn capabilities(&self) -> HarnessCapabilities {
         HarnessCapabilities {
             live_approvals: false,
@@ -586,42 +496,15 @@ impl AgentHarness for UnsupportedCompactionHarness {
         Ok(Vec::new())
     }
 
-    async fn open_thread(&self, opts: OpenThreadOptions) -> Result<ThreadHandle, HarnessError> {
-        let thread = opts.thread;
-        let tx = Arc::new(EventLog::new());
-        self.threads.lock().await.insert(thread, tx);
-        Ok(ThreadHandle {
-            resumed_model: Some(opts.initial_model.clone()),
-            ..ThreadHandle::opened(
-                thread,
-                opts.resume.unwrap_or_else(|| format!("test_{thread}")),
-                opts.workspace_root.clone(),
-            )
-        })
-    }
-
-    async fn start_turn(
-        &self,
-        _thread: &ThreadHandle,
-        _input: UserInput,
-        _overrides: TurnOverrides,
-    ) -> Result<TurnId, HarnessError> {
+    async fn start_turn(&self, _core: &FakeCore, _call: &TurnCall) -> Result<(), HarnessError> {
         Err(HarnessError::Unsupported(
             "turns are not supported by this harness".into(),
         ))
     }
 
-    fn subscribe(&self, thread: &ThreadHandle) -> AgentEventStream {
-        if let Ok(threads) = self.threads.try_lock()
-            && let Some(sender) = threads.get(&thread.thread)
-        {
-            return AgentEventStream::new(sender.reader());
-        }
-        AgentEventStream::closed()
-    }
-
     async fn respond_approval(
         &self,
+        _core: &FakeCore,
         _req: ApprovalId,
         _decision: ApprovalDecision,
     ) -> Result<(), HarnessError> {
@@ -632,6 +515,7 @@ impl AgentHarness for UnsupportedCompactionHarness {
 
     async fn respond_server_request(
         &self,
+        _core: &FakeCore,
         _req: ServerRequestId,
         _response: ServerRequestResponse,
     ) -> Result<(), HarnessError> {
@@ -640,66 +524,27 @@ impl AgentHarness for UnsupportedCompactionHarness {
         ))
     }
 
-    async fn interrupt(&self, _thread: &ThreadHandle) -> Result<(), HarnessError> {
+    async fn interrupt(
+        &self,
+        _core: &FakeCore,
+        _thread: &ThreadHandle,
+    ) -> Result<(), HarnessError> {
         Err(HarnessError::Unsupported(
             "interrupts are not supported by this harness".into(),
         ))
     }
-
-    async fn shutdown(&self) -> Result<(), HarnessError> {
-        Ok(())
-    }
 }
 
 #[async_trait::async_trait]
-impl AgentHarness for SlowCompactionHarness {
+impl Script for SlowCompactionScript {
     fn capabilities(&self) -> HarnessCapabilities {
-        HarnessCapabilities {
-            live_approvals: false,
-            plan_build_modes: false,
-            per_turn_model: false,
-            reasoning_effort: false,
-            structured_diffs: false,
-            resumable_threads: true,
-            model_listing: false,
-            provider_listing: false,
-            token_usage: false,
-            mcp_status: false,
-            mcp_reload: false,
-            mcp_oauth_login: false,
-            context_compaction: true,
-        }
+        caps::RESUMABLE_COMPACTION
     }
 
-    async fn list_models(&self) -> Result<Vec<giskard_core::ModelDescriptor>, HarnessError> {
-        Ok(Vec::new())
-    }
-
-    async fn open_thread(&self, opts: OpenThreadOptions) -> Result<ThreadHandle, HarnessError> {
-        let thread = opts.thread;
-        let tx = Arc::new(EventLog::new());
-        self.threads.lock().await.insert(thread, tx);
-        Ok(ThreadHandle {
-            resumed_model: Some(opts.initial_model.clone()),
-            ..ThreadHandle::opened(
-                thread,
-                opts.resume.unwrap_or_else(|| format!("test_{thread}")),
-                opts.workspace_root.clone(),
-            )
-        })
-    }
-
-    async fn start_turn(
-        &self,
-        thread: &ThreadHandle,
-        _input: UserInput,
-        _overrides: TurnOverrides,
-    ) -> Result<TurnId, HarnessError> {
-        let Some(sender) = self.threads.lock().await.get(&thread.thread).cloned() else {
-            return Err(HarnessError::ThreadNotFound(thread.thread));
-        };
-        let thread_id = thread.thread;
-        let turn = TurnId::new();
+    async fn start_turn(&self, _core: &FakeCore, call: &TurnCall) -> Result<(), HarnessError> {
+        let log = call.log.clone();
+        let thread_id = call.thread;
+        let turn = call.turn;
         tokio::spawn(async move {
             let item = Item {
                 id: ItemId::new(),
@@ -709,18 +554,18 @@ impl AgentHarness for SlowCompactionHarness {
                 },
                 created_at: chrono::Utc::now(),
             };
-            let _ = sender.append(AgentEvent::TurnStarted {
+            log.append(AgentEvent::TurnStarted {
                 thread: thread_id,
                 turn,
             });
             tokio::task::yield_now().await;
-            let _ = sender.append(AgentEvent::ItemCompleted {
+            log.append(AgentEvent::ItemCompleted {
                 thread: thread_id,
                 turn,
                 item,
             });
             tokio::task::yield_now().await;
-            let _ = sender.append(AgentEvent::TurnCompleted {
+            log.append(AgentEvent::TurnCompleted {
                 thread: thread_id,
                 turn,
                 usage: TokenUsage::default(),
@@ -730,57 +575,27 @@ impl AgentHarness for SlowCompactionHarness {
                 },
             });
         });
-        Ok(turn)
+        Ok(())
     }
 
-    fn subscribe(&self, thread: &ThreadHandle) -> AgentEventStream {
-        if let Ok(threads) = self.threads.try_lock()
-            && let Some(sender) = threads.get(&thread.thread)
-        {
-            return AgentEventStream::new(sender.reader());
-        }
-        AgentEventStream::closed()
-    }
-
-    async fn respond_approval(
+    async fn compact_thread(
         &self,
-        _req: ApprovalId,
-        _decision: ApprovalDecision,
+        core: &FakeCore,
+        thread: &ThreadHandle,
     ) -> Result<(), HarnessError> {
-        Ok(())
-    }
-
-    async fn respond_server_request(
-        &self,
-        _req: ServerRequestId,
-        _response: ServerRequestResponse,
-    ) -> Result<(), HarnessError> {
-        Ok(())
-    }
-
-    async fn interrupt(&self, _thread: &ThreadHandle) -> Result<(), HarnessError> {
-        Ok(())
-    }
-
-    async fn compact_thread(&self, thread: &ThreadHandle) -> Result<(), HarnessError> {
-        self.compact_calls.fetch_add(1, Ordering::SeqCst);
-        while self.hold_compaction.load(Ordering::SeqCst)
-            && !self.release_compaction.load(Ordering::SeqCst)
-        {
-            tokio::task::yield_now().await;
-        }
-        let Some(sender) = self.threads.lock().await.get(&thread.thread).cloned() else {
+        self.compaction.pass().await;
+        let Some(log) = core.try_log(thread.thread) else {
             return Err(HarnessError::ThreadNotFound(thread.thread));
         };
         let thread_id = thread.thread;
         tokio::spawn(async move {
             let turn = TurnId::new();
-            let _ = sender.append(AgentEvent::TurnStarted {
+            log.append(AgentEvent::TurnStarted {
                 thread: thread_id,
                 turn,
             });
             tokio::task::yield_now().await;
-            let _ = sender.append(AgentEvent::ItemCompleted {
+            log.append(AgentEvent::ItemCompleted {
                 thread: thread_id,
                 turn,
                 item: Item {
@@ -796,7 +611,7 @@ impl AgentHarness for SlowCompactionHarness {
                 },
             });
             tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
-            let _ = sender.append(AgentEvent::TurnCompleted {
+            log.append(AgentEvent::TurnCompleted {
                 thread: thread_id,
                 turn,
                 usage: TokenUsage::default(),
@@ -808,123 +623,58 @@ impl AgentHarness for SlowCompactionHarness {
         });
         Ok(())
     }
-
-    async fn shutdown(&self) -> Result<(), HarnessError> {
-        Ok(())
-    }
 }
 
 #[async_trait::async_trait]
-impl AgentHarness for ActivityHarness {
+impl Script for ActivityScript {
     fn capabilities(&self) -> HarnessCapabilities {
-        HarnessCapabilities {
-            live_approvals: true,
-            plan_build_modes: true,
-            per_turn_model: true,
-            reasoning_effort: true,
-            structured_diffs: false,
-            resumable_threads: true,
-            model_listing: false,
-            provider_listing: false,
-            token_usage: false,
-            mcp_status: false,
-            mcp_reload: false,
-            mcp_oauth_login: false,
-            context_compaction: false,
-        }
+        caps::ACTIVITY
     }
 
-    async fn list_models(&self) -> Result<Vec<giskard_core::ModelDescriptor>, HarnessError> {
-        Ok(Vec::new())
-    }
-
-    async fn open_thread(&self, opts: OpenThreadOptions) -> Result<ThreadHandle, HarnessError> {
-        if let Some(native_thread_id) = opts.resume.as_ref() {
-            self.resumed_native_ids
-                .lock()
-                .await
-                .push(native_thread_id.clone());
-        }
+    async fn open_thread(
+        &self,
+        core: &FakeCore,
+        opts: &OpenThreadOptions,
+    ) -> Result<ThreadHandle, HarnessError> {
         if matches!(
             opts.resume.as_deref(),
             Some("native-child" | "native-terminal-child")
-        ) && self.hold_native_child_open.load(Ordering::SeqCst)
-        {
-            self.native_child_open_started.store(true, Ordering::SeqCst);
-            while !self.release_native_child_open.load(Ordering::SeqCst) {
-                tokio::task::yield_now().await;
-            }
+        ) {
+            self.child_open.pass().await;
         }
-        let thread = opts.thread;
-        let tx = Arc::new(EventLog::new());
-        self.threads.lock().await.insert(thread, tx);
-        let harness_thread_id = opts.resume.unwrap_or_else(|| format!("test_{thread}"));
-        self.native_routes
-            .lock()
-            .await
-            .insert(harness_thread_id.clone(), thread);
-        let agent_name = (harness_thread_id == "native-collab-child").then(|| "James".to_string());
-        let parent_harness_thread_id = attested_native_parent(&harness_thread_id);
+        let handle = core.opened(opts, format!("test_{}", opts.thread));
+        let native_id = handle.harness_thread_id.clone();
         Ok(ThreadHandle {
-            resumed_model: Some(opts.initial_model.clone()),
-            agent_name,
-            parent_harness_thread_id,
-            ..ThreadHandle::opened(thread, harness_thread_id, opts.workspace_root.clone())
+            agent_name: (native_id == "native-collab-child").then(|| "James".to_string()),
+            parent_harness_thread_id: attested_native_parent(&native_id),
+            ..handle
         })
     }
 
     async fn claim_native_thread(
         &self,
+        core: &FakeCore,
         thread: ThreadId,
-        harness_thread_id: String,
-        workspace_root: std::path::PathBuf,
+        harness_thread_id: &str,
+        workspace_root: &std::path::Path,
     ) -> Result<ThreadHandle, HarnessError> {
-        if matches!(
-            harness_thread_id.as_str(),
-            "native-child" | "native-terminal-child"
-        ) && self.hold_native_child_open.load(Ordering::SeqCst)
-        {
-            self.native_child_open_started.store(true, Ordering::SeqCst);
-            while !self.release_native_child_open.load(Ordering::SeqCst) {
-                tokio::task::yield_now().await;
-            }
+        if matches!(harness_thread_id, "native-child" | "native-terminal-child") {
+            self.child_open.pass().await;
         }
-        let thread = *self
-            .native_routes
-            .lock()
-            .await
-            .entry(harness_thread_id.clone())
-            .or_insert(thread);
-        self.claims
-            .lock()
-            .await
-            .push((harness_thread_id.clone(), thread));
-        let mut threads = self.threads.lock().await;
-        threads
-            .entry(thread)
-            .or_insert_with(|| Arc::new(EventLog::new()));
         // Mirrors the Codex adapter: a claim reports the parentage this harness lifetime already
         // attested through its own events, and nothing a resume would have to ask for.
-        let parent_harness_thread_id = attested_native_parent(&harness_thread_id);
         Ok(ThreadHandle {
-            parent_harness_thread_id,
-            ..ThreadHandle::opened(thread, harness_thread_id, workspace_root)
+            parent_harness_thread_id: attested_native_parent(harness_thread_id),
+            ..core.claimed(thread, harness_thread_id, workspace_root)
         })
     }
 
-    async fn start_turn(
-        &self,
-        thread: &ThreadHandle,
-        input: UserInput,
-        _overrides: TurnOverrides,
-    ) -> Result<TurnId, HarnessError> {
-        let Some(sender) = self.threads.lock().await.get(&thread.thread).cloned() else {
-            return Err(HarnessError::ThreadNotFound(thread.thread));
-        };
-        let thread_id = thread.thread;
-        let turn = TurnId::new();
-        let text = input.as_text().unwrap_or_default().to_string();
-        let _ = sender.append(AgentEvent::TurnStarted {
+    async fn start_turn(&self, core: &FakeCore, call: &TurnCall) -> Result<(), HarnessError> {
+        let log = call.log.clone();
+        let thread_id = call.thread;
+        let turn = call.turn;
+        let text = call.input.as_text().unwrap_or_default().to_string();
+        log.append(AgentEvent::TurnStarted {
             thread: thread_id,
             turn,
         });
@@ -935,7 +685,7 @@ impl AgentHarness for ActivityHarness {
                 .lock()
                 .await
                 .insert(approval_id.clone(), (thread_id, turn));
-            let _ = sender.append(AgentEvent::ApprovalRequested {
+            log.append(AgentEvent::ApprovalRequested {
                 thread: thread_id,
                 turn,
                 request: ApprovalRequest {
@@ -955,7 +705,7 @@ impl AgentHarness for ActivityHarness {
                 .lock()
                 .await
                 .insert(request_id.clone(), (thread_id, turn));
-            let _ = sender.append(AgentEvent::ServerRequestReceived {
+            log.append(AgentEvent::ServerRequestReceived {
                 thread: thread_id,
                 turn: Some(turn),
                 request: ServerRequest {
@@ -975,7 +725,7 @@ impl AgentHarness for ActivityHarness {
         } else if text.contains("subagent terminal fallback") {
             let item_id = ItemId::new();
             let harness_item_id = format!("subagent_terminal_{turn}");
-            let _ = sender.append(AgentEvent::ItemStarted {
+            log.append(AgentEvent::ItemStarted {
                 thread: thread_id,
                 turn,
                 item: ItemStart {
@@ -1023,12 +773,12 @@ impl AgentHarness for ActivityHarness {
                 },
                 created_at: chrono::Utc::now(),
             };
-            let _ = sender.append(AgentEvent::ItemCompleted {
+            log.append(AgentEvent::ItemCompleted {
                 thread: thread_id,
                 turn,
                 item,
             });
-            self.complete_turn(thread_id, turn).await?;
+            core.complete_turn(thread_id, turn);
         } else if text.contains("subagent interrupted") {
             let item = Item {
                 id: ItemId::new(),
@@ -1048,12 +798,12 @@ impl AgentHarness for ActivityHarness {
                 },
                 created_at: chrono::Utc::now(),
             };
-            let _ = sender.append(AgentEvent::ItemCompleted {
+            log.append(AgentEvent::ItemCompleted {
                 thread: thread_id,
                 turn,
                 item,
             });
-            self.complete_turn(thread_id, turn).await?;
+            core.complete_turn(thread_id, turn);
         } else if text.contains("plain activity") {
             let item = Item {
                 id: ItemId::new(),
@@ -1066,7 +816,7 @@ impl AgentHarness for ActivityHarness {
                 },
                 created_at: chrono::Utc::now(),
             };
-            let _ = sender.append(AgentEvent::ItemCompleted {
+            log.append(AgentEvent::ItemCompleted {
                 thread: thread_id,
                 turn,
                 item,
@@ -1090,7 +840,7 @@ impl AgentHarness for ActivityHarness {
                 },
                 created_at: chrono::Utc::now(),
             };
-            let _ = sender.append(AgentEvent::ItemCompleted {
+            log.append(AgentEvent::ItemCompleted {
                 thread: thread_id,
                 turn,
                 item,
@@ -1114,7 +864,7 @@ impl AgentHarness for ActivityHarness {
                 },
                 created_at: chrono::Utc::now(),
             };
-            let _ = sender.append(AgentEvent::ItemCompleted {
+            log.append(AgentEvent::ItemCompleted {
                 thread: thread_id,
                 turn,
                 item,
@@ -1138,14 +888,14 @@ impl AgentHarness for ActivityHarness {
                 },
                 created_at: chrono::Utc::now(),
             };
-            let _ = sender.append(AgentEvent::ItemCompleted {
+            log.append(AgentEvent::ItemCompleted {
                 thread: thread_id,
                 turn,
                 item,
             });
             tokio::spawn(async move {
                 tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
-                let _ = sender.append(AgentEvent::ItemStarted {
+                log.append(AgentEvent::ItemStarted {
                     thread: thread_id,
                     turn,
                     item: ItemStart {
@@ -1173,7 +923,7 @@ impl AgentHarness for ActivityHarness {
                 });
             });
         } else if text.contains("collab spawn input fallback") {
-            let _ = sender.append(AgentEvent::ItemStarted {
+            log.append(AgentEvent::ItemStarted {
                 thread: thread_id,
                 turn,
                 item: ItemStart {
@@ -1200,7 +950,7 @@ impl AgentHarness for ActivityHarness {
                 },
             });
         } else if text.contains("nested collab spawn") {
-            let _ = sender.append(AgentEvent::ItemStarted {
+            log.append(AgentEvent::ItemStarted {
                 thread: thread_id,
                 turn,
                 item: ItemStart {
@@ -1227,7 +977,7 @@ impl AgentHarness for ActivityHarness {
                 },
             });
         } else if text.contains("collab spawn") {
-            let _ = sender.append(AgentEvent::ItemStarted {
+            log.append(AgentEvent::ItemStarted {
                 thread: thread_id,
                 turn,
                 item: ItemStart {
@@ -1272,179 +1022,97 @@ impl AgentHarness for ActivityHarness {
                 },
                 created_at: chrono::Utc::now(),
             };
-            let _ = sender.append(AgentEvent::ItemCompleted {
+            log.append(AgentEvent::ItemCompleted {
                 thread: thread_id,
                 turn,
                 item,
             });
-            self.complete_turn(thread_id, turn).await?;
+            core.complete_turn(thread_id, turn);
         } else {
-            self.complete_turn(thread_id, turn).await?;
+            core.complete_turn(thread_id, turn);
         }
 
-        Ok(turn)
-    }
-
-    fn subscribe(&self, thread: &ThreadHandle) -> AgentEventStream {
-        if let Ok(threads) = self.threads.try_lock()
-            && let Some(sender) = threads.get(&thread.thread)
-        {
-            return AgentEventStream::new(sender.reader());
-        }
-        AgentEventStream::closed()
+        Ok(())
     }
 
     async fn respond_approval(
         &self,
+        core: &FakeCore,
         req: ApprovalId,
-        decision: ApprovalDecision,
+        _decision: ApprovalDecision,
     ) -> Result<(), HarnessError> {
-        self.approval_responses
-            .lock()
-            .await
-            .push((req.clone(), decision));
         let Some((thread, turn)) = self.pending_approvals.lock().await.remove(&req) else {
             return Err(HarnessError::Protocol(format!(
                 "unknown approval response {req}"
             )));
         };
-        self.complete_turn(thread, turn).await
+        core.complete_turn(thread, turn);
+        Ok(())
     }
 
     async fn respond_server_request(
         &self,
+        core: &FakeCore,
         req: ServerRequestId,
-        response: ServerRequestResponse,
+        _response: ServerRequestResponse,
     ) -> Result<(), HarnessError> {
-        self.server_responses
-            .lock()
-            .await
-            .push((req.clone(), response));
         let Some((thread, turn)) = self.pending_server_requests.lock().await.remove(&req) else {
             return Err(HarnessError::Protocol(format!(
                 "unknown server request response {req}"
             )));
         };
-        self.complete_turn(thread, turn).await
-    }
-
-    async fn interrupt(&self, _thread: &ThreadHandle) -> Result<(), HarnessError> {
-        Ok(())
-    }
-
-    async fn delete_thread(&self, thread: &ThreadHandle) -> Result<(), HarnessError> {
-        self.deleted_harness_thread_ids
-            .lock()
-            .await
-            .push(thread.harness_thread_id.clone());
-        self.threads.lock().await.remove(&thread.thread);
-        Ok(())
-    }
-
-    async fn shutdown(&self) -> Result<(), HarnessError> {
+        core.complete_turn(thread, turn);
         Ok(())
     }
 }
 
 #[async_trait::async_trait]
-impl AgentHarness for SlowStartHarness {
+impl Script for SlowStartScript {
     fn capabilities(&self) -> HarnessCapabilities {
-        HarnessCapabilities {
-            live_approvals: false,
-            plan_build_modes: false,
-            per_turn_model: false,
-            reasoning_effort: false,
-            structured_diffs: false,
-            resumable_threads: true,
-            model_listing: false,
-            provider_listing: false,
-            token_usage: false,
-            mcp_status: false,
-            mcp_reload: false,
-            mcp_oauth_login: false,
-            context_compaction: true,
-        }
+        caps::RESUMABLE_COMPACTION
     }
 
-    async fn list_models(&self) -> Result<Vec<giskard_core::ModelDescriptor>, HarnessError> {
-        Ok(Vec::new())
-    }
-
-    async fn open_thread(&self, opts: OpenThreadOptions) -> Result<ThreadHandle, HarnessError> {
-        let thread = opts.thread;
-        let tx = Arc::new(EventLog::new());
-        self.threads.lock().await.insert(thread, tx);
-        Ok(ThreadHandle {
-            resumed_model: Some(opts.initial_model.clone()),
-            ..ThreadHandle::opened(
-                thread,
-                opts.resume.unwrap_or_else(|| format!("test_{thread}")),
-                opts.workspace_root.clone(),
-            )
-        })
-    }
-
-    async fn start_turn(
-        &self,
-        thread: &ThreadHandle,
-        input: UserInput,
-        _overrides: TurnOverrides,
-    ) -> Result<TurnId, HarnessError> {
-        let Some(sender) = self.threads.lock().await.get(&thread.thread).cloned() else {
-            return Err(HarnessError::ThreadNotFound(thread.thread));
-        };
-        let call = self.start_calls.fetch_add(1, Ordering::SeqCst) + 1;
-        if call == 1 && self.hold_first_start.swap(false, Ordering::SeqCst) {
-            while !self.release_first_start.load(Ordering::SeqCst) {
-                tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
-            }
+    async fn start_turn(&self, _core: &FakeCore, call: &TurnCall) -> Result<(), HarnessError> {
+        if !self.first_seen.swap(true, Ordering::SeqCst) {
+            self.first_start.pass().await;
         }
 
-        let thread_id = thread.thread;
-        let turn = TurnId::new();
-        let text = input.as_text().unwrap_or("message").to_owned();
+        let sequence = 1;
+        let text = call.input.as_text().unwrap_or("message").to_owned();
         let item = Item {
             id: ItemId::new(),
-            harness_item_id: format!("reply_{call}_{turn}"),
+            harness_item_id: format!("reply_{sequence}_{}", call.turn),
             payload: ItemPayload::AgentMessage {
                 text: format!("reply to {text}"),
             },
             created_at: chrono::Utc::now(),
         };
-        let _ = sender.append(AgentEvent::TurnStarted {
-            thread: thread_id,
-            turn,
+        call.log.append(AgentEvent::TurnStarted {
+            thread: call.thread,
+            turn: call.turn,
         });
         tokio::task::yield_now().await;
-        let _ = sender.append(AgentEvent::ItemCompleted {
-            thread: thread_id,
-            turn,
+        call.log.append(AgentEvent::ItemCompleted {
+            thread: call.thread,
+            turn: call.turn,
             item,
         });
         tokio::task::yield_now().await;
-        let _ = sender.append(AgentEvent::TurnCompleted {
-            thread: thread_id,
-            turn,
+        call.log.append(AgentEvent::TurnCompleted {
+            thread: call.thread,
+            turn: call.turn,
             usage: TokenUsage::default(),
             status: TurnStatus {
                 kind: TurnStatusKind::Completed,
                 message: None,
             },
         });
-        Ok(turn)
-    }
-
-    fn subscribe(&self, thread: &ThreadHandle) -> AgentEventStream {
-        if let Ok(threads) = self.threads.try_lock()
-            && let Some(sender) = threads.get(&thread.thread)
-        {
-            return AgentEventStream::new(sender.reader());
-        }
-        AgentEventStream::closed()
+        Ok(())
     }
 
     async fn respond_approval(
         &self,
+        _core: &FakeCore,
         _req: ApprovalId,
         _decision: ApprovalDecision,
     ) -> Result<(), HarnessError> {
@@ -1453,160 +1121,74 @@ impl AgentHarness for SlowStartHarness {
 
     async fn respond_server_request(
         &self,
+        _core: &FakeCore,
         _req: ServerRequestId,
         _response: ServerRequestResponse,
     ) -> Result<(), HarnessError> {
         Ok(())
     }
 
-    async fn interrupt(&self, _thread: &ThreadHandle) -> Result<(), HarnessError> {
+    async fn interrupt(
+        &self,
+        _core: &FakeCore,
+        _thread: &ThreadHandle,
+    ) -> Result<(), HarnessError> {
         Ok(())
     }
 
-    async fn compact_thread(&self, _thread: &ThreadHandle) -> Result<(), HarnessError> {
-        Ok(())
-    }
-
-    async fn shutdown(&self) -> Result<(), HarnessError> {
+    async fn compact_thread(
+        &self,
+        _core: &FakeCore,
+        _thread: &ThreadHandle,
+    ) -> Result<(), HarnessError> {
         Ok(())
     }
 }
 
 #[async_trait::async_trait]
-impl AgentHarness for CountingOpenHarness {
+impl Script for CountingScript {
     fn capabilities(&self) -> HarnessCapabilities {
-        HarnessCapabilities {
-            live_approvals: false,
-            plan_build_modes: false,
-            per_turn_model: false,
-            reasoning_effort: false,
-            structured_diffs: false,
-            resumable_threads: true,
-            model_listing: false,
-            provider_listing: false,
-            token_usage: false,
-            mcp_status: false,
-            mcp_reload: false,
-            mcp_oauth_login: false,
-            context_compaction: false,
-        }
+        caps::RESUMABLE
     }
 
-    async fn list_models(&self) -> Result<Vec<giskard_core::ModelDescriptor>, HarnessError> {
-        Ok(Vec::new())
-    }
-
-    async fn open_thread(&self, opts: OpenThreadOptions) -> Result<ThreadHandle, HarnessError> {
-        let open_call = self.open_calls.fetch_add(1, Ordering::SeqCst) + 1;
-        let thread = opts.thread;
-        self.opened_models
-            .lock()
-            .await
-            .push(opts.initial_model.clone());
-        let tx = Arc::new(EventLog::new());
-        self.threads.lock().await.insert(thread, tx);
-        Ok(ThreadHandle {
-            resumed_model: Some(opts.initial_model.clone()),
-            ..ThreadHandle::opened(
-                thread,
-                opts.resume
-                    .unwrap_or_else(|| format!("count_{thread}_{open_call}")),
-                opts.workspace_root.clone(),
-            )
-        })
+    async fn open_thread(
+        &self,
+        core: &FakeCore,
+        opts: &OpenThreadOptions,
+    ) -> Result<ThreadHandle, HarnessError> {
+        // The harness recorded this call before the script ran, so the count already includes it.
+        let open_call = core.count(|c| matches!(c, Call::Open { .. }));
+        Ok(core.opened(opts, format!("count_{}_{open_call}", opts.thread)))
     }
 
     async fn claim_native_thread(
         &self,
+        core: &FakeCore,
         thread: ThreadId,
-        harness_thread_id: String,
-        workspace_root: PathBuf,
+        harness_thread_id: &str,
+        workspace_root: &std::path::Path,
     ) -> Result<ThreadHandle, HarnessError> {
-        let mut threads = self.threads.lock().await;
-        if let std::collections::hash_map::Entry::Vacant(entry) = threads.entry(thread) {
-            self.claim_calls.fetch_add(1, Ordering::SeqCst);
-            entry.insert(Arc::new(EventLog::new()));
+        // Counted only for a thread with no log yet, as the vacant-entry check did.
+        if core.ensure_log(thread).1 {
+            self.new_claims.fetch_add(1, Ordering::SeqCst);
         }
-        Ok(ThreadHandle::opened(
-            thread,
-            harness_thread_id,
-            workspace_root,
-        ))
+        Ok(core.claimed(thread, harness_thread_id, workspace_root))
     }
 
-    async fn start_turn(
-        &self,
-        thread: &ThreadHandle,
-        input: UserInput,
-        overrides: TurnOverrides,
-    ) -> Result<TurnId, HarnessError> {
-        self.start_calls.fetch_add(1, Ordering::SeqCst);
-        self.started_models.lock().await.push(overrides.model);
-        self.started_inputs
-            .lock()
-            .await
-            .push(input.as_text().unwrap_or_default().to_string());
-
+    async fn start_turn(&self, _core: &FakeCore, call: &TurnCall) -> Result<(), HarnessError> {
         if let Some(error) = self.start_error.lock().await.clone() {
             return Err(error);
         }
-
-        let turn = TurnId::new();
-        let sender = {
-            let threads = self.threads.lock().await;
-            threads.get(&thread.thread).cloned()
-        }
-        .ok_or(HarnessError::ThreadNotFound(thread.thread))?;
-        let _ = sender.append(AgentEvent::TurnStarted {
-            thread: thread.thread,
-            turn,
+        call.log.append(AgentEvent::TurnStarted {
+            thread: call.thread,
+            turn: call.turn,
         });
-        Ok(turn)
-    }
-
-    fn subscribe(&self, thread: &ThreadHandle) -> AgentEventStream {
-        if let Ok(threads) = self.threads.try_lock()
-            && let Some(sender) = threads.get(&thread.thread)
-        {
-            return AgentEventStream::new(sender.reader());
-        }
-        AgentEventStream::closed()
-    }
-
-    async fn respond_approval(
-        &self,
-        _req: ApprovalId,
-        _decision: ApprovalDecision,
-    ) -> Result<(), HarnessError> {
-        Ok(())
-    }
-
-    async fn respond_server_request(
-        &self,
-        _req: ServerRequestId,
-        _response: ServerRequestResponse,
-    ) -> Result<(), HarnessError> {
-        Ok(())
-    }
-
-    async fn interrupt(&self, _thread: &ThreadHandle) -> Result<(), HarnessError> {
-        Ok(())
-    }
-
-    async fn delete_thread(&self, thread: &ThreadHandle) -> Result<(), HarnessError> {
-        self.delete_calls.fetch_add(1, Ordering::SeqCst);
-        self.threads.lock().await.remove(&thread.thread);
-        Ok(())
-    }
-
-    async fn shutdown(&self) -> Result<(), HarnessError> {
-        self.shutdown_calls.fetch_add(1, Ordering::SeqCst);
         Ok(())
     }
 }
 
 #[async_trait::async_trait]
-impl AgentHarness for NoMcpHarness {
+impl Script for NoMcpScript {
     fn capabilities(&self) -> HarnessCapabilities {
         HarnessCapabilities {
             live_approvals: false,
@@ -1629,29 +1211,25 @@ impl AgentHarness for NoMcpHarness {
         Ok(Vec::new())
     }
 
-    async fn open_thread(&self, _opts: OpenThreadOptions) -> Result<ThreadHandle, HarnessError> {
+    async fn open_thread(
+        &self,
+        _core: &FakeCore,
+        _opts: &OpenThreadOptions,
+    ) -> Result<ThreadHandle, HarnessError> {
         Err(HarnessError::Unsupported(
             "thread opening is not supported by this harness".into(),
         ))
     }
 
-    async fn start_turn(
-        &self,
-        _thread: &ThreadHandle,
-        _input: UserInput,
-        _overrides: TurnOverrides,
-    ) -> Result<TurnId, HarnessError> {
+    async fn start_turn(&self, _core: &FakeCore, _call: &TurnCall) -> Result<(), HarnessError> {
         Err(HarnessError::Unsupported(
             "turns are not supported by this harness".into(),
         ))
     }
 
-    fn subscribe(&self, _thread: &ThreadHandle) -> AgentEventStream {
-        AgentEventStream::closed()
-    }
-
     async fn respond_approval(
         &self,
+        _core: &FakeCore,
         _req: ApprovalId,
         _decision: ApprovalDecision,
     ) -> Result<(), HarnessError> {
@@ -1662,6 +1240,7 @@ impl AgentHarness for NoMcpHarness {
 
     async fn respond_server_request(
         &self,
+        _core: &FakeCore,
         _req: ServerRequestId,
         _response: ServerRequestResponse,
     ) -> Result<(), HarnessError> {
@@ -1670,14 +1249,14 @@ impl AgentHarness for NoMcpHarness {
         ))
     }
 
-    async fn interrupt(&self, _thread: &ThreadHandle) -> Result<(), HarnessError> {
+    async fn interrupt(
+        &self,
+        _core: &FakeCore,
+        _thread: &ThreadHandle,
+    ) -> Result<(), HarnessError> {
         Err(HarnessError::Unsupported(
             "interrupts are not supported by this harness".into(),
         ))
-    }
-
-    async fn shutdown(&self) -> Result<(), HarnessError> {
-        Ok(())
     }
 }
 
@@ -1974,47 +1553,52 @@ async fn start_server_with_fixture_and_extra_config_on_available_port(
 }
 
 async fn start_no_mcp_server_on_available_port() -> TestServer {
-    start_custom_server_on_available_port(factory::from_fn(|_, _| Ok(Arc::new(NoMcpHarness)))).await
+    start_custom_server_on_available_port(fake::factory(FakeHarness::new(NoMcpScript))).await
 }
 
 async fn start_unsupported_compaction_server_on_available_port() -> TestServer {
-    start_custom_server_on_available_port(factory::from_fn(|_, _| {
-        Ok(Arc::new(UnsupportedCompactionHarness::default()))
-    }))
+    start_custom_server_on_available_port(fake::factory(FakeHarness::new(
+        UnsupportedCompactionScript,
+    )))
     .await
 }
 
 async fn start_slow_compaction_server_on_available_port() -> TestServer {
-    start_custom_server_on_available_port(factory::from_fn(|_, _| {
-        Ok(Arc::new(SlowCompactionHarness::default()))
-    }))
+    start_custom_server_on_available_port(fake::factory(FakeHarness::new(
+        SlowCompactionScript::open(),
+    )))
     .await
 }
 
 async fn start_held_compaction_server_on_available_port(
-    harness: Arc<SlowCompactionHarness>,
+    harness: Arc<FakeHarness<SlowCompactionScript>>,
 ) -> TestServer {
-    start_custom_server_on_available_port(factory::shared(harness)).await
+    start_custom_server_on_available_port(fake::factory(harness)).await
 }
 
-async fn start_slow_start_server_on_available_port(harness: Arc<SlowStartHarness>) -> TestServer {
-    start_custom_server_on_available_port(factory::shared(harness)).await
+async fn start_slow_start_server_on_available_port(
+    harness: Arc<FakeHarness<SlowStartScript>>,
+) -> TestServer {
+    start_custom_server_on_available_port(fake::factory(harness)).await
 }
 
-async fn start_activity_server_on_available_port(harness: Arc<ActivityHarness>) -> TestServer {
-    let factory = factory::from_fn(move |_, bootstrap| {
-        // Factory creation precedes harness publication, so no harness operation can hold this
-        // lock. Surface a violated lifecycle invariant as a harness error instead of panicking.
-        let mut routes = harness.native_routes.try_lock().map_err(|_| {
-            HarnessError::Transport("activity harness routes were busy during bootstrap".into())
-        })?;
-        for binding in bootstrap.known_threads {
-            routes.insert(binding.harness_thread_id, binding.thread_id);
-        }
-        drop(routes);
-        Ok(harness.clone())
-    });
-    start_custom_server_on_available_port(factory).await
+async fn start_activity_server_on_available_port(
+    harness: Arc<FakeHarness<ActivityScript>>,
+) -> TestServer {
+    start_custom_server_on_available_port(fake::factory(harness)).await
+}
+
+/// As above, with a driver probe installed so a test can await an admission by native id
+/// instead of polling the store for the thread file it wrote.
+async fn start_activity_server_with_probe(
+    harness: Arc<FakeHarness<ActivityScript>>,
+) -> (TestServer, DriverProbe) {
+    let (sink, probe) = driver::probe();
+    let server = TestServer::builder(fake::factory(harness))
+        .driver_events(sink)
+        .start()
+        .await;
+    (server, probe)
 }
 
 async fn start_custom_server_on_available_port(
@@ -2144,34 +1728,6 @@ async fn open_subagent_link(
         .send()
         .await
         .unwrap()
-}
-
-async fn wait_for_native_thread(
-    state: &AppState,
-    project_id: ProjectId,
-    harness_thread_id: &str,
-) -> giskard_persist::store::ThreadFile {
-    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
-    loop {
-        for thread_id in state.store.list_threads(project_id).await.unwrap() {
-            let Some(thread) = state
-                .store
-                .load_thread(project_id, thread_id)
-                .await
-                .unwrap()
-            else {
-                // Thread creation rollback can remove an entry after the listing snapshot.
-                continue;
-            };
-            if thread.harness_thread_id == harness_thread_id {
-                return thread;
-            }
-        }
-        if tokio::time::Instant::now() >= deadline {
-            panic!("native thread {harness_thread_id} was not materialized");
-        }
-        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
-    }
 }
 
 async fn wait_for_ws_error(
@@ -2545,7 +2101,7 @@ fn is_turn_completed_activity(kind: &ThreadActivityKind) -> bool {
 
 #[tokio::test]
 async fn send_input_rejects_second_turn_before_turn_started() {
-    let harness = Arc::new(SlowStartHarness::new());
+    let harness = FakeHarness::new(SlowStartScript::new());
     let server = start_slow_start_server_on_available_port(harness.clone()).await;
     let state = &server.state;
     let port = server.addr.port();
@@ -2581,7 +2137,10 @@ async fn send_input_rejects_second_turn_before_turn_started() {
         ))
         .await
         .unwrap();
-    harness.wait_for_start_calls(1).await;
+    harness
+        .core
+        .wait_for_calls(|c| matches!(c, Call::StartTurn { .. }), 1)
+        .await;
 
     second
         .send(tokio_tungstenite::tungstenite::Message::Text(
@@ -2599,9 +2158,12 @@ async fn send_input_rejects_second_turn_before_turn_started() {
     let error = wait_for_ws_error(&mut second, "send_input", "thread_turn_active").await;
     assert_eq!(error.severity, ErrorSeverity::Error);
     assert_eq!(error.thread_id, Some(thread_id));
-    assert_eq!(harness.start_calls(), 1);
+    assert_eq!(
+        harness.core.count(|c| matches!(c, Call::StartTurn { .. })),
+        1
+    );
 
-    harness.release_first_start();
+    harness.script.release_first_start();
     wait_for_turn_completed(&mut first, thread_id).await;
 
     second
@@ -2616,14 +2178,20 @@ async fn send_input_rejects_second_turn_before_turn_started() {
         ))
         .await
         .unwrap();
-    harness.wait_for_start_calls(2).await;
+    harness
+        .core
+        .wait_for_calls(|c| matches!(c, Call::StartTurn { .. }), 2)
+        .await;
     wait_for_turn_completed(&mut second, thread_id).await;
-    assert_eq!(harness.start_calls(), 2);
+    assert_eq!(
+        harness.core.count(|c| matches!(c, Call::StartTurn { .. })),
+        2
+    );
 }
 
 #[tokio::test]
 async fn cancelling_start_turn_caller_does_not_abandon_admitted_operation() {
-    let harness = Arc::new(SlowStartHarness::new());
+    let harness = FakeHarness::new(SlowStartScript::new());
     let server = start_slow_start_server_on_available_port(harness.clone()).await;
     let state = &server.state;
     let base = server.base.clone();
@@ -2653,9 +2221,12 @@ async fn cancelling_start_turn_caller_does_not_abandon_admitted_operation() {
             )
             .await
     });
-    harness.wait_for_start_calls(1).await;
+    harness
+        .core
+        .wait_for_calls(|c| matches!(c, Call::StartTurn { .. }), 1)
+        .await;
     request.abort();
-    harness.release_first_start();
+    harness.script.release_first_start();
 
     let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
     while state.registry.thread_has_active_turn(thread_id).await {
@@ -2680,12 +2251,15 @@ async fn cancelling_start_turn_caller_does_not_abandon_admitted_operation() {
         )
         .await
         .expect("the completed detached operation must not strand admission");
-    assert_eq!(harness.start_calls(), 2);
+    assert_eq!(
+        harness.core.count(|c| matches!(c, Call::StartTurn { .. })),
+        2
+    );
 }
 
 #[tokio::test]
 async fn cancelling_compaction_caller_does_not_abandon_admitted_operation() {
-    let harness = Arc::new(SlowCompactionHarness::held());
+    let harness = FakeHarness::new(SlowCompactionScript::held());
     let server = start_held_compaction_server_on_available_port(harness.clone()).await;
     let state = &server.state;
     let base = server.base.clone();
@@ -2706,9 +2280,12 @@ async fn cancelling_compaction_caller_does_not_abandon_admitted_operation() {
             .compact_thread(thread_id, model, thread.mode.as_known().unwrap())
             .await
     });
-    harness.wait_for_compact_calls(1).await;
+    harness
+        .core
+        .wait_for_calls(|c| matches!(c, Call::CompactThread { .. }), 1)
+        .await;
     request.abort();
-    harness.release_compaction();
+    harness.script.release_compaction();
 
     let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(7);
     while state.registry.thread_has_active_turn(thread_id).await {
@@ -2807,7 +2384,7 @@ async fn subscribe_thread_state_reports_a_turn_that_ended_before_the_socket_atta
 /// The turn gate, reserved before the start request returns, is what covers this window.
 #[tokio::test]
 async fn subscribe_thread_state_reports_a_turn_the_harness_has_not_streamed_yet() {
-    let harness = Arc::new(SlowStartHarness::new());
+    let harness = FakeHarness::new(SlowStartScript::new());
     let server = start_slow_start_server_on_available_port(harness.clone()).await;
     let state = &server.state;
     let port = server.addr.port();
@@ -2840,7 +2417,10 @@ async fn subscribe_thread_state_reports_a_turn_the_harness_has_not_streamed_yet(
         ))
         .await
         .unwrap();
-    harness.wait_for_start_calls(1).await;
+    harness
+        .core
+        .wait_for_calls(|c| matches!(c, Call::StartTurn { .. }), 1)
+        .await;
     assert!(
         !state
             .registry
@@ -2870,7 +2450,7 @@ async fn subscribe_thread_state_reports_a_turn_the_harness_has_not_streamed_yet(
         "a turn the harness has accepted is running, even before it streams anything"
     );
 
-    harness.release_first_start();
+    harness.script.release_first_start();
     wait_for_turn_completed(&mut sender, thread_id).await;
 }
 
@@ -3411,7 +2991,7 @@ async fn inactive_thread_progress_sends_activity_without_full_event_subscription
 
 #[tokio::test]
 async fn inactive_thread_requests_send_activity_and_route_responses() {
-    let harness = Arc::new(ActivityHarness::default());
+    let harness = FakeHarness::new(ActivityScript::default());
     let server = start_activity_server_on_available_port(harness.clone()).await;
     let state = &server.state;
     let port = server.addr.port();
@@ -3479,7 +3059,7 @@ async fn inactive_thread_requests_send_activity_and_route_responses() {
     .await
     .unwrap();
 
-    let (handled_approval, decision) = harness.wait_for_approval_response().await;
+    let (handled_approval, decision) = wait_for_approval_response(&harness.core).await;
     assert_eq!(handled_approval.0, approval_id);
     assert_eq!(decision, ApprovalDecision::Accept);
     let completion_activity = wait_for_thread_activity(
@@ -3532,7 +3112,7 @@ async fn inactive_thread_requests_send_activity_and_route_responses() {
     .await
     .unwrap();
 
-    let (handled_request, response) = harness.wait_for_server_response().await;
+    let (handled_request, response) = wait_for_server_response(&harness.core).await;
     assert_eq!(handled_request.0, server_request_id);
     match response {
         ServerRequestResponse::Result { value } => {
@@ -3553,7 +3133,7 @@ async fn inactive_thread_requests_send_activity_and_route_responses() {
 
 #[tokio::test]
 async fn approval_decision_broadcasts_resolution_to_other_tabs() {
-    let harness = Arc::new(ActivityHarness::default());
+    let harness = FakeHarness::new(ActivityScript::default());
     let server = start_activity_server_on_available_port(harness.clone()).await;
     let state = &server.state;
     let port = server.addr.port();
@@ -3610,7 +3190,7 @@ async fn approval_decision_broadcasts_resolution_to_other_tabs() {
     let decision =
         wait_for_approval_resolution(&mut second_ws, thread_id, &first_approval_id).await;
     assert_eq!(decision, ApprovalDecision::Accept);
-    let (handled_approval, handled_decision) = harness.wait_for_approval_response().await;
+    let (handled_approval, handled_decision) = wait_for_approval_response(&harness.core).await;
     assert_eq!(handled_approval.0, first_approval_id);
     assert_eq!(handled_decision, ApprovalDecision::Accept);
 }
@@ -3872,7 +3452,7 @@ async fn thread_rename_updates_thread_summary_and_persistence() {
 
 #[tokio::test]
 async fn importing_subagent_thread_records_parent_and_reuses_native_child() {
-    let harness = Arc::new(ActivityHarness::default());
+    let harness = FakeHarness::new(ActivityScript::default());
     let server = start_activity_server_on_available_port(harness.clone()).await;
     let state = &server.state;
     let base = server.base.clone();
@@ -3949,17 +3529,14 @@ async fn importing_subagent_thread_records_parent_and_reuses_native_child() {
     assert_eq!(saved.spawned_by_turn_id, Some(spawned_by_turn_id));
     assert_eq!(saved.kind, giskard_core::ThreadKind::Subagent);
     assert!(
-        !harness
-            .resumed_native_ids()
-            .await
+        !resumed_native_ids(&harness.core)
             .iter()
             .any(|native_id| native_id == "native-child"),
         "materializing a read-only sub-agent must not issue a native resume"
     );
 
-    harness.wait_for_subscribers(child_id, 1).await;
-    let external_turn = harness
-        .emit_external_turn(child_id, "subagent live output")
+    harness.core.wait_for_readers(child_id, 1).await;
+    let external_turn = emit_external_turn(&harness.core, child_id, "subagent live output")
         .await
         .unwrap();
     let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
@@ -3984,10 +3561,7 @@ async fn importing_subagent_thread_records_parent_and_reuses_native_child() {
         }
         tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
     }
-    harness
-        .complete_turn(parent_id, spawned_by_turn_id)
-        .await
-        .unwrap();
+    harness.core.complete_turn(parent_id, spawned_by_turn_id);
 
     let listed = client
         .get(format!("{base}/api/projects/{project_id}/threads"))
@@ -4040,8 +3614,8 @@ async fn importing_subagent_thread_records_parent_and_reuses_native_child() {
 
 #[tokio::test]
 async fn route_and_forwarder_import_same_native_child_once() {
-    let harness = Arc::new(ActivityHarness::default());
-    harness.hold_native_child_open();
+    let harness = FakeHarness::new(ActivityScript::default());
+    harness.script.hold_native_child_open();
     let server = start_activity_server_on_available_port(harness.clone()).await;
     let state = &server.state;
     let base = server.base.clone();
@@ -4082,7 +3656,7 @@ async fn route_and_forwarder_import_same_native_child_once() {
         .await
         .unwrap();
 
-    harness.wait_for_native_child_open().await;
+    harness.script.child_open.wait_blocked().await;
     let link_item_id = wait_for_live_item_id(state, parent_id, "subagent_activity_").await;
 
     let blocked_delete = tokio::time::timeout(
@@ -4114,7 +3688,7 @@ async fn route_and_forwarder_import_same_native_child_once() {
         .await
     });
     tokio::task::yield_now().await;
-    harness.release_native_child_open();
+    harness.script.release_native_child_open();
 
     let route_response = route_import.await.unwrap();
     assert_eq!(route_response.status(), 200);
@@ -4139,9 +3713,7 @@ async fn route_and_forwarder_import_same_native_child_once() {
     assert_eq!(native_children[0].id, route_child_id);
     // Both admissions use the harness's idempotent claim instead of resuming provider-owned work.
     assert_eq!(
-        harness
-            .resumed_native_ids()
-            .await
+        resumed_native_ids(&harness.core)
             .iter()
             .filter(|native_id| *native_id == "native-child")
             .count(),
@@ -4149,28 +3721,22 @@ async fn route_and_forwarder_import_same_native_child_once() {
         "claiming a native child must not resume it"
     );
     assert_eq!(
-        harness
-            .claims()
-            .await
+        claims(&harness.core)
             .iter()
             .filter(|(native_id, _)| native_id == "native-child")
             .count(),
         2
     );
 
-    harness
-        .emit_external_turn(route_child_id, "child complete")
+    emit_external_turn(&harness.core, route_child_id, "child complete")
         .await
         .unwrap();
-    harness
-        .complete_turn(parent_id, spawned_by_turn_id)
-        .await
-        .unwrap();
+    harness.core.complete_turn(parent_id, spawned_by_turn_id);
 }
 
 #[tokio::test]
 async fn passive_subagent_command_start_streams_before_completion() {
-    let harness = Arc::new(ActivityHarness::default());
+    let harness = FakeHarness::new(ActivityScript::default());
     let server = start_activity_server_on_available_port(harness.clone()).await;
     let state = &server.state;
     let port = server.addr.port();
@@ -4234,7 +3800,7 @@ async fn passive_subagent_command_start_streams_before_completion() {
         tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
     };
 
-    harness.wait_for_subscribers(child_id, 1).await;
+    harness.core.wait_for_readers(child_id, 1).await;
 
     let mut ws = ws::connect(([127, 0, 0, 1], port).into(), &cookie).await;
     ws.send(tokio_tungstenite::tungstenite::Message::Text(
@@ -4345,10 +3911,10 @@ async fn passive_subagent_command_start_streams_before_completion() {
     assert!(!state.registry.thread_has_active_turn(child_id).await);
 
     let command = "sleep 30";
-    let (external_turn, command_item_id) = harness
-        .emit_external_command_without_completion(child_id, command)
-        .await
-        .unwrap();
+    let (external_turn, command_item_id) =
+        emit_external_command_without_completion(&harness.core, child_id, command)
+            .await
+            .unwrap();
     let streamed_turn = wait_for_command_started(&mut ws, child_id, command).await;
     assert_eq!(streamed_turn, external_turn);
 
@@ -4411,16 +3977,18 @@ async fn passive_subagent_command_start_streams_before_completion() {
         "sub-agent turn should not be persisted before completion"
     );
 
-    harness
-        .complete_external_command(child_id, external_turn, command_item_id, command)
-        .await
-        .unwrap();
-    harness
-        .complete_turn(child_id, external_turn)
-        .await
-        .unwrap();
+    complete_external_command(
+        &harness.core,
+        child_id,
+        external_turn,
+        command_item_id,
+        command,
+    )
+    .await
+    .unwrap();
+    harness.core.complete_turn(child_id, external_turn);
     wait_for_turn_completed(&mut ws, child_id).await;
-    harness.wait_for_subscriber_count(child_id, 1).await;
+    harness.core.wait_for_reader_count(child_id, 1).await;
 
     ws.send(tokio_tungstenite::tungstenite::Message::Text(
         serde_json::to_string(&ClientMessage::SendInput {
@@ -4444,15 +4012,12 @@ async fn passive_subagent_command_start_streams_before_completion() {
             .iter()
             .all(|turn| turn.user_input.as_text() != Some("idle child follow-up"))
     );
-    harness
-        .complete_turn(parent_id, spawned_by_turn_id)
-        .await
-        .unwrap();
+    harness.core.complete_turn(parent_id, spawned_by_turn_id);
 }
 
 #[tokio::test]
 async fn collab_agent_spawn_start_imports_subagent_thread() {
-    let harness = Arc::new(ActivityHarness::default());
+    let harness = FakeHarness::new(ActivityScript::default());
     let server = start_activity_server_on_available_port(harness.clone()).await;
     let state = &server.state;
     let base = server.base.clone();
@@ -4523,9 +4088,8 @@ async fn collab_agent_spawn_start_imports_subagent_thread() {
     assert_eq!(child.revision, 1);
     assert_eq!(child.title, "Sub-agent: explorer");
 
-    harness.wait_for_subscribers(child.id, 1).await;
-    let external_turn = harness
-        .emit_external_turn(child.id, "collab child output")
+    harness.core.wait_for_readers(child.id, 1).await;
+    let external_turn = emit_external_turn(&harness.core, child.id, "collab child output")
         .await
         .unwrap();
     let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
@@ -4554,7 +4118,7 @@ async fn collab_agent_spawn_start_imports_subagent_thread() {
 
 #[tokio::test]
 async fn collab_agent_spawn_uses_tool_input_prompt_when_link_prompt_is_missing() {
-    let harness = Arc::new(ActivityHarness::default());
+    let harness = FakeHarness::new(ActivityScript::default());
     let server = start_activity_server_on_available_port(harness.clone()).await;
     let state = &server.state;
     let port = server.addr.port();
@@ -4618,7 +4182,7 @@ async fn collab_agent_spawn_uses_tool_input_prompt_when_link_prompt_is_missing()
         tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
     };
 
-    harness.wait_for_subscribers(child.id, 1).await;
+    harness.core.wait_for_readers(child.id, 1).await;
     let mut ws = ws::connect(([127, 0, 0, 1], port).into(), &cookie).await;
     ws.send(tokio_tungstenite::tungstenite::Message::Text(
         serde_json::to_string(&ClientMessage::Subscribe {
@@ -4632,20 +4196,17 @@ async fn collab_agent_spawn_uses_tool_input_prompt_when_link_prompt_is_missing()
     .unwrap();
     wait_for_thread_state(&mut ws, child.id).await;
 
-    let external_turn = harness
-        .emit_external_turn_without_completion(child.id, "fallback child output")
-        .await
-        .unwrap();
+    let external_turn =
+        emit_external_turn_without_completion(&harness.core, child.id, "fallback child output")
+            .await
+            .unwrap();
     let (streamed_turn, streamed_input) = wait_for_turn_started_with_input(&mut ws, child.id).await;
     assert_eq!(streamed_turn, external_turn);
     assert_eq!(
         streamed_input.as_ref().and_then(UserInput::as_text),
         Some("Sub-agent turn")
     );
-    harness
-        .complete_turn(child.id, external_turn)
-        .await
-        .unwrap();
+    harness.core.complete_turn(child.id, external_turn);
 
     let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
     loop {
@@ -4673,7 +4234,7 @@ async fn collab_agent_spawn_uses_tool_input_prompt_when_link_prompt_is_missing()
 
 #[tokio::test]
 async fn passive_subagent_prompt_updates_when_spawn_metadata_arrives_late() {
-    let harness = Arc::new(ActivityHarness::default());
+    let harness = FakeHarness::new(ActivityScript::default());
     let server = start_activity_server_on_available_port(harness.clone()).await;
     let state = &server.state;
     let base = server.base.clone();
@@ -4736,16 +4297,16 @@ async fn passive_subagent_prompt_updates_when_spawn_metadata_arrives_late() {
         tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
     };
 
-    harness.wait_for_subscribers(child.id, 1).await;
-    let external_turn = harness
-        .emit_external_turn_without_completion(child.id, "delayed metadata child output")
-        .await
-        .unwrap();
+    harness.core.wait_for_readers(child.id, 1).await;
+    let external_turn = emit_external_turn_without_completion(
+        &harness.core,
+        child.id,
+        "delayed metadata child output",
+    )
+    .await
+    .unwrap();
     tokio::time::sleep(tokio::time::Duration::from_millis(300)).await;
-    harness
-        .complete_turn(child.id, external_turn)
-        .await
-        .unwrap();
+    harness.core.complete_turn(child.id, external_turn);
     let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
     loop {
         let turns = state
@@ -4778,7 +4339,7 @@ async fn passive_subagent_prompt_updates_when_spawn_metadata_arrives_late() {
 
 #[tokio::test]
 async fn server_resolved_subagent_link_uses_agent_name_prompt_and_turn() {
-    let harness = Arc::new(ActivityHarness::default());
+    let harness = FakeHarness::new(ActivityScript::default());
     let server = start_activity_server_on_available_port(harness.clone()).await;
     let state = &server.state;
     let port = server.addr.port();
@@ -4834,7 +4395,7 @@ async fn server_resolved_subagent_link_uses_agent_name_prompt_and_turn() {
     assert_eq!(child.parent_thread_id, Some(parent_id));
     assert_eq!(child.spawned_by_turn_id, Some(spawned_by_turn_id));
 
-    harness.wait_for_subscribers(child_id, 1).await;
+    harness.core.wait_for_readers(child_id, 1).await;
     let mut ws = ws::connect(([127, 0, 0, 1], port).into(), &cookie).await;
     ws.send(tokio_tungstenite::tungstenite::Message::Text(
         serde_json::to_string(&ClientMessage::Subscribe {
@@ -4848,10 +4409,13 @@ async fn server_resolved_subagent_link_uses_agent_name_prompt_and_turn() {
     .unwrap();
     wait_for_thread_state(&mut ws, child_id).await;
 
-    let external_turn = harness
-        .emit_external_turn_without_completion(child_id, "server-resolved child output")
-        .await
-        .unwrap();
+    let external_turn = emit_external_turn_without_completion(
+        &harness.core,
+        child_id,
+        "server-resolved child output",
+    )
+    .await
+    .unwrap();
     let (streamed_turn, streamed_input) = wait_for_turn_started_with_input(&mut ws, child_id).await;
     assert_eq!(streamed_turn, external_turn);
     assert_eq!(
@@ -4873,10 +4437,7 @@ async fn server_resolved_subagent_link_uses_agent_name_prompt_and_turn() {
         wait_for_agent_message_item(&mut ws, child_id, "server-resolved child output").await;
     assert_eq!(streamed_turn, external_turn);
 
-    harness
-        .complete_turn(child_id, external_turn)
-        .await
-        .unwrap();
+    harness.core.complete_turn(child_id, external_turn);
     let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
     loop {
         let turns = state
@@ -4905,15 +4466,12 @@ async fn server_resolved_subagent_link_uses_agent_name_prompt_and_turn() {
         }
         tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
     }
-    harness
-        .complete_turn(parent_id, spawned_by_turn_id)
-        .await
-        .unwrap();
+    harness.core.complete_turn(parent_id, spawned_by_turn_id);
 }
 
 #[tokio::test]
 async fn subagent_link_open_rejects_unknown_and_non_link_items() {
-    let harness = Arc::new(ActivityHarness::default());
+    let harness = FakeHarness::new(ActivityScript::default());
     let server = start_activity_server_on_available_port(harness.clone()).await;
     let state = &server.state;
     let base = server.base.clone();
@@ -4974,13 +4532,13 @@ async fn subagent_link_open_rejects_unknown_and_non_link_items() {
     )
     .await;
     assert_eq!(unknown.status(), 409);
-    harness.complete_turn(parent_id, turn_id).await.unwrap();
+    harness.core.complete_turn(parent_id, turn_id);
 }
 
 #[tokio::test]
 async fn terminal_subagent_link_does_not_synthesize_a_fallback_turn() {
-    let harness = Arc::new(ActivityHarness::default());
-    harness.hold_native_child_open();
+    let harness = FakeHarness::new(ActivityScript::default());
+    harness.script.hold_native_child_open();
     let server = start_activity_server_on_available_port(harness.clone()).await;
     let state = &server.state;
     let base = server.base.clone();
@@ -5020,7 +4578,7 @@ async fn terminal_subagent_link_does_not_synthesize_a_fallback_turn() {
         .await
         .unwrap();
 
-    harness.wait_for_native_child_open().await;
+    harness.script.child_open.wait_blocked().await;
     let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
     loop {
         let terminal_link_persisted = state
@@ -5039,7 +4597,7 @@ async fn terminal_subagent_link_does_not_synthesize_a_fallback_turn() {
         }
         tokio::task::yield_now().await;
     }
-    harness.release_native_child_open();
+    harness.script.release_native_child_open();
 
     let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
     let child = loop {
@@ -5076,12 +4634,12 @@ async fn terminal_subagent_link_does_not_synthesize_a_fallback_turn() {
             .is_empty(),
         "parent terminal evidence must not synthesize a child turn"
     );
-    harness.wait_for_subscriber_count(child.id, 1).await;
+    harness.core.wait_for_reader_count(child.id, 1).await;
 }
 
 #[tokio::test]
 async fn persisted_or_interrupted_subagent_keeps_one_event_owner() {
-    let harness = Arc::new(ActivityHarness::default());
+    let harness = FakeHarness::new(ActivityScript::default());
     let server = start_activity_server_on_available_port(harness.clone()).await;
     let state = &server.state;
     let base = server.base.clone();
@@ -5144,9 +4702,8 @@ async fn persisted_or_interrupted_subagent_keeps_one_event_owner() {
         tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
     };
 
-    harness.wait_for_subscribers(child.id, 1).await;
-    let child_turn = harness
-        .emit_external_turn(child.id, "persisted child output")
+    harness.core.wait_for_readers(child.id, 1).await;
+    let child_turn = emit_external_turn(&harness.core, child.id, "persisted child output")
         .await
         .unwrap();
     let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
@@ -5166,11 +4723,8 @@ async fn persisted_or_interrupted_subagent_keeps_one_event_owner() {
         }
         tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
     }
-    harness.wait_for_subscriber_count(child.id, 1).await;
-    harness
-        .complete_turn(parent_id, spawned_by_turn_id)
-        .await
-        .unwrap();
+    harness.core.wait_for_reader_count(child.id, 1).await;
+    harness.core.complete_turn(parent_id, spawned_by_turn_id);
     let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
     loop {
         if !state.registry.thread_has_active_turn(parent_id).await
@@ -5220,7 +4774,7 @@ async fn persisted_or_interrupted_subagent_keeps_one_event_owner() {
         }
         tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
     }
-    harness.wait_for_subscriber_count(child.id, 1).await;
+    harness.core.wait_for_reader_count(child.id, 1).await;
 
     let interrupted_item_id = state
         .store
@@ -5249,7 +4803,7 @@ async fn persisted_or_interrupted_subagent_keeps_one_event_owner() {
     )
     .await;
     assert_eq!(reopen.status(), 200);
-    harness.wait_for_subscriber_count(child.id, 1).await;
+    harness.core.wait_for_reader_count(child.id, 1).await;
     let after_reopen = state
         .store
         .load_thread(project_id, child.id)
@@ -5262,7 +4816,7 @@ async fn persisted_or_interrupted_subagent_keeps_one_event_owner() {
 #[tokio::test]
 async fn reverse_subagent_activity_preserves_parent_and_uses_one_forwarder() {
     install_registry_event_capture();
-    let harness = Arc::new(ActivityHarness::default());
+    let harness = FakeHarness::new(ActivityScript::default());
     let server = start_activity_server_on_available_port(harness.clone()).await;
     let state = &server.state;
     let port = server.addr.port();
@@ -5325,7 +4879,7 @@ async fn reverse_subagent_activity_preserves_parent_and_uses_one_forwarder() {
         }
         tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
     };
-    harness.wait_for_subscribers(child.id, 1).await;
+    harness.core.wait_for_readers(child.id, 1).await;
     assert!(state.registry.thread_has_active_turn(parent_id).await);
 
     let mut child_ws = ws::connect(([127, 0, 0, 1], port).into(), &cookie).await;
@@ -5342,8 +4896,7 @@ async fn reverse_subagent_activity_preserves_parent_and_uses_one_forwarder() {
         .unwrap();
     wait_for_thread_state(&mut child_ws, child.id).await;
 
-    let child_turn = harness
-        .emit_external_reverse_activity(child.id, "native-parent")
+    let child_turn = emit_external_reverse_activity(&harness.core, child.id, "native-parent")
         .await
         .unwrap();
 
@@ -5526,12 +5079,12 @@ async fn reverse_subagent_activity_preserves_parent_and_uses_one_forwarder() {
         .await
         .unwrap();
 
-    harness.complete_turn(parent_id, parent_turn).await.unwrap();
+    harness.core.complete_turn(parent_id, parent_turn);
 }
 
 #[tokio::test]
 async fn route_rejects_native_child_with_a_different_parent() {
-    let harness = Arc::new(ActivityHarness::default());
+    let harness = FakeHarness::new(ActivityScript::default());
     let server = start_activity_server_on_available_port(harness).await;
     let state = &server.state;
     let base = server.base.clone();
@@ -5574,15 +5127,32 @@ async fn route_rejects_native_child_with_a_different_parent() {
     assert_eq!(import.status(), 409);
     let thread_ids = state.store.list_threads(project_id).await.unwrap();
     assert_eq!(thread_ids.len(), 2);
-    let foreign = wait_for_native_thread(state, project_id, "native-foreign-child").await;
+    // The rejected link still left the foreign child installed as an orphan, and the listing
+    // above already saw it, so this is an assertion rather than a wait. The probe cannot serve
+    // it: the admission that installs an orphan reports `Ok(None)`, indistinguishable from a
+    // refusal until the disposition reaches the event.
+    let mut foreign = None;
+    for thread_id in &thread_ids {
+        let thread = state
+            .store
+            .load_thread(project_id, *thread_id)
+            .await
+            .unwrap()
+            .unwrap();
+        if thread.harness_thread_id == "native-foreign-child" {
+            foreign = Some(thread);
+            break;
+        }
+    }
+    let foreign = foreign.expect("the rejected link must leave the foreign child as an orphan");
     assert_eq!(foreign.kind, giskard_core::ThreadKind::Orphan);
     assert_eq!(foreign.parent_thread_id, None);
 }
 
 #[tokio::test]
 async fn parent_deletion_cascades_to_all_descendants_leaf_first() {
-    let harness = Arc::new(ActivityHarness::default());
-    let server = start_activity_server_on_available_port(harness.clone()).await;
+    let harness = FakeHarness::new(ActivityScript::default());
+    let (server, mut probe) = start_activity_server_with_probe(harness.clone()).await;
     let state = &server.state;
     let base = server.base.clone();
     let client = reqwest::Client::new();
@@ -5620,9 +5190,17 @@ async fn parent_deletion_cascades_to_all_descendants_leaf_first() {
         )
         .await
         .unwrap();
-    let child = wait_for_native_thread(state, project_id, "native-collab-child").await;
+    let child = {
+        let id = probe.expect_admitted("native-collab-child").await;
+        state
+            .store
+            .load_thread(project_id, id)
+            .await
+            .unwrap()
+            .unwrap()
+    };
     let child_id = child.id;
-    harness.wait_for_subscribers(child_id, 1).await;
+    harness.core.wait_for_readers(child_id, 1).await;
     let child_handle = state
         .registry
         .loaded_thread_binding(child_id)
@@ -5643,11 +5221,19 @@ async fn parent_deletion_cascades_to_all_descendants_leaf_first() {
         )
         .await
         .unwrap();
-    let grandchild = wait_for_native_thread(state, project_id, "native-grandchild").await;
+    let grandchild = {
+        let id = probe.expect_admitted("native-grandchild").await;
+        state
+            .store
+            .load_thread(project_id, id)
+            .await
+            .unwrap()
+            .unwrap()
+    };
     let grandchild_id = grandchild.id;
-    harness.complete_turn(child_id, child_turn).await.unwrap();
-    harness.complete_turn(parent_id, parent_turn).await.unwrap();
-    harness.wait_for_subscriber_count(child_id, 1).await;
+    harness.core.complete_turn(child_id, child_turn);
+    harness.core.complete_turn(parent_id, parent_turn);
+    harness.core.wait_for_reader_count(child_id, 1).await;
     let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
     while state.registry.thread_has_active_turn(parent_id).await {
         if tokio::time::Instant::now() >= deadline {
@@ -5694,7 +5280,7 @@ async fn parent_deletion_cascades_to_all_descendants_leaf_first() {
         );
     }
     assert_eq!(
-        harness.deleted_harness_thread_ids().await,
+        deleted_harness_thread_ids(&harness.core),
         vec![
             "native-grandchild".to_string(),
             "native-collab-child".to_string(),
@@ -5705,8 +5291,8 @@ async fn parent_deletion_cascades_to_all_descendants_leaf_first() {
 
 #[tokio::test]
 async fn parent_deletion_rejects_active_descendant_before_deleting_anything() {
-    let harness = Arc::new(ActivityHarness::default());
-    let server = start_activity_server_on_available_port(harness.clone()).await;
+    let harness = FakeHarness::new(ActivityScript::default());
+    let (server, mut probe) = start_activity_server_with_probe(harness.clone()).await;
     let state = &server.state;
     let base = server.base.clone();
     let client = reqwest::Client::new();
@@ -5744,10 +5330,18 @@ async fn parent_deletion_rejects_active_descendant_before_deleting_anything() {
         )
         .await
         .unwrap();
-    let child_file = wait_for_native_thread(state, project_id, "native-collab-child").await;
+    let child_file = {
+        let id = probe.expect_admitted("native-collab-child").await;
+        state
+            .store
+            .load_thread(project_id, id)
+            .await
+            .unwrap()
+            .unwrap()
+    };
     let child_id = child_file.id;
-    harness.wait_for_subscribers(child_id, 1).await;
-    harness.complete_turn(parent_id, parent_turn).await.unwrap();
+    harness.core.wait_for_readers(child_id, 1).await;
+    harness.core.complete_turn(parent_id, parent_turn);
     let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
     while state.registry.thread_has_active_turn(parent_id).await {
         if tokio::time::Instant::now() >= deadline {
@@ -5793,7 +5387,7 @@ async fn parent_deletion_rejects_active_descendant_before_deleting_anything() {
         .unwrap();
     assert_eq!(deletion.status(), 409);
     assert_eq!(state.store.list_threads(project_id).await.unwrap().len(), 2);
-    assert!(harness.deleted_harness_thread_ids().await.is_empty());
+    assert!(deleted_harness_thread_ids(&harness.core).is_empty());
 }
 
 #[tokio::test]
@@ -5893,12 +5487,10 @@ async fn thread_delete_removes_native_and_persisted_thread() {
 
 #[tokio::test]
 async fn project_remove_shuts_down_harness_and_removes_giskard_data_only() {
-    let harness = Arc::new(CountingOpenHarness::default());
-    let server = start_custom_server_with_extra_config_on_available_port(
-        factory::shared(harness.clone()),
-        "",
-    )
-    .await;
+    let harness = FakeHarness::new(CountingScript::default());
+    let server =
+        start_custom_server_with_extra_config_on_available_port(fake::factory(harness.clone()), "")
+            .await;
     let state = &server.state;
     let base = server.base.clone();
     let client = reqwest::Client::new();
@@ -5952,7 +5544,7 @@ async fn project_remove_shuts_down_harness_and_removes_giskard_data_only() {
         .await
         .unwrap();
     assert_eq!(resp.status(), 204);
-    assert_eq!(harness.shutdown_calls(), 1);
+    assert_eq!(shutdown_calls(&harness.core), 1);
     assert!(
         state
             .registry
@@ -7442,9 +7034,9 @@ async fn open_thread_normalization_reuses_live_handle() {
   context_window = 262144
   supports_reasoning_effort = true
 "#;
-    let harness = Arc::new(CountingOpenHarness::default());
+    let harness = FakeHarness::new(CountingScript::default());
     let server = start_custom_server_with_extra_config_on_available_port(
-        factory::shared(harness.clone()),
+        fake::factory(harness.clone()),
         extra_config,
     )
     .await;
@@ -7508,7 +7100,7 @@ async fn open_thread_normalization_reuses_live_handle() {
         )
         .await
         .unwrap();
-    assert_eq!(harness.open_calls(), 1);
+    assert_eq!(open_calls(&harness.core), 1);
 
     let resp = client
         .post(format!("{base}/api/projects/{pid}/threads"))
@@ -7521,7 +7113,7 @@ async fn open_thread_normalization_reuses_live_handle() {
     let body = resp.json::<serde_json::Value>().await.unwrap();
     assert_eq!(body["harness_thread_id"], "th_live");
     assert_eq!(
-        harness.open_calls(),
+        open_calls(&harness.core),
         1,
         "HTTP reopen must reuse the live registry handle"
     );
@@ -7536,12 +7128,10 @@ async fn open_thread_normalization_reuses_live_handle() {
 
 #[tokio::test]
 async fn concurrent_cold_opens_install_one_native_owner() {
-    let harness = Arc::new(CountingOpenHarness::default());
-    let server = start_custom_server_with_extra_config_on_available_port(
-        factory::shared(harness.clone()),
-        "",
-    )
-    .await;
+    let harness = FakeHarness::new(CountingScript::default());
+    let server =
+        start_custom_server_with_extra_config_on_available_port(fake::factory(harness.clone()), "")
+            .await;
     let state = &server.state;
     let project_id = ProjectId::new();
     state
@@ -7571,7 +7161,7 @@ async fn concurrent_cold_opens_install_one_native_owner() {
     assert_eq!(first.unwrap().harness_thread_id, "native-thread");
     assert_eq!(second.unwrap().harness_thread_id, "native-thread");
     assert_eq!(
-        harness.open_calls(),
+        open_calls(&harness.core),
         1,
         "the cold-open lock must cover the native open, not only owner publication"
     );
@@ -7579,12 +7169,10 @@ async fn concurrent_cold_opens_install_one_native_owner() {
 
 #[tokio::test]
 async fn concurrent_subagent_cold_opens_install_one_native_owner() {
-    let harness = Arc::new(CountingOpenHarness::default());
-    let server = start_custom_server_with_extra_config_on_available_port(
-        factory::shared(harness.clone()),
-        "",
-    )
-    .await;
+    let harness = FakeHarness::new(CountingScript::default());
+    let server =
+        start_custom_server_with_extra_config_on_available_port(fake::factory(harness.clone()), "")
+            .await;
     let state = &server.state;
     let project_id = ProjectId::new();
     state
@@ -7645,18 +7233,16 @@ async fn concurrent_subagent_cold_opens_install_one_native_owner() {
     let (first, second) = tokio::join!(first, second);
     assert_eq!(first.unwrap().harness_thread_id, "native-child");
     assert_eq!(second.unwrap().harness_thread_id, "native-child");
-    assert_eq!(harness.open_calls(), 0);
-    assert_eq!(harness.claim_calls(), 1);
+    assert_eq!(open_calls(&harness.core), 0);
+    assert_eq!(harness.script.new_claims.load(Ordering::SeqCst), 1);
 }
 
 #[tokio::test]
 async fn removed_resume_field_is_rejected_before_harness_io() {
-    let harness = Arc::new(CountingOpenHarness::default());
-    let server = start_custom_server_with_extra_config_on_available_port(
-        factory::shared(harness.clone()),
-        "",
-    )
-    .await;
+    let harness = FakeHarness::new(CountingScript::default());
+    let server =
+        start_custom_server_with_extra_config_on_available_port(fake::factory(harness.clone()), "")
+            .await;
     let base = server.base.clone();
     let client = server.client.clone();
     let cookie = auth::login(&client, &base).await;
@@ -7673,7 +7259,7 @@ async fn removed_resume_field_is_rejected_before_harness_io() {
     assert_eq!(resp.status(), reqwest::StatusCode::UNPROCESSABLE_ENTITY);
     let body = resp.text().await.unwrap();
     assert!(body.contains("resume"));
-    assert_eq!(harness.open_calls(), 0);
+    assert_eq!(open_calls(&harness.core), 0);
 }
 
 #[tokio::test]
@@ -7695,9 +7281,9 @@ async fn start_thread_with_initial_message_uses_selected_provider_and_starts_tur
   context_window = 131072
   supports_reasoning_effort = false
 "#;
-    let harness = Arc::new(CountingOpenHarness::default());
+    let harness = FakeHarness::new(CountingScript::default());
     let server = start_custom_server_with_extra_config_on_available_port(
-        factory::shared(harness.clone()),
+        fake::factory(harness.clone()),
         extra_config,
     )
     .await;
@@ -7729,15 +7315,15 @@ async fn start_thread_with_initial_message_uses_selected_provider_and_starts_tur
     let body = resp.json::<serde_json::Value>().await.unwrap();
     let tid: ThreadId = body["thread_id"].as_str().unwrap().parse().unwrap();
 
-    assert_eq!(harness.open_calls(), 1);
-    assert_eq!(harness.start_calls(), 1);
-    let opened = harness.opened_models().await;
+    assert_eq!(open_calls(&harness.core), 1);
+    assert_eq!(start_calls(&harness.core), 1);
+    let opened = opened_models(&harness.core);
     let opened_first = &opened[0];
     assert_eq!(opened_first.provider, "proxy");
     assert_eq!(opened_first.model, "glm-5.2-workers-ai");
-    let started_models = harness.started_models().await;
+    let started_models = started_models(&harness.core);
     assert_eq!(started_models[0], Some(opened_first.clone()));
-    assert_eq!(harness.started_inputs().await, vec!["Hello".to_string()]);
+    assert_eq!(started_inputs(&harness.core), vec!["Hello".to_string()]);
 
     let saved_thread = state.store.load_thread(pid, tid).await.unwrap().unwrap();
     assert_eq!(
@@ -7758,17 +7344,16 @@ async fn start_thread_with_initial_message_uses_selected_provider_and_starts_tur
 
 #[tokio::test]
 async fn start_thread_turn_rejection_cleans_up_new_thread() {
-    let harness = Arc::new(CountingOpenHarness::default());
+    let harness = FakeHarness::new(CountingScript::default());
     harness
+        .script
         .fail_start_with(HarnessError::Unsupported(
             "turns are not supported by this harness".into(),
         ))
         .await;
-    let server = start_custom_server_with_extra_config_on_available_port(
-        factory::shared(harness.clone()),
-        "",
-    )
-    .await;
+    let server =
+        start_custom_server_with_extra_config_on_available_port(fake::factory(harness.clone()), "")
+            .await;
     let state = &server.state;
     let base = server.base.clone();
     let client = server.client.clone();
@@ -7791,9 +7376,9 @@ async fn start_thread_turn_rejection_cleans_up_new_thread() {
     assert_eq!(resp.status(), reqwest::StatusCode::BAD_REQUEST);
     let body = resp.text().await.unwrap();
     assert!(body.contains("turns are not supported"));
-    assert_eq!(harness.open_calls(), 1);
-    assert_eq!(harness.start_calls(), 1);
-    assert_eq!(harness.delete_calls(), 1);
+    assert_eq!(open_calls(&harness.core), 1);
+    assert_eq!(start_calls(&harness.core), 1);
+    assert_eq!(delete_calls(&harness.core), 1);
     assert!(state.store.list_threads(pid).await.unwrap().is_empty());
 }
 
@@ -7816,9 +7401,9 @@ async fn select_model_rejects_provider_change_on_non_empty_thread() {
   context_window = 131072
   supports_reasoning_effort = false
 "#;
-    let harness = Arc::new(CountingOpenHarness::default());
+    let harness = FakeHarness::new(CountingScript::default());
     let server = start_custom_server_with_extra_config_on_available_port(
-        factory::shared(harness.clone()),
+        fake::factory(harness.clone()),
         extra_config,
     )
     .await;
@@ -7884,7 +7469,7 @@ async fn select_model_rejects_provider_change_on_non_empty_thread() {
             .unwrap_or_default()
             .contains("native provider: openai; selected provider: proxy")
     );
-    assert_eq!(harness.open_calls(), 1);
+    assert_eq!(open_calls(&harness.core), 1);
     let saved_thread = state.store.load_thread(pid, tid).await.unwrap().unwrap();
     assert_eq!(
         saved_thread.current_model.as_known().unwrap().provider,
@@ -7911,9 +7496,9 @@ async fn send_input_rejects_persisted_provider_mismatch_on_non_empty_thread() {
   context_window = 131072
   supports_reasoning_effort = false
 "#;
-    let harness = Arc::new(CountingOpenHarness::default());
+    let harness = FakeHarness::new(CountingScript::default());
     let server = start_custom_server_with_extra_config_on_available_port(
-        factory::shared(harness.clone()),
+        fake::factory(harness.clone()),
         extra_config,
     )
     .await;
@@ -7987,7 +7572,7 @@ async fn send_input_rejects_persisted_provider_mismatch_on_non_empty_thread() {
             .unwrap_or_default()
             .contains("native provider: openai; selected provider: proxy")
     );
-    assert_eq!(harness.open_calls(), 1);
+    assert_eq!(open_calls(&harness.core), 1);
 }
 
 #[tokio::test]

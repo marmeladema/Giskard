@@ -1,94 +1,51 @@
 //! End-to-end coverage: a running tool/MCP call surfaces in the `RunningTasks` snapshot through the
 //! real server path (registry forward → broadcast → WebSocket), the same way commands do (TK1).
 
-use std::sync::Arc;
-
 use async_trait::async_trait;
 use futures_util::{SinkExt, StreamExt};
-use giskard_core::error::HarnessError;
 use giskard_core::event::AgentEvent;
-use giskard_core::ids::{ApprovalId, ItemId, ServerRequestId, TurnId};
+use giskard_core::ids::{ItemId, TurnId};
 use giskard_core::item::{ItemKind, ItemStart, ToolCallStart};
-use giskard_core::model::ModelDescriptor;
-use giskard_core::server_request::ServerRequestResponse;
-use giskard_core::turn::{TurnOverrides, TurnStatus, TurnStatusKind};
-use giskard_core::user_input::UserInput;
-use giskard_harness::{
-    AgentEventStream, AgentHarness, EventLog, HarnessCapabilities, OpenThreadOptions, ThreadHandle,
-};
+use giskard_core::turn::{TurnStatus, TurnStatusKind};
 use giskard_proto::{ClientMessage, ServerMessage, TaskKind};
-use giskard_testenv::{TestServer, factory, ws};
+use giskard_testenv::fake::{self, FakeCore, FakeHarness, Script, TurnCall};
+use giskard_testenv::{TestServer, ws};
 use tokio::sync::Mutex;
 use tokio::time::{Duration, Instant};
 
 /// Harness that, on `start_turn`, emits `TurnStarted` + an in-progress tool `ItemStarted` and
 /// leaves the turn open (the tool blocks the turn), so the server keeps a running tool task.
-struct ToolHarness {
-    tx: Arc<EventLog>,
+struct ToolScript {
     active_turn: Mutex<Option<TurnId>>,
 }
 
-impl ToolHarness {
+impl ToolScript {
     fn new() -> Self {
-        let tx = Arc::new(EventLog::new());
         Self {
-            tx,
             active_turn: Mutex::new(None),
         }
     }
 }
 
 #[async_trait]
-impl AgentHarness for ToolHarness {
-    fn capabilities(&self) -> HarnessCapabilities {
-        HarnessCapabilities {
-            live_approvals: true,
-            plan_build_modes: true,
-            per_turn_model: true,
-            reasoning_effort: true,
-            structured_diffs: true,
-            resumable_threads: true,
-            model_listing: false,
-            provider_listing: false,
-            token_usage: true,
-            mcp_status: false,
-            mcp_reload: false,
-            mcp_oauth_login: false,
-            context_compaction: false,
-        }
-    }
-
-    async fn list_models(&self) -> Result<Vec<ModelDescriptor>, HarnessError> {
-        Ok(vec![])
-    }
-
-    async fn open_thread(&self, opts: OpenThreadOptions) -> Result<ThreadHandle, HarnessError> {
-        let thread = opts.thread;
-        Ok(ThreadHandle {
-            resumed_model: Some(opts.initial_model.clone()),
-            ..ThreadHandle::opened(
-                thread,
-                opts.resume.unwrap_or_else(|| "tool_harness".into()),
-                opts.workspace_root.clone(),
-            )
-        })
+impl Script for ToolScript {
+    fn native_thread_id(&self, _thread: giskard_core::ids::ThreadId) -> String {
+        "tool_harness".into()
     }
 
     async fn start_turn(
         &self,
-        thread: &ThreadHandle,
-        _input: UserInput,
-        _overrides: TurnOverrides,
-    ) -> Result<TurnId, HarnessError> {
-        let turn = TurnId::new();
-        let tid = thread.thread;
-        *self.active_turn.lock().await = Some(turn);
-        let _ = self
-            .tx
-            .append(AgentEvent::TurnStarted { thread: tid, turn });
-        let _ = self.tx.append(AgentEvent::ItemStarted {
-            thread: tid,
-            turn,
+        _core: &FakeCore,
+        call: &TurnCall,
+    ) -> Result<(), giskard_core::HarnessError> {
+        *self.active_turn.lock().await = Some(call.turn);
+        call.log.append(AgentEvent::TurnStarted {
+            thread: call.thread,
+            turn: call.turn,
+        });
+        call.log.append(AgentEvent::ItemStarted {
+            thread: call.thread,
+            turn: call.turn,
             item: ItemStart {
                 id: ItemId::new(),
                 harness_item_id: "tool1".into(),
@@ -105,30 +62,14 @@ impl AgentHarness for ToolHarness {
                 }),
             },
         });
-        Ok(turn)
-    }
-
-    fn subscribe(&self, _thread: &ThreadHandle) -> AgentEventStream {
-        AgentEventStream::new(self.tx.reader())
-    }
-
-    async fn respond_approval(
-        &self,
-        _req: ApprovalId,
-        _decision: giskard_core::approval::ApprovalDecision,
-    ) -> Result<(), HarnessError> {
         Ok(())
     }
 
-    async fn respond_server_request(
+    async fn interrupt(
         &self,
-        _req: ServerRequestId,
-        _response: ServerRequestResponse,
-    ) -> Result<(), HarnessError> {
-        Ok(())
-    }
-
-    async fn interrupt(&self, thread: &ThreadHandle) -> Result<(), HarnessError> {
+        core: &FakeCore,
+        thread: &giskard_harness::ThreadHandle,
+    ) -> Result<(), giskard_core::HarnessError> {
         // Interrupting the turn ends it; the still-running tool is then dropped by the registry.
         let turn = self
             .active_turn
@@ -136,26 +77,26 @@ impl AgentHarness for ToolHarness {
             .await
             .take()
             .unwrap_or_else(TurnId::new);
-        let _ = self.tx.append(AgentEvent::TurnCompleted {
-            thread: thread.thread,
-            turn,
-            usage: giskard_core::token::TokenUsage::default(),
-            status: TurnStatus {
-                kind: TurnStatusKind::Interrupted,
-                message: None,
+        core.append(
+            thread.thread,
+            AgentEvent::TurnCompleted {
+                thread: thread.thread,
+                turn,
+                usage: giskard_core::token::TokenUsage::default(),
+                status: TurnStatus {
+                    kind: TurnStatusKind::Interrupted,
+                    message: None,
+                },
             },
-        });
-        Ok(())
-    }
-
-    async fn shutdown(&self) -> Result<(), HarnessError> {
+        );
         Ok(())
     }
 }
 
 #[tokio::test]
 async fn running_tool_call_surfaces_in_running_tasks_snapshot() {
-    let server = TestServer::spawn(factory::from_fn(|_, _| Ok(Arc::new(ToolHarness::new())))).await;
+    let harness = FakeHarness::new(ToolScript::new());
+    let server = TestServer::spawn(fake::factory(harness)).await;
     let project = server.create_project("tool-proj").await;
     let thread_id = server.register_thread(project.id, "th_tool").await;
     let mut ws = server.ws().await;

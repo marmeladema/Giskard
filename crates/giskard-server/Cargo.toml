@@ -10,7 +10,6 @@ giskard-core = { workspace = true }
 giskard-git-parser = { workspace = true }
 giskard-harness = { workspace = true }
 giskard-harness-codex = { workspace = true }
-giskard-harness-replay = { workspace = true }
 giskard-persist = { workspace = true }
 giskard-proto = { workspace = true }
 serde = { workspace = true }
@@ -44,6 +43,7 @@ indexmap = { workspace = true }
 sha2 = { workspace = true }
 
 [dev-dependencies]
+giskard-harness-replay = { workspace = true }
 giskard-testenv = { workspace = true }
 tempfile = { workspace = true }
 tokio-tungstenite = "0.29"

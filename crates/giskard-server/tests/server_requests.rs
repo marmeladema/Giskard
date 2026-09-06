@@ -8,23 +8,17 @@ use futures_util::{SinkExt, StreamExt};
 use giskard_core::error::HarnessError;
 use giskard_core::event::AgentEvent;
 use giskard_core::ids::{ServerRequestId, ThreadId, TurnId};
-use giskard_core::model::ModelDescriptor;
 use giskard_core::server_request::{ServerRequest, ServerRequestResponse};
 use giskard_core::token::TokenUsage;
-use giskard_core::turn::{TurnOverrides, TurnStatus, TurnStatusKind};
-use giskard_core::user_input::UserInput;
-use giskard_harness::{
-    AgentEventStream, AgentHarness, EventLog, HarnessCapabilities, OpenThreadOptions, ThreadHandle,
-};
+use giskard_core::turn::{TurnStatus, TurnStatusKind};
 use giskard_proto::{ClientMessage, LiveTurnSnapshot, ServerMessage, WireAgentEvent};
-use giskard_testenv::{TestServer, TestWs, factory, ws};
+use giskard_testenv::fake::{self, Call, FakeCore, FakeHarness, Script, TurnCall};
+use giskard_testenv::{TestServer, TestWs, ws};
 use tokio::sync::Mutex;
 use tokio::time::{Duration, Instant};
 
-struct ServerRequestHarness {
-    tx: Arc<EventLog>,
+struct ServerRequestScript {
     active: Mutex<Option<(ThreadId, TurnId)>>,
-    responses: Mutex<Vec<(ServerRequestId, ServerRequestResponse)>>,
     fail_next_response: Mutex<Option<HarnessError>>,
     hang_next_response: Mutex<bool>,
     resolve_before_reply: Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
@@ -34,13 +28,10 @@ struct ServerRequestHarness {
     suppress_resolution: Mutex<bool>,
 }
 
-impl ServerRequestHarness {
+impl ServerRequestScript {
     fn new() -> Self {
-        let tx = Arc::new(EventLog::new());
         Self {
-            tx,
             active: Mutex::new(None),
-            responses: Mutex::new(Vec::new()),
             fail_next_response: Mutex::new(None),
             hang_next_response: Mutex::new(false),
             resolve_before_reply: Mutex::new(None),
@@ -65,73 +56,33 @@ impl ServerRequestHarness {
         *self.resolve_before_reply.lock().await = Some(receiver);
         sender
     }
+}
 
-    async fn wait_for_response(&self) -> (ServerRequestId, ServerRequestResponse) {
-        let deadline = Instant::now() + Duration::from_secs(5);
-        loop {
-            if let Some(response) = self.responses.lock().await.first().cloned() {
-                return response;
-            }
-            if Instant::now() >= deadline {
-                panic!("server request response did not reach harness");
-            }
-            tokio::time::sleep(Duration::from_millis(25)).await;
+async fn wait_for_response(core: &FakeCore) -> (ServerRequestId, ServerRequestResponse) {
+    core.wait_for_call(|call| match call {
+        Call::RespondServerRequest { request, response } => {
+            Some((request.clone(), response.clone()))
         }
-    }
+        _ => None,
+    })
+    .await
 }
 
 #[async_trait]
-impl AgentHarness for ServerRequestHarness {
-    fn capabilities(&self) -> HarnessCapabilities {
-        HarnessCapabilities {
-            live_approvals: true,
-            plan_build_modes: true,
-            per_turn_model: true,
-            reasoning_effort: true,
-            structured_diffs: true,
-            resumable_threads: true,
-            model_listing: false,
-            provider_listing: false,
-            token_usage: true,
-            mcp_status: false,
-            mcp_reload: false,
-            mcp_oauth_login: false,
-            context_compaction: false,
-        }
+impl Script for ServerRequestScript {
+    fn native_thread_id(&self, _thread: ThreadId) -> String {
+        "server_request_harness".into()
     }
 
-    async fn list_models(&self) -> Result<Vec<ModelDescriptor>, HarnessError> {
-        Ok(vec![])
-    }
-
-    async fn open_thread(&self, opts: OpenThreadOptions) -> Result<ThreadHandle, HarnessError> {
-        let thread = opts.thread;
-        Ok(ThreadHandle {
-            resumed_model: Some(opts.initial_model.clone()),
-            ..ThreadHandle::opened(
-                thread,
-                opts.resume
-                    .unwrap_or_else(|| "server_request_harness".into()),
-                opts.workspace_root.clone(),
-            )
-        })
-    }
-
-    async fn start_turn(
-        &self,
-        thread: &ThreadHandle,
-        _input: UserInput,
-        _overrides: TurnOverrides,
-    ) -> Result<TurnId, HarnessError> {
-        let turn = TurnId::new();
-        *self.active.lock().await = Some((thread.thread, turn));
-        let _ = self.tx.append(AgentEvent::TurnStarted {
-            thread: thread.thread,
-            turn,
+    async fn start_turn(&self, _core: &FakeCore, call: &TurnCall) -> Result<(), HarnessError> {
+        *self.active.lock().await = Some((call.thread, call.turn));
+        call.log.append(AgentEvent::TurnStarted {
+            thread: call.thread,
+            turn: call.turn,
         });
-        let _ = self.tx.append(AgentEvent::ServerRequestReceived {
-            thread: thread.thread,
-            turn: Some(turn),
+        call.log.append(AgentEvent::ServerRequestReceived {
+            thread: call.thread,
+            turn: Some(call.turn),
             request: ServerRequest {
                 id: ServerRequestId("srv_1".into()),
                 method: "item/tool/requestUserInput".into(),
@@ -146,15 +97,12 @@ impl AgentHarness for ServerRequestHarness {
                 received_at: Utc::now(),
             },
         });
-        Ok(turn)
-    }
-
-    fn subscribe(&self, _thread: &ThreadHandle) -> AgentEventStream {
-        AgentEventStream::new(self.tx.reader())
+        Ok(())
     }
 
     async fn respond_approval(
         &self,
+        _core: &FakeCore,
         _req: giskard_core::ids::ApprovalId,
         _decision: giskard_core::approval::ApprovalDecision,
     ) -> Result<(), HarnessError> {
@@ -163,8 +111,10 @@ impl AgentHarness for ServerRequestHarness {
 
     async fn respond_server_request(
         &self,
+        core: &FakeCore,
         req: ServerRequestId,
-        response: ServerRequestResponse,
+        // Recorded by the harness on entry; the script only decides how to answer.
+        _response: ServerRequestResponse,
     ) -> Result<(), HarnessError> {
         let suppress_resolution = *self.suppress_resolution.lock().await;
         let receiver = if suppress_resolution {
@@ -176,16 +126,22 @@ impl AgentHarness for ServerRequestHarness {
         if let Some(receiver) = receiver {
             let (thread, turn) = self.active.lock().await.take().unwrap_or_default();
             active = Some((thread, turn));
-            let _ = self.tx.append(AgentEvent::ServerRequestResolved {
+            core.append(
                 thread,
-                turn: Some(turn),
-                request_id: req.clone(),
-            });
-            let _ = self.tx.append(AgentEvent::Notice {
+                AgentEvent::ServerRequestResolved {
+                    thread,
+                    turn: Some(turn),
+                    request_id: req.clone(),
+                },
+            );
+            core.append(
                 thread,
-                turn: Some(turn),
-                message: "resolution-fence".into(),
-            });
+                AgentEvent::Notice {
+                    thread,
+                    turn: Some(turn),
+                    message: "resolution-fence".into(),
+                },
+            );
             let _ = receiver.await;
         }
         if let Some(error) = self.fail_next_response.lock().await.take() {
@@ -194,10 +150,6 @@ impl AgentHarness for ServerRequestHarness {
         if std::mem::take(&mut *self.hang_next_response.lock().await) {
             std::future::pending::<()>().await;
         }
-        self.responses
-            .lock()
-            .await
-            .push((req.clone(), response.clone()));
         if suppress_resolution {
             return Ok(());
         }
@@ -205,44 +157,42 @@ impl AgentHarness for ServerRequestHarness {
             Some(active) => active,
             None => {
                 let active = self.active.lock().await.take().unwrap_or_default();
-                let _ = self.tx.append(AgentEvent::ServerRequestResolved {
-                    thread: active.0,
-                    turn: Some(active.1),
-                    request_id: req,
-                });
+                core.append(
+                    active.0,
+                    AgentEvent::ServerRequestResolved {
+                        thread: active.0,
+                        turn: Some(active.1),
+                        request_id: req,
+                    },
+                );
                 active
             }
         };
-        let _ = self.tx.append(AgentEvent::TurnCompleted {
+        core.append(
             thread,
-            turn,
-            usage: TokenUsage::default(),
-            status: TurnStatus {
-                kind: TurnStatusKind::Completed,
-                message: None,
+            AgentEvent::TurnCompleted {
+                thread,
+                turn,
+                usage: TokenUsage::default(),
+                status: TurnStatus {
+                    kind: TurnStatusKind::Completed,
+                    message: None,
+                },
             },
-        });
-        Ok(())
-    }
-
-    async fn interrupt(&self, _thread: &ThreadHandle) -> Result<(), HarnessError> {
-        Ok(())
-    }
-
-    async fn shutdown(&self) -> Result<(), HarnessError> {
+        );
         Ok(())
     }
 }
 
 struct TestApp {
     server: TestServer,
-    harness: Arc<ServerRequestHarness>,
+    harness: Arc<FakeHarness<ServerRequestScript>>,
     thread_id: ThreadId,
 }
 
 async fn spawn_test_app() -> TestApp {
-    let harness = Arc::new(ServerRequestHarness::new());
-    let server = TestServer::spawn(factory::shared(harness.clone())).await;
+    let harness = FakeHarness::new(ServerRequestScript::new());
+    let server = TestServer::spawn(fake::factory(harness.clone())).await;
     let project = server.create_project("proj").await;
     let thread_id = server
         .register_thread(project.id, "server_request_thread")
@@ -285,7 +235,7 @@ async fn websocket_server_request_response_routes_to_harness() {
     .await
     .unwrap();
 
-    let (request_id, response) = harness.wait_for_response().await;
+    let (request_id, response) = wait_for_response(&harness.core).await;
     assert_eq!(request_id, ServerRequestId("srv_1".into()));
     match response {
         ServerRequestResponse::Result { value } => {
@@ -324,7 +274,7 @@ async fn websocket_server_request_error_response_routes_to_harness() {
     .await
     .unwrap();
 
-    let (request_id, response) = harness.wait_for_response().await;
+    let (request_id, response) = wait_for_response(&harness.core).await;
     assert_eq!(request_id, ServerRequestId("srv_1".into()));
     match response {
         ServerRequestResponse::Error { code, message } => {
@@ -357,6 +307,7 @@ async fn websocket_server_request_response_failure_can_be_retried() {
 
     wait_for_server_request(&mut ws).await;
     harness
+        .script
         .fail_next_response(HarnessError::Protocol("temporary failure".into()))
         .await;
 
@@ -391,7 +342,7 @@ async fn websocket_server_request_response_failure_can_be_retried() {
     .await
     .unwrap();
 
-    let (request_id, response) = harness.wait_for_response().await;
+    let (request_id, response) = wait_for_response(&harness.core).await;
     assert_eq!(request_id, ServerRequestId("srv_1".into()));
     match response {
         ServerRequestResponse::Result { value } => {
@@ -428,7 +379,7 @@ async fn timed_out_server_request_response_republishes_pending_to_peer_tabs() {
     let pending = wait_for_request_state(&mut peer, "pending").await;
     assert_eq!(pending.revision, 1);
 
-    harness.hang_next_response().await;
+    harness.script.hang_next_response().await;
     claimant
         .send(ws::text(&ClientMessage::ServerRequestResponse {
             thread_id,
@@ -501,7 +452,7 @@ async fn answered_server_request_is_not_pending_after_reconnect() {
     let app = spawn_test_app().await;
     let harness = app.harness.clone();
     let thread_id = app.thread_id;
-    harness.suppress_resolution().await;
+    harness.script.suppress_resolution().await;
 
     let mut ws = app.server.ws().await;
     ws.send(ws::text(&ClientMessage::Subscribe {
@@ -527,7 +478,7 @@ async fn answered_server_request_is_not_pending_after_reconnect() {
     .await
     .unwrap();
     // The harness confirms it received the answer; it deliberately never resolves it.
-    let (answered_id, _) = harness.wait_for_response().await;
+    let (answered_id, _) = wait_for_response(&harness.core).await;
     assert_eq!(answered_id, ServerRequestId("srv_1".into()));
 
     let mut reconnect = app.server.ws().await;
@@ -587,7 +538,7 @@ async fn server_request_answer_succeeds_when_the_harness_resolves_first() {
     .unwrap();
     wait_for_server_request(&mut ws).await;
 
-    let gate = harness.resolve_before_reply().await;
+    let gate = harness.script.resolve_before_reply().await;
     ws.send(ws::text(&ClientMessage::ServerRequestResponse {
         thread_id,
         request_id: "srv_1".into(),
@@ -600,7 +551,7 @@ async fn server_request_answer_succeeds_when_the_harness_resolves_first() {
 
     let resolved = wait_for_resolved_and_completion_without_error(&mut ws).await;
     assert_eq!(resolved.revision, 3);
-    let (request_id, response) = harness.wait_for_response().await;
+    let (request_id, response) = wait_for_response(&harness.core).await;
     assert_eq!(request_id, ServerRequestId("srv_1".into()));
     assert_eq!(
         response,
@@ -638,9 +589,10 @@ async fn harness_failure_after_a_native_resolution_leaves_the_request_resolved()
     );
 
     harness
+        .script
         .fail_next_response(HarnessError::Protocol("late failure".into()))
         .await;
-    let gate = harness.resolve_before_reply().await;
+    let gate = harness.script.resolve_before_reply().await;
     ws.send(ws::text(&ClientMessage::ServerRequestResponse {
         thread_id,
         request_id: "srv_1".into(),
@@ -714,8 +666,8 @@ async fn timeout_after_a_native_resolution_republishes_resolved_to_peer_tabs() {
         1
     );
 
-    harness.hang_next_response().await;
-    let gate = harness.resolve_before_reply().await;
+    harness.script.hang_next_response().await;
+    let gate = harness.script.resolve_before_reply().await;
     claimant
         .send(ws::text(&ClientMessage::ServerRequestResponse {
             thread_id,
@@ -768,7 +720,7 @@ async fn reconnect_after_a_native_resolution_during_a_claim_does_not_re_prompt()
     .unwrap();
     wait_for_server_request(&mut ws).await;
 
-    let gate = harness.resolve_before_reply().await;
+    let gate = harness.script.resolve_before_reply().await;
     ws.send(ws::text(&ClientMessage::ServerRequestResponse {
         thread_id,
         request_id: "srv_1".into(),

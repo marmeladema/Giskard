@@ -4,25 +4,20 @@
 //! strategy must be opened against the worktree rather than the project's checkout, and must still
 //! be after a restart. Everything here therefore records the workspace root the harness was handed.
 
-use std::collections::HashMap;
 use std::path::Path;
 use std::process::Command;
 use std::sync::Arc;
 
-use giskard_core::approval::ApprovalDecision;
 use giskard_core::error::HarnessError;
 use giskard_core::event::AgentEvent;
-use giskard_core::ids::{ApprovalId, ItemId, ProjectId, ServerRequestId, ThreadId, TurnId};
+use giskard_core::ids::{ItemId, ProjectId, ThreadId};
 use giskard_core::item::{Item, ItemPayload, SubagentAction, SubagentLink};
-use giskard_core::server_request::ServerRequestResponse;
 use giskard_core::token::TokenUsage;
-use giskard_core::turn::{TurnOverrides, TurnStatus, TurnStatusKind};
-use giskard_core::user_input::UserInput;
-use giskard_harness::{
-    AgentEventStream, AgentHarness, EventLog, HarnessCapabilities, OpenThreadOptions, ThreadHandle,
-};
+use giskard_core::turn::{TurnStatus, TurnStatusKind};
 use giskard_persist::store::ThreadGitWorkspace;
-use giskard_testenv::{TestProject, TestServer, factory, git, ws};
+use giskard_testenv::driver::DriverProbe;
+use giskard_testenv::fake::{self, Call, FakeCore, FakeHarness, Script, TurnCall, caps};
+use giskard_testenv::{TestProject, TestServer, git, ws};
 use tokio::sync::Mutex;
 
 /// Saving a plan writes a file into the workspace and then offers it back as a link. For an
@@ -34,6 +29,7 @@ async fn a_plan_saved_from_an_isolated_thread_lands_in_its_worktree() {
     let server = start(/*git_repo*/ true).await;
     server
         .harness
+        .script
         .agent_says
         .lock()
         .await
@@ -225,14 +221,7 @@ async fn an_unknown_git_strategy_is_refused_and_an_absent_one_is_an_ordinary_thr
 /// Records the workspace root every thread is opened against, which is the whole point of the
 /// feature: the cwd the agent works in.
 #[derive(Default)]
-struct RecordingHarness {
-    opened_workspace_roots: Mutex<Vec<String>>,
-    /// A `std` mutex, not a `tokio` one: `subscribe` is a synchronous trait method, and with an
-    /// async mutex it could only `try_lock` — handing back a stream over a dropped sender whenever
-    /// the map happened to be held. Every event for that thread would then vanish and the test would
-    /// fail on an unexplained timeout. Nothing holds this guard across an await.
-    threads: std::sync::Mutex<Vec<(ThreadId, Arc<EventLog>)>>,
-    native_routes: std::sync::Mutex<HashMap<String, ThreadId>>,
+struct RecordingScript {
     /// When set, the next turn reports having spawned a sub-agent with this native id, which is what
     /// drives the registry to materialize a linked thread the way Codex does.
     spawns_subagent: Mutex<Option<String>>,
@@ -242,210 +231,95 @@ struct RecordingHarness {
 }
 
 #[async_trait::async_trait]
-impl AgentHarness for RecordingHarness {
-    fn capabilities(&self) -> HarnessCapabilities {
-        HarnessCapabilities {
-            resumable_threads: true,
-            ..Default::default()
-        }
+impl Script for RecordingScript {
+    fn capabilities(&self) -> giskard_harness::HarnessCapabilities {
+        caps::RESUMABLE
     }
 
-    async fn list_models(&self) -> Result<Vec<giskard_core::ModelDescriptor>, HarnessError> {
-        Ok(Vec::new())
+    fn native_thread_id(&self, thread: ThreadId) -> String {
+        format!("native-{thread}")
     }
 
-    async fn open_thread(&self, opts: OpenThreadOptions) -> Result<ThreadHandle, HarnessError> {
-        self.opened_workspace_roots
-            .lock()
-            .await
-            .push(opts.workspace_root.to_string_lossy().into_owned());
-        let thread = opts.thread;
-        let tx = Arc::new(EventLog::new());
-        self.threads.lock().unwrap().push((thread, tx));
-        let harness_thread_id = opts.resume.unwrap_or_else(|| format!("native-{thread}"));
-        self.native_routes
-            .lock()
-            .unwrap()
-            .insert(harness_thread_id.clone(), thread);
-        Ok(ThreadHandle {
-            resumed_model: Some(opts.initial_model.clone()),
-            ..ThreadHandle::opened(thread, harness_thread_id, opts.workspace_root.clone())
-        })
-    }
-
-    /// Binding a provider-owned child's identity: no resume, no native work, but the workspace it
-    /// is bound against is still recorded — that is what these tests assert about inheritance.
-    async fn claim_native_thread(
-        &self,
-        thread: ThreadId,
-        harness_thread_id: String,
-        workspace_root: std::path::PathBuf,
-    ) -> Result<ThreadHandle, HarnessError> {
-        self.opened_workspace_roots
-            .lock()
-            .await
-            .push(workspace_root.to_string_lossy().into_owned());
-        let thread = *self
-            .native_routes
-            .lock()
-            .unwrap()
-            .entry(harness_thread_id.clone())
-            .or_insert(thread);
-        let tx = Arc::new(EventLog::new());
-        self.threads.lock().unwrap().push((thread, tx));
-        Ok(ThreadHandle::opened(
-            thread,
-            harness_thread_id,
-            workspace_root,
-        ))
-    }
-
-    async fn start_turn(
-        &self,
-        thread: &ThreadHandle,
-        _input: UserInput,
-        _overrides: TurnOverrides,
-    ) -> Result<TurnId, HarnessError> {
-        let turn = TurnId::new();
+    async fn start_turn(&self, _core: &FakeCore, call: &TurnCall) -> Result<(), HarnessError> {
         // Complete the turn immediately. A turn that never ends holds the thread's turn gate, and
         // every lifecycle operation these tests drive — delete above all — refuses a live thread.
         // Cloned out and the guard dropped before the awaits below: a `std` mutex must not be held
         // across one, and a `Sender` clone is all this needs.
-        let sender = self
-            .threads
-            .lock()
-            .unwrap()
-            .iter()
-            .find(|(id, _)| *id == thread.thread)
-            .map(|(_, tx)| tx.clone());
-        if let Some(tx) = sender {
-            let _ = tx.append(AgentEvent::TurnStarted {
-                thread: thread.thread,
-                turn,
-            });
-            if let Some(text) = self.agent_says.lock().await.clone() {
-                let _ = tx.append(AgentEvent::ItemCompleted {
-                    thread: thread.thread,
-                    turn,
-                    item: Item {
-                        id: ItemId::new(),
-                        harness_item_id: format!("say_{turn}"),
-                        payload: ItemPayload::AgentMessage { text },
-                        created_at: chrono::Utc::now(),
-                    },
-                });
-            }
-            if let Some(child) = self.spawns_subagent.lock().await.take() {
-                let _ = tx.append(AgentEvent::ItemCompleted {
-                    thread: thread.thread,
-                    turn,
-                    item: Item {
-                        id: ItemId::new(),
-                        harness_item_id: format!("spawn_{turn}"),
-                        payload: ItemPayload::ToolCall {
-                            name: "spawn_subagent".into(),
-                            input: serde_json::json!({}),
-                            output: None,
-                            server: None,
-                            status: Some("completed".into()),
-                            metadata: None,
-                            subagent: Some(SubagentLink {
-                                harness_thread_id: child,
-                                path: Some("reviewer".into()),
-                                initial_prompt: Some("review the change".into()),
-                                action: SubagentAction::Spawned,
-                                // Pending, not completed: a child that is still running is the one
-                                // the monitor attaches to, which is the route being covered.
-                                status: Some(giskard_core::item::SubagentStatus::Pending),
-                                message: None,
-                            }),
-                            error: None,
-                        },
-                        created_at: chrono::Utc::now(),
-                    },
-                });
-            }
-            let _ = tx.append(AgentEvent::TurnCompleted {
-                thread: thread.thread,
-                turn,
-                usage: TokenUsage::new(0, 0),
-                status: TurnStatus {
-                    kind: TurnStatusKind::Completed,
-                    message: None,
+        call.log.append(AgentEvent::TurnStarted {
+            thread: call.thread,
+            turn: call.turn,
+        });
+        if let Some(text) = self.agent_says.lock().await.clone() {
+            call.log.append(AgentEvent::ItemCompleted {
+                thread: call.thread,
+                turn: call.turn,
+                item: Item {
+                    id: ItemId::new(),
+                    harness_item_id: format!("say_{}", call.turn),
+                    payload: ItemPayload::AgentMessage { text },
+                    created_at: chrono::Utc::now(),
                 },
             });
         }
-        Ok(turn)
-    }
-
-    fn subscribe(&self, thread: &ThreadHandle) -> AgentEventStream {
-        if let Some((_, tx)) = self
-            .threads
-            .lock()
-            .unwrap()
-            .iter()
-            .find(|(id, _)| *id == thread.thread)
-        {
-            return AgentEventStream::new(tx.reader());
+        if let Some(child) = self.spawns_subagent.lock().await.take() {
+            call.log.append(AgentEvent::ItemCompleted {
+                thread: call.thread,
+                turn: call.turn,
+                item: Item {
+                    id: ItemId::new(),
+                    harness_item_id: format!("spawn_{}", call.turn),
+                    payload: ItemPayload::ToolCall {
+                        name: "spawn_subagent".into(),
+                        input: serde_json::json!({}),
+                        output: None,
+                        server: None,
+                        status: Some("completed".into()),
+                        metadata: None,
+                        subagent: Some(SubagentLink {
+                            harness_thread_id: child,
+                            path: Some("reviewer".into()),
+                            initial_prompt: Some("review the change".into()),
+                            action: SubagentAction::Spawned,
+                            // Pending, not completed: a child that is still running is the one
+                            // the monitor attaches to, which is the route being covered.
+                            status: Some(giskard_core::item::SubagentStatus::Pending),
+                            message: None,
+                        }),
+                        error: None,
+                    },
+                    created_at: chrono::Utc::now(),
+                },
+            });
         }
-        AgentEventStream::closed()
-    }
-
-    async fn respond_approval(
-        &self,
-        _req: ApprovalId,
-        _decision: ApprovalDecision,
-    ) -> Result<(), HarnessError> {
+        call.log.append(AgentEvent::TurnCompleted {
+            thread: call.thread,
+            turn: call.turn,
+            usage: TokenUsage::new(0, 0),
+            status: TurnStatus {
+                kind: TurnStatusKind::Completed,
+                message: None,
+            },
+        });
         Ok(())
     }
-
-    async fn respond_server_request(
-        &self,
-        _req: ServerRequestId,
-        _response: ServerRequestResponse,
-    ) -> Result<(), HarnessError> {
-        Ok(())
-    }
-
-    async fn interrupt(&self, _thread: &ThreadHandle) -> Result<(), HarnessError> {
-        Ok(())
-    }
-
-    async fn delete_thread(&self, thread: &ThreadHandle) -> Result<(), HarnessError> {
-        self.threads
-            .lock()
-            .unwrap()
-            .retain(|(id, _)| *id != thread.thread);
-        Ok(())
-    }
-
-    async fn shutdown(&self) -> Result<(), HarnessError> {
-        Ok(())
-    }
-}
-
-fn recording_factory(harness: Arc<RecordingHarness>) -> Arc<dyn giskard_server::HarnessFactory> {
-    factory::from_fn(move |_, bootstrap| {
-        let mut routes = harness.native_routes.lock().unwrap();
-        for binding in bootstrap.known_threads {
-            routes.insert(binding.harness_thread_id, binding.thread_id);
-        }
-        drop(routes);
-        Ok(harness.clone())
-    })
 }
 
 struct Harnessed {
     server: TestServer,
     project: TestProject,
-    harness: Arc<RecordingHarness>,
+    harness: Arc<FakeHarness<RecordingScript>>,
+    probe: DriverProbe,
     project_id: ProjectId,
 }
 
 /// A server whose single project is a real Git repository with one commit.
 async fn start(git_repo: bool) -> Harnessed {
-    let harness = Arc::new(RecordingHarness::default());
-    let server = TestServer::spawn(recording_factory(harness.clone())).await;
+    let harness = FakeHarness::new(RecordingScript::default());
+    let (sink, probe) = giskard_testenv::driver::probe();
+    let server = TestServer::builder(fake::factory(harness.clone()))
+        .driver_events(sink)
+        .start()
+        .await;
     let project = server.create_project("worktree-test").await;
     if git_repo {
         git::init_repo_with_commit(project.dir.path());
@@ -456,6 +330,7 @@ async fn start(git_repo: bool) -> Harnessed {
         server,
         project,
         harness,
+        probe,
         project_id,
     }
 }
@@ -543,7 +418,17 @@ impl Harnessed {
     }
 
     async fn workspace_roots(&self) -> Vec<String> {
-        self.harness.opened_workspace_roots.lock().await.clone()
+        self.harness
+            .core
+            .calls()
+            .iter()
+            .filter_map(|call| match call {
+                Call::Open { workspace_root, .. } | Call::Claim { workspace_root, .. } => {
+                    Some(workspace_root.to_string_lossy().into_owned())
+                }
+                _ => None,
+            })
+            .collect()
     }
 
     async fn thread_summaries(&self) -> serde_json::Value {
@@ -696,37 +581,31 @@ impl Harnessed {
 }
 
 /// The sub-agent the registry materialized under `parent`, once it lands on disk.
-async fn wait_for_subagent(server: &Harnessed, parent: ThreadId) -> ThreadId {
-    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
-    loop {
-        for thread_id in server
+async fn children_of(server: &Harnessed, parent: ThreadId) -> Vec<ThreadId> {
+    let mut children = Vec::new();
+    for thread_id in server
+        .server
+        .state
+        .store
+        .list_threads(server.project_id)
+        .await
+        .unwrap()
+    {
+        let Some(thread) = server
             .server
             .state
             .store
-            .list_threads(server.project_id)
+            .load_thread(server.project_id, thread_id)
             .await
             .unwrap()
-        {
-            let Some(thread) = server
-                .server
-                .state
-                .store
-                .load_thread(server.project_id, thread_id)
-                .await
-                .unwrap()
-            else {
-                continue;
-            };
-            if thread.parent_thread_id == Some(parent) {
-                return thread_id;
-            }
+        else {
+            continue;
+        };
+        if thread.parent_thread_id == Some(parent) {
+            children.push(thread_id);
         }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "the sub-agent was never materialized"
-        );
-        tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
     }
+    children
 }
 
 fn branch_exists(repo: &Path, branch: &str) -> bool {
@@ -881,7 +760,7 @@ async fn reopening_an_isolated_thread_returns_to_its_worktree() {
         .path;
 
     // A second server over the same data directory: the restart, with nothing in memory.
-    let (restarted, base, cookie) = restart(&server).await;
+    let (restarted, base, cookie, _probe) = restart(&server).await;
     let response = server
         .server
         .client
@@ -894,7 +773,7 @@ async fn reopening_an_isolated_thread_returns_to_its_worktree() {
     assert_eq!(response.status(), 200);
 
     assert_eq!(
-        restarted.opened_workspace_roots.lock().await.clone(),
+        workspace_roots(&restarted),
         vec![worktree_path],
         "the reopen must land in the thread's worktree, not the project's checkout"
     );
@@ -1070,9 +949,10 @@ async fn deleting_a_project_sweeps_its_worktrees() {
 /// the harness is already running the child there.
 #[tokio::test]
 async fn materializing_a_subagent_opens_it_in_its_parents_worktree() {
-    let server = start(/*git_repo*/ true).await;
+    let mut server = start(/*git_repo*/ true).await;
     server
         .harness
+        .script
         .spawns_subagent
         .lock()
         .await
@@ -1082,7 +962,7 @@ async fn materializing_a_subagent_opens_it_in_its_parents_worktree() {
     let parent_id: ThreadId = started["thread_id"].as_str().unwrap().parse().unwrap();
     let worktree = server.worktree_of(parent_id).await;
 
-    wait_for_subagent(&server, parent_id).await;
+    server.probe.expect_child_of(parent_id).await;
 
     // The child's thread file lands before the harness open that records its workspace root, so
     // comparing straight away races the second open.
@@ -1106,9 +986,10 @@ async fn materializing_a_subagent_opens_it_in_its_parents_worktree() {
 /// sends is the cwd the harness uses.
 #[tokio::test]
 async fn reattaching_a_subagent_after_a_restart_uses_its_parents_worktree() {
-    let server = start(/*git_repo*/ true).await;
+    let mut server = start(/*git_repo*/ true).await;
     server
         .harness
+        .script
         .spawns_subagent
         .lock()
         .await
@@ -1117,11 +998,12 @@ async fn reattaching_a_subagent_after_a_restart_uses_its_parents_worktree() {
     let started: serde_json::Value = serde_json::from_str(&body).unwrap();
     let parent_id: ThreadId = started["thread_id"].as_str().unwrap().parse().unwrap();
     let worktree = server.worktree_of(parent_id).await;
-    let child = wait_for_subagent(&server, parent_id).await;
+    let child = server.probe.expect_child_of(parent_id).await;
 
     // A second server over the same data directory: the child is persisted but nothing is attached.
-    let (restarted, base, cookie) = restart(&server).await;
+    let (restarted, base, cookie, mut probe) = restart(&server).await;
     restarted
+        .script
         .spawns_subagent
         .lock()
         .await
@@ -1150,7 +1032,11 @@ async fn reattaching_a_subagent_after_a_restart_uses_its_parents_worktree() {
     let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
     loop {
         // Two opens: the parent on subscribe, then the child when its activity is reported.
-        if restarted.opened_workspace_roots.lock().await.len() >= 2 {
+        if restarted
+            .core
+            .count(|call| matches!(call, Call::Open { .. } | Call::Claim { .. }))
+            >= 2
+        {
             break;
         }
         assert!(
@@ -1160,12 +1046,13 @@ async fn reattaching_a_subagent_after_a_restart_uses_its_parents_worktree() {
         tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
     }
     assert_eq!(
-        restarted.opened_workspace_roots.lock().await.clone(),
+        workspace_roots(&restarted),
         vec![worktree.path.clone(), worktree.path],
         "reattaching a sub-agent must use the worktree it works in"
     );
     // The reattach must not have invented a second child.
-    assert_eq!(wait_for_subagent(&server, parent_id).await, child);
+    probe.expect_child_of(parent_id).await;
+    assert_eq!(children_of(&server, parent_id).await, vec![child]);
 }
 
 /// Opening a sub-agent is the cold path — the one where the harness stops ignoring the cwd Giskard
@@ -1181,7 +1068,7 @@ async fn opening_a_subagent_attaches_in_its_parents_worktree() {
     server.wait_until_idle(parent_id).await;
     let child = server.persist_subagent(parent_id).await;
     // Drop the parent's own open, so what is asserted below is the sub-agent's.
-    server.harness.opened_workspace_roots.lock().await.clear();
+    server.harness.core.clear_calls();
 
     let response = server
         .server
@@ -1573,7 +1460,7 @@ async fn subscribing_after_a_restart_attaches_in_the_worktree() {
         .unwrap()
         .path;
 
-    let (restarted, base, cookie) = restart(&server).await;
+    let (restarted, base, cookie, _probe) = restart(&server).await;
     let addr = base.trim_start_matches("http://").parse().unwrap();
     let mut ws = ws::connect(addr, &cookie).await;
     use futures_util::SinkExt;
@@ -1590,7 +1477,7 @@ async fn subscribing_after_a_restart_attaches_in_the_worktree() {
 
     let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
     loop {
-        if !restarted.opened_workspace_roots.lock().await.is_empty() {
+        if !workspace_roots(&restarted).is_empty() {
             break;
         }
         assert!(
@@ -1600,7 +1487,7 @@ async fn subscribing_after_a_restart_attaches_in_the_worktree() {
         tokio::time::sleep(tokio::time::Duration::from_millis(20)).await;
     }
     assert_eq!(
-        restarted.opened_workspace_roots.lock().await.clone(),
+        workspace_roots(&restarted),
         vec![worktree_path],
         "attaching on subscribe must use the thread's worktree"
     );
@@ -1608,11 +1495,39 @@ async fn subscribing_after_a_restart_attaches_in_the_worktree() {
 
 /// Build a second server over the same data directory, as a restart would leave it: the persisted
 /// thread is all there is to go on.
-async fn restart(server: &Harnessed) -> (Arc<RecordingHarness>, String, String) {
-    let harness = Arc::new(RecordingHarness::default());
-    let restarted = TestServer::builder(recording_factory(harness.clone()))
+async fn restart(
+    server: &Harnessed,
+) -> (
+    Arc<FakeHarness<RecordingScript>>,
+    String,
+    String,
+    DriverProbe,
+) {
+    let harness = FakeHarness::new(RecordingScript::default());
+    let (sink, probe) = giskard_testenv::driver::probe();
+    let restarted = TestServer::builder(fake::factory(harness.clone()))
+        .driver_events(sink)
         .data_dir(server.server.data_dir())
         .start()
         .await;
-    (harness, restarted.base.clone(), restarted.cookie.clone())
+    (
+        harness,
+        restarted.base.clone(),
+        restarted.cookie.clone(),
+        probe,
+    )
+}
+
+fn workspace_roots(harness: &FakeHarness<RecordingScript>) -> Vec<String> {
+    harness
+        .core
+        .calls()
+        .iter()
+        .filter_map(|call| match call {
+            Call::Open { workspace_root, .. } | Call::Claim { workspace_root, .. } => {
+                Some(workspace_root.to_string_lossy().into_owned())
+            }
+            _ => None,
+        })
+        .collect()
 }

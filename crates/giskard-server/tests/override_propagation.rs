@@ -4,158 +4,52 @@
 //! so mid-thread model/effort changes take effect (§8.4/§8.5); (2) the thread's permission preset
 //! must reach the harness (§9). A capturing harness records every `TurnOverrides` it is handed.
 
-use std::sync::Arc;
-use std::sync::Mutex as StdMutex;
-
 use async_trait::async_trait;
 use futures_util::SinkExt;
-use giskard_core::error::HarnessError;
 use giskard_core::event::AgentEvent;
-use giskard_core::ids::{ApprovalId, ServerRequestId, ThreadId, TurnId};
-use giskard_core::model::{Effort, ModelDescriptor, ModelRef};
-use giskard_core::server_request::ServerRequestResponse;
+use giskard_core::model::{Effort, ModelRef};
 use giskard_core::token::TokenUsage;
 use giskard_core::turn::{Mode, PermissionPreset, TurnOverrides, TurnStatus, TurnStatusKind};
-use giskard_core::user_input::UserInput;
-use giskard_harness::{
-    AgentEventStream, AgentHarness, EventLog, HarnessCapabilities, OpenThreadOptions, ThreadHandle,
-};
 use giskard_proto::ClientMessage;
-use giskard_testenv::{TestServer, factory, fixtures, ws};
-use tokio::sync::Mutex as TokioMutex;
+use giskard_testenv::fake::{self, Call, FakeCore, FakeHarness, Script, TurnCall};
+use giskard_testenv::{TestServer, fixtures, ws};
 
 /// Harness that records the overrides passed to `start_turn` and emits a trivial completed turn.
-struct CapturingHarness {
-    captured: Arc<TokioMutex<Vec<TurnOverrides>>>,
-    tx: Arc<EventLog>,
-    thread_id: StdMutex<Option<ThreadId>>,
-    /// What each `open_thread` asked for.
-    requested_models: Arc<StdMutex<Vec<ModelRef>>>,
-}
-
-impl CapturingHarness {
-    fn with_requests(
-        captured: Arc<TokioMutex<Vec<TurnOverrides>>>,
-        requested_models: Arc<StdMutex<Vec<ModelRef>>>,
-    ) -> Self {
-        let tx = Arc::new(EventLog::new());
-        Self {
-            captured,
-            tx,
-            requested_models,
-            thread_id: StdMutex::new(None),
-        }
-    }
-}
+struct CapturingScript;
 
 #[async_trait]
-impl AgentHarness for CapturingHarness {
-    fn capabilities(&self) -> HarnessCapabilities {
-        HarnessCapabilities {
-            live_approvals: true,
-            plan_build_modes: true,
-            per_turn_model: true,
-            reasoning_effort: true,
-            structured_diffs: true,
-            resumable_threads: true,
-            model_listing: false,
-            provider_listing: false,
-            token_usage: true,
-            mcp_status: false,
-            mcp_reload: false,
-            mcp_oauth_login: false,
-            context_compaction: false,
-        }
-    }
-
-    async fn list_models(&self) -> Result<Vec<ModelDescriptor>, HarnessError> {
-        Ok(vec![])
-    }
-
-    async fn open_thread(&self, opts: OpenThreadOptions) -> Result<ThreadHandle, HarnessError> {
-        let tid = opts.thread;
-        *self.thread_id.lock().unwrap() = Some(tid);
-        self.requested_models
-            .lock()
-            .unwrap()
-            .push(opts.initial_model.clone());
-        Ok(ThreadHandle {
-            resumed_model: Some(opts.initial_model.clone()),
-            ..ThreadHandle::opened(
-                tid,
-                opts.resume.unwrap_or_else(|| "cap".into()),
-                opts.workspace_root.clone(),
-            )
-        })
+impl Script for CapturingScript {
+    fn native_thread_id(&self, _thread: giskard_core::ids::ThreadId) -> String {
+        "cap".into()
     }
 
     async fn start_turn(
         &self,
-        thread: &ThreadHandle,
-        _input: UserInput,
-        overrides: TurnOverrides,
-    ) -> Result<TurnId, HarnessError> {
-        self.captured.lock().await.push(overrides);
-        let tid = thread.thread;
-        let turn = TurnId::new();
+        _core: &FakeCore,
+        call: &TurnCall,
+    ) -> Result<(), giskard_core::HarnessError> {
         // Drive a minimal turn so the server-side forwarder completes and persists.
-        let _ = self
-            .tx
-            .append(AgentEvent::TurnStarted { thread: tid, turn });
-        let _ = self.tx.append(AgentEvent::TurnCompleted {
-            thread: tid,
-            turn,
+        call.log.append(AgentEvent::TurnStarted {
+            thread: call.thread,
+            turn: call.turn,
+        });
+        call.log.append(AgentEvent::TurnCompleted {
+            thread: call.thread,
+            turn: call.turn,
             usage: TokenUsage::default(),
             status: TurnStatus {
                 kind: TurnStatusKind::Completed,
                 message: None,
             },
         });
-        Ok(turn)
-    }
-
-    fn subscribe(&self, _thread: &ThreadHandle) -> AgentEventStream {
-        AgentEventStream::new(self.tx.reader())
-    }
-
-    async fn respond_approval(
-        &self,
-        _req: ApprovalId,
-        _decision: giskard_core::approval::ApprovalDecision,
-    ) -> Result<(), HarnessError> {
-        Ok(())
-    }
-
-    async fn respond_server_request(
-        &self,
-        _req: ServerRequestId,
-        _response: ServerRequestResponse,
-    ) -> Result<(), HarnessError> {
-        Ok(())
-    }
-
-    async fn interrupt(&self, _thread: &ThreadHandle) -> Result<(), HarnessError> {
-        Ok(())
-    }
-
-    async fn shutdown(&self) -> Result<(), HarnessError> {
         Ok(())
     }
 }
 
 #[tokio::test]
 async fn send_input_snapshot_carries_model_effort_and_permission_preset() {
-    let captured = Arc::new(TokioMutex::new(Vec::<TurnOverrides>::new()));
-    let requested_models = Arc::new(StdMutex::new(Vec::new()));
-    let captured_for_factory = captured.clone();
-    let models_for_factory = requested_models.clone();
-    let factory = factory::from_fn(move |_, _| {
-        Ok(Arc::new(CapturingHarness::with_requests(
-            captured_for_factory.clone(),
-            models_for_factory.clone(),
-        )))
-    });
-    let server = TestServer::builder(factory)
+    let harness = FakeHarness::new(CapturingScript);
+    let server = TestServer::builder(fake::factory(harness.clone()))
         .config(
             r#"[providers.openai]
   [[providers.openai.models]]
@@ -170,8 +64,16 @@ async fn send_input_snapshot_carries_model_effort_and_permission_preset() {
     let pid = project.id;
     let thread_id = server.register_thread(pid, "th_cap").await;
     assert_eq!(
-        requested_models.lock().unwrap().as_slice(),
-        &[fixtures::fake_native_model()],
+        harness
+            .core
+            .calls()
+            .iter()
+            .filter_map(|call| match call {
+                Call::Open { model, .. } => Some(model.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>(),
+        vec![fixtures::fake_native_model()],
         "reopening a persisted thread passes its effective model"
     );
     let state = &server.state;
@@ -206,7 +108,7 @@ async fn send_input_snapshot_carries_model_effort_and_permission_preset() {
     .await
     .unwrap();
 
-    let first = wait_for_capture(&captured, 1).await;
+    let first = captured(&harness.core, 1).await;
     assert_eq!(
         first.model,
         Some(ModelRef {
@@ -255,7 +157,7 @@ async fn send_input_snapshot_carries_model_effort_and_permission_preset() {
     .await
     .unwrap();
 
-    let second = wait_for_capture(&captured, 2).await;
+    let second = captured(&harness.core, 2).await;
     assert_eq!(
         second.permission_preset,
         PermissionPreset::FullAccess,
@@ -303,7 +205,7 @@ async fn send_input_snapshot_carries_model_effort_and_permission_preset() {
     .await
     .unwrap();
 
-    let third = wait_for_capture(&captured, 3).await;
+    let third = captured(&harness.core, 3).await;
     assert_eq!(
         third.model,
         Some(ModelRef {
@@ -316,21 +218,15 @@ async fn send_input_snapshot_carries_model_effort_and_permission_preset() {
 }
 
 /// Wait until at least `n` overrides have been captured, returning the `n`-th (1-based).
-async fn wait_for_capture(
-    captured: &Arc<TokioMutex<Vec<TurnOverrides>>>,
-    n: usize,
-) -> TurnOverrides {
-    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
-    loop {
-        {
-            let guard = captured.lock().await;
-            if guard.len() >= n {
-                return guard[n - 1].clone();
-            }
-        }
-        if tokio::time::Instant::now() >= deadline {
-            panic!("expected {n} captured overrides");
-        }
-        tokio::time::sleep(tokio::time::Duration::from_millis(25)).await;
-    }
+async fn captured(core: &FakeCore, n: usize) -> TurnOverrides {
+    core.wait_for_calls(|call| matches!(call, Call::StartTurn { .. }), n)
+        .await;
+    core.calls()
+        .iter()
+        .filter_map(|call| match call {
+            Call::StartTurn { overrides, .. } => Some(overrides.clone()),
+            _ => None,
+        })
+        .nth(n - 1)
+        .unwrap()
 }
