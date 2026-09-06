@@ -46,8 +46,8 @@ use crate::thread_graph::{
 };
 use crate::thread_metadata::ThreadMetadataService;
 use crate::thread_runtime::{
-    RequestResolution, RequestTransition, ResolvedThreadRuntime, RestorePermit, RuntimeRequestId,
-    ThreadRuntimeSupport, ThreadTurnLease, TurnReservation,
+    AppliedRuntimeEvent, RequestResolution, RequestTransition, ResolvedThreadRuntime,
+    RestorePermit, RuntimeRequestId, ThreadRuntimeSupport, ThreadTurnLease, TurnReservation,
 };
 
 mod admission;
@@ -1085,7 +1085,10 @@ impl HarnessRegistry {
         self.shared
             .services
             .hub
-            .publish(request.thread_id, Outbound::Request(request))
+            .publish(
+                request.thread_id,
+                Outbound::RuntimeEffects(AppliedRuntimeEvent::for_request(request)),
+            )
             .await;
         self.shared.services.publish_runtime_overview().await;
     }
@@ -1094,15 +1097,8 @@ impl HarnessRegistry {
         self.shared
             .services
             .hub
-            .publish(thread_id, Outbound::Request(transition.request_state))
+            .publish(thread_id, Outbound::RuntimeEffects(transition.into()))
             .await;
-        if let Some(overview) = transition.overview_if_changed {
-            self.shared
-                .services
-                .hub
-                .publish_runtime_overview(overview)
-                .await;
-        }
     }
 
     pub(crate) async fn republish_server_request_state(

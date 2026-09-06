@@ -9,8 +9,8 @@ use giskard_core::event::AgentEvent;
 use giskard_core::ids::{ProjectId, ThreadId};
 use giskard_core::user_input::UserInput;
 use giskard_proto::{
-    ErrorInfo, RequestState, RunningTask, ServerMessage, ThreadRuntimeOverview, ThreadState,
-    WireAgentEvent, WireCommandOutput, WireItem,
+    ErrorInfo, RunningTask, ServerMessage, ThreadRuntimeOverview, ThreadState, WireAgentEvent,
+    WireCommandOutput, WireItem,
 };
 
 use crate::delivery::{ClientDelivery, DeliverySendError, ReplacementReceiver};
@@ -29,8 +29,6 @@ pub enum Outbound {
         /// Attached to `ItemCompleted` only: the durable command output of a late completion.
         command_output: Option<WireCommandOutput>,
     },
-    /// Authoritative replacement state for one request, on the ordered lane.
-    Request(RequestState),
     /// The running-tasks projection as a revisioned snapshot. On the ordered lane today; the
     /// spec table lists it as revisioned replacement, a lane change this step does not make.
     RunningTasks {
@@ -300,10 +298,6 @@ impl Hub {
                     },
                 )
                 .await;
-            }
-            Outbound::Request(request) => {
-                self.send_ordered(thread_id, ServerMessage::RequestState(request))
-                    .await;
             }
             Outbound::RunningTasks { revision, tasks } => {
                 self.send_running_tasks(thread_id, revision, tasks).await;

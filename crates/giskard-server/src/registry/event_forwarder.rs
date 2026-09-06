@@ -4871,7 +4871,7 @@ mod tests {
             responding.request_state.status,
             WireRequestStatus::Responding
         ));
-        hub.publish(thread_id, Outbound::Request(responding.request_state))
+        hub.publish(thread_id, Outbound::RuntimeEffects(responding.into()))
             .await;
 
         assert!(log.append(AgentEvent::ServerRequestResolved {

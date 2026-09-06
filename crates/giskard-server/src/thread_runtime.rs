@@ -5,32 +5,48 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::Instant;
 
-use giskard_core::approval::{ApprovalDecision, ApprovalRequest};
-use giskard_core::diff::{CapturedDiffDescriptor, CapturedDiffRecord};
+use giskard_core::approval::ApprovalDecision;
+#[cfg(test)]
+use giskard_core::approval::ApprovalRequest;
+use giskard_core::diff::CapturedDiffRecord;
 use giskard_core::error::HarnessError;
 use giskard_core::event::AgentEvent;
-use giskard_core::ids::{ApprovalId, ProjectId, ServerRequestId, ThreadId, TurnId};
+use giskard_core::ids::{ApprovalId, ServerRequestId, ThreadId, TurnId};
 use giskard_core::ids::{DiffId, ItemId};
-use giskard_core::item::{Item, ItemPayload, command_status_is_running};
-use giskard_core::server_request::{ServerRequest, ServerRequestResponse};
-use giskard_core::turn::{Turn, TurnMode, TurnModel};
+use giskard_core::item::ItemPayload;
+use giskard_core::turn::Turn;
 use giskard_core::user_input::UserInput;
-use sha2::{Digest, Sha256};
 use tracing::{debug, warn};
 
 use crate::log_fields::display_opt;
 use crate::registry::ThreadAuthority;
-use crate::runtime_live::LiveTurnState;
-use crate::runtime_tasks::RunningTaskState;
 use giskard_proto::{LiveTurnSnapshot, RunningTask};
 use giskard_proto::{
-    OutstandingRequest, RequestKind, RequestPayload as WireRequestPayload,
-    RequestResolution as WireRequestResolution, RequestState as WireRequestState,
-    RequestStatus as WireRequestStatus, RuntimeTurnState, ThreadRuntimeOverview,
-    ThreadRuntimeSummary, WireApprovalRequest,
+    RequestState as WireRequestState, RequestStatus as WireRequestStatus, RuntimeTurnState,
+    ThreadRuntimeOverview, ThreadRuntimeSummary,
 };
+
+mod diffs;
+mod gate;
+mod live;
+mod outputs;
+mod requests;
+mod tasks;
+
+pub(crate) use diffs::RuntimeDiffLookup;
+pub(crate) use gate::TurnReservation;
+pub(crate) use outputs::{
+    RuntimeCommandOutputLookup, RuntimeToolOutputLookup, command_output_version,
+};
+pub(crate) use requests::{RequestResolution, RuntimeRequestId};
+
+use diffs::CapturedDiffState;
+use gate::TurnGate;
+use live::LiveTurnState;
+use outputs::{ItemOutputState, PreparedItemOutput, prepare_item_output};
+use requests::{ClaimRejection, CommitRejection, RequestLedger, RequestPayload};
+use tasks::RunningTaskState;
 
 pub(crate) struct ThreadRuntimeSupport {
     // Cross-thread derived projection; entity-local runtime state lives on ThreadAuthority.
@@ -41,28 +57,27 @@ pub(crate) struct ThreadRuntimeSupport {
 #[derive(Default)]
 /// Per-thread runtime state, grouped by lifetime:
 /// - the in-flight turn, cleared for the completed turn in `settle_completed_turn`:
-///   `captured_diffs` (per turn, slot model: turn-level and per-item paths evolve
-///   independently), `item_outputs` (per item, one command and one tool output at most),
-///   `live`, and the resolved `requests` of that turn;
-/// - the thread's owner and clocks, cleared only with the entry: `active_turn`,
-///   `lifecycle_revision`, `event_sequence`, `task_revision`;
+///   `diffs` (per turn, slot model: turn-level and per-item paths evolve independently),
+///   `outputs` (per item, one command and one tool output at most), `live`, and the
+///   resolved records inside `requests`;
+/// - the thread's owner and clocks, cleared only with the entry: `gate` (the active owner
+///   and the lifecycle revision it numbers), `event_sequence`, and the task revision
+///   inside `tasks`;
 /// - caches for persisted turns, cleared only with the entry:
 ///   `persisted_command_output_versions`;
 /// - `tasks`, which outlive turns because a command may finish after its turn persisted.
 ///
-/// A new per-item value that ends with the turn goes in `ItemOutputs`; a new per-turn
-/// value that has slot or sharing semantics goes next to `captured_diffs`; anything that
+/// A new per-item value that ends with the turn goes in `ItemOutputState`; a new per-turn
+/// value that has slot or sharing semantics goes in `CapturedDiffState`; anything that
 /// survives completion gets its own field and its own cleanup site.
 pub(crate) struct ThreadRuntimeEntry {
-    active_turn: Option<ActiveTurnOwner>,
-    lifecycle_revision: u64,
-    requests: HashMap<RuntimeRequestId, RequestRecord>,
+    gate: TurnGate,
+    requests: RequestLedger,
     event_sequence: u64,
-    task_revision: u64,
     live: LiveTurnState,
     tasks: RunningTaskState,
-    captured_diffs: HashMap<TurnId, ActiveCapturedDiffs>,
-    item_outputs: HashMap<(TurnId, ItemId), ItemOutputs>,
+    diffs: CapturedDiffState,
+    outputs: ItemOutputState,
     persisted_command_output_versions: HashMap<(TurnId, ItemId), String>,
 }
 
@@ -112,73 +127,6 @@ impl ThreadRuntimeSlot {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct RuntimeCommandOutput {
-    pub output: String,
-    pub output_truncated: bool,
-    pub original_bytes: u64,
-    pub original_lines: u64,
-    pub version: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct RuntimeToolOutput {
-    pub bytes: Vec<u8>,
-    pub descriptor: giskard_proto::WireToolOutput,
-}
-
-/// The live, authoritative outputs of one completed item while its turn is in flight.
-#[derive(Default)]
-struct ItemOutputs {
-    command: Option<RuntimeCommandOutput>,
-    tool: Option<RuntimeToolOutput>,
-}
-
-impl ItemOutputs {
-    fn is_empty(&self) -> bool {
-        self.command.is_none() && self.tool.is_none()
-    }
-}
-
-impl ThreadRuntimeEntry {
-    fn set_command_output(&mut self, key: (TurnId, ItemId), output: Option<RuntimeCommandOutput>) {
-        let outputs = self.item_outputs.entry(key).or_default();
-        outputs.command = output;
-        if outputs.is_empty() {
-            self.item_outputs.remove(&key);
-        }
-    }
-
-    fn set_tool_output(&mut self, key: (TurnId, ItemId), output: Option<RuntimeToolOutput>) {
-        let outputs = self.item_outputs.entry(key).or_default();
-        outputs.tool = output;
-        if outputs.is_empty() {
-            self.item_outputs.remove(&key);
-        }
-    }
-}
-
-pub(crate) struct PreparedItemOutput {
-    turn_id: TurnId,
-    item_id: ItemId,
-    command_runtime: Option<RuntimeCommandOutput>,
-    command_descriptor: Option<giskard_core::CommandOutputDescriptor>,
-    tool_runtime: Option<RuntimeToolOutput>,
-    tool_descriptor: Option<giskard_proto::WireToolOutput>,
-    command_item: bool,
-    live_event: Option<AgentEvent>,
-}
-
-pub(crate) enum RuntimeCommandOutputLookup {
-    Found(RuntimeCommandOutput),
-    Missing,
-}
-
-pub(crate) enum RuntimeToolOutputLookup {
-    Found(RuntimeToolOutput),
-    Missing,
-}
-
 pub(crate) struct PersistedCommandOutputVersionPermit {
     entry: std::sync::Weak<Mutex<ThreadRuntimeEntry>>,
 }
@@ -207,39 +155,6 @@ impl PersistedCommandOutputVersionPermit {
                 .clone(),
         )
     }
-}
-
-#[derive(Default)]
-struct ActiveCapturedDiffs {
-    // Current authority is a set of logical slots, not a path map: turn-level paths and each
-    // occurrence of a path inside an item evolve independently. ItemCompleted replaces the
-    // complete slot set for that item. A matched replacement keeps one conflict redirect; an
-    // omitted slot becomes missing. `contents` contains exactly bodies still referenced by at
-    // least one current slot, with identical content identities shared across slots.
-    contents: HashMap<DiffId, CapturedDiffRecord>,
-    current_by_slot: HashMap<CapturedDiffSlot, CapturedDiffDescriptor>,
-    superseded: HashMap<DiffId, SupersededCapturedDiff>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-enum CapturedDiffSlot {
-    Item {
-        item_id: ItemId,
-        path: std::path::PathBuf,
-        occurrence: usize,
-    },
-    Turn(std::path::PathBuf),
-}
-
-struct SupersededCapturedDiff {
-    slot: CapturedDiffSlot,
-    current: CapturedDiffDescriptor,
-}
-
-pub(crate) enum RuntimeDiffLookup {
-    Found(CapturedDiffRecord),
-    Superseded(CapturedDiffDescriptor),
-    Missing,
 }
 
 #[derive(Default)]
@@ -280,47 +195,6 @@ pub(crate) struct RequestCommitError {
     pub rollback: Option<RequestTransition>,
 }
 
-#[derive(Clone)]
-struct ActiveTurnOwner {
-    reservation: TurnReservation,
-    acknowledged_turn: Option<TurnId>,
-    reserved_at: Instant,
-    persistence_blocked: Option<(Turn, String)>,
-}
-
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub(crate) enum RuntimeRequestId {
-    Approval(ApprovalId),
-    Server(ServerRequestId),
-}
-
-#[derive(Clone, PartialEq)]
-enum RequestPayload {
-    Approval(ApprovalRequest),
-    Server(ServerRequest),
-}
-
-#[derive(Clone, Debug, PartialEq)]
-enum RequestStatus {
-    Pending,
-    Responding { claim: u64, harness_resolved: bool },
-    Resolved(RequestResolution),
-}
-
-#[derive(Clone)]
-struct RequestRecord {
-    turn_id: Option<TurnId>,
-    payload: RequestPayload,
-    status: RequestStatus,
-    revision: u64,
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub(crate) enum RequestResolution {
-    Approval(ApprovalDecision),
-    Server(ServerRequestResponse),
-}
-
 pub(crate) struct RequestClaim {
     authority: Arc<ThreadAuthority>,
     overview: Arc<Mutex<OverviewState>>,
@@ -329,15 +203,6 @@ pub(crate) struct RequestClaim {
     thread_id: ThreadId,
     claim_id: u64,
     settled: bool,
-}
-
-#[derive(Clone)]
-pub(crate) struct TurnReservation {
-    pub project_id: ProjectId,
-    pub harness_thread_id: String,
-    pub mode: TurnMode,
-    pub model: TurnModel,
-    pub context_kind: &'static str,
 }
 
 pub(crate) struct ThreadTurnLease {
@@ -520,54 +385,7 @@ impl ThreadRuntimeSupport {
         let thread_id = authority.thread_id();
         let entry = self.entry_or_create(authority);
         let mut entry = lock_unpoison(&entry, "thread runtime entry");
-        match &mut event {
-            AgentEvent::ItemCompleted { turn, item, .. } => {
-                let state = entry.captured_diffs.entry(*turn).or_default();
-                let mut captures = Vec::new();
-                if let ItemPayload::FileChange { changes, .. } = &mut item.payload {
-                    let mut occurrences = HashMap::new();
-                    for change in changes {
-                        let occurrence = occurrences.entry(change.path.clone()).or_insert(0);
-                        let slot = CapturedDiffSlot::Item {
-                            item_id: item.id,
-                            path: change.path.clone(),
-                            occurrence: *occurrence,
-                        };
-                        *occurrence += 1;
-                        let Some(text) = change.diff.take() else {
-                            continue;
-                        };
-                        let (descriptor, record) = giskard_core::capture_unified_diff(
-                            change.path.clone(),
-                            change.change,
-                            Some(item.id),
-                            text,
-                        );
-                        captures.push((slot, descriptor.clone(), record));
-                        change.captured_diff = Some(descriptor);
-                    }
-                }
-                // ItemCompleted is an upsert of the complete item payload. An empty file-change
-                // set or a replacement payload of another kind therefore retires every old slot.
-                reconcile_item_captured_diffs(state, thread_id, *turn, item.id, captures);
-            }
-            AgentEvent::DiffUpdated { turn, diff, .. } => {
-                let (projected, record) = giskard_core::capture_structured_diff(diff.clone());
-                if let Some(descriptor) = projected.captured.clone() {
-                    let state = entry.captured_diffs.entry(*turn).or_default();
-                    install_captured_diff(
-                        state,
-                        thread_id,
-                        *turn,
-                        CapturedDiffSlot::Turn(descriptor.path.clone()),
-                        descriptor,
-                        record,
-                    );
-                }
-                *diff = projected;
-            }
-            _ => {}
-        }
+        entry.diffs.capture(thread_id, &mut event);
         event
     }
 
@@ -580,10 +398,7 @@ impl ThreadRuntimeSupport {
             return Vec::new();
         };
         let entry = lock_unpoison(&entry, "thread runtime entry");
-        entry
-            .captured_diffs
-            .get(&turn_id)
-            .map_or_else(Vec::new, |state| state.contents.values().cloned().collect())
+        entry.diffs.records(turn_id)
     }
 
     pub(crate) fn command_output(
@@ -596,14 +411,7 @@ impl ThreadRuntimeSupport {
             return RuntimeCommandOutputLookup::Missing;
         };
         let entry = lock_unpoison(&entry, "thread runtime entry");
-        entry
-            .item_outputs
-            .get(&(turn_id, item_id))
-            .and_then(|outputs| outputs.command.clone())
-            .map_or(
-                RuntimeCommandOutputLookup::Missing,
-                RuntimeCommandOutputLookup::Found,
-            )
+        entry.outputs.command_output(turn_id, item_id)
     }
 
     pub(crate) fn tool_output(
@@ -616,14 +424,7 @@ impl ThreadRuntimeSupport {
             return RuntimeToolOutputLookup::Missing;
         };
         let entry = lock_unpoison(&entry, "thread runtime entry");
-        entry
-            .item_outputs
-            .get(&(turn_id, item_id))
-            .and_then(|outputs| outputs.tool.clone())
-            .map_or(
-                RuntimeToolOutputLookup::Missing,
-                RuntimeToolOutputLookup::Found,
-            )
+        entry.outputs.tool_output(turn_id, item_id)
     }
 
     pub(crate) fn remove_tool_output(
@@ -635,7 +436,9 @@ impl ThreadRuntimeSupport {
         let Some(entry) = self.existing_entry(authority) else {
             return;
         };
-        lock_unpoison(&entry, "thread runtime entry").set_tool_output((turn_id, item_id), None);
+        lock_unpoison(&entry, "thread runtime entry")
+            .outputs
+            .set_tool((turn_id, item_id), None);
     }
 
     pub(crate) fn remove_command_output(
@@ -647,7 +450,9 @@ impl ThreadRuntimeSupport {
         let Some(entry) = self.existing_entry(authority) else {
             return;
         };
-        lock_unpoison(&entry, "thread runtime entry").set_command_output((turn_id, item_id), None);
+        lock_unpoison(&entry, "thread runtime entry")
+            .outputs
+            .set_command((turn_id, item_id), None);
     }
 
     pub(crate) fn persisted_command_output_version_permit(
@@ -670,17 +475,7 @@ impl ThreadRuntimeSupport {
             return RuntimeDiffLookup::Missing;
         };
         let entry = lock_unpoison(&entry, "thread runtime entry");
-        let Some(state) = entry.captured_diffs.get(&turn_id) else {
-            return RuntimeDiffLookup::Missing;
-        };
-        if let Some(record) = state.contents.get(diff_id) {
-            return RuntimeDiffLookup::Found(record.clone());
-        }
-        state
-            .superseded
-            .get(diff_id)
-            .map(|superseded| superseded.current.clone())
-            .map_or(RuntimeDiffLookup::Missing, RuntimeDiffLookup::Superseded)
+        entry.diffs.lookup(turn_id, diff_id)
     }
     pub(crate) fn new() -> Self {
         Self::with_max_command_output_bytes(
@@ -713,7 +508,9 @@ impl ThreadRuntimeSupport {
         authority: &Arc<ThreadAuthority>,
         entry: Arc<Mutex<ThreadRuntimeEntry>>,
     ) -> RestorePermit {
-        let revision = lock_unpoison(&entry, "thread runtime entry").lifecycle_revision;
+        let revision = lock_unpoison(&entry, "thread runtime entry")
+            .gate
+            .lifecycle_revision();
         RestorePermit {
             thread_id: authority.thread_id(),
             authority: Arc::downgrade(authority),
@@ -730,7 +527,7 @@ impl ThreadRuntimeSupport {
             return false;
         };
         authority
-            .with_exact_runtime_entry(&expected, |entry| entry.lifecycle_revision)
+            .with_exact_runtime_entry(&expected, |entry| entry.gate.lifecycle_revision())
             .is_some_and(|revision| revision == permit.lifecycle_revision)
     }
 
@@ -833,7 +630,7 @@ impl ThreadRuntimeSupport {
         };
         let entry = lock_unpoison(&entry, "thread runtime entry");
         let tasks = entry.tasks.snapshot(thread_id);
-        (entry.task_revision, tasks)
+        (entry.tasks.revision(), tasks)
     }
 
     pub(crate) fn has_running_for_turn(
@@ -892,13 +689,9 @@ impl ThreadRuntimeSupport {
             return false;
         };
         let mut entry = lock_unpoison(&entry, "thread runtime entry");
-        let changed = entry
+        entry
             .tasks
-            .set_terminating_by_process(thread_id, process_id, terminating);
-        if changed {
-            entry.task_revision = entry.task_revision.saturating_add(1);
-        }
-        changed
+            .set_terminating_by_process(thread_id, process_id, terminating)
     }
 
     pub(crate) fn remove_task_by_process(
@@ -911,11 +704,7 @@ impl ThreadRuntimeSupport {
             return false;
         };
         let mut entry = lock_unpoison(&entry, "thread runtime entry");
-        let changed = entry.tasks.remove_by_process(thread_id, process_id);
-        if changed {
-            entry.task_revision = entry.task_revision.saturating_add(1);
-        }
-        changed
+        entry.tasks.remove_by_process(thread_id, process_id)
     }
 
     pub(crate) fn apply_event(
@@ -976,7 +765,7 @@ impl ThreadRuntimeSupport {
         // before this check, or removes the fully-applied entry afterward; it cannot be followed by
         // stale prepared work recreating authority.
         authority.with_exact_runtime_entry(&expected, |entry| {
-            if entry.lifecycle_revision != permit.lifecycle_revision {
+            if entry.gate.lifecycle_revision() != permit.lifecycle_revision {
                 return None;
             }
             Some(self.apply_prepared_event_to_entry(
@@ -1035,8 +824,7 @@ impl ThreadRuntimeSupport {
         });
         let (request_id, request_changed) = match event {
             AgentEvent::ApprovalRequested { turn, request, .. } => {
-                let changed = register_request(
-                    entry,
+                let changed = entry.requests.register(
                     RuntimeRequestId::Approval(request.id.clone()),
                     Some(*turn),
                     RequestPayload::Approval(request.clone()),
@@ -1047,8 +835,7 @@ impl ThreadRuntimeSupport {
                 )
             }
             AgentEvent::ServerRequestReceived { turn, request, .. } => {
-                let changed = register_request(
-                    entry,
+                let changed = entry.requests.register(
                     RuntimeRequestId::Server(request.id.clone()),
                     *turn,
                     RequestPayload::Server(request.clone()),
@@ -1056,23 +843,23 @@ impl ThreadRuntimeSupport {
                 (Some(RuntimeRequestId::Server(request.id.clone())), changed)
             }
             AgentEvent::ServerRequestResolved { request_id, .. } => {
-                let changed = resolve_server_request_from_harness(entry, thread_id, request_id);
+                let changed = entry.requests.resolve_from_harness(thread_id, request_id);
                 (Some(RuntimeRequestId::Server(request_id.clone())), changed)
             }
             _ => (None, false),
         };
         if let AgentEvent::ItemCompleted { turn, item, .. } = event {
-            if let Some(prepared) = prepared_output {
-                update_prepared_item_output_authority(entry, prepared);
-            } else {
-                update_command_output_authority(entry, *turn, item);
-                update_tool_output_authority(entry, thread_id, *turn, item);
+            match prepared_output {
+                Some(prepared) => entry.outputs.apply_prepared(prepared),
+                None => entry.outputs.apply_completed_item(
+                    thread_id,
+                    entry.gate.project_id(),
+                    *turn,
+                    item,
+                ),
             }
         }
         let tasks_changed = entry.tasks.apply_event(event);
-        if tasks_changed {
-            entry.task_revision = entry.task_revision.saturating_add(1);
-        }
         if append_live && entry.live.is_active(thread_id) {
             entry.live.append(thread_id, event.clone());
         }
@@ -1082,8 +869,7 @@ impl ThreadRuntimeSupport {
         let request_state = if request_changed {
             request_id
                 .as_ref()
-                .and_then(|id| entry.requests.get(id))
-                .map(|record| wire_request_state(thread_id, record))
+                .and_then(|id| entry.requests.state(thread_id, id))
         } else {
             None
         };
@@ -1091,7 +877,7 @@ impl ThreadRuntimeSupport {
             sequence,
             tasks_changed,
             running_tasks_if_changed: tasks_changed.then(|| RunningTasksProjection {
-                revision: entry.task_revision,
+                revision: entry.tasks.revision(),
                 tasks: entry.tasks.snapshot(thread_id),
             }),
             request_state,
@@ -1118,16 +904,11 @@ impl ThreadRuntimeSupport {
                     _ => None,
                 };
                 if let Some(completed_turn) = completed_turn {
-                    entry.captured_diffs.remove(&completed_turn);
-                    entry
-                        .item_outputs
-                        .retain(|(turn_id, _), _| *turn_id != completed_turn);
+                    entry.diffs.clear_turn(completed_turn);
+                    entry.outputs.clear_turn(completed_turn);
                 }
-                entry.requests.retain(|_, record| {
-                    !(matches!(record.status, RequestStatus::Resolved(_))
-                        && record.turn_id == completed_turn)
-                });
-                if let Some(owner) = entry.active_turn.take() {
+                entry.requests.prune_resolved(completed_turn);
+                if let Some(owner) = entry.gate.release() {
                     debug!(
                         %thread_id,
                         project_id = %owner.reservation.project_id,
@@ -1138,10 +919,7 @@ impl ThreadRuntimeSupport {
                 }
             }
             Some((turn, error)) => {
-                if let Some(owner) = entry.active_turn.as_mut() {
-                    owner.acknowledged_turn = Some(turn.id);
-                    owner.persistence_blocked = Some((turn, error));
-                } else {
+                if !entry.gate.block_on_persistence(turn, error) {
                     warn!(%thread_id, "cannot retain failed turn without an active owner");
                 }
             }
@@ -1158,27 +936,7 @@ impl ThreadRuntimeSupport {
         let thread_id = authority.thread_id();
         let entry = self.entry_or_create(authority);
         let mut entry = lock_unpoison(&entry, "thread runtime entry");
-        if let Some(existing) = &entry.active_turn {
-            warn!(
-                %thread_id,
-                owner_project_id = %existing.reservation.project_id,
-                owner_turn_id = display_opt(existing.acknowledged_turn),
-                owner_harness_thread_id = %existing.reservation.harness_thread_id,
-                owner_context_kind = existing.reservation.context_kind,
-                owner_mode = ?existing.reservation.mode,
-                owner_model = ?existing.reservation.model,
-                owner_elapsed_ms = existing.reserved_at.elapsed().as_millis(),
-                "rejecting turn start because thread runtime is already active"
-            );
-            return Err(HarnessError::ThreadBusy { thread: thread_id });
-        }
-        entry.active_turn = Some(ActiveTurnOwner {
-            reservation,
-            acknowledged_turn: None,
-            reserved_at: Instant::now(),
-            persistence_blocked: None,
-        });
-        entry.lifecycle_revision = entry.lifecycle_revision.saturating_add(1);
+        entry.gate.reserve(thread_id, reservation)?;
         self.refresh_overview(thread_id, &entry);
         Ok(ThreadTurnLease {
             authority: authority.clone(),
@@ -1193,8 +951,8 @@ impl ThreadRuntimeSupport {
             return false;
         };
         lock_unpoison(&entry, "thread runtime entry")
-            .active_turn
-            .is_some()
+            .gate
+            .is_active()
     }
 
     fn acknowledge_turn(
@@ -1205,11 +963,10 @@ impl ThreadRuntimeSupport {
         let thread_id = authority.thread_id();
         let entry = self.entry_or_create(authority);
         let mut entry = lock_unpoison(&entry, "thread runtime entry");
-        let Some(owner) = entry.active_turn.as_mut() else {
+        if !entry.gate.acknowledge(turn_id) {
             warn!(%thread_id, %turn_id, "turn acknowledgement has no runtime owner");
             return None;
-        };
-        owner.acknowledged_turn = Some(turn_id);
+        }
         self.refresh_overview(thread_id, &entry)
     }
 
@@ -1217,7 +974,7 @@ impl ThreadRuntimeSupport {
         let thread_id = authority.thread_id();
         let entry = self.existing_entry(authority)?;
         let mut entry = lock_unpoison(&entry, "thread runtime entry");
-        if let Some(owner) = entry.active_turn.take() {
+        if let Some(owner) = entry.gate.release() {
             debug!(
                 %thread_id,
                 project_id = %owner.reservation.project_id,
@@ -1238,8 +995,7 @@ impl ThreadRuntimeSupport {
         let thread_id = authority.thread_id();
         let entry = self.entry_or_create(authority);
         let mut entry = lock_unpoison(&entry, "thread runtime entry");
-        register_request(
-            &mut entry,
+        entry.requests.register(
             RuntimeRequestId::Approval(request.id.clone()),
             None,
             RequestPayload::Approval(request),
@@ -1255,23 +1011,22 @@ impl ThreadRuntimeSupport {
         let thread_id = authority.thread_id();
         let entry = self.entry_or_create(authority);
         let mut entry = lock_unpoison(&entry, "thread runtime entry");
-        let record = entry.requests.get_mut(&request_id).ok_or_else(|| {
-            HarnessError::Protocol(format!("no pending request for id {}", request_id.as_str()))
-        })?;
-        if record.status != RequestStatus::Pending {
-            return Err(HarnessError::Protocol(format!(
-                "request {} is not pending",
-                request_id.as_str()
-            )));
-        }
-        let claim_id = next_claim_id();
-        record.status = RequestStatus::Responding {
-            claim: claim_id,
-            harness_resolved: false,
-        };
-        record.revision = record.revision.saturating_add(1);
+        let (claim_id, request_state) =
+            entry
+                .requests
+                .claim(thread_id, &request_id)
+                .map_err(|rejection| match rejection {
+                    ClaimRejection::Missing => HarnessError::Protocol(format!(
+                        "no pending request for id {}",
+                        request_id.as_str()
+                    )),
+                    ClaimRejection::NotPending => HarnessError::Protocol(format!(
+                        "request {} is not pending",
+                        request_id.as_str()
+                    )),
+                })?;
         let transition = RequestTransition {
-            request_state: wire_request_state(thread_id, record),
+            request_state,
             overview_if_changed: self.refresh_overview(thread_id, &entry),
         };
         Ok((
@@ -1313,8 +1068,7 @@ impl ThreadRuntimeSupport {
         let entry = self.existing_entry(authority)?;
         lock_unpoison(&entry, "thread runtime entry")
             .requests
-            .get(request_id)
-            .map(|record| wire_request_state(thread_id, record))
+            .state(thread_id, request_id)
     }
 
     pub(crate) fn request_states(&self, authority: &Arc<ThreadAuthority>) -> Vec<WireRequestState> {
@@ -1324,9 +1078,7 @@ impl ThreadRuntimeSupport {
         };
         lock_unpoison(&entry, "thread runtime entry")
             .requests
-            .values()
-            .map(|record| wire_request_state(thread_id, record))
-            .collect()
+            .states(thread_id)
     }
 
     #[cfg(test)]
@@ -1337,10 +1089,7 @@ impl ThreadRuntimeSupport {
     ) -> Option<RequestResolution> {
         let entry = self.existing_entry(authority)?;
         let entry = lock_unpoison(&entry, "thread runtime entry");
-        match &entry.requests.get(request_id)?.status {
-            RequestStatus::Resolved(resolution) => Some(resolution.clone()),
-            RequestStatus::Pending | RequestStatus::Responding { .. } => None,
-        }
+        entry.requests.resolution(request_id)
     }
 
     pub(crate) fn current_overview(&self) -> ThreadRuntimeOverview {
@@ -1401,94 +1150,15 @@ pub(crate) fn is_internal_event(event: &AgentEvent) -> bool {
     )
 }
 
-fn install_captured_diff(
-    state: &mut ActiveCapturedDiffs,
-    thread_id: ThreadId,
-    turn_id: TurnId,
-    slot: CapturedDiffSlot,
-    descriptor: CapturedDiffDescriptor,
-    record: CapturedDiffRecord,
-) {
-    if let Some(previous) = state
-        .current_by_slot
-        .insert(slot.clone(), descriptor.clone())
-        && previous.id != descriptor.id
-    {
-        if !state
-            .current_by_slot
-            .values()
-            .any(|current| current.id == previous.id)
-        {
-            state.contents.remove(&previous.id);
-            debug!(
-                %thread_id,
-                %turn_id,
-                ?slot,
-                superseded_diff_id = %previous.id,
-                current_diff_id = %descriptor.id,
-                "dropped superseded captured diff body"
-            );
-        }
-        // Keep only the immediately superseded identity for each logical diff slot. Item-owned
-        // and turn-level diffs for the same path are independent authorities.
-        state
-            .superseded
-            .retain(|_, superseded| superseded.slot != slot);
-        state.superseded.insert(
-            previous.id,
-            SupersededCapturedDiff {
-                slot,
-                current: descriptor.clone(),
-            },
-        );
-    }
-    state.contents.insert(record.id.clone(), record);
-}
-
-fn reconcile_item_captured_diffs(
-    state: &mut ActiveCapturedDiffs,
-    thread_id: ThreadId,
-    turn_id: TurnId,
-    item_id: ItemId,
-    captures: Vec<(CapturedDiffSlot, CapturedDiffDescriptor, CapturedDiffRecord)>,
-) {
-    let new_slots: std::collections::HashSet<_> =
-        captures.iter().map(|(slot, _, _)| slot.clone()).collect();
-    let omitted: Vec<_> = state
-        .current_by_slot
-        .keys()
-        .filter(|slot| {
-            matches!(slot, CapturedDiffSlot::Item { item_id: owner, .. } if *owner == item_id)
-                && !new_slots.contains(*slot)
-        })
-        .cloned()
-        .collect();
-    for slot in omitted {
-        if let Some(previous) = state.current_by_slot.remove(&slot)
-            && !state
-                .current_by_slot
-                .values()
-                .any(|current| current.id == previous.id)
-        {
-            state.contents.remove(&previous.id);
-            debug!(
-                %thread_id,
-                %turn_id,
-                ?slot,
-                removed_diff_id = %previous.id,
-                "dropped captured diff body omitted by replacement item"
-            );
-        }
-        state
-            .superseded
-            .retain(|_, superseded| superseded.slot != slot);
-    }
-    for (slot, descriptor, record) in captures {
-        install_captured_diff(state, thread_id, turn_id, slot, descriptor, record);
-    }
-}
-
 impl AppliedRuntimeEvent {
+    /// Effects that carry only one request's replacement state: a republish of the current record.
+    pub(crate) fn for_request(request_state: WireRequestState) -> Self {
+        Self {
+            request_state: Some(request_state),
+            ..Self::unchanged()
+        }
+    }
+
     fn unchanged() -> Self {
         Self {
             sequence: None,
@@ -1501,6 +1171,15 @@ impl AppliedRuntimeEvent {
     }
 }
 
+impl From<RequestTransition> for AppliedRuntimeEvent {
+    fn from(transition: RequestTransition) -> Self {
+        Self {
+            overview_if_changed: transition.overview_if_changed,
+            ..Self::for_request(transition.request_state)
+        }
+    }
+}
+
 impl Clone for ThreadRuntimeSupport {
     fn clone(&self) -> Self {
         Self {
@@ -1508,209 +1187,6 @@ impl Clone for ThreadRuntimeSupport {
             max_command_output_bytes: self.max_command_output_bytes,
         }
     }
-}
-
-fn update_command_output_authority(entry: &mut ThreadRuntimeEntry, turn_id: TurnId, item: &Item) {
-    let ItemPayload::CommandExecution {
-        output,
-        output_truncated,
-        output_original_bytes,
-        output_original_lines,
-        status,
-        ..
-    } = &item.payload
-    else {
-        entry.set_command_output((turn_id, item.id), None);
-        return;
-    };
-    if status.as_deref().is_some_and(command_status_is_running) {
-        entry.set_command_output((turn_id, item.id), None);
-        return;
-    }
-    let Ok(descriptor) = giskard_persist::command_output_descriptor(
-        output,
-        *output_truncated,
-        *output_original_bytes,
-        *output_original_lines,
-        true,
-    ) else {
-        tracing::error!(
-            %turn_id,
-            item_id = %item.id,
-            "completed command output has inconsistent truncation metadata"
-        );
-        entry.set_command_output((turn_id, item.id), None);
-        return;
-    };
-    entry.set_command_output(
-        (turn_id, item.id),
-        Some(RuntimeCommandOutput {
-            output: output.clone(),
-            output_truncated: *output_truncated,
-            original_bytes: descriptor.original_bytes,
-            original_lines: descriptor.original_lines,
-            version: command_output_version(output),
-        }),
-    );
-}
-
-fn prepare_item_output(event: &AgentEvent) -> Option<PreparedItemOutput> {
-    let AgentEvent::ItemCompleted { turn, item, .. } = event else {
-        return None;
-    };
-    if let ItemPayload::ToolCall { output, status, .. } = &item.payload {
-        let terminal = !status
-            .as_deref()
-            .is_some_and(giskard_core::item::tool_status_is_running);
-        let prepared = output
-            .as_ref()
-            .filter(|_| terminal)
-            .and_then(|output| giskard_core::item::serialize_tool_output(output).ok());
-        let (tool_runtime, tool_descriptor) =
-            prepared.map_or((None, None), |(bytes, descriptor)| {
-                (
-                    Some(RuntimeToolOutput {
-                        bytes,
-                        descriptor: descriptor.clone(),
-                    }),
-                    Some(descriptor),
-                )
-            });
-        let mut live_event = event.clone();
-        if let AgentEvent::ItemCompleted { item, .. } = &mut live_event
-            && let ItemPayload::ToolCall { output, .. } = &mut item.payload
-        {
-            *output = None;
-        }
-        return Some(PreparedItemOutput {
-            turn_id: *turn,
-            item_id: item.id,
-            command_runtime: None,
-            command_descriptor: None,
-            tool_runtime,
-            tool_descriptor,
-            command_item: false,
-            live_event: Some(live_event),
-        });
-    }
-    let ItemPayload::CommandExecution {
-        output,
-        output_truncated,
-        output_original_bytes,
-        output_original_lines,
-        status,
-        ..
-    } = &item.payload
-    else {
-        return None;
-    };
-    let descriptor = giskard_persist::command_output_descriptor(
-        output,
-        *output_truncated,
-        *output_original_bytes,
-        *output_original_lines,
-        true,
-    );
-    let (runtime, descriptor) = match descriptor {
-        Ok(descriptor) => {
-            let runtime = (!status.as_deref().is_some_and(command_status_is_running)).then(|| {
-                RuntimeCommandOutput {
-                    output: output.clone(),
-                    output_truncated: *output_truncated,
-                    original_bytes: descriptor.original_bytes,
-                    original_lines: descriptor.original_lines,
-                    version: command_output_version(output),
-                }
-            });
-            (runtime, Some(descriptor))
-        }
-        Err(_) => (None, None),
-    };
-    let mut live_event = event.clone();
-    if let (Some(descriptor), AgentEvent::ItemCompleted { item, .. }) =
-        (&descriptor, &mut live_event)
-        && let ItemPayload::CommandExecution { output, .. } = &mut item.payload
-    {
-        *output = descriptor.preview.clone();
-    }
-    Some(PreparedItemOutput {
-        turn_id: *turn,
-        item_id: item.id,
-        command_runtime: runtime,
-        command_descriptor: descriptor,
-        tool_runtime: None,
-        tool_descriptor: None,
-        command_item: true,
-        live_event: Some(live_event),
-    })
-}
-
-fn update_prepared_item_output_authority(
-    entry: &mut ThreadRuntimeEntry,
-    prepared: PreparedItemOutput,
-) {
-    let key = (prepared.turn_id, prepared.item_id);
-    if prepared.command_runtime.is_none()
-        && prepared.command_item
-        && prepared.command_descriptor.is_none()
-    {
-        tracing::error!(
-            turn_id = %prepared.turn_id,
-            item_id = %prepared.item_id,
-            "completed command output has inconsistent truncation metadata"
-        );
-    }
-    entry.set_command_output(key, prepared.command_runtime);
-    entry.set_tool_output(key, prepared.tool_runtime);
-}
-
-fn update_tool_output_authority(
-    entry: &mut ThreadRuntimeEntry,
-    thread_id: ThreadId,
-    turn_id: TurnId,
-    item: &Item,
-) {
-    let key = (turn_id, item.id);
-    let ItemPayload::ToolCall { output, status, .. } = &item.payload else {
-        entry.set_tool_output(key, None);
-        return;
-    };
-    if status
-        .as_deref()
-        .is_some_and(giskard_core::item::tool_status_is_running)
-    {
-        entry.set_tool_output(key, None);
-        return;
-    }
-    let Some(output) = output else {
-        entry.set_tool_output(key, None);
-        return;
-    };
-    match giskard_core::item::serialize_tool_output(output) {
-        Ok((bytes, descriptor)) => {
-            entry.set_tool_output(key, Some(RuntimeToolOutput { bytes, descriptor }));
-        }
-        Err(error) => {
-            let project_id = entry
-                .active_turn
-                .as_ref()
-                .map(|owner| tracing::field::display(owner.reservation.project_id));
-            tracing::error!(
-                project_id,
-                %thread_id,
-                %turn_id,
-                item_id = %item.id,
-                action = "serialize_completed_tool_output",
-                %error,
-                "could not serialize completed tool output"
-            );
-            entry.set_tool_output(key, None);
-        }
-    }
-}
-
-pub(crate) fn command_output_version(output: &str) -> String {
-    format!("\"sha256_{:x}\"", Sha256::digest(output.as_bytes()))
 }
 
 impl ThreadTurnLease {
@@ -1773,15 +1249,6 @@ impl Drop for ThreadTurnLease {
     }
 }
 
-impl RuntimeRequestId {
-    fn as_str(&self) -> &str {
-        match self {
-            Self::Approval(id) => &id.0,
-            Self::Server(id) => &id.0,
-        }
-    }
-}
-
 fn lock_unpoison<'a, T>(mutex: &'a Mutex<T>, state_kind: &'static str) -> MutexGuard<'a, T> {
     match mutex.lock() {
         Ok(guard) => guard,
@@ -1795,124 +1262,12 @@ fn lock_unpoison<'a, T>(mutex: &'a Mutex<T>, state_kind: &'static str) -> MutexG
     }
 }
 
-fn register_request(
-    entry: &mut ThreadRuntimeEntry,
-    request_id: RuntimeRequestId,
-    turn_id: Option<TurnId>,
-    payload: RequestPayload,
-) -> bool {
-    use std::collections::hash_map::Entry;
-
-    match entry.requests.entry(request_id) {
-        Entry::Vacant(record) => {
-            record.insert(RequestRecord {
-                turn_id,
-                payload,
-                status: RequestStatus::Pending,
-                revision: 1,
-            });
-            true
-        }
-        Entry::Occupied(mut record) => {
-            // Duplicate provider delivery may refresh bounded request metadata, but it must not
-            // resurrect a responding or resolved request. An identical redelivery is not a new
-            // revision, and a changed one must take a new revision rather than republish different
-            // content under the revision a client already accepted.
-            let record = record.get_mut();
-            if record.payload == payload {
-                return false;
-            }
-            record.payload = payload;
-            record.revision = record.revision.saturating_add(1);
-            true
-        }
-    }
-}
-
-fn resolve_server_request_from_harness(
-    entry: &mut ThreadRuntimeEntry,
-    thread_id: ThreadId,
-    request_id: &ServerRequestId,
-) -> bool {
-    let Some(record) = entry
-        .requests
-        .get_mut(&RuntimeRequestId::Server(request_id.clone()))
-    else {
-        warn!(
-            %thread_id,
-            request_id = %request_id.0,
-            "harness resolved a server request with no runtime record"
-        );
-        return false;
-    };
-    match &mut record.status {
-        RequestStatus::Responding {
-            harness_resolved, ..
-        } => {
-            if !*harness_resolved {
-                debug!(
-                    %thread_id,
-                    request_id = %request_id.0,
-                    "harness resolved a server request while a claim is in flight; deferring to the claimant"
-                );
-            }
-            *harness_resolved = true;
-            return false;
-        }
-        RequestStatus::Resolved(_) => return false,
-        RequestStatus::Pending => {}
-    }
-    debug!(
-        %thread_id,
-        request_id = %request_id.0,
-        "synthesizing runtime resolution from a harness-resolved server request"
-    );
-    record.status = RequestStatus::Resolved(RequestResolution::Server(
-        ServerRequestResponse::result(serde_json::Value::Null),
-    ));
-    record.revision = record.revision.saturating_add(1);
-    true
-}
-
 fn runtime_summary(
     thread_id: ThreadId,
     entry: &ThreadRuntimeEntry,
 ) -> Option<ThreadRuntimeSummary> {
-    let turn_state = entry
-        .active_turn
-        .as_ref()
-        .map_or(RuntimeTurnState::Idle, |owner| {
-            if let Some((turn, error)) = &owner.persistence_blocked {
-                RuntimeTurnState::PersistenceBlocked {
-                    turn_id: turn.id,
-                    error: error.clone(),
-                }
-            } else {
-                RuntimeTurnState::Active {
-                    turn_id: owner.acknowledged_turn,
-                }
-            }
-        });
-    let mut outstanding_requests = entry
-        .requests
-        .iter()
-        .filter_map(|(id, record)| {
-            let responding = matches!(record.status, RequestStatus::Responding { .. });
-            matches!(
-                record.status,
-                RequestStatus::Pending | RequestStatus::Responding { .. }
-            )
-            .then(|| OutstandingRequest {
-                request_id: id.as_str().to_string(),
-                kind: match id {
-                    RuntimeRequestId::Approval(_) => RequestKind::Approval,
-                    RuntimeRequestId::Server(_) => RequestKind::Server,
-                },
-                responding,
-            })
-        })
-        .collect::<Vec<_>>();
-    outstanding_requests.sort_by(|left, right| left.request_id.cmp(&right.request_id));
+    let turn_state = entry.gate.turn_state();
+    let outstanding_requests = entry.requests.outstanding();
     if matches!(turn_state, RuntimeTurnState::Idle) && outstanding_requests.is_empty() {
         return None;
     }
@@ -1921,44 +1276,6 @@ fn runtime_summary(
         turn_state,
         outstanding_requests,
     })
-}
-
-fn wire_request_state(thread_id: ThreadId, record: &RequestRecord) -> WireRequestState {
-    let (request_id, payload) = match &record.payload {
-        RequestPayload::Approval(request) => (
-            request.id.0.clone(),
-            WireRequestPayload::Approval {
-                request: WireApprovalRequest::from(request.clone()),
-            },
-        ),
-        RequestPayload::Server(request) => (
-            request.id.0.clone(),
-            WireRequestPayload::Server {
-                request: request.clone(),
-            },
-        ),
-    };
-    let status = match &record.status {
-        RequestStatus::Pending => WireRequestStatus::Pending,
-        RequestStatus::Responding { .. } => WireRequestStatus::Responding,
-        RequestStatus::Resolved(RequestResolution::Approval(decision)) => {
-            WireRequestStatus::Resolved {
-                resolution: WireRequestResolution::Approval {
-                    decision: decision.clone(),
-                },
-            }
-        }
-        RequestStatus::Resolved(RequestResolution::Server(_)) => WireRequestStatus::Resolved {
-            resolution: WireRequestResolution::Server,
-        },
-    };
-    WireRequestState {
-        thread_id,
-        request_id,
-        revision: record.revision,
-        payload,
-        status,
-    }
 }
 
 impl RequestClaim {
@@ -1985,32 +1302,32 @@ impl RequestClaim {
             }));
         };
         let mut entry = lock_unpoison(&entry, "thread runtime entry");
-        let Some(record) = entry.requests.get_mut(&self.request_id) else {
-            self.settled = true;
-            return Err(Box::new(RequestCommitError {
-                error: HarnessError::Protocol(format!(
-                    "request {} disappeared",
+        let committed =
+            entry
+                .requests
+                .commit(self.thread_id, &self.request_id, self.claim_id, resolution);
+        let request_state = match committed {
+            Ok(request_state) => request_state,
+            Err(CommitRejection::Missing) => {
+                self.settled = true;
+                return Err(Box::new(RequestCommitError {
+                    error: HarnessError::Protocol(format!(
+                        "request {} disappeared",
+                        self.request_id.as_str()
+                    )),
+                    rollback: None,
+                }));
+            }
+            Err(CommitRejection::StaleClaim) => {
+                let error = HarnessError::Protocol(format!(
+                    "stale claim for request {}",
                     self.request_id.as_str()
-                )),
-                rollback: None,
-            }));
-        };
-        if !matches!(
-            record.status,
-            RequestStatus::Responding { claim, .. } if claim == self.claim_id
-        ) {
-            let error = HarnessError::Protocol(format!(
-                "stale claim for request {}",
-                self.request_id.as_str()
-            ));
-            drop(entry);
-            let rollback = self.rollback_inner();
-            return Err(Box::new(RequestCommitError { error, rollback }));
-        }
-        match (&record.payload, &resolution) {
-            (RequestPayload::Approval(_), RequestResolution::Approval(_))
-            | (RequestPayload::Server(_), RequestResolution::Server(_)) => {}
-            _ => {
+                ));
+                drop(entry);
+                let rollback = self.rollback_inner();
+                return Err(Box::new(RequestCommitError { error, rollback }));
+            }
+            Err(CommitRejection::KindMismatch) => {
                 let error = HarnessError::Protocol(format!(
                     "response kind does not match request {}",
                     self.request_id.as_str()
@@ -2019,11 +1336,9 @@ impl RequestClaim {
                 let rollback = self.rollback_inner();
                 return Err(Box::new(RequestCommitError { error, rollback }));
             }
-        }
-        record.status = RequestStatus::Resolved(resolution);
-        record.revision = record.revision.saturating_add(1);
+        };
         let transition = RequestTransition {
-            request_state: wire_request_state(self.thread_id, record),
+            request_state,
             overview_if_changed: support.refresh_overview(self.thread_id, &entry),
         };
         self.settled = true;
@@ -2044,23 +1359,13 @@ impl RequestClaim {
             return None;
         };
         let mut entry = lock_unpoison(&entry, "thread runtime entry");
-        if let Some(record) = entry.requests.get_mut(&self.request_id)
-            && let RequestStatus::Responding {
-                claim,
-                harness_resolved,
-            } = record.status
-            && claim == self.claim_id
+        if let Some(request_state) =
+            entry
+                .requests
+                .rollback(self.thread_id, &self.request_id, self.claim_id)
         {
-            record.status = if harness_resolved {
-                RequestStatus::Resolved(RequestResolution::Server(ServerRequestResponse::result(
-                    serde_json::Value::Null,
-                )))
-            } else {
-                RequestStatus::Pending
-            };
-            record.revision = record.revision.saturating_add(1);
             let transition = RequestTransition {
-                request_state: wire_request_state(self.thread_id, record),
+                request_state,
                 overview_if_changed: support.refresh_overview(self.thread_id, &entry),
             };
             self.settled = true;
@@ -2090,12 +1395,6 @@ impl Drop for RequestClaim {
     }
 }
 
-fn next_claim_id() -> u64 {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static NEXT: AtomicU64 = AtomicU64::new(1);
-    NEXT.fetch_add(1, Ordering::Relaxed).max(1)
-}
-
 impl Default for ThreadRuntimeSupport {
     fn default() -> Self {
         Self::new()
@@ -2107,8 +1406,12 @@ mod tests {
     use super::*;
     use chrono::Utc;
     use giskard_core::approval::ApprovalKind;
+    use giskard_core::ids::ProjectId;
+    use giskard_core::item::Item;
     use giskard_core::model::ModelRef;
+    use giskard_core::server_request::{ServerRequest, ServerRequestResponse};
     use giskard_core::turn::{Mode, TurnMode, TurnModel, TurnStatus, TurnStatusKind};
+    use giskard_proto::RequestResolution as WireRequestResolution;
 
     fn test_authority(thread_id: ThreadId) -> Arc<ThreadAuthority> {
         Arc::new(ThreadAuthority::new_for_test(thread_id, ProjectId::new()))
@@ -2341,131 +1644,7 @@ mod tests {
             second_id, repeated_id,
             "identical content reuses its hash id"
         );
-        let entry = runtime.existing_entry(&authority).unwrap();
-        let entry = lock_unpoison(&entry, "thread runtime entry");
-        assert_eq!(entry.captured_diffs[&turn].contents.len(), 1);
-    }
-
-    #[test]
-    fn identical_unified_text_on_different_paths_has_independent_identity() {
-        let mut state = ActiveCapturedDiffs::default();
-        let thread = ThreadId::new();
-        let turn = TurnId::new();
-        let (first, first_record) = giskard_core::capture_unified_diff(
-            "src/first.rs".into(),
-            giskard_core::FileChangeKind::Modified,
-            None,
-            "@@ -1 +1 @@\n-old\n+same".into(),
-        );
-        let (second, second_record) = giskard_core::capture_unified_diff(
-            "src/second.rs".into(),
-            giskard_core::FileChangeKind::Modified,
-            None,
-            "@@ -1 +1 @@\n-old\n+same".into(),
-        );
-        assert_ne!(first.id, second.id);
-        install_captured_diff(
-            &mut state,
-            thread,
-            turn,
-            CapturedDiffSlot::Turn(first.path.clone()),
-            first.clone(),
-            first_record,
-        );
-        install_captured_diff(
-            &mut state,
-            thread,
-            turn,
-            CapturedDiffSlot::Turn(second.path.clone()),
-            second.clone(),
-            second_record,
-        );
-
-        let (replacement, replacement_record) = giskard_core::capture_unified_diff(
-            "src/first.rs".into(),
-            giskard_core::FileChangeKind::Modified,
-            None,
-            "@@ -1 +1 @@\n-old\n+changed".into(),
-        );
-        install_captured_diff(
-            &mut state,
-            thread,
-            turn,
-            CapturedDiffSlot::Turn(replacement.path.clone()),
-            replacement,
-            replacement_record,
-        );
-
-        assert!(state.contents.contains_key(&second.id));
-        assert!(!state.superseded.contains_key(&second.id));
-        assert_eq!(
-            state.current_by_slot[&CapturedDiffSlot::Turn(second.path.clone())].id,
-            second.id
-        );
-    }
-
-    #[test]
-    fn item_and_turn_diffs_for_the_same_path_have_independent_authority() {
-        let mut state = ActiveCapturedDiffs::default();
-        let thread = ThreadId::new();
-        let turn_id = TurnId::new();
-        let path = std::path::PathBuf::from("src/main.rs");
-        let item_id = ItemId::new();
-        let (item, item_record) = giskard_core::capture_unified_diff(
-            path.clone(),
-            giskard_core::FileChangeKind::Modified,
-            Some(item_id),
-            "item body".into(),
-        );
-        let structured = giskard_core::FileDiff {
-            path: path.clone(),
-            change: giskard_core::FileChangeKind::Modified,
-            old_text: Some("old".into()),
-            new_text: Some("turn body".into()),
-            hunks: Vec::new(),
-            binary: false,
-            captured: None,
-        };
-        let (turn, turn_record) = giskard_core::capture_structured_diff(structured);
-        let turn = turn.captured.unwrap();
-
-        install_captured_diff(
-            &mut state,
-            thread,
-            turn_id,
-            CapturedDiffSlot::Item {
-                item_id,
-                path: path.clone(),
-                occurrence: 0,
-            },
-            item.clone(),
-            item_record,
-        );
-        install_captured_diff(
-            &mut state,
-            thread,
-            turn_id,
-            CapturedDiffSlot::Turn(path.clone()),
-            turn.clone(),
-            turn_record,
-        );
-
-        assert!(state.contents.contains_key(&item.id));
-        assert!(state.contents.contains_key(&turn.id));
-        assert!(state.superseded.is_empty());
-        assert_eq!(
-            state.current_by_slot[&CapturedDiffSlot::Item {
-                item_id,
-                path: path.clone(),
-                occurrence: 0,
-            }]
-                .id,
-            item.id
-        );
-        assert_eq!(
-            state.current_by_slot[&CapturedDiffSlot::Turn(path)].id,
-            turn.id
-        );
+        assert_eq!(runtime.captured_diff_records(&authority, turn).len(), 1);
     }
 
     #[test]
@@ -2605,11 +1784,13 @@ mod tests {
             RuntimeDiffLookup::Missing
         ));
         let entry = runtime.existing_entry(&authority).unwrap();
-        let entry = lock_unpoison(&entry, "thread runtime entry");
-        let state = &entry.captured_diffs[&turn];
-        assert_eq!(state.current_by_slot.len(), 2);
-        assert_eq!(state.contents.len(), 2);
-        drop(entry);
+        assert_eq!(
+            lock_unpoison(&entry, "thread runtime entry")
+                .diffs
+                .slot_count(turn),
+            2
+        );
+        assert_eq!(runtime.captured_diff_records(&authority, turn).len(), 2);
 
         runtime.capture_event_diffs(
             &authority,
@@ -3548,17 +2729,7 @@ mod tests {
         ));
         let entry = runtime.existing_entry(&authority).unwrap();
         let entry = lock_unpoison(&entry, "thread runtime entry");
-        assert_eq!(
-            entry
-                .active_turn
-                .as_ref()
-                .unwrap()
-                .persistence_blocked
-                .as_ref()
-                .unwrap()
-                .0,
-            turn
-        );
+        assert_eq!(entry.gate.blocked_turn(), Some(turn.id));
     }
 
     #[test]
@@ -3654,14 +2825,14 @@ mod tests {
         let entry = runtime.existing_entry(&authority).unwrap();
         assert!(
             lock_unpoison(&entry, "thread runtime entry")
-                .item_outputs
-                .contains_key(&(turn, command_item_id))
+                .outputs
+                .contains(turn, command_item_id)
         );
         runtime.remove_command_output(&authority, turn, command_item_id);
         assert!(
             !lock_unpoison(&entry, "thread runtime entry")
-                .item_outputs
-                .contains_key(&(turn, command_item_id))
+                .outputs
+                .contains(turn, command_item_id)
         );
 
         let tool_item_id = ItemId::new();
@@ -3690,14 +2861,14 @@ mod tests {
         );
         assert!(
             lock_unpoison(&entry, "thread runtime entry")
-                .item_outputs
-                .contains_key(&(turn, tool_item_id))
+                .outputs
+                .contains(turn, tool_item_id)
         );
         runtime.remove_tool_output(&authority, turn, tool_item_id);
         assert!(
             !lock_unpoison(&entry, "thread runtime entry")
-                .item_outputs
-                .contains_key(&(turn, tool_item_id))
+                .outputs
+                .contains(turn, tool_item_id)
         );
     }
 

@@ -12,6 +12,7 @@ type TaskKey = (TurnId, ItemId);
 #[derive(Default)]
 pub struct RunningTaskState {
     tasks: HashMap<TaskKey, RunningTask>,
+    revision: u64,
 }
 impl RunningTaskState {
     #[cfg(test)]
@@ -19,7 +20,21 @@ impl RunningTaskState {
         Self::default()
     }
 
+    /// The clock the running-task projection is published under: it advances exactly when one of
+    /// the three mutators below reports a change.
+    pub fn revision(&self) -> u64 {
+        self.revision
+    }
+
     pub fn apply_event(&mut self, event: &AgentEvent) -> bool {
+        let changed = self.apply_event_inner(event);
+        if changed {
+            self.revision = self.revision.saturating_add(1);
+        }
+        changed
+    }
+
+    fn apply_event_inner(&mut self, event: &AgentEvent) -> bool {
         match event {
             AgentEvent::ItemStarted { thread, turn, item } => {
                 let task = if let Some(command) = &item.command {
@@ -193,6 +208,9 @@ impl RunningTaskState {
                 changed = true;
             }
         }
+        if changed {
+            self.revision = self.revision.saturating_add(1);
+        }
         changed
     }
 
@@ -220,7 +238,11 @@ impl RunningTaskState {
         self.tasks.retain(|_, cmd| {
             cmd.thread_id != thread_id || cmd.process_id.as_deref() != Some(process_id)
         });
-        self.tasks.len() != before
+        let changed = self.tasks.len() != before;
+        if changed {
+            self.revision = self.revision.saturating_add(1);
+        }
+        changed
     }
 
     pub fn snapshot(&self, thread_id: ThreadId) -> Vec<RunningTask> {

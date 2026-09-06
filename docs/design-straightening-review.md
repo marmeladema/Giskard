@@ -198,8 +198,8 @@ impl Hub { async fn publish(&self, thread_id: ThreadId, outbound: Outbound) }
 so the "which lane, which clock" table in spec §13.6.1 has one implementation, and the
 forwarder and registry stop knowing about `WireAgentEvent`.
 
-**Status: landed in S5.** `Outbound` carries two more variants than sketched here — `Request` and
-`RunningTasks`, the lanes the registry and `routes.rs` compute directly — and the overview keeps
+**Status: landed in S5.** `Outbound` carries one more variant than sketched here —
+`RunningTasks`, the lane `routes.rs` computes directly — and the overview keeps
 its own method; see [`s5-hub-publish.md`](s5-hub-publish.md).
 
 **C4. `AgentHarness` is three interfaces.** Its 21 methods split cleanly by receiver:
@@ -232,6 +232,13 @@ let `ThreadRuntimeSupport` become the lock-and-dispatch layer around `ThreadRunt
 requests: RequestLedger, live: LiveTurnState, tasks: RunningTaskState, outputs: ItemOutputs,
 gate: TurnGate }`. `runtime_live.rs` and `runtime_tasks.rs` already are this shape; the other
 three are inline. `apply_event_locked` then reads as five `apply` calls.
+
+**Status: landed in S7**, with three corrections: the entry has ten fields rather than five (three
+clocks, two existing types, and a cache S2 left alone), "outputs" is two types with no shared code
+(`CapturedDiffState` keyed by `TurnId` and `ItemOutputState` keyed by `(TurnId, ItemId)`), and
+`RequestTransition` stays as the ledger's typed result while `Outbound::Request` goes at the
+publish edge through `impl From<RequestTransition> for AppliedRuntimeEvent`; see
+[`s7-runtime-components.md`](s7-runtime-components.md).
 
 **C6. A test-support crate — landed in S4a (scaffolding) and S4b (the shared fake).** Twenty-one `impl AgentHarness for` fakes, twelve copies of
 `generate_password_hash`, six of `ws_text`, three of `spawn_test_app`, and `e2e_smoke.rs` at
@@ -278,7 +285,7 @@ Each step is one PR that stands alone on `main`, mechanical first:
 | 4 | C6 test-support crate; migrate the server integration tests to it — **landed in S4a and S4b** | tests only | −3000 |
 | 5 | C3 `Hub::publish(Outbound)` — **landed in S5** | one seam | ±100 |
 | 6 | B3 `Services` split; forwarder takes `Arc<Services>` — **landed in S6** | mechanical | ±60 |
-| 7 | C5 runtime components | structural, no behaviour change | ±300 |
+| 7 | C5 runtime components — **landed in S7** | structural, no behaviour change | ±300 |
 | 8 | C2 `classify` / `apply` in the forwarder | structural, no behaviour change | ±250 |
 | 9 | C4 option 1, then option 2 if C6 wants it | API | −200 |
 | 10 | D file splits (`ws.rs`, codex modules, `app.js`) | mechanical | 0 |
