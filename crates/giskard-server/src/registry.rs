@@ -46,8 +46,9 @@ use crate::thread_graph::{
 };
 use crate::thread_metadata::ThreadMetadataService;
 use crate::thread_runtime::{
-    AppliedRuntimeEvent, RequestResolution, RequestTransition, ResolvedThreadRuntime,
-    RestorePermit, RuntimeRequestId, ThreadRuntimeSupport, ThreadTurnLease, TurnReservation,
+    AppliedRuntimeEvent, PreparedItemOutput, RequestResolution, RequestTransition,
+    ResolvedThreadRuntime, RestorePermit, RuntimeRequestId, ThreadRuntimeSupport, ThreadTurnLease,
+    TurnReservation,
 };
 
 mod admission;

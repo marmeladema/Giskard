@@ -37,14 +37,14 @@ mod tasks;
 pub(crate) use diffs::RuntimeDiffLookup;
 pub(crate) use gate::TurnReservation;
 pub(crate) use outputs::{
-    RuntimeCommandOutputLookup, RuntimeToolOutputLookup, command_output_version,
+    PreparedItemOutput, RuntimeCommandOutputLookup, RuntimeToolOutputLookup, command_output_version,
 };
 pub(crate) use requests::{RequestResolution, RuntimeRequestId};
 
 use diffs::CapturedDiffState;
 use gate::TurnGate;
 use live::LiveTurnState;
-use outputs::{ItemOutputState, PreparedItemOutput, prepare_item_output};
+use outputs::{ItemOutputState, prepare_item_output};
 use requests::{ClaimRejection, CommitRejection, RequestLedger, RequestPayload};
 use tasks::RunningTaskState;
 

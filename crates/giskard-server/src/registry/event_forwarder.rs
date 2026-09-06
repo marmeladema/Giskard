@@ -7,14 +7,15 @@ fn is_context_compaction_item(item: &Item) -> bool {
     )
 }
 
-fn should_skip_duplicate_notice(
+/// Read half of the duplicate-notice gate: whether this notice was already recorded.
+fn is_duplicate_notice(
+    seen_notices: &HashSet<(Option<TurnId>, String)>,
     event: &AgentEvent,
-    seen_notices: &mut HashSet<(Option<TurnId>, String)>,
 ) -> bool {
     let AgentEvent::Notice { turn, message, .. } = event else {
         return false;
     };
-    !seen_notices.insert((*turn, message.clone()))
+    seen_notices.contains(&(*turn, message.clone()))
 }
 
 fn event_item_identity(event: &AgentEvent) -> Option<(TurnId, &str, ItemId)> {
@@ -55,8 +56,9 @@ impl HarnessItemKey {
     }
 }
 
-fn track_item_identity(
-    item_ids_by_harness: &mut HashMap<HarnessItemKey, ItemId>,
+/// Read half of the item-identity gate: the conflict tuple, or `None`. Never inserts.
+fn item_identity_conflict(
+    item_ids_by_harness: &HashMap<HarnessItemKey, ItemId>,
     event: &AgentEvent,
 ) -> Option<(TurnId, String, ItemId, ItemId)> {
     let (turn, harness_item_id, item_id) = event_item_identity(event)?;
@@ -65,12 +67,21 @@ fn track_item_identity(
         Some(existing_item_id) if *existing_item_id != item_id => {
             Some((turn, harness_item_id.to_owned(), *existing_item_id, item_id))
         }
-        Some(_) => None,
-        None => {
-            item_ids_by_harness.insert(identity_key, item_id);
-            None
-        }
+        _ => None,
     }
+}
+
+fn track_item_identity(
+    item_ids_by_harness: &mut HashMap<HarnessItemKey, ItemId>,
+    event: &AgentEvent,
+) -> Option<(TurnId, String, ItemId, ItemId)> {
+    if let Some(conflict) = item_identity_conflict(item_ids_by_harness, event) {
+        return Some(conflict);
+    }
+    let (turn, harness_item_id, item_id) = event_item_identity(event)?;
+    let identity_key = HarnessItemKey::new(turn, HarnessItemId::new(harness_item_id.to_owned()));
+    item_ids_by_harness.insert(identity_key, item_id);
+    None
 }
 
 fn event_item_delta_kind(event: &AgentEvent) -> Option<&'static str> {
@@ -653,6 +664,16 @@ impl ForwardedTurnState {
         self.live_context_window = None;
         self.persisted_context_window = None;
     }
+
+    /// The two gate writes, in the order the gates read them: a notice's `(turn, message)` into
+    /// `seen_notices`, then a first-seen native item id into `item_ids_by_harness`. Runs once for
+    /// every non-foreign event, including the ones a later gate drops.
+    fn remember(&mut self, event: &AgentEvent) {
+        if let AgentEvent::Notice { turn, message, .. } = event {
+            self.seen_notices.insert((*turn, message.clone()));
+        }
+        track_item_identity(&mut self.item_ids_by_harness, event);
+    }
 }
 
 struct AdmittedIntent {
@@ -691,6 +712,129 @@ pub(super) struct ThreadEventForwarder {
     seen_turn_ids: HashSet<TurnId>,
     forwarder_started: Instant,
     stream_error: Option<String>,
+}
+
+/// Why an event never reaches an effect path.
+#[derive(Debug, PartialEq)]
+enum DropReason {
+    ForeignThread {
+        event_thread: ThreadId,
+    },
+    DuplicateNotice,
+    ItemIdentityConflict {
+        turn: TurnId,
+        harness_item_id: String,
+        existing: ItemId,
+        conflicting: ItemId,
+    },
+    CrossTurn {
+        owned: TurnId,
+        event_turn: TurnId,
+    },
+    UsageForPersistedTurn {
+        turn: TurnId,
+    },
+}
+
+/// What one event is, decided before any effect runs.
+#[derive(Debug, PartialEq)]
+enum EventDisposition {
+    Drop(DropReason),
+    LateForPersistedTurn(TurnId),
+    Turnless,
+    Owned {
+        /// `Some(turn)` when this event is the first for a turn nobody owns: the owned path
+        /// attaches the forwarder to it before anything else.
+        attaches: Option<TurnId>,
+        /// The `TurnCompleted` triple, when the event completes the owned turn.
+        completes: Option<(TurnId, giskard_core::token::TokenUsage, TurnStatus)>,
+    },
+}
+
+/// Decide what an event is from the forwarder's bookkeeping alone. Reads `turn.owned_turn`,
+/// `turn.seen_notices`, `turn.item_ids_by_harness`, `seen_turn_ids`, and the event; writes nothing.
+fn classify(
+    thread_id: ThreadId,
+    turn: &ForwardedTurnState,
+    seen_turn_ids: &HashSet<TurnId>,
+    event: &AgentEvent,
+) -> EventDisposition {
+    let event_thread = event.thread_id();
+    if event_thread != thread_id {
+        return EventDisposition::Drop(DropReason::ForeignThread { event_thread });
+    }
+
+    if is_duplicate_notice(&turn.seen_notices, event) {
+        return EventDisposition::Drop(DropReason::DuplicateNotice);
+    }
+
+    if let Some((conflict_turn, harness_item_id, existing, conflicting)) =
+        item_identity_conflict(&turn.item_ids_by_harness, event)
+    {
+        return EventDisposition::Drop(DropReason::ItemIdentityConflict {
+            turn: conflict_turn,
+            harness_item_id,
+            existing,
+            conflicting,
+        });
+    }
+
+    let event_turn = event.turn();
+    // A command may outlive its persisted turn. Its terminal replacement must still reach the
+    // late-event path while a newer turn is active; it updates runtime task state only and cannot
+    // enter the newer turn's transcript. Events for any other non-owned, non-persisted turn remain
+    // a protocol violation and are dropped before they mutate runtime or persistence.
+    if let Some(owned) = turn.owned_turn
+        && let Some(event_turn) = event_turn
+        && event_turn != owned
+        && !seen_turn_ids.contains(&event_turn)
+    {
+        return EventDisposition::Drop(DropReason::CrossTurn { owned, event_turn });
+    }
+
+    if let Some(persisted_turn) = event_turn
+        && seen_turn_ids.contains(&persisted_turn)
+    {
+        if matches!(event, AgentEvent::TurnUsageUpdated { .. }) {
+            return EventDisposition::Drop(DropReason::UsageForPersistedTurn {
+                turn: persisted_turn,
+            });
+        }
+        return EventDisposition::LateForPersistedTurn(persisted_turn);
+    }
+
+    if turn.owned_turn.is_none() && event_turn.is_none() {
+        return EventDisposition::Turnless;
+    }
+
+    let completes = if let AgentEvent::TurnCompleted {
+        turn: completed_turn,
+        usage,
+        status,
+        ..
+    } = event
+    {
+        Some((*completed_turn, *usage, status.clone()))
+    } else {
+        None
+    };
+    let attaches = if turn.owned_turn.is_none() {
+        event_turn
+    } else {
+        None
+    };
+    EventDisposition::Owned {
+        attaches,
+        completes,
+    }
+}
+
+/// One addressable-output preparation step: the event as the runtime normalized it, the
+/// prepared output, and the permit that preparation was performed under.
+struct PreparedEvent {
+    event: AgentEvent,
+    output: Option<PreparedItemOutput>,
+    permit: Option<RestorePermit>,
 }
 
 impl ThreadEventForwarder {
@@ -1180,367 +1324,410 @@ impl ThreadEventForwarder {
     }
 
     async fn handle_event(&mut self, event: AgentEvent) -> ForwarderControl {
+        let disposition = classify(self.thread_id(), &self.turn, &self.seen_turn_ids, &event);
+        if !matches!(
+            disposition,
+            EventDisposition::Drop(DropReason::ForeignThread { .. })
+        ) {
+            self.turn.remember(&event);
+        }
+        self.apply(event, disposition).await
+    }
+
+    async fn apply(
+        &mut self,
+        event: AgentEvent,
+        disposition: EventDisposition,
+    ) -> ForwarderControl {
+        match disposition {
+            EventDisposition::Drop(reason) => {
+                self.log_drop(reason, &event);
+                ForwarderControl::Continue
+            }
+            EventDisposition::LateForPersistedTurn(_) => self.apply_late(event).await,
+            EventDisposition::Turnless => self.apply_turnless(event).await,
+            EventDisposition::Owned {
+                attaches,
+                completes,
+            } => self.apply_owned(event, attaches, completes).await,
+        }
+    }
+
+    /// The five drop logs behind one door; two keep their free functions because tests call them.
+    fn log_drop(&self, reason: DropReason, event: &AgentEvent) {
         let thread_id = self.thread_id();
         let project_id = self.binding.project_id;
-        let hub = self.services.hub.clone();
-        let runtime = self.services.runtime.clone();
-        let event_thread = event.thread_id();
-        if event_thread != thread_id {
-            log_foreign_thread_event_drop(project_id, thread_id, event_thread, &event);
-            return ForwarderControl::Continue;
-        }
-
-        if should_skip_duplicate_notice(&event, &mut self.turn.seen_notices) {
-            debug!(
-                %project_id,
-                %thread_id,
-                event_turn_id = display_opt(event.turn()),
-                "skipping duplicate harness notice"
-            );
-            return ForwarderControl::Continue;
-        }
-
-        if let Some((event_turn, harness_item_id, existing_item_id, conflicting_item_id)) =
-            track_item_identity(&mut self.turn.item_ids_by_harness, &event)
-        {
-            error!(
-                %project_id,
-                %thread_id,
-                turn_id = %event_turn,
-                event_kind = event.kind(),
-                harness_item_id,
-                existing_item_id = %existing_item_id,
-                conflicting_item_id = %conflicting_item_id,
-                "dropping harness event because a native item id remapped to a different Giskard item id"
-            );
-            return ForwarderControl::Continue;
-        }
-
-        let event_turn = event.turn();
-        if let Some(owned) = self.turn.owned_turn {
-            if let Some(turn) = event_turn {
-                // A command may outlive its persisted turn. Its terminal replacement must
-                // still reach the late-event path while a newer turn is active; it updates
-                // runtime task state only and cannot enter the newer turn's transcript.
-                // Events for any other non-owned, non-persisted turn remain a protocol
-                // violation and are dropped before they mutate runtime or persistence.
-                if turn != owned && !self.seen_turn_ids.contains(&turn) {
-                    log_cross_turn_event_drop(
-                        project_id,
-                        thread_id,
-                        owned,
-                        turn,
-                        &event,
-                        self.forwarder_started.elapsed().as_millis(),
-                    );
-                    return ForwarderControl::Continue;
-                }
+        match reason {
+            DropReason::ForeignThread { event_thread } => {
+                log_foreign_thread_event_drop(project_id, thread_id, event_thread, event);
             }
-        } else if let Some(turn) = event_turn
-            && !self.seen_turn_ids.contains(&turn)
-        {
-            let (context, mut lease) = if let Some(admitted) = self.admitted.take() {
-                (admitted.context, admitted.lease)
-            } else {
-                let persisted = self
-                    .services
-                    .store
-                    .load_thread(project_id, thread_id)
-                    .await
-                    .ok()
-                    .flatten();
-                let defaults = external_turn_defaults(&self.binding, persisted.as_ref());
-                let classification = self.coordinator.classification().await;
-                let context = TurnContext {
-                    user_input: external_turn_input_label(classification),
-                    model: defaults.model,
-                    mode: defaults.mode,
-                    kind: match classification {
-                        ClassificationPhase::Primary => TurnContextKind::User,
-                        ClassificationPhase::Subagent => TurnContextKind::ExternalSubagent,
-                        ClassificationPhase::Orphan => TurnContextKind::ExternalOrphan,
-                    },
-                };
-                let lease = match runtime.reserve_turn(
-                    &self.authority,
-                    turn_reservation(project_id, &self.binding.handle, &context),
-                ) {
-                    Ok(lease) => lease,
-                    Err(error) => {
-                        error!(%project_id, %thread_id, %turn, %error,
-                            "event owner could not reserve an external native turn");
-                        return ForwarderControl::Exit(
-                            ForwarderExitReason::RuntimeAuthorityReplaced,
-                        );
-                    }
-                };
-                (context, lease)
-            };
-            if let Some(overview) = lease.acknowledge_turn(turn) {
-                self.services.hub.publish_runtime_overview(overview).await;
-            }
-            self.turn.context = context;
-            self.turn.lease = Some(lease);
-            self.turn.owned_turn = Some(turn);
-            if !matches!(event, AgentEvent::TurnStarted { .. }) {
+            DropReason::DuplicateNotice => {
                 debug!(
+                    %project_id,
                     %thread_id,
-                    %turn,
-                    "event forwarder attached to turn before seeing turn start"
+                    event_turn_id = display_opt(event.turn()),
+                    "skipping duplicate harness notice"
                 );
             }
-        }
-
-        // Normalize every admitted completed-item payload once before runtime state, wire
-        // projection, current-turn assembly, or persistence can observe it. Command
-        // terminality is handled separately: providers may send a nonterminal
-        // ItemCompleted followed by a later terminal replacement.
-        let is_completed_addressable_output = matches!(
-            &event,
-            AgentEvent::ItemCompleted { item, .. }
-                if matches!(&item.payload, ItemPayload::CommandExecution { .. } | ItemPayload::ToolCall { .. })
-        );
-        let (event, prepared_item_output, preparation_permit) = if is_completed_addressable_output {
-            let Some(permit) = runtime.event_application_permit(&self.authority) else {
-                return ForwarderControl::Exit(ForwarderExitReason::RuntimeAuthorityReplaced);
-            };
-            let preparation_diagnostics = completed_item_diagnostics(&event);
-            let preparation_runtime = runtime.clone();
-            match tokio::task::spawn_blocking(move || {
-                preparation_runtime.prepare_item_output(event)
-            })
-            .await
-            {
-                Ok((event, prepared)) => (event, prepared, Some(permit)),
-                Err(error) => {
-                    tracing::error!(
-                        %project_id,
-                        %thread_id,
-                        self.turn.observed_turn = preparation_diagnostics.as_ref().map(|value| tracing::field::display(value.turn_id)),
-                        item_id = preparation_diagnostics.as_ref().map(|value| tracing::field::display(value.item_id)),
-                        harness_item_id = preparation_diagnostics.as_ref().map(|value| value.harness_item_id.as_str()),
-                        item_payload_kind = preparation_diagnostics.as_ref().map(|value| value.payload_kind),
-                        error = %error,
-                        "addressable item-output event preparation task failed"
-                    );
-                    return ForwarderControl::Exit(ForwarderExitReason::EventPreparationFailed);
-                }
+            DropReason::ItemIdentityConflict {
+                turn,
+                harness_item_id,
+                existing,
+                conflicting,
+            } => {
+                error!(
+                    %project_id,
+                    %thread_id,
+                    turn_id = %turn,
+                    event_kind = event.kind(),
+                    harness_item_id,
+                    existing_item_id = %existing,
+                    conflicting_item_id = %conflicting,
+                    "dropping harness event because a native item id remapped to a different Giskard item id"
+                );
             }
-        } else {
-            (event, None, None)
-        };
-
-        if let Some(turn) = event_turn
-            && self.seen_turn_ids.contains(&turn)
-        {
-            if matches!(event, AgentEvent::TurnUsageUpdated { .. }) {
+            DropReason::CrossTurn { owned, event_turn } => {
+                log_cross_turn_event_drop(
+                    project_id,
+                    thread_id,
+                    owned,
+                    event_turn,
+                    event,
+                    self.forwarder_started.elapsed().as_millis(),
+                );
+            }
+            DropReason::UsageForPersistedTurn { turn } => {
                 debug!(
                     %project_id,
                     %thread_id,
                     %turn,
                     "ignoring usage update for an already-persisted turn"
                 );
-                return ForwarderControl::Continue;
             }
-            let command_state_changed = if is_terminal_command_completion(&event) {
-                let before = terminating_command_before_terminal_completion(
-                    &runtime,
-                    &self.authority,
-                    &event,
-                )
-                .await;
-                let applied = match preparation_permit.as_ref() {
-                    Some(permit) => match self.services.runtime.apply_prepared_event_if_current(
-                        permit,
-                        &event,
-                        false,
-                        prepared_item_output,
-                    ) {
-                        Some(applied) => applied,
-                        None => {
-                            return ForwarderControl::Exit(
-                                ForwarderExitReason::RuntimeAuthorityReplaced,
-                            );
-                        }
-                    },
-                    None => self.services.runtime.apply_prepared_event(
-                        &self.authority,
-                        &event,
-                        false,
-                        prepared_item_output,
-                    ),
-                };
-                if let AgentEvent::ItemCompleted { turn, item, .. } = &event {
-                    self.services
-                        .runtime
-                        .remove_command_output(&self.authority, *turn, item.id);
-                    warn!(
-                        %project_id,
-                        %thread_id,
-                        %turn,
-                        item_id = %item.id,
-                        harness_item_id = %item.harness_item_id,
-                        "deferred durable command-output update for already-persisted turn"
-                    );
-                }
-                log_command_completion_after_terminate(project_id, before.as_ref(), &event);
-                debug!(
-                    %thread_id,
-                    event_sequence = display_opt(applied.sequence),
-                    event_kind = event.kind(),
-                    "applied late terminal event to thread runtime"
-                );
-                let changed = applied.tasks_changed;
-                hub.publish(thread_id, Outbound::RuntimeEffects(applied))
+        }
+    }
+
+    /// The late path: an event for a turn this forwarder has already persisted. It updates
+    /// runtime task state only and cannot enter a newer turn's transcript.
+    async fn apply_late(&mut self, event: AgentEvent) -> ForwarderControl {
+        let thread_id = self.thread_id();
+        let project_id = self.binding.project_id;
+        let hub = self.services.hub.clone();
+        let runtime = self.services.runtime.clone();
+        let PreparedEvent {
+            event,
+            output: prepared_item_output,
+            permit: preparation_permit,
+        } = match self.prepare_output(event).await {
+            Ok(prepared) => prepared,
+            Err(reason) => return ForwarderControl::Exit(reason),
+        };
+        let command_state_changed = if is_terminal_command_completion(&event) {
+            let before =
+                terminating_command_before_terminal_completion(&runtime, &self.authority, &event)
                     .await;
-                changed
-            } else {
-                log_ignored_seen_turn_running_task_start(project_id, &event);
-                false
+            let Some(applied) = self.apply_to_runtime(
+                preparation_permit.as_ref(),
+                &event,
+                false,
+                prepared_item_output,
+            ) else {
+                return ForwarderControl::Exit(ForwarderExitReason::RuntimeAuthorityReplaced);
             };
-            if is_terminal_command_completion(&event) {
-                if !command_state_changed
-                    && let AgentEvent::ItemCompleted { turn, item, .. } = &event
-                {
-                    warn!(
-                        %project_id,
-                        %thread_id,
-                        %turn,
-                        item_id = %item.id,
-                        harness_item_id = %item.harness_item_id,
-                        "broadcasting terminal command completion for a persisted turn without matching running-task state"
-                    );
-                }
-                if let AgentEvent::ItemCompleted { item, .. } = &event {
-                    let command_output = late_command_output(item);
-                    hub.publish(
-                        thread_id,
-                        Outbound::Transcript {
-                            event: Box::new(event.clone()),
-                            user_input: None,
-                            command_output,
-                        },
-                    )
-                    .await;
-                }
-            }
-            if let AgentEvent::ItemCompleted { turn, item, .. } = &event
-                && let ItemPayload::ToolCall { name, server, .. } = &item.payload
-            {
+            if let AgentEvent::ItemCompleted { turn, item, .. } = &event {
                 self.services
                     .runtime
-                    .remove_tool_output(&self.authority, *turn, item.id);
-                if completed_tool_has_terminal_output(item) {
-                    warn!(
-                        %project_id,
-                        %thread_id,
-                        %turn,
-                        item_id = %item.id,
-                        harness_item_id = %item.harness_item_id,
-                        tool_name = %name,
-                        tool_server = server.as_deref(),
-                        "ignoring completed tool output for an already-persisted turn"
-                    );
-                }
+                    .remove_command_output(&self.authority, *turn, item.id);
+                warn!(
+                    %project_id,
+                    %thread_id,
+                    %turn,
+                    item_id = %item.id,
+                    harness_item_id = %item.harness_item_id,
+                    "deferred durable command-output update for already-persisted turn"
+                );
             }
-            return ForwarderControl::Continue;
-        }
-
-        if self.turn.owned_turn.is_none() && event_turn.is_none() {
-            let applied = self
-                .services
-                .runtime
-                .apply_event(&self.authority, &event, false);
+            log_command_completion_after_terminate(project_id, before.as_ref(), &event);
             debug!(
                 %thread_id,
                 event_sequence = display_opt(applied.sequence),
                 event_kind = event.kind(),
-                "applied turnless agent event to thread runtime"
+                "applied late terminal event to thread runtime"
             );
+            let changed = applied.tasks_changed;
             hub.publish(thread_id, Outbound::RuntimeEffects(applied))
                 .await;
-            match &event {
-                AgentEvent::Error { error, .. } => {
-                    warn!(
-                        %project_id,
-                        %thread_id,
-                        error = %error,
-                        turn_gate_held = self.turn.lease
-                            .as_ref()
-                            .is_some_and(|lease| !lease.is_released()),
-                        elapsed_ms = self.forwarder_started.elapsed().as_millis(),
-                        "turnless harness error received before turn ownership"
-                    );
-                    hub.publish(
-                        thread_id,
-                        Outbound::Transcript {
-                            event: Box::new(event.clone()),
-                            user_input: None,
-                            command_output: None,
-                        },
-                    )
-                    .await;
-                }
-                AgentEvent::Notice { message, .. } => {
-                    debug!(
-                        %project_id,
-                        %thread_id,
-                        message,
-                        turn_gate_held = self.turn.lease
-                            .as_ref()
-                            .is_some_and(|lease| !lease.is_released()),
-                        elapsed_ms = self.forwarder_started.elapsed().as_millis(),
-                        "turnless harness notice received before turn ownership"
-                    );
-                    hub.publish(
-                        thread_id,
-                        Outbound::Transcript {
-                            event: Box::new(event.clone()),
-                            user_input: None,
-                            command_output: None,
-                        },
-                    )
-                    .await;
-                }
-                AgentEvent::ServerRequestReceived { request, .. } => {
-                    warn!(
-                        %project_id,
-                        %thread_id,
-                        request_id = %request.id,
-                        method = %request.method,
-                        turn_gate_held = self.turn.lease
-                            .as_ref()
-                            .is_some_and(|lease| !lease.is_released()),
-                        elapsed_ms = self.forwarder_started.elapsed().as_millis(),
-                        "turnless server request received before turn ownership"
-                    );
-                    hub.publish(
-                        thread_id,
-                        Outbound::Transcript {
-                            event: Box::new(event.clone()),
-                            user_input: None,
-                            command_output: None,
-                        },
-                    )
-                    .await;
-                }
-                _ => {}
+            changed
+        } else {
+            log_ignored_seen_turn_running_task_start(project_id, &event);
+            false
+        };
+        if is_terminal_command_completion(&event) {
+            if !command_state_changed && let AgentEvent::ItemCompleted { turn, item, .. } = &event {
+                warn!(
+                    %project_id,
+                    %thread_id,
+                    %turn,
+                    item_id = %item.id,
+                    harness_item_id = %item.harness_item_id,
+                    "broadcasting terminal command completion for a persisted turn without matching running-task state"
+                );
             }
-            return ForwarderControl::Continue;
+            if let AgentEvent::ItemCompleted { item, .. } = &event {
+                let command_output = late_command_output(item);
+                hub.publish(
+                    thread_id,
+                    Outbound::Transcript {
+                        event: Box::new(event.clone()),
+                        user_input: None,
+                        command_output,
+                    },
+                )
+                .await;
+            }
         }
+        if let AgentEvent::ItemCompleted { turn, item, .. } = &event
+            && let ItemPayload::ToolCall { name, server, .. } = &item.payload
+        {
+            self.services
+                .runtime
+                .remove_tool_output(&self.authority, *turn, item.id);
+            if completed_tool_has_terminal_output(item) {
+                warn!(
+                    %project_id,
+                    %thread_id,
+                    %turn,
+                    item_id = %item.id,
+                    harness_item_id = %item.harness_item_id,
+                    tool_name = %name,
+                    tool_server = server.as_deref(),
+                    "ignoring completed tool output for an already-persisted turn"
+                );
+            }
+        }
+        ForwarderControl::Continue
+    }
+
+    /// The turnless path: an event that names no turn while this forwarder owns none.
+    async fn apply_turnless(&mut self, event: AgentEvent) -> ForwarderControl {
+        let thread_id = self.thread_id();
+        let project_id = self.binding.project_id;
+        let hub = self.services.hub.clone();
+        let applied = self
+            .services
+            .runtime
+            .apply_event(&self.authority, &event, false);
+        debug!(
+            %thread_id,
+            event_sequence = display_opt(applied.sequence),
+            event_kind = event.kind(),
+            "applied turnless agent event to thread runtime"
+        );
+        hub.publish(thread_id, Outbound::RuntimeEffects(applied))
+            .await;
+        let reaches_transcript = match &event {
+            AgentEvent::Error { error, .. } => {
+                warn!(
+                    %project_id,
+                    %thread_id,
+                    error = %error,
+                    turn_gate_held = self.turn.lease
+                        .as_ref()
+                        .is_some_and(|lease| !lease.is_released()),
+                    elapsed_ms = self.forwarder_started.elapsed().as_millis(),
+                    "turnless harness error received before turn ownership"
+                );
+                true
+            }
+            AgentEvent::Notice { message, .. } => {
+                debug!(
+                    %project_id,
+                    %thread_id,
+                    message,
+                    turn_gate_held = self.turn.lease
+                        .as_ref()
+                        .is_some_and(|lease| !lease.is_released()),
+                    elapsed_ms = self.forwarder_started.elapsed().as_millis(),
+                    "turnless harness notice received before turn ownership"
+                );
+                true
+            }
+            AgentEvent::ServerRequestReceived { request, .. } => {
+                warn!(
+                    %project_id,
+                    %thread_id,
+                    request_id = %request.id,
+                    method = %request.method,
+                    turn_gate_held = self.turn.lease
+                        .as_ref()
+                        .is_some_and(|lease| !lease.is_released()),
+                    elapsed_ms = self.forwarder_started.elapsed().as_millis(),
+                    "turnless server request received before turn ownership"
+                );
+                true
+            }
+            _ => false,
+        };
+        if reaches_transcript {
+            hub.publish(
+                thread_id,
+                Outbound::Transcript {
+                    event: Box::new(event),
+                    user_input: None,
+                    command_output: None,
+                },
+            )
+            .await;
+        }
+        ForwarderControl::Continue
+    }
+
+    /// The owned path: an event for the turn this forwarder owns, or the first event of a turn
+    /// it attaches to here.
+    async fn apply_owned(
+        &mut self,
+        event: AgentEvent,
+        attaches: Option<TurnId>,
+        completes: Option<(TurnId, giskard_core::token::TokenUsage, TurnStatus)>,
+    ) -> ForwarderControl {
+        let thread_id = self.thread_id();
+        let hub = self.services.hub.clone();
+        let runtime = self.services.runtime.clone();
+        let event_turn = event.turn();
+        if let Some(turn) = attaches
+            && let Err(reason) = self.attach_to_turn(turn, &event).await
+        {
+            return ForwarderControl::Exit(reason);
+        }
+
+        let PreparedEvent {
+            event,
+            output: prepared_item_output,
+            permit: preparation_permit,
+        } = match self.prepare_output(event).await {
+            Ok(prepared) => prepared,
+            Err(reason) => return ForwarderControl::Exit(reason),
+        };
 
         // Only admitted events may mutate lazy diff storage. Extract bodies after the
         // wrong-turn and already-persisted-turn exits, but before reconnect state,
         // persistence assembly, or browser projection can observe the event.
         let event = runtime.capture_event_diffs(&self.authority, event);
 
+        self.record_turn_usage(&event).await;
+
+        self.note_owned_event(&event).await;
+
+        let append_to_live_buffer = self.admit_to_live_buffer(event_turn, &event);
+        if completes.is_none() {
+            let Some(applied) = self.apply_to_runtime(
+                preparation_permit.as_ref(),
+                &event,
+                append_to_live_buffer,
+                prepared_item_output,
+            ) else {
+                return ForwarderControl::Exit(ForwarderExitReason::RuntimeAuthorityReplaced);
+            };
+            debug!(
+                %thread_id,
+                event_sequence = display_opt(applied.sequence),
+                event_kind = event.kind(),
+                "applied agent event to thread runtime"
+            );
+            hub.publish(thread_id, Outbound::RuntimeEffects(applied))
+                .await;
+        }
+
+        if let Some((completed_turn, usage, status)) = completes {
+            return self
+                .finish_owned_turn(event, completed_turn, usage, status)
+                .await;
+        }
+
+        hub.publish(
+            thread_id,
+            Outbound::Transcript {
+                event: Box::new(event),
+                user_input: live_turn_user_input(&self.turn.context),
+                command_output: None,
+            },
+        )
+        .await;
+        ForwarderControl::Continue
+    }
+
+    /// Take the admitted intent or build an external turn context, reserve the turn, acknowledge
+    /// it, and record the forwarder's ownership of it.
+    async fn attach_to_turn(
+        &mut self,
+        turn: TurnId,
+        event: &AgentEvent,
+    ) -> Result<(), ForwarderExitReason> {
+        let thread_id = self.thread_id();
+        let project_id = self.binding.project_id;
+        let runtime = self.services.runtime.clone();
+        let (context, mut lease) = if let Some(admitted) = self.admitted.take() {
+            (admitted.context, admitted.lease)
+        } else {
+            let persisted = self
+                .services
+                .store
+                .load_thread(project_id, thread_id)
+                .await
+                .ok()
+                .flatten();
+            let defaults = external_turn_defaults(&self.binding, persisted.as_ref());
+            let classification = self.coordinator.classification().await;
+            let context = TurnContext {
+                user_input: external_turn_input_label(classification),
+                model: defaults.model,
+                mode: defaults.mode,
+                kind: match classification {
+                    ClassificationPhase::Primary => TurnContextKind::User,
+                    ClassificationPhase::Subagent => TurnContextKind::ExternalSubagent,
+                    ClassificationPhase::Orphan => TurnContextKind::ExternalOrphan,
+                },
+            };
+            let lease = match runtime.reserve_turn(
+                &self.authority,
+                turn_reservation(project_id, &self.binding.handle, &context),
+            ) {
+                Ok(lease) => lease,
+                Err(error) => {
+                    error!(%project_id, %thread_id, %turn, %error,
+                        "event owner could not reserve an external native turn");
+                    return Err(ForwarderExitReason::RuntimeAuthorityReplaced);
+                }
+            };
+            (context, lease)
+        };
+        if let Some(overview) = lease.acknowledge_turn(turn) {
+            self.services.hub.publish_runtime_overview(overview).await;
+        }
+        self.turn.context = context;
+        self.turn.lease = Some(lease);
+        self.turn.owned_turn = Some(turn);
+        if !matches!(event, AgentEvent::TurnStarted { .. }) {
+            debug!(
+                %thread_id,
+                %turn,
+                "event forwarder attached to turn before seeing turn start"
+            );
+        }
+        Ok(())
+    }
+
+    /// Live usage, live context window, model adoption, and the durable context-window write.
+    async fn record_turn_usage(&mut self, event: &AgentEvent) {
+        let thread_id = self.thread_id();
+        let project_id = self.binding.project_id;
         if let AgentEvent::TurnUsageUpdated {
             turn,
             usage,
             model,
             context_window,
             ..
-        } = &event
+        } = event
         {
             self.turn.live_usage = Some(*usage);
             if let Some(window) = context_window {
@@ -1578,7 +1765,13 @@ impl ThreadEventForwarder {
                 }
             }
         }
+    }
 
+    /// Per-kind bookkeeping for an owned event: turn start state, driver links for started and
+    /// completed items, the compaction marker, current-turn item assembly, and diff accumulation.
+    async fn note_owned_event(&mut self, event: &AgentEvent) {
+        let thread_id = self.thread_id();
+        let project_id = self.binding.project_id;
         match &event {
             AgentEvent::TurnStarted { turn, .. } => {
                 self.turn.observed_turn = Some(*turn);
@@ -1609,8 +1802,8 @@ impl ThreadEventForwarder {
                         .await
                 {
                     warn!(%project_id, parent_thread_id = %thread_id, turn_id = %turn,
-                        item_id = %item.id, %error,
-                        "failed to send linked native identity to the project event driver");
+                    item_id = %item.id, %error,
+                    "failed to send linked native identity to the project event driver");
                 }
             }
             AgentEvent::ItemCompleted { item, turn, .. } => {
@@ -1628,8 +1821,8 @@ impl ThreadEventForwarder {
                         .await
                 {
                     warn!(%project_id, parent_thread_id = %thread_id, turn_id = %turn,
-                        item_id = %item.id, %error,
-                        "failed to send linked native identity to the project event driver");
+                    item_id = %item.id, %error,
+                    "failed to send linked native identity to the project event driver");
                 }
                 if self.turn.context.kind == TurnContextKind::ManualCompaction
                     && is_context_compaction_item(item)
@@ -1667,22 +1860,15 @@ impl ThreadEventForwarder {
             }
             _ => {}
         }
+    }
 
-        let completed = if let AgentEvent::TurnCompleted {
-            turn,
-            usage,
-            status,
-            ..
-        } = &event
-        {
-            Some((*turn, *usage, status.clone()))
-        } else {
-            None
-        };
-
-        // A harness may deliver an item for an unseen turn before TurnStarted. Start the
-        // reconnect buffer from the first turn-scoped event and reuse it when the delayed
-        // start arrives, otherwise a reload in that window loses the already-visible item.
+    /// A harness may deliver an item for an unseen turn before TurnStarted. Start the
+    /// reconnect buffer from the first turn-scoped event and reuse it when the delayed
+    /// start arrives, otherwise a reload in that window loses the already-visible item.
+    fn admit_to_live_buffer(&self, event_turn: Option<TurnId>, event: &AgentEvent) -> bool {
+        let thread_id = self.thread_id();
+        let project_id = self.binding.project_id;
+        let runtime = &self.services.runtime;
         let mut append_to_live_buffer = true;
         if let Some(buffer_turn) = event_turn
             && let Err(existing_turn) = runtime.ensure_live_turn(
@@ -1716,103 +1902,149 @@ impl ThreadEventForwarder {
                 append_to_live_buffer = false;
             }
         }
-        if completed.is_none() {
-            let applied = match preparation_permit.as_ref() {
-                Some(permit) => {
-                    match self.services.runtime.apply_prepared_event_if_current(
-                        permit,
-                        &event,
-                        append_to_live_buffer,
-                        prepared_item_output,
-                    ) {
-                        Some(applied) => applied,
-                        None => {
-                            return ForwarderControl::Exit(
-                                ForwarderExitReason::RuntimeAuthorityReplaced,
-                            );
-                        }
-                    }
-                }
-                None => self.services.runtime.apply_prepared_event(
-                    &self.authority,
-                    &event,
-                    append_to_live_buffer,
-                    prepared_item_output,
-                ),
-            };
-            debug!(
-                %thread_id,
-                event_sequence = display_opt(applied.sequence),
-                event_kind = event.kind(),
-                "applied agent event to thread runtime"
-            );
-            hub.publish(thread_id, Outbound::RuntimeEffects(applied))
-                .await;
-        }
+        append_to_live_buffer
+    }
 
-        if let Some((completed_turn, usage, status)) = completed {
+    /// Close the owned turn: the two completion logs, persistence, the completion transcript
+    /// publish, the after-turn running-command notice, and the reset back to the idle context.
+    async fn finish_owned_turn(
+        &mut self,
+        event: AgentEvent,
+        completed_turn: TurnId,
+        usage: giskard_core::token::TokenUsage,
+        status: TurnStatus,
+    ) -> ForwarderControl {
+        let thread_id = self.thread_id();
+        let project_id = self.binding.project_id;
+        let hub = self.services.hub.clone();
+        let runtime = self.services.runtime.clone();
+        info!(
+            %project_id,
+            %thread_id,
+            turn = %completed_turn,
+            started_turn = display_opt(self.turn.observed_turn),
+            status = ?status.kind,
+            context_kind = turn_context_kind_label(self.turn.context.kind),
+            items_buffered = self.turn.items.len(),
+            diffs_buffered = self.turn.diffs.len(),
+            elapsed_ms = self.forwarder_started.elapsed().as_millis(),
+            "turn completion event received"
+        );
+        if self.turn.context.kind == TurnContextKind::ManualCompaction {
             info!(
                 %project_id,
                 %thread_id,
                 turn = %completed_turn,
-                started_turn = display_opt(self.turn.observed_turn),
                 status = ?status.kind,
-                context_kind = turn_context_kind_label(self.turn.context.kind),
                 items_buffered = self.turn.items.len(),
-                diffs_buffered = self.turn.diffs.len(),
+                saw_context_compaction_marker = self.turn.saw_context_compaction_marker,
                 elapsed_ms = self.forwarder_started.elapsed().as_millis(),
-                "turn completion event received"
+                "context compaction turn completed"
             );
-            if self.turn.context.kind == TurnContextKind::ManualCompaction {
-                info!(
-                    %project_id,
-                    %thread_id,
-                    turn = %completed_turn,
-                    status = ?status.kind,
-                    items_buffered = self.turn.items.len(),
-                    saw_context_compaction_marker = self.turn.saw_context_compaction_marker,
-                    elapsed_ms = self.forwarder_started.elapsed().as_millis(),
-                    "context compaction turn completed"
-                );
-            }
-            let Some(tid) = self
-                .complete_forwarded_turn(completed_turn, usage, status.clone())
-                .await
-            else {
-                return ForwarderControl::Exit(ForwarderExitReason::PersistenceBlocked);
-            };
-            hub.publish(
-                thread_id,
-                Outbound::Transcript {
-                    event: Box::new(event),
-                    user_input: None,
-                    command_output: None,
-                },
-            )
-            .await;
-            if runtime.has_running_for_turn(&self.authority, tid) {
-                info!(
-                    %project_id,
-                    %thread_id,
-                    turn = %tid,
-                    elapsed_ms = self.forwarder_started.elapsed().as_millis(),
-                    "event forwarder monitoring after-turn running commands"
-                );
-            }
-            self.turn.reset(&self.idle_context);
-            return ForwarderControl::Continue;
         }
-
+        let Some(tid) = self
+            .complete_forwarded_turn(completed_turn, usage, status.clone())
+            .await
+        else {
+            return ForwarderControl::Exit(ForwarderExitReason::PersistenceBlocked);
+        };
         hub.publish(
             thread_id,
             Outbound::Transcript {
                 event: Box::new(event),
-                user_input: live_turn_user_input(&self.turn.context),
+                user_input: None,
                 command_output: None,
             },
         )
         .await;
+        if runtime.has_running_for_turn(&self.authority, tid) {
+            info!(
+                %project_id,
+                %thread_id,
+                turn = %tid,
+                elapsed_ms = self.forwarder_started.elapsed().as_millis(),
+                "event forwarder monitoring after-turn running commands"
+            );
+        }
+        self.turn.reset(&self.idle_context);
         ForwarderControl::Continue
+    }
+
+    /// Normalize every admitted completed-item payload once before runtime state, wire
+    /// projection, current-turn assembly, or persistence can observe it. Command
+    /// terminality is handled separately: providers may send a nonterminal
+    /// ItemCompleted followed by a later terminal replacement.
+    async fn prepare_output(
+        &mut self,
+        event: AgentEvent,
+    ) -> Result<PreparedEvent, ForwarderExitReason> {
+        let is_completed_addressable_output = matches!(
+            &event,
+            AgentEvent::ItemCompleted { item, .. }
+                if matches!(&item.payload, ItemPayload::CommandExecution { .. } | ItemPayload::ToolCall { .. })
+        );
+        if !is_completed_addressable_output {
+            return Ok(PreparedEvent {
+                event,
+                output: None,
+                permit: None,
+            });
+        }
+        let project_id = self.binding.project_id;
+        let thread_id = self.thread_id();
+        let runtime = self.services.runtime.clone();
+        let Some(permit) = runtime.event_application_permit(&self.authority) else {
+            return Err(ForwarderExitReason::RuntimeAuthorityReplaced);
+        };
+        let preparation_diagnostics = completed_item_diagnostics(&event);
+        let preparation_runtime = runtime.clone();
+        match tokio::task::spawn_blocking(move || preparation_runtime.prepare_item_output(event))
+            .await
+        {
+            Ok((event, prepared)) => Ok(PreparedEvent {
+                event,
+                output: prepared,
+                permit: Some(permit),
+            }),
+            Err(error) => {
+                tracing::error!(
+                    %project_id,
+                    %thread_id,
+                    self.turn.observed_turn = preparation_diagnostics.as_ref().map(|value| tracing::field::display(value.turn_id)),
+                    item_id = preparation_diagnostics.as_ref().map(|value| tracing::field::display(value.item_id)),
+                    harness_item_id = preparation_diagnostics.as_ref().map(|value| value.harness_item_id.as_str()),
+                    item_payload_kind = preparation_diagnostics.as_ref().map(|value| value.payload_kind),
+                    error = %error,
+                    "addressable item-output event preparation task failed"
+                );
+                Err(ForwarderExitReason::EventPreparationFailed)
+            }
+        }
+    }
+
+    /// Apply through the preparation permit when there is one, otherwise through the authority.
+    /// `None` means the permit no longer names the current runtime entry.
+    fn apply_to_runtime(
+        &self,
+        permit: Option<&RestorePermit>,
+        event: &AgentEvent,
+        append_live: bool,
+        output: Option<PreparedItemOutput>,
+    ) -> Option<AppliedRuntimeEvent> {
+        match permit {
+            Some(permit) => self.services.runtime.apply_prepared_event_if_current(
+                permit,
+                event,
+                append_live,
+                output,
+            ),
+            None => Some(self.services.runtime.apply_prepared_event(
+                &self.authority,
+                event,
+                append_live,
+                output,
+            )),
+        }
     }
 
     async fn complete_forwarded_turn(
@@ -6349,5 +6581,220 @@ mod tests {
             }
             tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
         }
+    }
+    fn classify_turn_state() -> ForwardedTurnState {
+        ForwardedTurnState::new(TurnContext {
+            user_input: UserInput::text(""),
+            model: TurnModel::Unknown,
+            mode: TurnMode::Unknown,
+            kind: TurnContextKind::User,
+        })
+    }
+
+    fn classify_notice(thread: ThreadId, turn: Option<TurnId>, message: &str) -> AgentEvent {
+        AgentEvent::Notice {
+            thread,
+            turn,
+            message: message.into(),
+        }
+    }
+
+    #[test]
+    fn classify_drops_foreign_thread_events() {
+        let thread = ThreadId::new();
+        let foreign_thread = ThreadId::new();
+        let state = classify_turn_state();
+        let seen = HashSet::new();
+        let event = classify_notice(foreign_thread, None, "from another thread");
+
+        assert_eq!(
+            classify(thread, &state, &seen, &event),
+            EventDisposition::Drop(DropReason::ForeignThread {
+                event_thread: foreign_thread
+            })
+        );
+    }
+
+    #[test]
+    fn classify_drops_a_repeated_notice_after_remember() {
+        let thread = ThreadId::new();
+        let mut state = classify_turn_state();
+        let seen = HashSet::new();
+        let event = classify_notice(thread, None, "config deprecated");
+
+        assert_eq!(
+            classify(thread, &state, &seen, &event),
+            EventDisposition::Turnless
+        );
+
+        state.remember(&event);
+
+        assert_eq!(
+            classify(thread, &state, &seen, &event),
+            EventDisposition::Drop(DropReason::DuplicateNotice)
+        );
+    }
+
+    #[test]
+    fn classify_drops_a_remapped_native_item_id() {
+        let thread = ThreadId::new();
+        let turn = TurnId::new();
+        let original_item = ItemId::new();
+        let conflicting_item = ItemId::new();
+        let mut state = classify_turn_state();
+        state.owned_turn = Some(turn);
+        let seen = HashSet::new();
+
+        let started = AgentEvent::ItemStarted {
+            thread,
+            turn,
+            item: ItemStart {
+                id: original_item,
+                harness_item_id: "cmd_1".into(),
+                kind: ItemKind::CommandExecution,
+                command: None,
+                tool: None,
+            },
+        };
+        state.remember(&started);
+
+        let conflicting = AgentEvent::ItemCompleted {
+            thread,
+            turn,
+            item: Item {
+                id: conflicting_item,
+                harness_item_id: "cmd_1".into(),
+                payload: ItemPayload::AgentMessage {
+                    text: "different identity".into(),
+                },
+                created_at: Utc::now(),
+            },
+        };
+
+        assert_eq!(
+            classify(thread, &state, &seen, &conflicting),
+            EventDisposition::Drop(DropReason::ItemIdentityConflict {
+                turn,
+                harness_item_id: "cmd_1".into(),
+                existing: original_item,
+                conflicting: conflicting_item,
+            })
+        );
+    }
+
+    #[test]
+    fn classify_drops_events_for_another_unpersisted_turn() {
+        let thread = ThreadId::new();
+        let owned = TurnId::new();
+        let other = TurnId::new();
+        let mut state = classify_turn_state();
+        state.owned_turn = Some(owned);
+        let seen = HashSet::new();
+        let event = classify_notice(thread, Some(other), "for a different turn");
+
+        assert_eq!(
+            classify(thread, &state, &seen, &event),
+            EventDisposition::Drop(DropReason::CrossTurn {
+                owned,
+                event_turn: other
+            })
+        );
+    }
+
+    #[test]
+    fn classify_routes_persisted_turn_events_to_the_late_path() {
+        let thread = ThreadId::new();
+        let owned = TurnId::new();
+        let persisted = TurnId::new();
+        let mut state = classify_turn_state();
+        state.owned_turn = Some(owned);
+        let seen = HashSet::from([persisted]);
+        let event = AgentEvent::ItemCompleted {
+            thread,
+            turn: persisted,
+            item: Item {
+                id: ItemId::new(),
+                harness_item_id: "cmd_late".into(),
+                payload: ItemPayload::AgentMessage {
+                    text: "late".into(),
+                },
+                created_at: Utc::now(),
+            },
+        };
+
+        assert_eq!(
+            classify(thread, &state, &seen, &event),
+            EventDisposition::LateForPersistedTurn(persisted)
+        );
+    }
+
+    #[test]
+    fn classify_drops_usage_updates_for_persisted_turns() {
+        let thread = ThreadId::new();
+        let persisted = TurnId::new();
+        let state = classify_turn_state();
+        let seen = HashSet::from([persisted]);
+        let event = AgentEvent::TurnUsageUpdated {
+            thread,
+            turn: persisted,
+            usage: TokenUsage::new(3, 4),
+            context_window: None,
+            model: None,
+        };
+
+        assert_eq!(
+            classify(thread, &state, &seen, &event),
+            EventDisposition::Drop(DropReason::UsageForPersistedTurn { turn: persisted })
+        );
+    }
+
+    #[test]
+    fn classify_marks_turnless_events() {
+        let thread = ThreadId::new();
+        let state = classify_turn_state();
+        let seen = HashSet::new();
+        let event = classify_notice(thread, None, "before turn ownership");
+
+        assert_eq!(
+            classify(thread, &state, &seen, &event),
+            EventDisposition::Turnless
+        );
+    }
+
+    #[test]
+    fn classify_attaches_the_first_event_of_a_new_turn_and_completes_the_owned_one() {
+        let thread = ThreadId::new();
+        let turn = TurnId::new();
+        let mut state = classify_turn_state();
+        let seen = HashSet::new();
+
+        let started = AgentEvent::TurnStarted { thread, turn };
+        assert_eq!(
+            classify(thread, &state, &seen, &started),
+            EventDisposition::Owned {
+                attaches: Some(turn),
+                completes: None,
+            }
+        );
+
+        state.owned_turn = Some(turn);
+        let usage = TokenUsage::new(11, 22);
+        let status = TurnStatus {
+            kind: TurnStatusKind::Completed,
+            message: None,
+        };
+        let completed = AgentEvent::TurnCompleted {
+            thread,
+            turn,
+            usage,
+            status: status.clone(),
+        };
+        assert_eq!(
+            classify(thread, &state, &seen, &completed),
+            EventDisposition::Owned {
+                attaches: None,
+                completes: Some((turn, usage, status)),
+            }
+        );
     }
 }

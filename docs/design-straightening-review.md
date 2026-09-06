@@ -180,6 +180,21 @@ effects. The current per-kind `match` in the middle (link items to the driver, d
 compaction markers) becomes a third small function. The 58 log statements in the file mostly
 belong to `classify`'s drop reasons and collapse into one `log_drop(reason, &event)`.
 
+**Status: landed in S8** ([`s8-classify-apply.md`](s8-classify-apply.md)), with five corrections to
+the sketch above. (1) Two of the gates keep registries — the duplicate-notice gate inserts into
+`seen_notices` and the item-identity gate inserts a first-seen id into `item_ids_by_harness` — so
+each gate split into a read used by the pure `classify` and a write, `ForwardedTurnState::remember`,
+run once for every non-foreign event. (2) `first_for_turn: bool` became
+`attaches: Option<TurnId>`, because the attach path needs the turn id it attaches to. (3) There is a
+sixth decision the enum above has no room for, the usage update dropped for an already-persisted
+turn; it is a `DropReason` variant. (4) `log_drop` is one entry point rather than one function body:
+`log_foreign_thread_event_drop` and `log_cross_turn_event_drop` stay free functions because
+log-field tests call them directly, and the count above is off — the file held 57 production log
+macros over 635 lines, not 58 over 584. (5) `Outbound::Transcript` keeps its fields; folding it into
+`RuntimeEffects` would move forwarder policy (which turnless kinds reach the transcript, and the
+`user_input` the runtime never holds) into the runtime, so S8 left `Outbound` and `hub.rs` untouched
+and made the policy legible by putting each transcript publish at the tail of its path.
+
 **C3. Outbound lanes are chosen in three places.** `Hub::broadcast_event` narrows to the wire
 and refuses internal-only kinds; `registry::broadcast_event_with_context` re-implements the
 narrowing to attach `user_input`; `publish_applied_runtime_effects` in the forwarder routes
@@ -286,7 +301,7 @@ Each step is one PR that stands alone on `main`, mechanical first:
 | 5 | C3 `Hub::publish(Outbound)` — **landed in S5** | one seam | ±100 |
 | 6 | B3 `Services` split; forwarder takes `Arc<Services>` — **landed in S6** | mechanical | ±60 |
 | 7 | C5 runtime components — **landed in S7** | structural, no behaviour change | ±300 |
-| 8 | C2 `classify` / `apply` in the forwarder | structural, no behaviour change | ±250 |
+| 8 | C2 `classify` / `apply` in the forwarder — **landed in S8** | structural, no behaviour change | ±250 |
 | 9 | C4 option 1, then option 2 if C6 wants it | API | −200 |
 | 10 | D file splits (`ws.rs`, codex modules, `app.js`) | mechanical | 0 |
 
