@@ -13,7 +13,7 @@ use giskard_persist::store::{
 };
 use giskard_proto::{ThreadMetadata, ThreadState};
 
-use crate::hub::Hub;
+use crate::hub::{Hub, Outbound};
 
 /// Owns committed thread-metadata mutation, browser projection, and publication.
 ///
@@ -191,7 +191,10 @@ impl ThreadMetadataService {
                 "publishing committed thread metadata"
             );
             self.hub
-                .publish_thread_metadata(after.id, Self::thread_state(after, None))
+                .publish(
+                    after.id,
+                    Outbound::Metadata(Self::thread_state(after, None)),
+                )
                 .await;
         }
 

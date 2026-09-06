@@ -193,6 +193,10 @@ impl Hub { async fn publish(&self, thread_id: ThreadId, outbound: Outbound) }
 so the "which lane, which clock" table in spec §13.6.1 has one implementation, and the
 forwarder and registry stop knowing about `WireAgentEvent`.
 
+**Status: landed in S5.** `Outbound` carries two more variants than sketched here — `Request` and
+`RunningTasks`, the lanes the registry and `routes.rs` compute directly — and the overview keeps
+its own method; see [`s5-hub-publish.md`](s5-hub-publish.md).
+
 **C4. `AgentHarness` is three interfaces.** Its 21 methods split cleanly by receiver:
 
 - process-scoped: `capabilities`, `client_version`, `list_models`, `list_providers`,
@@ -267,7 +271,7 @@ Each step is one PR that stands alone on `main`, mechanical first:
 | 2 | B1 `NativeTurnState`; B2 `ItemOutputs` — **landed in S2** | mechanical | −120 |
 | 3 | A `DriverEvent` seam; delete the five counters | contract for tests only | ±80 |
 | 4 | C6 test-support crate; migrate the server integration tests to it — **landed in S4a and S4b** | tests only | −3000 |
-| 5 | C3 `Hub::publish(Outbound)` | one seam | ±100 |
+| 5 | C3 `Hub::publish(Outbound)` — **landed in S5** | one seam | ±100 |
 | 6 | B3 `Services` split; forwarder takes `Arc<Services>` | mechanical | ±60 |
 | 7 | C5 runtime components | structural, no behaviour change | ±300 |
 | 8 | C2 `classify` / `apply` in the forwarder | structural, no behaviour change | ±250 |

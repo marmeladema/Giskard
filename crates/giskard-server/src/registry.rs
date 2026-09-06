@@ -34,9 +34,9 @@ use giskard_harness::{
 };
 use giskard_persist::PersistStore;
 use giskard_persist::store::{ProjectConfig, ThreadFile, ThreadMutation, TurnCommitOutcome};
-use giskard_proto::{RunningTask, ServerMessage, ThreadRuntimeOverview, WireAgentEvent, WireItem};
+use giskard_proto::{RunningTask, ThreadRuntimeOverview, WireCommandOutput};
 
-use crate::hub::Hub;
+use crate::hub::{Hub, Outbound};
 use crate::ledger::LedgerHandle;
 use crate::log_fields::{display_opt, rfc3339, rfc3339_opt};
 use crate::thread_graph::{
@@ -45,8 +45,8 @@ use crate::thread_graph::{
 };
 use crate::thread_metadata::ThreadMetadataService;
 use crate::thread_runtime::{
-    AppliedRuntimeEvent, RequestResolution, RequestTransition, ResolvedThreadRuntime,
-    RestorePermit, RuntimeRequestId, ThreadRuntimeSupport, ThreadTurnLease, TurnReservation,
+    RequestResolution, RequestTransition, ResolvedThreadRuntime, RestorePermit, RuntimeRequestId,
+    ThreadRuntimeSupport, ThreadTurnLease, TurnReservation,
 };
 
 mod admission;
@@ -61,7 +61,7 @@ pub use driver::{
     RefusedSubject,
 };
 pub use event_forwarder::ForwarderExitReason;
-use event_forwarder::{forwarder_exit_reason_label, log_metadata_only_event_rejection};
+use event_forwarder::forwarder_exit_reason_label;
 use project::{HarnessTransitions, LifecycleLock, ProjectAuthority, WeakLifecycleLock};
 pub(crate) use thread::ThreadAuthority;
 use thread::{
@@ -1086,7 +1086,7 @@ impl HarnessRegistry {
         };
         self.shared
             .hub
-            .broadcast(request.thread_id, ServerMessage::RequestState(request))
+            .publish(request.thread_id, Outbound::Request(request))
             .await;
         publish_runtime_overview(&self.shared).await;
     }
@@ -1094,10 +1094,7 @@ impl HarnessRegistry {
     async fn publish_request_transition(&self, thread_id: ThreadId, transition: RequestTransition) {
         self.shared
             .hub
-            .broadcast(
-                thread_id,
-                ServerMessage::RequestState(transition.request_state),
-            )
+            .publish(thread_id, Outbound::Request(transition.request_state))
             .await;
         if let Some(overview) = transition.overview_if_changed {
             self.shared.hub.publish_runtime_overview(overview).await;
@@ -1891,53 +1888,6 @@ async fn ensure_subagent_thread_open(
     )
     .await?;
     Ok(agent_name)
-}
-
-async fn broadcast_event_with_context(
-    hub: &Arc<Hub>,
-    project_id: ProjectId,
-    thread_id: ThreadId,
-    event: AgentEvent,
-    ctx: &TurnContext,
-) {
-    broadcast_event_with_user_input(hub, project_id, thread_id, event, live_turn_user_input(ctx))
-        .await;
-}
-
-async fn broadcast_event_with_user_input(
-    hub: &Arc<Hub>,
-    project_id: ProjectId,
-    thread_id: ThreadId,
-    event: AgentEvent,
-    user_input: Option<UserInput>,
-) {
-    let agent_event = match event {
-        AgentEvent::TurnStarted { thread, turn } => WireAgentEvent::TurnStarted {
-            thread,
-            turn,
-            user_input,
-        },
-        other => {
-            let event_kind = other.kind();
-            let event_turn = other.turn();
-            let event_item = other.item_id();
-            let Some(agent_event) = WireAgentEvent::from_agent_event(other) else {
-                log_metadata_only_event_rejection(
-                    project_id, thread_id, event_kind, event_turn, event_item,
-                );
-                return;
-            };
-            agent_event
-        }
-    };
-    hub.broadcast(
-        thread_id,
-        ServerMessage::Event {
-            thread_id,
-            agent_event: Box::new(agent_event),
-        },
-    )
-    .await;
 }
 
 async fn install_event_owner(

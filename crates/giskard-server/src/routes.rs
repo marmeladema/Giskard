@@ -44,6 +44,7 @@ use crate::auth::{
     SESSION_COOKIE, TokenPurpose, auth_middleware, create_session_cookie,
     get_session_token_from_header, sign_token, verify_token,
 };
+use crate::hub::Outbound;
 use crate::thread_graph::{
     descendant_deletion_order, effective_thread_workspace_root as effective_workspace_root,
     graph_issue, load_thread_graph,
@@ -5631,12 +5632,7 @@ async fn ensure_thread_open(
         );
         state
             .hub
-            .broadcast(
-                thread_id,
-                ServerMessage::Error {
-                    error: warning.clone(),
-                },
-            )
+            .publish(thread_id, Outbound::Error(warning.clone()))
             .await;
     }
 
@@ -6184,14 +6180,7 @@ async fn broadcast_running_commands(state: &AppState, thread_id: ThreadId) {
     let (revision, tasks) = runtime.tasks_snapshot();
     state
         .hub
-        .broadcast(
-            thread_id,
-            ServerMessage::RunningTasks {
-                thread_id,
-                revision,
-                tasks,
-            },
-        )
+        .publish(thread_id, Outbound::RunningTasks { revision, tasks })
         .await;
 }
 

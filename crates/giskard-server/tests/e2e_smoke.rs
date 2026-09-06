@@ -22,6 +22,7 @@ use giskard_proto::{
     ClientMessage, ErrorSeverity, RequestKind, RuntimeTurnState, ServerMessage, WireAgentEvent,
 };
 use giskard_server::AppState;
+use giskard_server::hub::Outbound;
 use giskard_testenv::driver::{self, DriverProbe};
 use giskard_testenv::fake::{self, Call, FakeCore, FakeHarness, Gate, Script, TurnCall, caps};
 use giskard_testenv::{TestServer, auth, factory, fixtures, ws};
@@ -6044,12 +6045,16 @@ async fn websocket_serializes_harness_error_events() {
 
     state
         .hub
-        .broadcast_event(
+        .publish(
             tid,
-            AgentEvent::Error {
-                thread: tid,
-                turn: None,
-                error: HarnessError::Protocol("bad frame".into()),
+            Outbound::Transcript {
+                event: Box::new(AgentEvent::Error {
+                    thread: tid,
+                    turn: None,
+                    error: HarnessError::Protocol("bad frame".into()),
+                }),
+                user_input: None,
+                command_output: None,
             },
         )
         .await;

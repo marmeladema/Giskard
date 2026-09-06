@@ -128,23 +128,6 @@ fn log_foreign_thread_event_drop(
     );
 }
 
-pub(super) fn log_metadata_only_event_rejection(
-    project_id: ProjectId,
-    thread_id: ThreadId,
-    event_kind: &'static str,
-    event_turn_id: Option<TurnId>,
-    event_item_id: Option<ItemId>,
-) {
-    warn!(
-        %project_id,
-        %thread_id,
-        event_kind,
-        event_turn_id = display_opt(event_turn_id),
-        event_item_id = display_opt(event_item_id),
-        "refusing to broadcast a metadata-only event on the transcript stream"
-    );
-}
-
 fn log_cross_turn_event_drop(
     project_id: ProjectId,
     thread_id: ThreadId,
@@ -255,31 +238,6 @@ fn log_command_completion_after_terminate(
     );
 }
 
-async fn publish_applied_runtime_effects(
-    hub: &Hub,
-    thread_id: ThreadId,
-    applied: AppliedRuntimeEvent,
-) {
-    if let Some(request) = applied.request_state {
-        hub.broadcast(thread_id, ServerMessage::RequestState(request))
-            .await;
-    }
-    if let Some(tasks) = applied.running_tasks_if_changed {
-        hub.broadcast(
-            thread_id,
-            ServerMessage::RunningTasks {
-                thread_id,
-                revision: tasks.revision,
-                tasks: tasks.tasks,
-            },
-        )
-        .await;
-    }
-    if let Some(overview) = applied.overview_if_changed {
-        hub.publish_runtime_overview(overview).await;
-    }
-}
-
 fn is_terminal_command_completion(event: &AgentEvent) -> bool {
     let AgentEvent::ItemCompleted { item, .. } = event else {
         return false;
@@ -300,45 +258,31 @@ fn completed_tool_has_terminal_output(item: &Item) -> bool {
     output.is_some() && !status.as_deref().is_some_and(tool_status_is_running)
 }
 
-fn late_command_completion_message(
-    thread_id: ThreadId,
-    event: AgentEvent,
-) -> Option<ServerMessage> {
-    let AgentEvent::ItemCompleted { thread, turn, item } = event else {
+/// The durable command output of a late completion, for the hub to attach to the wire item.
+fn late_command_output(item: &Item) -> Option<WireCommandOutput> {
+    let ItemPayload::CommandExecution {
+        output,
+        output_truncated,
+        output_original_bytes,
+        output_original_lines,
+        ..
+    } = &item.payload
+    else {
         return None;
     };
-    let descriptor = match &item.payload {
-        ItemPayload::CommandExecution {
-            output,
-            output_truncated,
-            output_original_bytes,
-            output_original_lines,
-            ..
-        } => {
-            let (original_bytes, original_lines) = giskard_core::resolve_command_output_counts(
-                output,
-                *output_truncated,
-                *output_original_bytes,
-                *output_original_lines,
-            );
-            Some(giskard_core::CommandOutputDescriptor::from_durable(
-                output,
-                *output_truncated,
-                original_bytes,
-                original_lines,
-                false,
-            ))
-        }
-        _ => None,
-    };
-    Some(ServerMessage::Event {
-        thread_id,
-        agent_event: Box::new(WireAgentEvent::ItemCompleted {
-            thread,
-            turn,
-            item: WireItem::from_item_with_command_output(item, descriptor),
-        }),
-    })
+    let (original_bytes, original_lines) = giskard_core::resolve_command_output_counts(
+        output,
+        *output_truncated,
+        *output_original_bytes,
+        *output_original_lines,
+    );
+    Some(giskard_core::CommandOutputDescriptor::from_durable(
+        output,
+        *output_truncated,
+        original_bytes,
+        original_lines,
+        false,
+    ))
 }
 
 fn command_completion_is_normal_success(status: &str, exit_code: Option<i32>) -> bool {
@@ -1206,7 +1150,15 @@ impl ThreadEventForwarder {
             else {
                 return ForwarderControl::Exit(ForwarderExitReason::PersistenceBlocked);
             };
-            hub.broadcast_event(thread_id, completion_event).await;
+            hub.publish(
+                thread_id,
+                Outbound::Transcript {
+                    event: Box::new(completion_event),
+                    user_input: None,
+                    command_output: None,
+                },
+            )
+            .await;
             if gap {
                 self.turn.reset(&self.idle_context);
                 self.stream_error = None;
@@ -1439,7 +1391,8 @@ impl ThreadEventForwarder {
                     "applied late terminal event to thread runtime"
                 );
                 let changed = applied.tasks_changed;
-                publish_applied_runtime_effects(&hub, thread_id, applied).await;
+                hub.publish(thread_id, Outbound::RuntimeEffects(applied))
+                    .await;
                 changed
             } else {
                 log_ignored_seen_turn_running_task_start(project_id, &event);
@@ -1458,8 +1411,17 @@ impl ThreadEventForwarder {
                         "broadcasting terminal command completion for a persisted turn without matching running-task state"
                     );
                 }
-                if let Some(message) = late_command_completion_message(thread_id, event.clone()) {
-                    hub.broadcast(thread_id, message).await;
+                if let AgentEvent::ItemCompleted { item, .. } = &event {
+                    let command_output = late_command_output(item);
+                    hub.publish(
+                        thread_id,
+                        Outbound::Transcript {
+                            event: Box::new(event.clone()),
+                            user_input: None,
+                            command_output,
+                        },
+                    )
+                    .await;
                 }
             }
             if let AgentEvent::ItemCompleted { turn, item, .. } = &event
@@ -1495,7 +1457,8 @@ impl ThreadEventForwarder {
                 event_kind = event.kind(),
                 "applied turnless agent event to thread runtime"
             );
-            publish_applied_runtime_effects(&hub, thread_id, applied).await;
+            hub.publish(thread_id, Outbound::RuntimeEffects(applied))
+                .await;
             match &event {
                 AgentEvent::Error { error, .. } => {
                     warn!(
@@ -1508,7 +1471,15 @@ impl ThreadEventForwarder {
                         elapsed_ms = self.forwarder_started.elapsed().as_millis(),
                         "turnless harness error received before turn ownership"
                     );
-                    hub.broadcast_event(thread_id, event.clone()).await;
+                    hub.publish(
+                        thread_id,
+                        Outbound::Transcript {
+                            event: Box::new(event.clone()),
+                            user_input: None,
+                            command_output: None,
+                        },
+                    )
+                    .await;
                 }
                 AgentEvent::Notice { message, .. } => {
                     debug!(
@@ -1521,7 +1492,15 @@ impl ThreadEventForwarder {
                         elapsed_ms = self.forwarder_started.elapsed().as_millis(),
                         "turnless harness notice received before turn ownership"
                     );
-                    hub.broadcast_event(thread_id, event.clone()).await;
+                    hub.publish(
+                        thread_id,
+                        Outbound::Transcript {
+                            event: Box::new(event.clone()),
+                            user_input: None,
+                            command_output: None,
+                        },
+                    )
+                    .await;
                 }
                 AgentEvent::ServerRequestReceived { request, .. } => {
                     warn!(
@@ -1535,7 +1514,15 @@ impl ThreadEventForwarder {
                         elapsed_ms = self.forwarder_started.elapsed().as_millis(),
                         "turnless server request received before turn ownership"
                     );
-                    hub.broadcast_event(thread_id, event.clone()).await;
+                    hub.publish(
+                        thread_id,
+                        Outbound::Transcript {
+                            event: Box::new(event.clone()),
+                            user_input: None,
+                            command_output: None,
+                        },
+                    )
+                    .await;
                 }
                 _ => {}
             }
@@ -1759,7 +1746,8 @@ impl ThreadEventForwarder {
                 event_kind = event.kind(),
                 "applied agent event to thread runtime"
             );
-            publish_applied_runtime_effects(&hub, thread_id, applied).await;
+            hub.publish(thread_id, Outbound::RuntimeEffects(applied))
+                .await;
         }
 
         if let Some((completed_turn, usage, status)) = completed {
@@ -1793,7 +1781,15 @@ impl ThreadEventForwarder {
             else {
                 return ForwarderControl::Exit(ForwarderExitReason::PersistenceBlocked);
             };
-            hub.broadcast_event(thread_id, event).await;
+            hub.publish(
+                thread_id,
+                Outbound::Transcript {
+                    event: Box::new(event),
+                    user_input: None,
+                    command_output: None,
+                },
+            )
+            .await;
             if runtime.has_running_for_turn(&self.authority, tid) {
                 info!(
                     %project_id,
@@ -1807,7 +1803,15 @@ impl ThreadEventForwarder {
             return ForwarderControl::Continue;
         }
 
-        broadcast_event_with_context(&hub, project_id, thread_id, event, &self.turn.context).await;
+        hub.publish(
+            thread_id,
+            Outbound::Transcript {
+                event: Box::new(event),
+                user_input: live_turn_user_input(&self.turn.context),
+                command_output: None,
+            },
+        )
+        .await;
         ForwarderControl::Continue
     }
 
@@ -1891,7 +1895,10 @@ impl ThreadEventForwarder {
                     None,
                 ),
             };
-            publish_applied_runtime_effects(&self.shared.hub, thread_id, applied).await;
+            self.shared
+                .hub
+                .publish(thread_id, Outbound::RuntimeEffects(applied))
+                .await;
         } else {
             let error = persist_outcome
                 .history_error
@@ -1907,13 +1914,15 @@ impl ThreadEventForwarder {
                     Some((turn, error)),
                 ),
             };
-            publish_applied_runtime_effects(&self.shared.hub, thread_id, applied).await;
             self.shared
-            .hub
-            .broadcast(
-                thread_id,
-                ServerMessage::Error {
-                    error: giskard_proto::ErrorInfo {
+                .hub
+                .publish(thread_id, Outbound::RuntimeEffects(applied))
+                .await;
+            self.shared
+                .hub
+                .publish(
+                    thread_id,
+                    Outbound::Error(giskard_proto::ErrorInfo {
                         code: "turn_persistence_blocked".into(),
                         severity: giskard_proto::ErrorSeverity::Error,
                         message:
@@ -1924,10 +1933,9 @@ impl ThreadEventForwarder {
                         action: Some("persist_turn".into()),
                         request_id: None,
                         process_id: None,
-                    },
-                },
-            )
-            .await;
+                    }),
+                )
+                .await;
             return None;
         }
         info!(
@@ -2660,27 +2668,6 @@ mod tests {
         }
         assert!(!output.contains("foreign sensitive text"), "{output}");
         assert!(!output.contains("Some("), "{output}");
-
-        let output = capture_logs(|| {
-            log_metadata_only_event_rejection(
-                project_id,
-                expected_thread_id,
-                "diff_updated",
-                Some(turn_id),
-                None,
-            );
-        });
-        assert!(
-            output.contains(&format!("project_id={project_id}")),
-            "{output}"
-        );
-        assert!(
-            output.contains(&format!("event_turn_id={turn_id}")),
-            "{output}"
-        );
-        assert!(output.contains("event_kind=\"diff_updated\""), "{output}");
-        assert!(!output.contains("event_item_id"), "{output}");
-        assert!(!output.contains("Some("), "{output}");
     }
 
     #[test]
@@ -2716,41 +2703,24 @@ mod tests {
 
     #[test]
     fn late_untruncated_command_completion_ignores_original_counts() {
-        let thread_id = ThreadId::new();
-        let message = late_command_completion_message(
-            thread_id,
-            AgentEvent::ItemCompleted {
-                thread: thread_id,
-                turn: TurnId::new(),
-                item: Item {
-                    id: ItemId::new(),
-                    harness_item_id: "command-1".into(),
-                    payload: ItemPayload::CommandExecution {
-                        command: "printf ok".into(),
-                        cwd: std::path::PathBuf::from("/tmp/project"),
-                        output: "ok\n".into(),
-                        output_truncated: false,
-                        output_original_bytes: Some(999),
-                        output_original_lines: Some(88),
-                        exit_code: Some(0),
-                        status: Some("completed".into()),
-                        process_id: None,
-                        duration_ms: None,
-                    },
-                    created_at: Utc::now(),
-                },
+        let item = Item {
+            id: ItemId::new(),
+            harness_item_id: "command-1".into(),
+            payload: ItemPayload::CommandExecution {
+                command: "printf ok".into(),
+                cwd: std::path::PathBuf::from("/tmp/project"),
+                output: "ok\n".into(),
+                output_truncated: false,
+                output_original_bytes: Some(999),
+                output_original_lines: Some(88),
+                exit_code: Some(0),
+                status: Some("completed".into()),
+                process_id: None,
+                duration_ms: None,
             },
-        )
-        .unwrap();
-        let ServerMessage::Event { agent_event, .. } = message else {
-            panic!("expected event message");
+            created_at: Utc::now(),
         };
-        let WireAgentEvent::ItemCompleted { item, .. } = *agent_event else {
-            panic!("expected completed item");
-        };
-        let giskard_proto::WireItemPayload::CommandExecution { output, .. } = item.payload else {
-            panic!("expected command execution payload");
-        };
+        let output = late_command_output(&item).unwrap();
         assert_eq!(output.original_bytes, 3);
         assert_eq!(output.original_lines, 1);
     }
@@ -4900,11 +4870,8 @@ mod tests {
             responding.request_state.status,
             WireRequestStatus::Responding
         ));
-        hub.broadcast(
-            thread_id,
-            ServerMessage::RequestState(responding.request_state),
-        )
-        .await;
+        hub.publish(thread_id, Outbound::Request(responding.request_state))
+            .await;
 
         assert!(log.append(AgentEvent::ServerRequestResolved {
             thread: thread_id,

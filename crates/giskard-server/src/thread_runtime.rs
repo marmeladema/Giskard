@@ -254,7 +254,7 @@ struct OverviewState {
     summaries: HashMap<ThreadId, ThreadRuntimeSummary>,
 }
 
-pub(crate) struct AppliedRuntimeEvent {
+pub struct AppliedRuntimeEvent {
     pub sequence: Option<u64>,
     pub tasks_changed: bool,
     pub running_tasks_if_changed: Option<RunningTasksProjection>,
@@ -263,7 +263,7 @@ pub(crate) struct AppliedRuntimeEvent {
     overview_refresh_needed: bool,
 }
 
-pub(crate) struct RunningTasksProjection {
+pub struct RunningTasksProjection {
     pub revision: u64,
     pub tasks: Vec<RunningTask>,
 }
@@ -1029,11 +1029,7 @@ impl ThreadRuntimeSupport {
         prepared_output: Option<PreparedItemOutput>,
         entry: &mut ThreadRuntimeEntry,
     ) -> AppliedRuntimeEvent {
-        let sequence = (!matches!(
-            event,
-            AgentEvent::ThreadOpened { .. } | AgentEvent::DiffUpdated { .. }
-        ))
-        .then(|| {
+        let sequence = (!is_internal_event(event)).then(|| {
             entry.event_sequence = entry.event_sequence.saturating_add(1);
             entry.event_sequence
         });
@@ -1394,6 +1390,15 @@ impl ThreadRuntimeSupport {
     ) -> Option<Arc<Mutex<ThreadRuntimeEntry>>> {
         authority.runtime_entry()
     }
+}
+
+/// Events that carry no client-visible transcript content: they consume no process-local
+/// sequence (RT1) and never reach the transcript stream.
+pub(crate) fn is_internal_event(event: &AgentEvent) -> bool {
+    matches!(
+        event,
+        AgentEvent::ThreadOpened { .. } | AgentEvent::DiffUpdated { .. }
+    )
 }
 
 fn install_captured_diff(
@@ -3917,5 +3922,115 @@ mod tests {
         runtime.forget_threads(std::slice::from_ref(&authority));
         assert_eq!(permit.cache(turn, item, "stale".into()), None);
         assert!(runtime.existing_entry(&authority).is_none());
+    }
+
+    #[test]
+    fn only_thread_opened_and_diff_updated_are_internal() {
+        use giskard_core::item::{ItemKind, ItemStart};
+
+        let thread = ThreadId::new();
+        let turn = TurnId::new();
+        let item_id = ItemId::new();
+        // Every `AgentEvent` variant, so a new one has to be classified here deliberately.
+        let events = vec![
+            AgentEvent::ThreadOpened {
+                thread,
+                harness_thread_id: "native-1".into(),
+            },
+            AgentEvent::TurnStarted { thread, turn },
+            AgentEvent::TurnUsageUpdated {
+                thread,
+                turn,
+                usage: Default::default(),
+                context_window: None,
+                model: None,
+            },
+            AgentEvent::ItemStarted {
+                thread,
+                turn,
+                item: ItemStart {
+                    id: item_id,
+                    harness_item_id: "item-1".into(),
+                    kind: ItemKind::AgentMessage,
+                    command: None,
+                    tool: None,
+                },
+            },
+            AgentEvent::ItemDelta {
+                thread,
+                turn,
+                item_id,
+                delta: giskard_core::item::ItemDelta::Text {
+                    text: "delta".into(),
+                },
+            },
+            AgentEvent::ItemCompleted {
+                thread,
+                turn,
+                item: Item {
+                    id: item_id,
+                    harness_item_id: "item-1".into(),
+                    payload: ItemPayload::AgentMessage {
+                        text: "done".into(),
+                    },
+                    created_at: Utc::now(),
+                },
+            },
+            AgentEvent::DiffUpdated {
+                thread,
+                turn,
+                diff: giskard_core::FileDiff {
+                    path: "src/lib.rs".into(),
+                    change: giskard_core::FileChangeKind::Modified,
+                    old_text: None,
+                    new_text: None,
+                    hunks: Vec::new(),
+                    binary: false,
+                    captured: None,
+                },
+            },
+            AgentEvent::ApprovalRequested {
+                thread,
+                turn,
+                request: approval("approval-1"),
+            },
+            AgentEvent::ServerRequestReceived {
+                thread,
+                turn: Some(turn),
+                request: server_request("request-1"),
+            },
+            AgentEvent::ServerRequestResolved {
+                thread,
+                turn: Some(turn),
+                request_id: ServerRequestId("request-1".into()),
+            },
+            AgentEvent::TurnCompleted {
+                thread,
+                turn,
+                usage: Default::default(),
+                status: TurnStatus {
+                    kind: TurnStatusKind::Completed,
+                    message: None,
+                },
+            },
+            AgentEvent::Error {
+                thread,
+                turn: Some(turn),
+                error: HarnessError::Protocol("bad frame".into()),
+            },
+            AgentEvent::Notice {
+                thread,
+                turn: Some(turn),
+                message: "notice".into(),
+            },
+        ];
+        assert_eq!(events.len(), 13);
+
+        let internal: Vec<&'static str> = events
+            .iter()
+            .filter(|event| is_internal_event(event))
+            .map(|event| event.kind())
+            .collect();
+        assert_eq!(internal, vec!["thread_opened", "diff_updated"]);
     }
 }
