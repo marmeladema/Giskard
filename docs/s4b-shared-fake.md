@@ -99,8 +99,9 @@ impl FakeCore {
     pub fn bind_route(&self, harness_thread_id: &str, thread: ThreadId) -> ThreadId;   // entry().or_insert
     pub fn seed_routes(&self, bootstrap: &HarnessBootstrap);
     // default handle shapes
+    pub fn set_route(&self, harness_thread_id: &str, thread: ThreadId);               // insert, replacing any owner
     pub fn opened(&self, opts: &OpenThreadOptions, fallback_native_id: String) -> ThreadHandle;
-        // creates the log, binds the route, returns the twelve-of-fourteen handle shape
+        // creates the log, `set_route`s the native id to opts.thread, returns the twelve-of-fourteen handle shape
     pub fn claimed(&self, thread: ThreadId, harness_thread_id: &str, workspace_root: &Path) -> ThreadHandle;
         // bind_route + ensure_log, bare ThreadHandle::opened (no resumed_model)
     // calls
@@ -115,6 +116,13 @@ impl FakeCore {
     pub async fn wait_for_reader_count(&self, thread: ThreadId, exactly: usize);
 }
 ```
+
+Route rule (found during implementation, revision 2): an **open** points the native id at the
+thread the server asked to open (`set_route`), while a **claim** keeps an existing owner
+(`bind_route`). Two projects seeded from one fixture both persist `"th_test"`; resolving an open
+through `bind_route` would hand the second project's open the first project's thread and stream
+its turns into the wrong log. Only claims carry the "one native owner" rule. The testenv unit
+test `opening_a_shared_native_id_keeps_each_thread_its_own` pins this.
 
 Recording rule, stated once in the `Call` doc and honoured by `FakeHarness`: every trait call is
 recorded **on entry**, before the script runs and regardless of what it returns. This matches
@@ -298,7 +306,8 @@ byte-for-byte; the assertions on `error.code`/`error.message` depend on them.
 | Site | Today | After |
 | --- | --- | --- |
 | `e2e_smoke.rs:2004` `start_activity_server_on_available_port(harness)` | returns `TestServer` | unchanged for 13 callers; a sibling `start_activity_server_with_probe(harness) -> (TestServer, DriverProbe)` installs `driver::probe()` through `.driver_events(sink)` |
-| `:5577`, `:5623`, `:5646`, `:5747` | `wait_for_native_thread(state, pid, id)` → `ThreadFile` | `let id = probe.expect_admitted("<native id>").await; state.store.load_thread(pid, id).await.unwrap().unwrap()` |
+| `:5623`, `:5646`, `:5747` | `wait_for_native_thread(state, pid, id)` → `ThreadFile` | `let id = probe.expect_admitted("<native id>").await; state.store.load_thread(pid, id).await.unwrap().unwrap()` |
+| `:5577` | `wait_for_native_thread(state, pid, "native-foreign-child")` | a plain store read, no wait (revision 2): the listing two lines above already asserted the thread count, so the orphan is present, and the probe cannot serve this site because the admission that leaves a foreign child as an orphan reports `Ok(None)`, indistinguishable from a refusal until the disposition reaches the event (see Deferred) |
 | `:2149-2175` | `wait_for_native_thread` | deleted |
 | `worktree_threads.rs:446` `start(git_repo)` | `Harnessed { server, project, harness, project_id }` | gains `probe: DriverProbe`; `start` installs it |
 | `:1611` `restart(&server)` | `(harness, base, cookie)` | `(harness, base, cookie, probe)` |
@@ -364,13 +373,13 @@ T=crates/giskard-server/tests
 # 14 → 0 and 0 → 14
 grep -oE "impl (giskard_harness::)?AgentHarness for" $T/*.rs | wc -l
 grep -o "impl Script for" $T/*.rs | wc -l
-# 13 → 0: no polling helper left (the thirteen names from the ground truth)
+# 13 → at most 5: a name may survive only as a one-expression wrapper over FakeCore::wait_for_call (revision 2); none may contain a deadline, a sleep, or a yield
 grep -cE "^\s*(pub )?(async )?fn (wait_for_compact_calls|wait_for_native_child_open|wait_for_approval_response|wait_for_server_response|wait_for_subscribers|wait_for_subscriber_count|wait_for_start_calls|wait_until_active|wait_until_terminated|wait_for_response|wait_for_capture|wait_for_native_thread|wait_for_subagent)\(" $T/*.rs | awk -F: '{s+=$2} END{print s}'
 # 14 → 0: every fake goes through fake::factory
 grep -o "factory::shared(" $T/*.rs | wc -l
 # 16 → 6: only the ReplayHarness-building closures remain (model_refresh.rs 1, project_models.rs 5)
 grep -o "factory::from_fn(" $T/*.rs | wc -l
-# 0 → 6: four expect_admitted sites in e2e_smoke.rs, two expect_child_of sites in worktree_threads.rs
+# 0 → 6: three expect_admitted sites in e2e_smoke.rs, three expect_child_of sites in worktree_threads.rs
 grep -oE "expect_admitted\(|expect_child_of\(" $T/*.rs | wc -l
 # 2 → 2: the tracing capture is untouched (definition + one call)
 grep -c "install_registry_event_capture" $T/e2e_smoke.rs
