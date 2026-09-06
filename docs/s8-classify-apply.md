@@ -24,7 +24,7 @@ After S8:
 
 No behaviour change: no log line, log field, log level, error string, wire message, message
 order, or test assertion changes. Every existing test passes unedited; `hub.rs` and every file
-other than `event_forwarder.rs` and the review are untouched, except one re-export line in
+other than `event_forwarder.rs` and the review are untouched, except two `use`-list lines in
 `thread_runtime.rs` and one import line in `registry.rs` (D4).
 
 ## Corrections to the review and the S5 follow-on
@@ -90,7 +90,7 @@ starts at `:1959`; 44 tests; 57 production log macros (one is spelled `tracing::
 | The permit-or-authority apply block appears twice, identical except `append_live`: `:1352-1369` (`false`) and `:1720-1740` (`append_to_live_buffer`) | read |
 | Production `Outbound::Transcript` publishes: 7 (`:1155` stream error, `:1418` late, `:1476`/`:1497`/`:1519` turnless, `:1786` completion, `:1808` owned). The three turnless publishes are byte-identical (`event.clone()`, `None`, `None`); only their preceding logs differ | grep |
 | Production `Outbound::RuntimeEffects` publishes: 5 (`:1394`, `:1460`, `:1749`, `:1900`, `:1919`) | grep |
-| `RuntimeAuthorityReplaced` in production: 6 lines (`:588` variant, `:601` label, exits at `:1273`, `:1305`, `:1362`, `:1731`) — the two inside the duplicated apply block become one | grep |
+| `RuntimeAuthorityReplaced` in production: 6 lines (`:588` variant, `:601` label, exits at `:1273`, `:1305`, `:1362`, `:1731`) — all six survive; revision 2 corrects the first cut's claim that the two inside the duplicated apply block merge | grep |
 | Helpers `handle_event` calls that live in `registry.rs` and reach it through `use super::*`: `TurnContext` `:87-92`, `TurnContextKind` `:95-100`, `turn_context_kind_label` `:102`, `turn_reservation` `:111`, `live_turn_user_input` `:125`, `subagent_activity_info` `:1682`, `subagent_start_info` `:1772`; in `registry/thread.rs`: `external_turn_input_label` `:243`, `ExternalTurnDefaults` `:71` | grep |
 | `TokenUsage` is `Copy + PartialEq + Debug` (`giskard-core/src/token.rs:5`); `TurnStatus` is `Clone + PartialEq + Debug` (`turn.rs:135-136`); `TurnId`, `ItemId`, `ThreadId` derive `Debug, PartialEq` (ULIDs) | read |
 | Review anchors: C2 paragraph `design-straightening-review.md:159-181`, C3 heads `:183`; sequencing row 8 `:289` | grep |
@@ -206,7 +206,7 @@ async fn apply(&mut self, event: AgentEvent, disposition: EventDisposition) -> F
             self.log_drop(reason, &event);
             ForwarderControl::Continue
         }
-        EventDisposition::LateForPersistedTurn(turn) => self.apply_late(event, turn).await,
+        EventDisposition::LateForPersistedTurn(_) => self.apply_late(event).await,
         EventDisposition::Turnless => self.apply_turnless(event).await,
         EventDisposition::Owned { attaches, completes } => {
             self.apply_owned(event, attaches, completes).await
@@ -241,11 +241,16 @@ struct PreparedEvent {
     output: Option<PreparedItemOutput>,
     permit: Option<RestorePermit>,
 }
-async fn prepare_output(&self, event: AgentEvent) -> Result<PreparedEvent, ForwarderExitReason>;
+async fn prepare_output(
+    &mut self,
+    event: AgentEvent,
+) -> Result<PreparedEvent, ForwarderExitReason>;
 // Err(RuntimeAuthorityReplaced) from :1305, Err(EventPreparationFailed) from :1326.
+// `&mut self`, not `&self` (revision 2): see the note below.
 
 /// The permit-or-authority apply (:1352-1369 and :1720-1740, now once).
-/// `None` means the permit no longer names the current runtime entry: `RuntimeAuthorityReplaced`.
+/// `None` means the permit no longer names the current runtime entry; each of the two callers
+/// turns it into `Exit(RuntimeAuthorityReplaced)` itself (revision 2: see exit check J).
 fn apply_to_runtime(
     &self,
     permit: Option<&RestorePermit>,
@@ -261,7 +266,7 @@ receives it through let-binding inference at `:1303-1331` and passes it straight
 re-export list (`thread_runtime.rs:39-41`) carries `RuntimeCommandOutputLookup`,
 `RuntimeToolOutputLookup`, `command_output_version` only; the type reaches `thread_runtime.rs`
 through a private `use` (`:47`), and `registry.rs:48-51` does not import it. A struct field and a
-parameter cannot be inferred, so D4 needs two one-line edits:
+parameter cannot be inferred, so D4 needs two one-line edits (and one they force):
 
 - `thread_runtime.rs:39-41`: add `PreparedItemOutput` to the `pub(crate) use outputs::{..}` list.
   This is a correction of S7's D8 list, not a widening of the runtime's surface: three
@@ -271,7 +276,19 @@ parameter cannot be inferred, so D4 needs two one-line edits:
 - `registry.rs:48-51`: add `PreparedItemOutput` to the `use crate::thread_runtime::{..}` list;
   `event_forwarder.rs` sees it through `use super::*` (`:1`). `RestorePermit` is already there.
 
-No other line in either file changes; exit check L pins both diffs.
+No other line in either file changes except one forced by the first: `thread_runtime.rs:47`
+imports the type privately (`use outputs::{ItemOutputState, PreparedItemOutput,
+prepare_item_output};`), which the new `pub(crate)` re-export makes a duplicate definition
+(E0252), so `PreparedItemOutput` drops out of that list. Three `use`-list lines in total, all
+naming only this type; exit check N pins them.
+
+**`prepare_output` takes `&mut self`, not `&self`** (revision 2). `ThreadEventForwarder` is not
+`Sync` — `InflightRequest.request` is a `BoxFuture<'static, ..>`, which is `Send` but not `Sync`
+— and an `async fn` stores every argument in its generator, so one holding `&self` can never be
+`Send`. `driver.rs:621` boxes the forwarder's future as `dyn Future + Send`, so `&self` here
+fails to compile. `&mut self` is `Send` whenever the referent is; the call site in `apply_late` /
+`apply_owned` holds no other borrow. Nothing else about D4 changes: the method still touches only
+`self.services.runtime`, `self.authority`, `self.binding`, and the event.
 
 ### D5. The three paths
 
@@ -282,8 +299,11 @@ No other line in either file changes; exit check L pins both diffs.
 /// the `applied late terminal event` debug, publish `RuntimeEffects`; else
 /// `log_ignored_seen_turn_running_task_start`; then the transcript block (:1401-1426) with
 /// `late_command_output`; then the tool cleanup (:1427-1445). Returns `Continue`, or `Exit` from
-/// preparation / a stale permit.
-async fn apply_late(&mut self, event: AgentEvent, turn: TurnId) -> ForwarderControl;
+/// preparation / a stale permit. It takes no turn id (revision 2): once the usage drop moves to
+/// `classify` nothing in this body reads one — every other `turn` here is a binding shadowed out
+/// of an `ItemCompleted` pattern — so `apply` discards `LateForPersistedTurn`'s payload. The
+/// variant keeps it: it is what `classify` decided, and D6 asserts on it.
+async fn apply_late(&mut self, event: AgentEvent) -> ForwarderControl;
 
 /// :1449-1530. `apply_event`, the `applied turnless agent event` debug, publish
 /// `RuntimeEffects`; then the per-kind logs for `Error` / `Notice` / `ServerRequestReceived`
@@ -366,7 +386,7 @@ Nothing else: the 44 existing tests already drive every effect path through the 
 | File | Change |
 | --- | --- |
 | `crates/giskard-server/src/registry/event_forwarder.rs` | D1 (`:10-18` deleted, `:58-74` reimplemented, `remember` added to `impl ForwardedTurnState` after `reset` `:655`); D2 types and `classify` placed directly above `impl ThreadEventForwarder` `:696`; D3 replaces `:1182-1816`; D4 and D5 methods in the same `impl` block, in pipeline order; D6 tests appended before the end of `mod tests` |
-| `crates/giskard-server/src/thread_runtime.rs` | `:39-41`: `PreparedItemOutput` joins the `pub(crate) use outputs::{..}` re-export (D4) |
+| `crates/giskard-server/src/thread_runtime.rs` | `:39-41`: `PreparedItemOutput` joins the `pub(crate) use outputs::{..}` re-export; `:47`: it leaves the private `use outputs::{..}`, which the re-export makes a duplicate definition (D4) |
 | `crates/giskard-server/src/registry.rs` | `:48-51`: `PreparedItemOutput` joins the `use crate::thread_runtime::{..}` import (D4) |
 | `docs/design-straightening-review.md` | a `**Status: landed in S8**` paragraph after the C2 paragraph (`:181`, before C3 at `:183`) naming corrections 1–5 in one sentence each; row 8 (`:289`) gains ` — **landed in S8**` |
 
@@ -431,10 +451,10 @@ M: git diff main -- $F | rg '^-.*#\[(test|tokio::test)\]'
 | G | 2 | 1 |
 | H | 7 | 5 |
 | I | 5 | 5 |
-| J | 6 | 5 |
+| J | 6 | 6 (revision 2, was 5) |
 | K, tests in the file | 44 | 52 |
 | L | — | empty |
-| N, the two D4 lines | — | only lines of the two `use` lists, each adding `PreparedItemOutput` and nothing else (rustfmt may rewrap the list: still only those lists) |
+| N, the D4 `use` lines | — | only `use`-list lines naming `PreparedItemOutput`: the two lists gain it, and `thread_runtime.rs:47`'s private import loses it (revision 2; rustfmt may rewrap a list: still only those lists) |
 | M, removed test attributes | — | no output |
 | `cargo clippy --workspace --all-targets --locked -- -D warnings`; `cargo test --workspace` | clean, green | clean, green |
 
