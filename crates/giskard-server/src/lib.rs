@@ -14,6 +14,7 @@ pub mod registry;
 pub mod routes;
 mod runtime_live;
 mod runtime_tasks;
+mod services;
 mod thread_graph;
 mod thread_metadata;
 pub mod thread_runtime;

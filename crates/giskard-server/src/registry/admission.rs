@@ -98,6 +98,7 @@ pub(super) async fn admit(
     source: Admission,
 ) -> Result<Option<Admitted>, HarnessError> {
     let project = shared
+        .services
         .store
         .load_project(project_id)
         .await
@@ -119,9 +120,10 @@ pub(super) async fn admit(
                 record.harness_thread_id.clone(),
                 TurnModel::Unknown,
             );
-            let root = effective_thread_workspace_root(&shared.store, &project, &provisional)
-                .await
-                .map_err(protocol)?;
+            let root =
+                effective_thread_workspace_root(&shared.services.store, &project, &provisional)
+                    .await
+                    .map_err(protocol)?;
             let handle = ThreadHandle {
                 parent_harness_thread_id: record.parent_harness_thread_id,
                 ..ThreadHandle::opened(record.thread, record.harness_thread_id, root.into())
@@ -130,12 +132,13 @@ pub(super) async fn admit(
         }
         Admission::Link(link) => {
             let parent = shared
+                .services
                 .store
                 .load_thread(project_id, link.parent_thread_id)
                 .await
                 .map_err(protocol)?
                 .ok_or(HarnessError::ThreadNotFound(link.parent_thread_id))?;
-            let root = effective_thread_workspace_root(&shared.store, &project, &parent)
+            let root = effective_thread_workspace_root(&shared.services.store, &project, &parent)
                 .await
                 .map_err(protocol)?;
             let handle = harness
@@ -156,6 +159,7 @@ pub(super) async fn admit(
     };
 
     let mut file = match shared
+        .services
         .store
         .load_thread(project_id, handle.thread)
         .await
@@ -175,7 +179,7 @@ pub(super) async fn admit(
                 current_model,
             );
             if let Some((link, parent)) = link.as_ref() {
-                let graph = load_thread_graph(&shared.store, project_id)
+                let graph = load_thread_graph(&shared.services.store, project_id)
                     .await
                     .map_err(protocol)?;
                 if !parent_chain_is_valid(&graph, parent.id) {
@@ -203,12 +207,14 @@ pub(super) async fn admit(
                 }
             }
             let file = shared
+                .services
                 .thread_metadata
                 .create(project_id, file)
                 .await
                 .map_err(protocol)?;
             if file.kind == ThreadKind::Subagent {
                 shared
+                    .services
                     .thread_metadata
                     .publish_created(project_id, &file)
                     .await;
@@ -223,7 +229,7 @@ pub(super) async fn admit(
                 && (file.kind == ThreadKind::Orphan || file.parent_thread_id != Some(parent.id)));
         let graph = if needs_graph {
             Some(
-                load_thread_graph(&shared.store, project_id)
+                load_thread_graph(&shared.services.store, project_id)
                     .await
                     .map_err(protocol)?,
             )
@@ -276,6 +282,7 @@ pub(super) async fn admit(
                 handle.agent_name.clone(),
             ));
             let mutation = shared
+                .services
                 .thread_metadata
                 .classify_orphan(
                     project_id,
@@ -310,6 +317,7 @@ pub(super) async fn admit(
                 coordinator.classify_orphan_as_subagent().await?;
             }
             shared
+                .services
                 .thread_metadata
                 .publish_created(project_id, &file)
                 .await;
@@ -321,6 +329,7 @@ pub(super) async fn admit(
         ));
         if should_refresh_subagent_title(&file.title, &desired_title) {
             shared
+                .services
                 .thread_metadata
                 .mutate(project_id, file.id, |current| {
                     if should_refresh_subagent_title(&current.title, &desired_title) {

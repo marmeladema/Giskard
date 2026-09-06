@@ -126,6 +126,11 @@ services into a `Services` struct owned by `RegistryShared` and passed by `Arc` 
 so the forwarder no longer needs the registry at all. That is the first step toward the
 forwarder becoming testable without a registry fixture (see D).
 
+**Status: landed in S6.** `Services` owns the five handles and `publish_runtime_overview`;
+`RegistryShared` keeps its five registry fields plus one `Arc<Services>`. The driver and the
+admission code still hold a `RegistryShared` and reach services through `shared.services`; see
+[`s6-services.md`](s6-services.md).
+
 **B4. `ForwarderExitReason`, `OwnerPhase`, and the teardown predicate** are already well placed.
 Leave them.
 
@@ -272,7 +277,7 @@ Each step is one PR that stands alone on `main`, mechanical first:
 | 3 | A `DriverEvent` seam; delete the five counters | contract for tests only | ±80 |
 | 4 | C6 test-support crate; migrate the server integration tests to it — **landed in S4a and S4b** | tests only | −3000 |
 | 5 | C3 `Hub::publish(Outbound)` — **landed in S5** | one seam | ±100 |
-| 6 | B3 `Services` split; forwarder takes `Arc<Services>` | mechanical | ±60 |
+| 6 | B3 `Services` split; forwarder takes `Arc<Services>` — **landed in S6** | mechanical | ±60 |
 | 7 | C5 runtime components | structural, no behaviour change | ±300 |
 | 8 | C2 `classify` / `apply` in the forwarder | structural, no behaviour change | ±250 |
 | 9 | C4 option 1, then option 2 if C6 wants it | API | −200 |

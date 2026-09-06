@@ -611,7 +611,7 @@ impl ProjectEventDriver {
             ))));
             return;
         }
-        let shared = self.shared.clone();
+        let services = self.shared.services.clone();
         let owner_harness = self.harness.clone();
         let owner_authority = authority.clone();
         let owner_coordinator = coordinator.clone();
@@ -620,7 +620,7 @@ impl ProjectEventDriver {
         };
         self.owners.push(Box::pin(async move {
             let forwarder = ThreadEventForwarder::new(
-                shared,
+                services,
                 owner_authority.clone(),
                 owner_coordinator.clone(),
                 owner_harness,
@@ -700,6 +700,7 @@ impl ProjectEventDriver {
             // rather than losing it; only a parent whose thread file is gone can never come back.
             match self
                 .shared
+                .services
                 .store
                 .load_thread(self.project_id, link.parent_thread_id)
                 .await
@@ -1641,7 +1642,7 @@ mod tests {
             .await
             .expect("detach should not wait for the harness reply");
         assert!(shared.coordinator(thread_id).await.is_none());
-        assert!(!shared.runtime.has_active_turn(&authority));
+        assert!(!shared.services.runtime.has_active_turn(&authority));
         assert!(matches!(
             response.await.unwrap(),
             Err(HarnessError::Protocol(message))
@@ -1865,7 +1866,7 @@ mod tests {
             thread: thread_id,
             turn,
         }));
-        wait_until(|| shared.runtime.has_active_turn(&authority)).await;
+        wait_until(|| shared.services.runtime.has_active_turn(&authority)).await;
 
         let history = store
             .data_dir()
@@ -1887,7 +1888,7 @@ mod tests {
         wait_until(|| {
             authority
                 .runtime_entry()
-                .is_some_and(|_| shared.runtime.has_active_turn(&authority))
+                .is_some_and(|_| shared.services.runtime.has_active_turn(&authority))
         })
         .await;
         tokio::time::timeout(std::time::Duration::from_secs(2), async {

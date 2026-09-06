@@ -674,7 +674,7 @@ struct InflightRequest {
 
 /// Owns event reduction for one installed coordinator without owning its lifecycle.
 pub(super) struct ThreadEventForwarder {
-    shared: Arc<RegistryShared>,
+    services: Arc<Services>,
     authority: Arc<ThreadAuthority>,
     coordinator: Arc<ThreadCoordinator>,
     harness: Weak<dyn AgentHarness>,
@@ -696,7 +696,7 @@ pub(super) struct ThreadEventForwarder {
 impl ThreadEventForwarder {
     #[allow(clippy::too_many_arguments)]
     pub(super) async fn new(
-        shared: Arc<RegistryShared>,
+        services: Arc<Services>,
         authority: Arc<ThreadAuthority>,
         coordinator: Arc<ThreadCoordinator>,
         harness: Weak<dyn AgentHarness>,
@@ -708,7 +708,7 @@ impl ThreadEventForwarder {
         let binding = coordinator.binding().await;
         let thread_id = binding.handle.thread;
         let project_id = binding.project_id;
-        let persisted = shared
+        let persisted = services
             .store
             .load_thread(project_id, thread_id)
             .await
@@ -721,11 +721,11 @@ impl ThreadEventForwarder {
             mode: idle_defaults.mode,
             kind: TurnContextKind::User,
         };
-        let runtime = shared.runtime.clone();
+        let runtime = services.runtime.clone();
         // Establish the authority once. Per-event permits must only observe this entry, never recreate
         // it after retirement.
         drop(runtime.restoration_permit(&authority));
-        let seen_turn_ids = persisted_turn_ids(&shared.store, project_id, thread_id).await;
+        let seen_turn_ids = persisted_turn_ids(&services.store, project_id, thread_id).await;
         let forwarder_started = Instant::now();
         let turn = ForwardedTurnState::new(idle_context.clone());
         debug!(
@@ -739,7 +739,7 @@ impl ThreadEventForwarder {
             "event forwarder started"
         );
         Self {
-            shared,
+            services,
             authority,
             coordinator,
             harness,
@@ -842,7 +842,7 @@ impl ThreadEventForwarder {
                 context.clone()
             }
         };
-        let lease = match self.shared.runtime.reserve_turn(
+        let lease = match self.services.runtime.reserve_turn(
             &self.authority,
             turn_reservation(project_id, &self.binding.handle, &context),
         ) {
@@ -852,11 +852,11 @@ impl ThreadEventForwarder {
                 return;
             }
         };
-        publish_runtime_overview(&self.shared).await;
+        self.services.publish_runtime_overview().await;
         let Some(harness) = self.harness.upgrade() else {
             let mut lease = lease;
             if let Some(overview) = lease.release() {
-                self.shared.hub.publish_runtime_overview(overview).await;
+                self.services.hub.publish_runtime_overview(overview).await;
             }
             reject(
                 intent,
@@ -937,7 +937,7 @@ impl ThreadEventForwarder {
                     && let Some(id) = turn_id
                     && let Some(overview) = admitted.lease.acknowledge_turn(id)
                 {
-                    self.shared.hub.publish_runtime_overview(overview).await;
+                    self.services.hub.publish_runtime_overview(overview).await;
                 }
                 if let (Some(owned), Some(id)) = (self.turn.owned_turn, turn_id)
                     && owned != id
@@ -984,7 +984,7 @@ impl ThreadEventForwarder {
                 if let Some(mut admitted) = self.admitted.take()
                     && let Some(overview) = admitted.lease.release()
                 {
-                    self.shared.hub.publish_runtime_overview(overview).await;
+                    self.services.hub.publish_runtime_overview(overview).await;
                 }
                 match request.reply {
                     IntentReply::Turn(reply) => {
@@ -1019,7 +1019,7 @@ impl ThreadEventForwarder {
         if let Some(mut admitted) = self.admitted.take()
             && let Some(overview) = admitted.lease.release()
         {
-            self.shared.hub.publish_runtime_overview(overview).await;
+            self.services.hub.publish_runtime_overview(overview).await;
         }
         if let Some(request) = self.inflight.take() {
             let error =
@@ -1072,7 +1072,7 @@ impl ThreadEventForwarder {
         if let Some(turn_gate) = self.turn.lease.as_mut()
             && let Some(overview) = turn_gate.release()
         {
-            self.shared.hub.publish_runtime_overview(overview).await;
+            self.services.hub.publish_runtime_overview(overview).await;
         }
         exit_reason
     }
@@ -1080,8 +1080,8 @@ impl ThreadEventForwarder {
     async fn handle_stream_error(&mut self, e: EventStreamError) -> ForwarderControl {
         let thread_id = self.thread_id();
         let project_id = self.binding.project_id;
-        let hub = self.shared.hub.clone();
-        let runtime = self.shared.runtime.clone();
+        let hub = self.services.hub.clone();
+        let runtime = self.services.runtime.clone();
         let gap = matches!(&e, EventStreamError::Gap { .. });
         self.stream_error = Some(e.to_string());
         if self.turn.context.kind == TurnContextKind::ManualCompaction {
@@ -1182,8 +1182,8 @@ impl ThreadEventForwarder {
     async fn handle_event(&mut self, event: AgentEvent) -> ForwarderControl {
         let thread_id = self.thread_id();
         let project_id = self.binding.project_id;
-        let hub = self.shared.hub.clone();
-        let runtime = self.shared.runtime.clone();
+        let hub = self.services.hub.clone();
+        let runtime = self.services.runtime.clone();
         let event_thread = event.thread_id();
         if event_thread != thread_id {
             log_foreign_thread_event_drop(project_id, thread_id, event_thread, &event);
@@ -1243,7 +1243,7 @@ impl ThreadEventForwarder {
                 (admitted.context, admitted.lease)
             } else {
                 let persisted = self
-                    .shared
+                    .services
                     .store
                     .load_thread(project_id, thread_id)
                     .await
@@ -1277,7 +1277,7 @@ impl ThreadEventForwarder {
                 (context, lease)
             };
             if let Some(overview) = lease.acknowledge_turn(turn) {
-                self.shared.hub.publish_runtime_overview(overview).await;
+                self.services.hub.publish_runtime_overview(overview).await;
             }
             self.turn.context = context;
             self.turn.lease = Some(lease);
@@ -1350,7 +1350,7 @@ impl ThreadEventForwarder {
                 )
                 .await;
                 let applied = match preparation_permit.as_ref() {
-                    Some(permit) => match self.shared.runtime.apply_prepared_event_if_current(
+                    Some(permit) => match self.services.runtime.apply_prepared_event_if_current(
                         permit,
                         &event,
                         false,
@@ -1363,7 +1363,7 @@ impl ThreadEventForwarder {
                             );
                         }
                     },
-                    None => self.shared.runtime.apply_prepared_event(
+                    None => self.services.runtime.apply_prepared_event(
                         &self.authority,
                         &event,
                         false,
@@ -1371,7 +1371,7 @@ impl ThreadEventForwarder {
                     ),
                 };
                 if let AgentEvent::ItemCompleted { turn, item, .. } = &event {
-                    self.shared
+                    self.services
                         .runtime
                         .remove_command_output(&self.authority, *turn, item.id);
                     warn!(
@@ -1427,7 +1427,7 @@ impl ThreadEventForwarder {
             if let AgentEvent::ItemCompleted { turn, item, .. } = &event
                 && let ItemPayload::ToolCall { name, server, .. } = &item.payload
             {
-                self.shared
+                self.services
                     .runtime
                     .remove_tool_output(&self.authority, *turn, item.id);
                 if completed_tool_has_terminal_output(item) {
@@ -1448,7 +1448,7 @@ impl ThreadEventForwarder {
 
         if self.turn.owned_turn.is_none() && event_turn.is_none() {
             let applied = self
-                .shared
+                .services
                 .runtime
                 .apply_event(&self.authority, &event, false);
             debug!(
@@ -1565,7 +1565,7 @@ impl ThreadEventForwarder {
                     }
                     if self.turn.persisted_context_window != Some(*window) {
                         persist_model_context_window(
-                            &self.shared.thread_metadata,
+                            &self.services.thread_metadata,
                             project_id,
                             thread_id,
                             *turn,
@@ -1719,7 +1719,7 @@ impl ThreadEventForwarder {
         if completed.is_none() {
             let applied = match preparation_permit.as_ref() {
                 Some(permit) => {
-                    match self.shared.runtime.apply_prepared_event_if_current(
+                    match self.services.runtime.apply_prepared_event_if_current(
                         permit,
                         &event,
                         append_to_live_buffer,
@@ -1733,7 +1733,7 @@ impl ThreadEventForwarder {
                         }
                     }
                 }
-                None => self.shared.runtime.apply_prepared_event(
+                None => self.services.runtime.apply_prepared_event(
                     &self.authority,
                     &event,
                     append_to_live_buffer,
@@ -1855,12 +1855,12 @@ impl ThreadEventForwarder {
             completed_at: Some(Utc::now()),
         };
         let captured_diffs = self
-            .shared
+            .services
             .runtime
             .captured_diff_records(&self.authority, tid);
         let persist_outcome = persist_turn(
-            &self.shared.thread_metadata,
-            &self.shared.ledger,
+            &self.services.thread_metadata,
+            &self.services.ledger,
             project_id,
             thread_id,
             &turn,
@@ -1889,13 +1889,13 @@ impl ThreadEventForwarder {
             self.seen_turn_ids.insert(tid);
             let applied = match self.turn.lease.as_mut() {
                 Some(turn_gate) => turn_gate.commit_after_persistence(&completion_event),
-                None => self.shared.runtime.settle_completed_turn(
+                None => self.services.runtime.settle_completed_turn(
                     &self.authority,
                     &completion_event,
                     None,
                 ),
             };
-            self.shared
+            self.services
                 .hub
                 .publish(thread_id, Outbound::RuntimeEffects(applied))
                 .await;
@@ -1908,17 +1908,17 @@ impl ThreadEventForwarder {
                 Some(turn_gate) => {
                     turn_gate.retain_after_persistence_failure(&completion_event, turn, error)
                 }
-                None => self.shared.runtime.settle_completed_turn(
+                None => self.services.runtime.settle_completed_turn(
                     &self.authority,
                     &completion_event,
                     Some((turn, error)),
                 ),
             };
-            self.shared
+            self.services
                 .hub
                 .publish(thread_id, Outbound::RuntimeEffects(applied))
                 .await;
-            self.shared
+            self.services
                 .hub
                 .publish(
                     thread_id,
@@ -2110,7 +2110,7 @@ mod tests {
         ThreadEventForwarder,
         mpsc::Sender<TurnIntent>,
         Arc<EventLog>,
-        Arc<RegistryShared>,
+        Arc<Services>,
         Arc<ThreadAuthority>,
         Arc<ThreadCoordinator>,
         Arc<dyn AgentHarness>,
@@ -2120,7 +2120,7 @@ mod tests {
     ) {
         let temp = tempfile::TempDir::new().unwrap();
         let store = Arc::new(PersistStore::new(temp.path().to_path_buf()));
-        let shared = Arc::new(RegistryShared::new(
+        let services = Arc::new(Services::for_test(
             Arc::new(Hub::new()),
             store.clone(),
             ledger::spawn(store),
@@ -2143,7 +2143,7 @@ mod tests {
         let log = Arc::new(EventLog::new());
         let trait_harness: Arc<dyn AgentHarness> = harness;
         let forwarder = ThreadEventForwarder::new(
-            shared.clone(),
+            services.clone(),
             authority.clone(),
             coordinator.clone(),
             Arc::downgrade(&trait_harness),
@@ -2157,7 +2157,7 @@ mod tests {
             forwarder,
             intent_tx,
             log,
-            shared,
+            services,
             authority,
             coordinator,
             trait_harness,
@@ -2174,7 +2174,7 @@ mod tests {
         JoinHandle<ForwarderExitReason>,
         mpsc::Sender<TurnIntent>,
         Arc<EventLog>,
-        Arc<RegistryShared>,
+        Arc<Services>,
         Arc<ThreadAuthority>,
         ProjectId,
         ThreadId,
@@ -2184,7 +2184,7 @@ mod tests {
             forwarder,
             intent_tx,
             log,
-            shared,
+            services,
             authority,
             _coordinator,
             trait_harness,
@@ -2198,7 +2198,7 @@ mod tests {
             result
         });
         (
-            handle, intent_tx, log, shared, authority, project_id, thread_id, temp,
+            handle, intent_tx, log, services, authority, project_id, thread_id, temp,
         )
     }
 
@@ -2236,7 +2236,7 @@ mod tests {
     #[tokio::test]
     async fn a_subagent_owner_rejects_intents_as_read_only() {
         let harness = Arc::new(TestIntentHarness::accepting(TurnId::new()));
-        let (handle, intents, log, shared, authority, _project_id, _thread_id, _temp) =
+        let (handle, intents, log, services, authority, _project_id, _thread_id, _temp) =
             running_intent_forwarder(ClassificationPhase::Subagent, harness.clone()).await;
         let (intent, response) = start_intent(crate::registry::tests::test_turn_context());
         intents.send(intent).await.unwrap();
@@ -2245,7 +2245,7 @@ mod tests {
             Err(HarnessError::ThreadReadOnly { .. })
         ));
         assert_eq!(harness.start_calls.load(Ordering::SeqCst), 0);
-        assert!(!shared.runtime.has_active_turn(&authority));
+        assert!(!services.runtime.has_active_turn(&authority));
         log.close();
         handle.await.unwrap();
     }
@@ -2257,7 +2257,7 @@ mod tests {
             forwarder,
             intents,
             log,
-            shared,
+            services,
             _authority,
             _coordinator,
             trait_harness,
@@ -2293,8 +2293,8 @@ mod tests {
                 message: None,
             },
         }));
-        wait_for_turn_count(&shared.store, project_id, thread_id, 1).await;
-        let saved = shared
+        wait_for_turn_count(&services.store, project_id, thread_id, 1).await;
+        let saved = services
             .store
             .load_all_turns(project_id, thread_id)
             .await
@@ -2338,7 +2338,7 @@ mod tests {
     async fn an_intent_reserves_the_runtime_and_the_first_native_turn_adopts_it() {
         let turn_id = TurnId::new();
         let harness = Arc::new(TestIntentHarness::accepting(turn_id));
-        let (handle, intents, log, shared, authority, project_id, thread_id, _temp) =
+        let (handle, intents, log, services, authority, project_id, thread_id, _temp) =
             running_intent_forwarder(ClassificationPhase::Primary, harness).await;
         let context = crate::registry::tests::test_turn_context();
         let expected_input = context.user_input.clone();
@@ -2348,7 +2348,7 @@ mod tests {
         intents.send(intent).await.unwrap();
         assert_eq!(response.await.unwrap().unwrap(), turn_id);
         assert!(matches!(
-            shared.runtime
+            services.runtime
                 .current_overview()
                 .threads
                 .iter()
@@ -2371,8 +2371,8 @@ mod tests {
                 message: None
             },
         }));
-        wait_for_turn_count(&shared.store, project_id, thread_id, 1).await;
-        let saved = shared
+        wait_for_turn_count(&services.store, project_id, thread_id, 1).await;
+        let saved = services
             .store
             .load_all_turns(project_id, thread_id)
             .await
@@ -2380,7 +2380,7 @@ mod tests {
         assert_eq!(saved[0].user_input, expected_input);
         assert_eq!(saved[0].model, expected_model);
         assert_eq!(saved[0].mode, expected_mode);
-        assert!(!shared.runtime.has_active_turn(&authority));
+        assert!(!services.runtime.has_active_turn(&authority));
         log.close();
         handle.await.unwrap();
     }
@@ -2390,7 +2390,7 @@ mod tests {
         let turn_id = TurnId::new();
         let gate = Arc::new(Notify::new());
         let harness = Arc::new(TestIntentHarness::gated(turn_id, gate.clone()));
-        let (handle, intents, log, shared, _authority, project_id, thread_id, _temp) =
+        let (handle, intents, log, services, _authority, project_id, thread_id, _temp) =
             running_intent_forwarder(ClassificationPhase::Primary, harness.clone()).await;
         let context = crate::registry::tests::test_turn_context();
         let expected_input = context.user_input.clone();
@@ -2403,7 +2403,7 @@ mod tests {
         }));
         tokio::time::timeout(tokio::time::Duration::from_secs(2), async {
             while !matches!(
-                shared
+                services
                     .runtime
                     .current_overview()
                     .threads
@@ -2430,8 +2430,8 @@ mod tests {
                 message: None
             },
         }));
-        wait_for_turn_count(&shared.store, project_id, thread_id, 1).await;
-        let saved = shared
+        wait_for_turn_count(&services.store, project_id, thread_id, 1).await;
+        let saved = services
             .store
             .load_all_turns(project_id, thread_id)
             .await
@@ -2446,7 +2446,7 @@ mod tests {
         let turn_id = TurnId::new();
         let gate = Arc::new(Notify::new());
         let harness = Arc::new(TestIntentHarness::gated(turn_id, gate.clone()));
-        let (handle, intents, log, shared, _authority, project_id, thread_id, _temp) =
+        let (handle, intents, log, services, _authority, project_id, thread_id, _temp) =
             running_intent_forwarder(ClassificationPhase::Primary, harness.clone()).await;
         let context = crate::registry::tests::test_turn_context();
         let expected_input = context.user_input.clone();
@@ -2466,10 +2466,10 @@ mod tests {
                 message: None
             },
         }));
-        wait_for_turn_count(&shared.store, project_id, thread_id, 1).await;
+        wait_for_turn_count(&services.store, project_id, thread_id, 1).await;
         gate.notify_one();
         assert_eq!(response.await.unwrap().unwrap(), turn_id);
-        let saved = shared
+        let saved = services
             .store
             .load_all_turns(project_id, thread_id)
             .await
@@ -2484,7 +2484,7 @@ mod tests {
         let mut configured = TestIntentHarness::accepting(TurnId::new());
         configured.start_result = Err(HarnessError::Protocol("rejected".into()));
         let harness = Arc::new(configured);
-        let (handle, intents, log, shared, authority, _project_id, _thread_id, _temp) =
+        let (handle, intents, log, services, authority, _project_id, _thread_id, _temp) =
             running_intent_forwarder(ClassificationPhase::Primary, harness.clone()).await;
         let (intent, response) = start_intent(crate::registry::tests::test_turn_context());
         intents.send(intent).await.unwrap();
@@ -2492,7 +2492,7 @@ mod tests {
             response.await.unwrap(),
             Err(HarnessError::Protocol(_))
         ));
-        assert!(!shared.runtime.has_active_turn(&authority));
+        assert!(!services.runtime.has_active_turn(&authority));
 
         let (second, second_response) = start_intent(crate::registry::tests::test_turn_context());
         intents.send(second).await.unwrap();
@@ -2508,7 +2508,7 @@ mod tests {
     #[tokio::test]
     async fn a_compaction_intent_labels_the_native_turn_as_manual_compaction() {
         let harness = Arc::new(TestIntentHarness::accepting(TurnId::new()));
-        let (handle, intents, log, shared, _authority, project_id, thread_id, _temp) =
+        let (handle, intents, log, services, _authority, project_id, thread_id, _temp) =
             running_intent_forwarder(ClassificationPhase::Primary, harness.clone()).await;
         let mut context = crate::registry::tests::test_turn_context();
         context.user_input = UserInput::text("/compact");
@@ -2535,8 +2535,8 @@ mod tests {
                 message: None
             },
         }));
-        wait_for_turn_count(&shared.store, project_id, thread_id, 1).await;
-        let saved = shared
+        wait_for_turn_count(&services.store, project_id, thread_id, 1).await;
+        let saved = services
             .store
             .load_all_turns(project_id, thread_id)
             .await
@@ -2990,6 +2990,7 @@ mod tests {
                     kind: TurnContextKind::User,
                 };
                 let _lease = shared
+                    .services
                     .runtime
                     .reserve_turn(
                         &stale_authority,
@@ -2997,7 +2998,7 @@ mod tests {
                     )
                     .unwrap();
             } else {
-                shared.runtime.forget_threads(&[stale_authority]);
+                shared.services.runtime.forget_threads(&[stale_authority]);
             }
             let forwarder = spawn_thread_update_forwarder(
                 shared.clone(),
@@ -3706,7 +3707,7 @@ mod tests {
             .unwrap();
 
         let log = Arc::new(EventLog::new());
-        let shared = Arc::new(super::RegistryShared::new(
+        let services = Arc::new(Services::for_test(
             Arc::new(Hub::new()),
             store.clone(),
             ledger::spawn(store.clone()),
@@ -3727,7 +3728,7 @@ mod tests {
         let harness: Arc<dyn AgentHarness> = Arc::new(TestIntentHarness::accepting(TurnId::new()));
         let forwarder = tokio::spawn(
             ThreadEventForwarder::new(
-                shared.clone(),
+                services.clone(),
                 authority,
                 coordinator.clone(),
                 Arc::downgrade(&harness),
@@ -3758,7 +3759,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        shared
+        services
             .thread_metadata
             .classify_orphan(
                 project_id,
@@ -4148,7 +4149,7 @@ mod tests {
     async fn stream_end_before_native_turn_releases_admitted_intent() {
         let gate = Arc::new(Notify::new());
         let harness = Arc::new(TestIntentHarness::gated(TurnId::new(), gate));
-        let (handle, intents, log, shared, authority, _project_id, _thread_id, _temp) =
+        let (handle, intents, log, services, authority, _project_id, _thread_id, _temp) =
             running_intent_forwarder(ClassificationPhase::Primary, harness.clone()).await;
         let (intent, response) = start_intent(crate::registry::tests::test_turn_context());
         intents.send(intent).await.unwrap();
@@ -4163,7 +4164,7 @@ mod tests {
             reason,
             ForwarderExitReason::StreamEndedWithoutTurn
         ));
-        assert!(!shared.runtime.has_active_turn(&authority));
+        assert!(!services.runtime.has_active_turn(&authority));
         assert!(matches!(
             response.await.unwrap(),
             Err(HarnessError::Protocol(message))
@@ -5469,9 +5470,9 @@ mod tests {
             mode: TurnMode::Known(Mode::Build),
             kind: TurnContextKind::User,
         };
-        let shared = super::RegistryShared::new(hub, store, ledger);
-        let shared = Arc::new(shared);
-        let runtime = shared.runtime.clone();
+        let services = Services::for_test(hub, store, ledger);
+        let services = Arc::new(services);
+        let runtime = services.runtime.clone();
         let native_handle = ThreadHandle::detached(thread_id, format!("native-{thread_id}"));
         let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
         let (intent_tx, intent_rx) = mpsc::channel(crate::registry::thread::TURN_INTENT_CAPACITY);
@@ -5508,7 +5509,7 @@ mod tests {
                 .await
                 .unwrap();
             ThreadEventForwarder::new(
-                shared,
+                services,
                 task_authority,
                 coordinator_for_task,
                 weak_harness,
@@ -5535,7 +5536,7 @@ mod tests {
         let thread_id = ThreadId::new();
         let turn = TurnId::new();
         let ledger = ledger::spawn(store.clone());
-        let shared = Arc::new(super::RegistryShared::new(
+        let services = Arc::new(Services::for_test(
             Arc::new(Hub::new()),
             store.clone(),
             ledger,
@@ -5563,7 +5564,7 @@ mod tests {
         let weak_harness = Arc::downgrade(&harness);
         let forwarder = tokio::spawn(
             ThreadEventForwarder::new(
-                shared,
+                services,
                 authority,
                 coordinator,
                 weak_harness,

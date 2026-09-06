@@ -39,6 +39,7 @@ use giskard_proto::{RunningTask, ThreadRuntimeOverview, WireCommandOutput};
 use crate::hub::{Hub, Outbound};
 use crate::ledger::LedgerHandle;
 use crate::log_fields::{display_opt, rfc3339, rfc3339_opt};
+use crate::services::Services;
 use crate::thread_graph::{
     ExistingLinkDisposition, classify_existing_link, effective_thread_workspace_root,
     load_thread_graph, parent_chain_is_valid, should_refresh_subagent_title,
@@ -284,11 +285,7 @@ struct RegistryShared {
     threads: Arc<Mutex<ThreadIndex>>,
     background_tasks: Arc<RegistryTaskTracker>,
     driver_events: Arc<dyn DriverEventSink>,
-    hub: Arc<Hub>,
-    runtime: Arc<ThreadRuntimeSupport>,
-    store: Arc<PersistStore>,
-    thread_metadata: Arc<ThreadMetadataService>,
-    ledger: LedgerHandle,
+    services: Arc<Services>,
 }
 
 impl RegistryShared {
@@ -429,20 +426,13 @@ impl RegistryShared {
         ledger: LedgerHandle,
         driver_events: Arc<dyn DriverEventSink>,
     ) -> Self {
-        let thread_metadata = Arc::new(ThreadMetadataService::new(store.clone(), hub.clone()));
         Self {
             projects: Arc::new(Mutex::new(ProjectIndex::default())),
             harness_transitions: Arc::new(HarnessTransitions::new()),
             threads: Arc::new(Mutex::new(ThreadIndex::default())),
             background_tasks: Arc::new(RegistryTaskTracker::default()),
             driver_events,
-            hub,
-            runtime: Arc::new(ThreadRuntimeSupport::with_max_command_output_bytes(
-                max_command_output_bytes,
-            )),
-            store,
-            thread_metadata,
-            ledger,
+            services: Arc::new(Services::new(hub, store, ledger, max_command_output_bytes)),
         }
     }
 }
@@ -462,7 +452,7 @@ async fn prepare_thread_updates(
         .intern_thread_authority(thread_id, project_id)
         .await
         .expect("test thread authority must be valid");
-    let permit = shared.runtime.restoration_permit(&authority);
+    let permit = shared.services.runtime.restoration_permit(&authority);
     (sink, stream, permit)
 }
 
@@ -493,8 +483,9 @@ fn spawn_thread_update_forwarder(
             context_window,
         } = update;
         let stored_model = model.clone();
-        let runtime = shared.runtime.clone();
+        let runtime = shared.services.runtime.clone();
         let result = shared
+            .services
             .thread_metadata
             .mutate(project_id, thread_id, move |thread| {
                 if runtime.restoration_is_current(&permit) {
@@ -521,7 +512,7 @@ impl HarnessRegistry {
     pub async fn thread_runtime(&self, thread_id: ThreadId) -> Option<ResolvedThreadRuntime> {
         let authority = self.shared.thread_authority(thread_id).await?;
         Some(ResolvedThreadRuntime::new(
-            self.shared.runtime.clone(),
+            self.shared.services.runtime.clone(),
             authority,
         ))
     }
@@ -545,14 +536,14 @@ impl HarnessRegistry {
             .await
             .map_err(|error| HarnessError::Protocol(error.to_string()))?;
         Ok(ResolvedThreadRuntime::new(
-            self.shared.runtime.clone(),
+            self.shared.services.runtime.clone(),
             authority,
         ))
     }
 
     /// Returns the current cross-thread runtime overview projection.
     pub(crate) fn runtime_overview(&self) -> ThreadRuntimeOverview {
-        self.shared.runtime.current_overview()
+        self.shared.services.runtime.current_overview()
     }
 
     pub(crate) async fn ensure_thread_writable(
@@ -562,6 +553,7 @@ impl HarnessRegistry {
     ) -> Result<(), HarnessError> {
         let thread = self
             .shared
+            .services
             .store
             .load_thread(project_id, thread_id)
             .await
@@ -629,7 +621,7 @@ impl HarnessRegistry {
     }
 
     pub(crate) fn thread_metadata_service(&self) -> Arc<ThreadMetadataService> {
-        self.shared.thread_metadata.clone()
+        self.shared.services.thread_metadata.clone()
     }
 
     pub(crate) async fn project_model_catalog(
@@ -747,7 +739,7 @@ impl HarnessRegistry {
         &self,
         project: ProjectId,
     ) -> Result<HarnessBootstrap, HarnessError> {
-        let graph = load_thread_graph(&self.shared.store, project)
+        let graph = load_thread_graph(&self.shared.services.store, project)
             .await
             .map_err(|error| {
                 HarnessError::Protocol(format!(
@@ -857,7 +849,7 @@ impl HarnessRegistry {
             .intern_thread_authority(thread, config.id)
             .await
             .map_err(|error| HarnessError::Protocol(error.to_string()))?;
-        let restore_permit = self.shared.runtime.restoration_permit(&authority);
+        let restore_permit = self.shared.services.runtime.restoration_permit(&authority);
 
         let handle = harness
             .open_thread(OpenThreadOptions {
@@ -975,7 +967,7 @@ impl HarnessRegistry {
             .await
             .ok_or(HarnessError::ThreadNotFound(thread_id))?;
 
-        let (claim, transition) = self.shared.runtime.claim_request(
+        let (claim, transition) = self.shared.services.runtime.claim_request(
             &resolved.authority,
             RuntimeRequestId::Approval(request_id.clone()),
         )?;
@@ -1002,7 +994,7 @@ impl HarnessRegistry {
         // Record the resolution against the in-flight turn *before* publishing it, so a browser
         // that reloads the instant it sees the resolved state replays this approval as answered
         // rather than re-prompting (spec §13.6).
-        self.shared.runtime.resolve_live_approval(
+        self.shared.services.runtime.resolve_live_approval(
             &resolved.authority,
             request_id.clone(),
             decision,
@@ -1037,7 +1029,7 @@ impl HarnessRegistry {
             .await
             .ok_or(HarnessError::ThreadNotFound(thread_id))?;
 
-        let (claim, transition) = self.shared.runtime.claim_request(
+        let (claim, transition) = self.shared.services.runtime.claim_request(
             &resolved.authority,
             RuntimeRequestId::Server(request_id.clone()),
         )?;
@@ -1066,6 +1058,7 @@ impl HarnessRegistry {
         // request still reads as outstanding in the replayed events, so a reload in that window
         // would re-prompt and re-answering routes a stale id to the harness (spec §13.6).
         self.shared
+            .services
             .runtime
             .resolve_live_server_request(&resolved.authority, request_id.clone());
         debug!(
@@ -1081,23 +1074,34 @@ impl HarnessRegistry {
         let Some(authority) = self.shared.thread_authority(thread_id).await else {
             return;
         };
-        let Some(request) = self.shared.runtime.request_state(&authority, request_id) else {
+        let Some(request) = self
+            .shared
+            .services
+            .runtime
+            .request_state(&authority, request_id)
+        else {
             return;
         };
         self.shared
+            .services
             .hub
             .publish(request.thread_id, Outbound::Request(request))
             .await;
-        publish_runtime_overview(&self.shared).await;
+        self.shared.services.publish_runtime_overview().await;
     }
 
     async fn publish_request_transition(&self, thread_id: ThreadId, transition: RequestTransition) {
         self.shared
+            .services
             .hub
             .publish(thread_id, Outbound::Request(transition.request_state))
             .await;
         if let Some(overview) = transition.overview_if_changed {
-            self.shared.hub.publish_runtime_overview(overview).await;
+            self.shared
+                .services
+                .hub
+                .publish_runtime_overview(overview)
+                .await;
         }
     }
 
@@ -1395,7 +1399,7 @@ impl HarnessRegistry {
         let Some(authority) = self.shared.thread_authority(thread_id).await else {
             return false;
         };
-        self.shared.runtime.has_active_turn(&authority)
+        self.shared.services.runtime.has_active_turn(&authority)
     }
 
     pub async fn forget_thread(&self, thread_id: ThreadId) {
@@ -1415,9 +1419,9 @@ impl HarnessRegistry {
         let authority = self.shared.thread_authority(thread_id).await;
         self.forget_thread(thread_id).await;
         if let Some(authority) = authority {
-            self.shared.runtime.forget_threads(&[authority]);
+            self.shared.services.runtime.forget_threads(&[authority]);
         }
-        publish_runtime_overview(&self.shared).await;
+        self.shared.services.publish_runtime_overview().await;
     }
 
     /// Stop every project harness after HTTP traffic has drained.
@@ -1509,9 +1513,12 @@ impl HarnessRegistry {
             error!(%error, "registry background tasks did not drain during server shutdown");
             failures.push(error.to_string());
         }
-        if timeout(LEDGER_SHUTDOWN_TIMEOUT, self.shared.ledger.shutdown())
-            .await
-            .is_err()
+        if timeout(
+            LEDGER_SHUTDOWN_TIMEOUT,
+            self.shared.services.ledger.shutdown(),
+        )
+        .await
+        .is_err()
         {
             let error = format!(
                 "token ledger did not shut down within {} ms",
@@ -1600,8 +1607,11 @@ impl HarnessRegistry {
             }
         }
         drop(retained_driver);
-        self.shared.runtime.forget_threads(&thread_authorities);
-        publish_runtime_overview(&self.shared).await;
+        self.shared
+            .services
+            .runtime
+            .forget_threads(&thread_authorities);
+        self.shared.services.publish_runtime_overview().await;
 
         Ok(())
     }
@@ -1665,13 +1675,6 @@ async fn lock_thread_owner(
     lock.lock_owned().await
 }
 
-async fn publish_runtime_overview(shared: &RegistryShared) {
-    shared
-        .hub
-        .publish_runtime_overview(shared.runtime.current_overview())
-        .await;
-}
-
 #[derive(Clone)]
 pub(super) struct SubagentActivityInfo {
     pub(super) native_thread_id: String,
@@ -1697,6 +1700,7 @@ async fn resolve_subagent_link_info(
     item_id: ItemId,
 ) -> Result<Option<(TurnId, SubagentActivityInfo)>, HarnessError> {
     let parent_exists = shared
+        .services
         .store
         .load_thread(project_id, parent_thread_id)
         .await
@@ -1707,7 +1711,10 @@ async fn resolve_subagent_link_info(
     }
 
     let live_events = match shared.thread_authority(parent_thread_id).await {
-        Some(authority) => shared.runtime.live_item_events(&authority, item_id),
+        Some(authority) => shared
+            .services
+            .runtime
+            .live_item_events(&authority, item_id),
         None => Vec::new(),
     };
     for event in live_events.into_iter().rev() {
@@ -1727,6 +1734,7 @@ async fn resolve_subagent_link_info(
     }
 
     let turns = shared
+        .services
         .store
         .load_all_turns(project_id, parent_thread_id)
         .await
@@ -1751,7 +1759,7 @@ async fn resolve_reverse_subagent_target(
     source_thread_id: ThreadId,
     native_thread_id: &str,
 ) -> Result<Option<ThreadId>, HarnessError> {
-    let graph = load_thread_graph(&shared.store, project_id)
+    let graph = load_thread_graph(&shared.services.store, project_id)
         .await
         .map_err(|error| HarnessError::Protocol(error.to_string()))?;
     let Some(source) = graph.get(&source_thread_id) else {
@@ -1844,7 +1852,7 @@ async fn ensure_subagent_thread_open(
     // A sub-agent is provider-owned and read-only. Reattach its durable identity to this harness
     // lifetime without issuing thread/resume or otherwise nudging native work.
     let workspace_root =
-        effective_thread_workspace_root(&shared.store, project_config, thread_file)
+        effective_thread_workspace_root(&shared.services.store, project_config, thread_file)
             .await
             .map_err(|error| HarnessError::Protocol(error.to_string()))?;
     if let Some(coordinator) = shared.coordinator(thread_file.id).await {
@@ -3198,7 +3206,7 @@ mod tests {
             .await
             .unwrap();
 
-        let _permit = shared.runtime.restoration_permit(&authority);
+        let _permit = shared.services.runtime.restoration_permit(&authority);
 
         assert!(authority.runtime_entry().is_some());
         assert!(authority.coordinator().await.is_none());
