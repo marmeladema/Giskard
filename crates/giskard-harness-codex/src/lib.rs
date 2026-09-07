@@ -1862,6 +1862,7 @@ async fn resume_thread(
         cwd: Some(cwd.to_owned()),
         model: Some(model.model.clone()),
         model_provider: Some(model.provider.clone()),
+        exclude_turns: Some(true),
         ..Default::default()
     };
     let resp: codex_codes::ThreadResumeResponse = codex_request(
@@ -4266,6 +4267,7 @@ mod tests {
                 && req.params["threadId"] == "native-existing"
                 && req.params["model"] == "gpt-5.5"
                 && req.params["modelProvider"] == "openai"
+                && req.params["excludeTurns"] == true
         }));
         assert_eq!(
             resumed.resumed_model,

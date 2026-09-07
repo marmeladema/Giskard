@@ -216,7 +216,9 @@ threads and their Sub-agents card entries. It maps `thread.parent_thread_id` to
 `ThreadHandle.parent_harness_thread_id` as a validation signal: the server accepts a proposed
 Giskard parent only when it agrees with this native parent when Codex supplies one. Reverse
 child-to-parent activity therefore remains transcript navigation and cannot reparent the real
-parent thread.
+parent thread. Resume requests set `excludeTurns: true` because Giskard reads transcript history
+from its own store and consumes only Codex's thread metadata and live subscription from the
+response; this also avoids Codex's deprecated full-history hydration path for paginated threads.
 
 Codex thread deletion is idempotent only for the exact JSON-RPC `-32600` response `no rollout found
 for thread id <requested-id>`. That response proves the requested native rollout is already absent,
