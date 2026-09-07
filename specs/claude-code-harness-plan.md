@@ -36,7 +36,7 @@ this document.
 | | Codex (today) | Claude Code (planned) |
 | --- | --- | --- |
 | Transport | stdio newline-delimited **JSON-RPC** | stdio newline-delimited **JSON objects** (two overlaid channels: transcript messages, and `control_request`/`control_response`) |
-| Protocol crate | `codex-codes` 0.151.2 (typed, versioned) | **`claude-codes` 2.1.259** — same author and repository (`meawoppl/rust-code-agent-sdks`), same feature shape, version tracking the CLI (§3.7) |
+| Protocol crate | `codex-codes` 0.153.4 (typed, versioned) | **`claude-codes` 2.1.259** — same author and repository (`meawoppl/rust-code-agent-sdks`), same feature shape, version tracking the CLI (§3.7) |
 | Processes | **1 `codex app-server` per project**, multiplexing every thread | **1 `claude` per session**; a session ≈ one Giskard thread |
 | Native thread id | Codex-minted rollout id | **client-minted UUID** via `--session-id`; resumed with `--resume=<uuid>` |
 | Concurrency | one worker task fans out to N threads | N independent children, each single-threaded through its own turn. **Verified:** two sessions in the same cwd ran concurrent tool-using turns, each with its own `<uuid>.jsonl` under one cwd-encoded directory, no locking or contention (§3.4). |
@@ -46,10 +46,14 @@ this document.
 
 Two consequences drive the whole design:
 
-1. **`AgentHarness` does not need to change.** It is already object-safe, project-shaped, and
-   thread-addressed. A `ClaudeHarness` is a project-scoped façade that internally owns a
-   `HashMap<ThreadId, ChildSession>`. "One working context = one harness instance" (spec §4.7) still
-   holds; the instance just fans out to children instead of multiplexing one pipe.
+1. **`AgentHarness` does not need to change — the trait now says so itself.** Since S9
+   (`docs/s9-harness-scopes.md`) its documentation states that one value implements it per working
+   context, that "how many operating-system processes stand behind an instance is the adapter's
+   business", and specifically that "an adapter for a CLI that runs one process per primary thread
+   spawns in `open_thread` and stops in `delete_thread`, `set_thread_archived`, `shutdown`, or on its
+   own idle policy. Both satisfy this trait unchanged." A `ClaudeHarness` is therefore a façade owning
+   a `HashMap<ThreadId, ChildSession>`, and that is the documented shape rather than an argument this
+   plan has to win.
 2. **Resume is cwd-scoped**, and the encoding is lossy (§3.7). Resuming works — **verified**: a fresh process launched with
    `--resume=<uuid>` answered a question that could only be answered from the previous process's
    conversation, and reused the same session id rather than forking. But the transcript it reads lives
@@ -387,6 +391,13 @@ carries only a key's *location*. There is no inline secret to leak because there
 provider rework makes for Codex. A `[providers.anthropic]` block remains optional, for pinning picker
 order or declaring models by hand.
 
+**A deliberate divergence from S9's table.** `docs/s9-harness-scopes.md` lists `list_providers` for a
+one-process-per-thread adapter as `Unsupported` (the trait default). This plan asks the Claude adapter
+to implement it instead, because the answer is load-bearing here: `harness_knows_provider` treats a
+harness that cannot list providers as knowing every id, so a defaulting harness cannot own anything —
+provider→harness resolution would have no signal to work from. Implementing it costs a static table
+(§3.5) and buys the ownership rule.
+
 **Open: id collisions across harnesses.** With one harness per project the table is unambiguous. With
 two, both could report the same id — Codex can be configured with an `anthropic` `[model_providers]`
 entry, and then `anthropic/claude-opus-5` names a route both harnesses claim. A rule is required
@@ -422,6 +433,11 @@ struct ProjectHarnessSlot { current: Mutex<HashMap<HarnessKind, ProjectHarnessSt
 Keying by harness kind is not keying by project or thread identity, so this stays inside the rule:
 the map is entity-local state on `ProjectAuthority`, reached only through the authority, exactly as the
 single slot is now.
+
+S9 has since written the same shape into the trait's own documentation — "Today a project has one
+working context; a project may later hold several (one per harness kind, each with its own threads),
+and nothing in this trait may assume otherwise" — so this is now the documented intent rather than
+this plan's proposal.
 
 **What this preserves for free**, which is the argument for doing it here rather than anywhere else:
 
@@ -480,15 +496,17 @@ Project creation derives the kind from the project's `default_model` rather than
 
 ### 5.4 Project-scoped queries become per-harness
 
-§5.2 covers the thread-addressed operations. The rest of the registry's harness surface is
-project-scoped and assumes one answer per project:
+§5.2 covers the thread-addressed operations. The rest of the harness surface is project-scoped, and
+S9 has just made that surface much smaller: the seven `HarnessRegistry` pass-throughs
+(`capabilities`, `client_version`, `list_models`, `list_providers`, `list_mcp_servers`,
+`reload_mcp_servers`, `start_mcp_oauth_login`) are gone, replaced by
+**`HarnessRegistry::harness(&ProjectConfig)`** — routes resolve the harness once and call the trait
+directly.
 
-| Call | Today |
-| --- | --- |
-| `HarnessRegistry::capabilities` (`registry.rs:1319`) | capabilities of *the* project harness |
-| `HarnessRegistry::list_models` (`:1295`) | catalog overlay for `GET /api/projects/{id}/models` |
-| `HarnessRegistry::list_providers` (`:1303`) | provider table behind discovery and id validation (§5.1) |
-| MCP status / reload / OAuth | the project's MCP endpoints |
+That consolidation is a gift to this work: "which harness answers a project-scoped question" is now a
+single decision point rather than seven, so multi-harness changes one resolver instead of every
+listing route. What it does not do is answer the question, because `harness(&ProjectConfig)` still
+takes a project and returns one instance.
 
 Three different rules apply, and conflating them is how this goes wrong:
 
@@ -579,6 +597,36 @@ independently of Claude.
 - Record `claude_code_version` from `system/init` and warn when it differs from the version the mapping
   was tested against — the drift guard the spec already mandates for Codex, and still worth having with
   `claude-codes` carrying the wire types (§3.7).
+
+### 5.7.1 The three contracts a multi-process adapter must satisfy
+
+S9 turned three conventions into trait contracts, written for exactly this adapter. Each is a
+requirement on the façade, not a nicety:
+
+1. **`subscribe` is synchronous and must answer for every handle the instance issued, before the
+   native session has produced anything.** A retained `EventLog` per thread, filled later by that
+   child's reader, satisfies it — which is what the Codex adapter does and what §5.7 already plans.
+   The trap is a façade that only creates a thread's log once its child emits, leaving a subscriber
+   with nothing to attach to.
+2. **`ApprovalId` and `ServerRequestId` name a pending request *within the instance*, and responses
+   carry no thread.** The trait spells out the consequence: "An adapter fronting several processes
+   must make its native request ids unique across them before publishing them." So the façade mints
+   these ids itself and keeps a map from id to `(thread, child, native request id)`; it must not
+   publish a child-local id and hope it is unique. Claude's `tool_use_id` happens to be globally
+   unique, which makes the correct implementation and the lazy one indistinguishable in testing —
+   worth stating so the lazy one is not written by accident.
+3. **A thread's stream ends when that thread's session ends, and no other thread's stream may end
+   with it.** For a façade this is the failure mode to test deliberately: one child crashing must
+   close exactly its own log and leave its siblings streaming.
+
+**And one gap the adapter inherits.** The server has two ways to drop a thread from memory —
+`retire_thread` and `forget_thread` — and the harness hears neither. S9 settled this deliberately
+(decision B): for Codex it is meaningless, and for a per-thread process it is an idle question, which
+spec §4.7 already assigns to the adapter. The consequence for Claude is concrete: **closing a thread
+in the UI does not stop its child**, so at 440–530 MB each (§5.7) memory tracks the high-water mark of
+threads opened, not threads open. That is the MVP's accepted cost, and it sharpens what reaping must
+do later. S9 also records the fix if an explicit signal is wanted instead: one default-`Ok(())` trait
+method and one call in `retire_thread`.
 
 ### 5.8 Sub-agent threads without native sessions
 
@@ -1061,9 +1109,9 @@ the first one.
 
 Every item below can be built, reviewed and merged **without the Claude adapter existing**, each as its
 own change. Two of them fix defects that exist today; the rest are structural preparation that leaves
-behaviour identical while there is only one harness. All are provable with `ReplayHarness` and
-`giskard-server-replay` — registering a second replay instance under a different kind gives a genuine
-two-harness test with no CLI involved.
+behaviour identical while there is only one harness. All are provable without a CLI: `crates/giskard-testenv` now provides a single `FakeHarness` (it
+replaced fourteen ad-hoc fakes), so registering two instances of it under different kinds gives a
+genuine two-harness test, with `giskard-server-replay` covering the browser end.
 
 | # | Change | Justification today, without Claude | Depends on |
 | --- | --- | --- | --- |
@@ -1086,9 +1134,10 @@ from the unfamiliar protocol work, so a regression during Phase 2 has an unambig
 Claude harness were abandoned after Phase 1, P1–P3 would still be worth keeping and P4–P8 would be
 harmless but idle.
 
-The two-harness test to add with P6 is the acceptance criterion for the whole phase: two projects, or
-one project with two threads, served by two `ReplayHarness` instances registered under different kinds,
-asserting that turns, approvals, interrupts and deletion each reach the right instance.
+The two-harness test to add with P6 is the acceptance criterion for the whole phase: one project with
+two threads, served by two `FakeHarness` instances registered under different kinds, asserting that
+turns, approvals, interrupts and deletion each reach the right instance — and, per §5.7.1, that one
+instance's stream ending leaves the other's alone.
 
 ### Phase 2 — `giskard-harness-claude` MVP
 
