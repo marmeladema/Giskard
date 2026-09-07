@@ -251,7 +251,7 @@ so "and their tests" removed nothing. (5) `Registry` had 25 `pub async fn`, not 
 and method order instead; **B** no thread-close hook for per-thread-process adapters in S9, since
 the adapter already hears `delete_thread`, `set_thread_archived` and `shutdown`, and `retire_thread`
 is an idle question spec §4.7 already assigns to the adapter; **C** the `"Context compacted"` title
-convention becomes a typed marker in a follow-up S9b, not here, because it changes a persisted item
+convention becomes a typed marker in follow-up S11, not here, because it changes a persisted item
 shape; **D** the request-id uniqueness rule is written down, on the trait, on `respond_approval` and
 `respond_server_request`, and in the spec's `ApprovalId` sketch. The trait doc also states the two
 other contracts a multi-process adapter must meet: `subscribe` must answer for any handle the
@@ -299,6 +299,15 @@ option 2 makes the fake small; without it the fake is still one place instead of
   an explicit `state` module would give the `ui.rs` source tests real boundaries to assert on
   instead of substring searches.
 
+**Status: landed in S10**, with four corrections: `ui.rs` is the integration test `tests/ui.rs`;
+the Codex production-line and watchdog sizes and the `routes.rs` layout and log count were
+corrected; `ws.rs` is a sibling module whose eleven shared `routes.rs` items and two struct fields
+make the HTTP-to-WebSocket coupling explicit; and the Codex crate keeps its flat module layout.
+The `app.js` split is deferred because it is not a mechanical move and provides no asserted module
+boundaries without a JavaScript unit-test toolchain; see [`s10-file-splits.md`](s10-file-splits.md).
+Implementation also verified the visibility and sequencing corrections recorded in that plan's
+implementation-corrections section.
+
 ### E. What not to do
 
 - Do not introduce a general event bus, an actor framework, or trait objects for the runtime
@@ -324,7 +333,8 @@ Each step is one PR that stands alone on `main`, mechanical first:
 | 7 | C5 runtime components — **landed in S7** | structural, no behaviour change | ±300 |
 | 8 | C2 `classify` / `apply` in the forwarder — **landed in S8** | structural, no behaviour change | ±250 |
 | 9 | C4 option 1, then option 2 if C6 wants it — **landed in S9** | API | −200 |
-| 10 | D file splits (`ws.rs`, codex modules, `app.js`) | mechanical | 0 |
+| 10 | D file splits (`ws.rs`, codex modules; `app.js` deferred) — **landed in S10** | mechanical | 0 |
+| 11 | Typed notices and activities, the compaction marker first — **plan pending** | core + adapters | ±150 |
 
 Steps 1–4 can be given to an agent today; each has a crisp exit (grep returns nothing, counter
 fields gone, one fake). Steps 7 and 8 need a plan document in the M-series style because they

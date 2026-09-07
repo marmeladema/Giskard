@@ -12,12 +12,18 @@ mod log_fields;
 mod mapping;
 mod native_ids;
 mod native_routes;
+mod queue;
+mod rpc;
 mod transport;
+mod uploads;
 
 use crate::log_fields::display_opt;
 use crate::native_ids::NativeThreadId;
 use instance::CodexInstance;
+use queue::{WorkerQueueKind, WorkerQueueToken, WorkerQueueWatchdog, run_worker_queue_watchdog};
+use rpc::{CodexStreamError, codex_request, codex_respond_error_json, codex_respond_json};
 use transport::StdioTransport;
+use uploads::{cleanup_codex_upload_dir, prepare_user_input_for_codex_uploads};
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -63,12 +69,7 @@ const CODEX_JSON_RPC_TIMEOUT: Duration = Duration::from_millis(50);
 const CODEX_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(10);
 #[cfg(test)]
 const CODEX_SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(50);
-#[cfg(not(test))]
-const WORKER_QUEUE_WARN_AFTER: Duration = Duration::from_secs(10);
-#[cfg(test)]
-const WORKER_QUEUE_WARN_AFTER: Duration = Duration::from_millis(50);
 const THREAD_BACKGROUND_TERMINALS_TERMINATE: &str = "thread/backgroundTerminals/terminate";
-const CODEX_UPLOAD_DIR_NAME: &str = "giskard-codex-uploads";
 
 struct PendingContextRestore {
     thread: ThreadId,
@@ -287,233 +288,6 @@ impl Drop for EventLogs {
 
 type SenderMap = Arc<EventLogs>;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum WorkerQueueKind {
-    Command,
-    Control,
-}
-
-impl WorkerQueueKind {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Command => "command",
-            Self::Control => "control",
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-struct WorkerQueueToken {
-    id: u64,
-    kind: WorkerQueueKind,
-    action: &'static str,
-    project_id: Option<ProjectId>,
-    thread_id: Option<ThreadId>,
-    enqueued_at: Instant,
-}
-
-#[derive(Debug, Clone)]
-struct WorkerQueueEntrySnapshot {
-    id: u64,
-    kind: WorkerQueueKind,
-    action: &'static str,
-    project_id: Option<ProjectId>,
-    thread_id: Option<ThreadId>,
-    elapsed_ms: u128,
-}
-
-#[derive(Debug, Clone)]
-struct WorkerQueueSnapshot {
-    active: Option<WorkerQueueEntrySnapshot>,
-    oldest_pending: Option<WorkerQueueEntrySnapshot>,
-    command_pending: usize,
-    control_pending: usize,
-}
-
-#[derive(Debug)]
-struct WorkerQueueState {
-    next_id: u64,
-    pending: HashMap<u64, WorkerQueueToken>,
-    active: Option<WorkerQueueToken>,
-    closed: bool,
-}
-
-#[derive(Debug)]
-struct WorkerQueueWatchdog {
-    state: StdMutex<WorkerQueueState>,
-}
-
-impl WorkerQueueWatchdog {
-    fn new() -> Self {
-        Self {
-            state: StdMutex::new(WorkerQueueState {
-                next_id: 1,
-                pending: HashMap::new(),
-                active: None,
-                closed: false,
-            }),
-        }
-    }
-
-    fn enqueue(
-        &self,
-        kind: WorkerQueueKind,
-        action: &'static str,
-        project_id: Option<ProjectId>,
-        thread_id: Option<ThreadId>,
-    ) -> WorkerQueueToken {
-        let mut state = self.lock_state();
-        let token = WorkerQueueToken {
-            id: state.next_id,
-            kind,
-            action,
-            project_id,
-            thread_id,
-            enqueued_at: Instant::now(),
-        };
-        state.next_id = state.next_id.saturating_add(1);
-        state.pending.insert(token.id, token);
-        token
-    }
-
-    fn cancel(&self, token: WorkerQueueToken) {
-        self.lock_state().pending.remove(&token.id);
-    }
-
-    fn mark_started(&self, token: WorkerQueueToken) {
-        let mut state = self.lock_state();
-        state.pending.remove(&token.id);
-        state.active = Some(token);
-    }
-
-    fn mark_finished(&self, token: WorkerQueueToken) {
-        let mut state = self.lock_state();
-        if state.active.is_some_and(|active| active.id == token.id) {
-            state.active = None;
-        }
-    }
-
-    fn close(&self) {
-        self.lock_state().closed = true;
-    }
-
-    fn snapshot(&self) -> WorkerQueueSnapshot {
-        let state = self.lock_state();
-        let now = Instant::now();
-        let mut command_pending = 0;
-        let mut control_pending = 0;
-        let mut oldest_pending: Option<WorkerQueueToken> = None;
-        for token in state.pending.values().copied() {
-            match token.kind {
-                WorkerQueueKind::Command => command_pending += 1,
-                WorkerQueueKind::Control => control_pending += 1,
-            }
-            if oldest_pending.is_none_or(|oldest| token.enqueued_at < oldest.enqueued_at) {
-                oldest_pending = Some(token);
-            }
-        }
-
-        WorkerQueueSnapshot {
-            active: state.active.map(|token| snapshot_queue_token(token, now)),
-            oldest_pending: oldest_pending.map(|token| snapshot_queue_token(token, now)),
-            command_pending,
-            control_pending,
-        }
-    }
-
-    fn is_closed(&self) -> bool {
-        self.lock_state().closed
-    }
-
-    fn lock_state(&self) -> StdMutexGuard<'_, WorkerQueueState> {
-        match self.state.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => {
-                warn!("Codex worker queue watchdog lock was poisoned; recovering state");
-                poisoned.into_inner()
-            }
-        }
-    }
-}
-
-fn snapshot_queue_token(token: WorkerQueueToken, now: Instant) -> WorkerQueueEntrySnapshot {
-    WorkerQueueEntrySnapshot {
-        id: token.id,
-        kind: token.kind,
-        action: token.action,
-        project_id: token.project_id,
-        thread_id: token.thread_id,
-        elapsed_ms: now.duration_since(token.enqueued_at).as_millis(),
-    }
-}
-
-async fn run_worker_queue_watchdog(watchdog: Weak<WorkerQueueWatchdog>) {
-    let mut tick = tokio::time::interval(WORKER_QUEUE_WARN_AFTER);
-    loop {
-        tick.tick().await;
-        let Some(watchdog) = watchdog.upgrade() else {
-            break;
-        };
-        if watchdog.is_closed() {
-            break;
-        }
-        let snapshot = watchdog.snapshot();
-        let active_is_slow = snapshot
-            .active
-            .as_ref()
-            .is_some_and(|active| active.elapsed_ms >= WORKER_QUEUE_WARN_AFTER.as_millis());
-        let pending_is_slow = snapshot
-            .oldest_pending
-            .as_ref()
-            .is_some_and(|pending| pending.elapsed_ms >= WORKER_QUEUE_WARN_AFTER.as_millis());
-        if active_is_slow || pending_is_slow {
-            warn!(
-                active_id = display_opt(snapshot.active.as_ref().map(|entry| entry.id)),
-                active_kind =
-                    display_opt(snapshot.active.as_ref().map(|entry| entry.kind.as_str())),
-                active_action = display_opt(snapshot.active.as_ref().map(|entry| entry.action)),
-                active_project_id =
-                    display_opt(snapshot.active.as_ref().and_then(|entry| entry.project_id)),
-                active_thread_id =
-                    display_opt(snapshot.active.as_ref().and_then(|entry| entry.thread_id)),
-                active_elapsed_ms =
-                    display_opt(snapshot.active.as_ref().map(|entry| entry.elapsed_ms)),
-                oldest_pending_id =
-                    display_opt(snapshot.oldest_pending.as_ref().map(|entry| entry.id)),
-                oldest_pending_kind = display_opt(
-                    snapshot
-                        .oldest_pending
-                        .as_ref()
-                        .map(|entry| entry.kind.as_str())
-                ),
-                oldest_pending_action =
-                    display_opt(snapshot.oldest_pending.as_ref().map(|entry| entry.action)),
-                oldest_pending_project_id = display_opt(
-                    snapshot
-                        .oldest_pending
-                        .as_ref()
-                        .and_then(|entry| entry.project_id)
-                ),
-                oldest_pending_thread_id = display_opt(
-                    snapshot
-                        .oldest_pending
-                        .as_ref()
-                        .and_then(|entry| entry.thread_id)
-                ),
-                oldest_pending_elapsed_ms = display_opt(
-                    snapshot
-                        .oldest_pending
-                        .as_ref()
-                        .map(|entry| entry.elapsed_ms)
-                ),
-                command_pending = snapshot.command_pending,
-                control_pending = snapshot.control_pending,
-                "Codex worker queue has slow active or pending work"
-            );
-        }
-    }
-}
-
 #[derive(Debug, Clone, Copy)]
 struct CodexOperationContext<'a> {
     action: &'static str,
@@ -639,100 +413,6 @@ trait CodexTransport: Send {
     async fn shutdown_transport(self) -> Result<(), HarnessError>
     where
         Self: Sized;
-}
-
-#[derive(Debug)]
-enum CodexStreamError {
-    /// A non-JSON line was consumed from app-server stdout. Since JSON-RPC is
-    /// newline-delimited, the next read starts at a fresh frame boundary.
-    NonJsonStdout {
-        parse_error: String,
-        raw_preview: String,
-        raw_bytes: usize,
-    },
-    Fatal(HarnessError),
-}
-
-const NON_JSON_STDOUT_PREVIEW_BYTES: usize = 4 * 1024;
-
-fn bounded_utf8_preview(value: &str, max_bytes: usize) -> String {
-    let mut end = value.len().min(max_bytes);
-    while !value.is_char_boundary(end) {
-        end -= 1;
-    }
-    value[..end].to_owned()
-}
-
-async fn codex_request<P, R>(
-    client: &mut dyn CodexTransport,
-    context: CodexOperationContext<'_>,
-    method: &str,
-    params: &P,
-) -> Result<R, HarnessError>
-where
-    P: Serialize + Sync,
-    R: DeserializeOwned,
-{
-    let params = serde_json::to_value(params).map_err(|e| HarnessError::Protocol(e.to_string()))?;
-    let started = Instant::now();
-    let response =
-        tokio::time::timeout(CODEX_JSON_RPC_TIMEOUT, client.request_json(method, params))
-            .await
-            .map_err(|_| {
-                context.log_timeout(
-                    Some(method),
-                    started.elapsed(),
-                    "Codex JSON-RPC request timed out; worker will resume processing commands",
-                );
-                HarnessError::Timeout(format!("Codex JSON-RPC request {method} timed out"))
-            })??;
-    serde_json::from_value(response).map_err(|e| HarnessError::Protocol(e.to_string()))
-}
-
-async fn codex_respond_json(
-    client: &mut dyn CodexTransport,
-    context: CodexOperationContext<'_>,
-    id: codex_codes::jsonrpc::RequestId,
-    value: serde_json::Value,
-) -> Result<(), HarnessError> {
-    let started = Instant::now();
-    let id_for_log = id.clone();
-    tokio::time::timeout(CODEX_JSON_RPC_TIMEOUT, client.respond_json(id, value))
-        .await
-        .map_err(|_| {
-            context.with_request_id(&id_for_log).log_timeout(
-                None,
-                started.elapsed(),
-                "Codex JSON-RPC response timed out; worker will resume processing commands",
-            );
-            HarnessError::Timeout(format!("Codex JSON-RPC response {id_for_log} timed out"))
-        })?
-}
-
-async fn codex_respond_error_json(
-    client: &mut dyn CodexTransport,
-    context: CodexOperationContext<'_>,
-    id: codex_codes::jsonrpc::RequestId,
-    code: i64,
-    message: &str,
-) -> Result<(), HarnessError> {
-    let started = Instant::now();
-    let id_for_log = id.clone();
-    tokio::time::timeout(
-        CODEX_JSON_RPC_TIMEOUT,
-        client.respond_error_json(id, code, message),
-    )
-    .await
-    .map_err(|_| {
-        context.with_request_id(&id_for_log).log_timeout(
-            None,
-            started.elapsed(),
-            "Codex JSON-RPC error response timed out; worker will resume processing commands",
-        );
-        HarnessError::Timeout(format!(
-            "Codex JSON-RPC error response {id_for_log} timed out"
-        ))
-    })?
 }
 
 /// Codex CLI harness adapter (one app-server process per project).
@@ -1994,192 +1674,6 @@ async fn handle_start_turn(
         }
     }
 }
-
-struct PreparedUserInput {
-    input: UserInput,
-    upload_dir: Option<PathBuf>,
-}
-
-async fn prepare_user_input_for_codex_uploads(
-    client: &mut dyn CodexTransport,
-    thread: &ThreadHandle,
-    input: &UserInput,
-) -> Result<PreparedUserInput, HarnessError> {
-    let UserInput::Text { text, attachments } = input;
-    if attachments.is_empty() {
-        return Ok(PreparedUserInput {
-            input: input.clone(),
-            upload_dir: None,
-        });
-    }
-
-    let mut prepared_text = text.clone();
-    let mut image_attachments = Vec::new();
-    let mut uploaded_files = Vec::new();
-    let upload_dir = codex_upload_dir(thread);
-    let mut ensured_upload_dir = false;
-
-    let upload_result: Result<(), HarnessError> = async {
-        for (index, attachment) in attachments.iter().enumerate() {
-            match attachment.kind {
-                AttachmentKind::Image => image_attachments.push(attachment.clone()),
-                AttachmentKind::File => {
-                    if !ensured_upload_dir {
-                        let params = codex_codes::FsCreateDirectoryParams {
-                            path: serde_json::json!(upload_dir.to_string_lossy()),
-                            recursive: Some(true),
-                        };
-                        let _: codex_codes::FsCreateDirectoryResponse = codex_request(
-                            client,
-                            CodexOperationContext::for_thread("upload_attachment_mkdir", thread),
-                            codex_codes::protocol::methods::FS_CREATEDIRECTORY,
-                            &params,
-                        )
-                        .await?;
-                        ensured_upload_dir = true;
-                    }
-                    let path = codex_upload_path(&upload_dir, index, attachment);
-                    let path_string = path.to_string_lossy().to_string();
-                    let params = codex_codes::FsWriteFileParams {
-                        data_base64: attachment.data_base64.clone(),
-                        path: serde_json::json!(path_string),
-                    };
-                    let _: codex_codes::FsWriteFileResponse = codex_request(
-                        client,
-                        CodexOperationContext::for_thread("upload_attachment_write", thread),
-                        codex_codes::protocol::methods::FS_WRITEFILE,
-                        &params,
-                    )
-                    .await?;
-                    uploaded_files.push((
-                        safe_upload_file_name(&attachment.name),
-                        path.to_string_lossy().to_string(),
-                    ));
-                }
-            }
-        }
-        Ok(())
-    }
-    .await;
-    if let Err(error) = upload_result {
-        cleanup_codex_upload_dir(client, thread, Some(&upload_dir)).await;
-        return Err(error);
-    }
-
-    if !uploaded_files.is_empty() {
-        if !prepared_text.trim().is_empty() {
-            prepared_text.push_str("\n\n");
-        }
-        prepared_text.push_str("Attached files available on the harness host:\n");
-        for (name, path) in uploaded_files {
-            prepared_text.push_str("- ");
-            prepared_text.push_str(&name);
-            prepared_text.push_str(": ");
-            prepared_text.push_str(&path);
-            prepared_text.push('\n');
-        }
-    }
-
-    Ok(PreparedUserInput {
-        input: UserInput::text_with_attachments(prepared_text, image_attachments),
-        upload_dir: ensured_upload_dir.then_some(upload_dir),
-    })
-}
-
-async fn cleanup_active_turn_upload(
-    client: &mut dyn CodexTransport,
-    active_turns: &mut ActiveTurns,
-    thread_id: ThreadId,
-) {
-    let Some(active) = active_turns.get_mut(&thread_id) else {
-        return;
-    };
-    let upload_dir = active.upload_dir.take();
-    cleanup_codex_upload_dir(client, &active.thread, upload_dir.as_ref()).await;
-}
-
-async fn cleanup_all_active_turn_uploads(
-    client: &mut dyn CodexTransport,
-    active_turns: &mut ActiveTurns,
-) {
-    let thread_ids: Vec<ThreadId> = active_turns.keys().copied().collect();
-    for thread_id in thread_ids {
-        cleanup_active_turn_upload(client, active_turns, thread_id).await;
-    }
-}
-
-async fn cleanup_codex_upload_dir(
-    client: &mut dyn CodexTransport,
-    thread: &ThreadHandle,
-    upload_dir: Option<&PathBuf>,
-) {
-    let Some(upload_dir) = upload_dir else {
-        return;
-    };
-    let params = codex_codes::FsRemoveParams {
-        path: serde_json::json!(upload_dir.to_string_lossy()),
-        recursive: Some(true),
-        force: Some(true),
-    };
-    if let Err(error) = codex_request::<_, codex_codes::FsRemoveResponse>(
-        client,
-        CodexOperationContext::for_thread("upload_attachment_cleanup", thread),
-        codex_codes::protocol::methods::FS_REMOVE,
-        &params,
-    )
-    .await
-    {
-        warn!(
-            thread_id = %thread.thread,
-            harness_thread_id = %thread.harness_thread_id,
-            path = %upload_dir.display(),
-            error = %error,
-            "failed to remove Codex attachment upload directory"
-        );
-    }
-}
-
-fn codex_upload_dir(thread: &ThreadHandle) -> PathBuf {
-    let mut rng = rand::thread_rng();
-    let nonce_high = rng.next_u64();
-    let nonce_low = rng.next_u64();
-    std::env::temp_dir()
-        .join(CODEX_UPLOAD_DIR_NAME)
-        .join(format!(
-            "{}-{:016x}{:016x}",
-            thread.thread, nonce_high, nonce_low
-        ))
-}
-
-fn codex_upload_path(dir: &std::path::Path, index: usize, attachment: &UserAttachment) -> PathBuf {
-    let mut nonce = [0_u8; 8];
-    rand::thread_rng().fill_bytes(&mut nonce);
-    dir.join(format!(
-        "{index:02}-{}-{}",
-        u64::from_le_bytes(nonce),
-        safe_upload_file_name(&attachment.name)
-    ))
-}
-
-fn safe_upload_file_name(name: &str) -> String {
-    let sanitized: String = name
-        .chars()
-        .map(|ch| {
-            if ch.is_ascii_alphanumeric() || matches!(ch, '.' | '-' | '_') {
-                ch
-            } else {
-                '_'
-            }
-        })
-        .collect();
-    let trimmed = sanitized.trim_matches(|ch| ch == '.' || ch == '_').trim();
-    if trimmed.is_empty() {
-        "attachment".into()
-    } else {
-        trimmed.chars().take(96).collect()
-    }
-}
-
 fn build_turn_start_params(
     thread: &ThreadHandle,
     input: &UserInput,
@@ -3150,6 +2644,7 @@ async fn handle_interrupt_turn(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::uploads::{cleanup_active_turn_upload, cleanup_all_active_turn_uploads};
     use chrono::Utc;
     use giskard_core::ids::ItemId;
     use giskard_core::item::{Item, ItemPayload};
@@ -3182,25 +2677,6 @@ mod tests {
             mode,
             permission_preset: PermissionPreset::AskFirst,
         }
-    }
-
-    #[test]
-    fn worker_queue_snapshot_preserves_operation_identity() {
-        let watchdog = WorkerQueueWatchdog::new();
-        let project_id = ProjectId::new();
-        let thread_id = ThreadId::new();
-        let token = watchdog.enqueue(
-            WorkerQueueKind::Command,
-            "open_thread",
-            Some(project_id),
-            Some(thread_id),
-        );
-        watchdog.mark_started(token);
-
-        let active = watchdog.snapshot().active.expect("active queue entry");
-        assert_eq!(active.project_id, Some(project_id));
-        assert_eq!(active.thread_id, Some(thread_id));
-        assert_eq!(active.action, "open_thread");
     }
 
     #[test]

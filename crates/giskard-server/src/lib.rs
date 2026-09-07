@@ -19,6 +19,7 @@ pub mod thread_runtime;
 pub mod throttle;
 pub mod tokens;
 pub mod worktree;
+mod ws;
 
 #[cfg(test)]
 pub(crate) mod test_logs;

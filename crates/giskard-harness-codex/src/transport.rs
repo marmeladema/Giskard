@@ -1,7 +1,5 @@
-use super::{
-    CodexStreamError, CodexTransport, HarnessError, NON_JSON_STDOUT_PREVIEW_BYTES,
-    bounded_utf8_preview,
-};
+use super::{CodexTransport, HarnessError};
+use crate::rpc::{CodexStreamError, NON_JSON_STDOUT_PREVIEW_BYTES, bounded_utf8_preview};
 use async_trait::async_trait;
 use codex_codes::jsonrpc::{
     JsonRpcError, JsonRpcErrorData, JsonRpcMessage, JsonRpcNotification, JsonRpcRequest,

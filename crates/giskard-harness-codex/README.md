@@ -634,8 +634,10 @@ share the same browser-facing generic server-request and MCP approval behavior.
   lifecycle tracking.
 - [`src/instance.rs`](src/instance.rs) defines the single-task app-server runtime that owns protocol
   state and reduction for all native threads on that process.
-- [`src/lib.rs`](src/lib.rs) owns the public harness handle, low-level JSON-RPC helpers, timeouts,
-  and process termination calls.
+- [`src/queue.rs`](src/queue.rs) owns the worker-queue watchdog.
+- [`src/rpc.rs`](src/rpc.rs) owns JSON-RPC request and response helpers and the stream error.
+- [`src/uploads.rs`](src/uploads.rs) owns attachment upload preparation and cleanup.
+- [`src/lib.rs`](src/lib.rs) owns the public harness handle, timeouts, and process termination calls.
 - Mapper tests assert same-lifecycle stability, cross-turn and cross-thread
   separation, and independent running commands when Codex reuses an item ID.
 - Worker tests assert background-terminal and `command/exec` termination routing
