@@ -1930,7 +1930,8 @@ pub struct ThreadId(pub Ulid);
 pub struct TurnId(pub Ulid);
 pub struct ItemId(pub Ulid);         // Giskard-owned item id (B2); the harness-native id
                                      // lives in `harness_item_id` on Item/ItemStart
-pub struct ApprovalId(pub String);   // harness-native request id (opaque; short-lived, not persisted)
+pub struct ApprovalId(pub String);   // harness-native request id (opaque; short-lived, not persisted;
+                                     // unique within one harness instance)
 
 // ---- Handles / options ----
 pub struct ThreadHandle {

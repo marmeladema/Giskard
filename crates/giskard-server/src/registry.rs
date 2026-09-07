@@ -19,7 +19,6 @@ use giskard_core::item::{
     Item, ItemDelta, ItemPayload, command_status_is_running, normalized_command_status,
     tool_status_is_running,
 };
-use giskard_core::mcp::{McpOauthStart, McpServerStatus};
 use giskard_core::model::{ModelDescriptor, ModelRef};
 use giskard_core::server_request::ServerRequestResponse;
 use giskard_core::text::trimmed_non_empty;
@@ -29,8 +28,8 @@ use giskard_core::turn::{
 };
 use giskard_core::user_input::UserInput;
 use giskard_harness::{
-    AgentHarness, EventStreamError, HarnessBootstrap, HarnessCapabilities, HarnessProvider,
-    KnownThreadBinding, OpenThreadOptions, ThreadHandle, ThreadUpdate, thread_update_channel,
+    AgentHarness, EventStreamError, HarnessBootstrap, KnownThreadBinding, OpenThreadOptions,
+    ThreadHandle, ThreadUpdate, thread_update_channel,
 };
 use giskard_persist::PersistStore;
 use giskard_persist::store::{ProjectConfig, ThreadFile, ThreadMutation, TurnCommitOutcome};
@@ -1319,60 +1318,13 @@ impl HarnessRegistry {
         harness.set_thread_name(&handle, &name).await
     }
 
-    pub async fn list_mcp_servers(
+    /// The project's harness instance, created on first use. This is the one way code outside the
+    /// registry reaches a harness; the trait is the API from here on.
+    pub async fn harness(
         &self,
         config: &ProjectConfig,
-    ) -> Result<Vec<McpServerStatus>, HarnessError> {
-        let harness = self.get_or_create_harness(config.id, config).await?;
-        harness.list_mcp_servers().await
-    }
-
-    /// List the models the project's harness advertises (e.g. Codex's `model/list` catalog). Used to
-    /// overlay friendly display names onto the configured model list.
-    pub async fn list_models(
-        &self,
-        config: &ProjectConfig,
-    ) -> Result<Vec<ModelDescriptor>, HarnessError> {
-        let harness = self.get_or_create_harness(config.id, config).await?;
-        harness.list_models().await
-    }
-
-    pub async fn list_providers(
-        &self,
-        config: &ProjectConfig,
-    ) -> Result<Vec<HarnessProvider>, HarnessError> {
-        let harness = self.get_or_create_harness(config.id, config).await?;
-        harness.list_providers().await
-    }
-
-    /// The harness's own version, for identifying it to a provider's `/models` endpoint (§8.3).
-    pub async fn client_version(&self, config: &ProjectConfig) -> Option<String> {
-        // A version is a nicety, not a reason to fail a catalog refresh: an unreachable harness is
-        // already reported by the calls that need one.
-        let harness = self.get_or_create_harness(config.id, config).await.ok()?;
-        harness.client_version()
-    }
-
-    pub async fn capabilities(
-        &self,
-        config: &ProjectConfig,
-    ) -> Result<HarnessCapabilities, HarnessError> {
-        let harness = self.get_or_create_harness(config.id, config).await?;
-        Ok(harness.capabilities())
-    }
-
-    pub async fn reload_mcp_servers(&self, config: &ProjectConfig) -> Result<(), HarnessError> {
-        let harness = self.get_or_create_harness(config.id, config).await?;
-        harness.reload_mcp_servers().await
-    }
-
-    pub async fn start_mcp_oauth_login(
-        &self,
-        config: &ProjectConfig,
-        name: &str,
-    ) -> Result<McpOauthStart, HarnessError> {
-        let harness = self.get_or_create_harness(config.id, config).await?;
-        harness.start_mcp_oauth_login(name).await
+    ) -> Result<Arc<dyn AgentHarness>, HarnessError> {
+        self.get_or_create_harness(config.id, config).await
     }
 
     pub async fn delete_thread(

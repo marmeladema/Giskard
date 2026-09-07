@@ -3491,7 +3491,12 @@ async fn refresh_project_model_catalog(
         config,
         harness_providers.as_deref().unwrap_or(&[]),
     ) {
-        state.registry.client_version(project_config).await
+        state
+            .registry
+            .harness(project_config)
+            .await
+            .ok()
+            .and_then(|harness| harness.client_version())
     } else {
         None
     };
@@ -3552,9 +3557,8 @@ async fn harness_provider_table(
     state: &AppState,
     project_config: &ProjectConfig,
 ) -> (Option<Vec<HarnessProvider>>, Vec<ModelListingWarning>) {
-    match state.registry.capabilities(project_config).await {
-        Ok(caps) if !caps.provider_listing => return (None, Vec::new()),
-        Ok(_) => {}
+    let harness = match state.registry.harness(project_config).await {
+        Ok(harness) => harness,
         Err(e) => {
             warn!(
                 project_id = %project_config.id,
@@ -3570,8 +3574,11 @@ async fn harness_provider_table(
                 }],
             );
         }
+    };
+    if !harness.capabilities().provider_listing {
+        return (None, Vec::new());
     }
-    match state.registry.list_providers(project_config).await {
+    match harness.list_providers().await {
         Ok(providers) => (Some(providers), Vec::new()),
         Err(e) => {
             warn!(
@@ -3602,9 +3609,8 @@ async fn overlay_harness_metadata(
     base: Vec<ModelDescriptor>,
     efforts_from_discovery: &std::collections::HashSet<(String, String)>,
 ) -> (Vec<ModelDescriptor>, Option<ModelListingWarning>) {
-    match state.registry.capabilities(project_config).await {
-        Ok(caps) if !caps.model_listing => return (base, None),
-        Ok(_) => {}
+    let harness = match state.registry.harness(project_config).await {
+        Ok(harness) => harness,
         Err(e) => {
             warn!(
                 project_id = %project_config.id,
@@ -3620,8 +3626,11 @@ async fn overlay_harness_metadata(
                 }),
             );
         }
+    };
+    if !harness.capabilities().model_listing {
+        return (base, None);
     }
-    match state.registry.list_models(project_config).await {
+    match harness.list_models().await {
         Ok(harness_models) => (
             crate::models::apply_harness_metadata(
                 base,
@@ -3658,11 +3667,12 @@ async fn list_mcp_servers(
         .load_project(project_id)
         .await?
         .ok_or(ApiError::NotFound)?;
-    let capabilities = state
+    let harness = state
         .registry
-        .capabilities(&project_config)
+        .harness(&project_config)
         .await
         .map_err(harness_api_error)?;
+    let capabilities = harness.capabilities();
     if !capabilities.mcp_status {
         warn!(
             %project_id,
@@ -3671,9 +3681,8 @@ async fn list_mcp_servers(
         );
     }
     let servers = if capabilities.mcp_status {
-        state
-            .registry
-            .list_mcp_servers(&project_config)
+        harness
+            .list_mcp_servers()
             .await
             .map_err(harness_api_error)?
     } else {
@@ -3707,11 +3716,12 @@ async fn reload_mcp_servers(
         .load_project(project_id)
         .await?
         .ok_or(ApiError::NotFound)?;
-    let capabilities = state
+    let harness = state
         .registry
-        .capabilities(&project_config)
+        .harness(&project_config)
         .await
         .map_err(harness_api_error)?;
+    let capabilities = harness.capabilities();
     if !capabilities.mcp_reload {
         warn!(
             %project_id,
@@ -3722,9 +3732,8 @@ async fn reload_mcp_servers(
             "MCP server reload is not supported by this harness".into(),
         ));
     }
-    state
-        .registry
-        .reload_mcp_servers(&project_config)
+    harness
+        .reload_mcp_servers()
         .await
         .map_err(harness_api_error)?;
     info!(
@@ -3751,11 +3760,12 @@ async fn start_mcp_oauth_login(
         .load_project(project_id)
         .await?
         .ok_or(ApiError::NotFound)?;
-    let capabilities = state
+    let harness = state
         .registry
-        .capabilities(&project_config)
+        .harness(&project_config)
         .await
         .map_err(harness_api_error)?;
+    let capabilities = harness.capabilities();
     if !capabilities.mcp_oauth_login {
         warn!(
             %project_id,
@@ -3767,9 +3777,8 @@ async fn start_mcp_oauth_login(
             "MCP OAuth login is not supported by this harness".into(),
         ));
     }
-    let login = state
-        .registry
-        .start_mcp_oauth_login(&project_config, name)
+    let login = harness
+        .start_mcp_oauth_login(name)
         .await
         .map_err(harness_api_error)?;
     info!(
@@ -5835,8 +5844,8 @@ async fn harness_knows_provider(
     // The capability gate matters as much as the call: a harness that does not support provider
     // listing may still answer with an empty table, and taking that as gospel would convict every
     // provider — the very accusation this function exists to stop making.
-    match state.registry.capabilities(project_config).await {
-        Ok(caps) if !caps.provider_listing => return true,
+    let harness = match state.registry.harness(project_config).await {
+        Ok(harness) => harness,
         Err(error) => {
             warn!(
                 project_id = %project_config.id,
@@ -5848,9 +5857,11 @@ async fn harness_knows_provider(
             );
             return true;
         }
-        Ok(_) => {}
+    };
+    if !harness.capabilities().provider_listing {
+        return true;
     }
-    match state.registry.list_providers(project_config).await {
+    match harness.list_providers().await {
         Ok(table) => table.iter().any(|known| known.id == provider),
         Err(error) => {
             warn!(

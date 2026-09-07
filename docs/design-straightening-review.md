@@ -236,6 +236,27 @@ its own method; see [`s5-hub-publish.md`](s5-hub-publish.md).
    `AgentHarness: HarnessProcess + HarnessThreads + HarnessTurns`. Fakes then implement only what
    they use, which directly attacks the 21 fake implementations below.
 
+**Status: landed in S9** ([`s9-harness-scopes.md`](s9-harness-scopes.md)), as option 1 only, with
+five corrections to the paragraph above. (1) Option 2's trigger is gone: after S4b there are nine
+`impl AgentHarness for` blocks, not 21, and trait defaults already let each implement what it uses,
+so a split would not reduce what any adapter or fake writes. (2) A split has a cost the review did
+not count: calling a supertrait method on `dyn AgentHarness` needs the supertrait in scope, so six
+files gain imports and each of the nine `impl` blocks becomes three. (3) "Process-scoped" is the
+wrong word — the nine methods are scoped to the harness *instance*, which is one per working
+context; calling that group "process" bakes in Codex's one-`app-server`-per-project model, which is
+exactly what a Claude Code adapter (one process per primary thread) must not inherit. The trait now
+says "instance". (4) The seven pass-throughs had thirteen callers, all in `routes.rs`, and no tests,
+so "and their tests" removed nothing. (5) `Registry` had 25 `pub async fn`, not 30; after S9 it has
+19. Four decisions were settled by the owner: **A** no split — the scope grouping is documentation
+and method order instead; **B** no thread-close hook for per-thread-process adapters in S9, since
+the adapter already hears `delete_thread`, `set_thread_archived` and `shutdown`, and `retire_thread`
+is an idle question spec §4.7 already assigns to the adapter; **C** the `"Context compacted"` title
+convention becomes a typed marker in a follow-up S9b, not here, because it changes a persisted item
+shape; **D** the request-id uniqueness rule is written down, on the trait, on `respond_approval` and
+`respond_server_request`, and in the spec's `ApprovalId` sketch. The trait doc also states the two
+other contracts a multi-process adapter must meet: `subscribe` must answer for any handle the
+instance issued before the session has produced anything, and a stream ends per thread.
+
 **C5. `ThreadRuntimeSupport` is five components behind one door.** Its 40 public methods cluster
 into: request ledger (`register_approval`, `claim_request`, `request_state(s)`), live buffer
 (`ensure_live_turn`, `replace_live_turn`, `live_snapshot`, `resolve_live_*`), running tasks
@@ -302,7 +323,7 @@ Each step is one PR that stands alone on `main`, mechanical first:
 | 6 | B3 `Services` split; forwarder takes `Arc<Services>` — **landed in S6** | mechanical | ±60 |
 | 7 | C5 runtime components — **landed in S7** | structural, no behaviour change | ±300 |
 | 8 | C2 `classify` / `apply` in the forwarder — **landed in S8** | structural, no behaviour change | ±250 |
-| 9 | C4 option 1, then option 2 if C6 wants it | API | −200 |
+| 9 | C4 option 1, then option 2 if C6 wants it — **landed in S9** | API | −200 |
 | 10 | D file splits (`ws.rs`, codex modules, `app.js`) | mechanical | 0 |
 
 Steps 1–4 can be given to an agent today; each has a crisp exit (grep returns nothing, counter

@@ -470,11 +470,51 @@ impl DiscoveryStream {
 
 /// The neutral harness contract (spec §4.3).
 ///
+/// One value implements this trait per working context: `HarnessFactory::create` builds it,
+/// `shutdown` ends it, and it owns the threads it opened. Today a project has one working
+/// context; a project may later hold several (one per harness kind, each with its own threads),
+/// and nothing in this trait may assume otherwise. How many operating-system processes stand
+/// behind an instance is the adapter's business, and nothing here may depend on the answer
+/// either. Codex runs one `app-server` per instance and hosts every thread in it; an adapter for
+/// a CLI that runs one process per primary thread spawns in `open_thread` and stops in
+/// `delete_thread`, `set_thread_archived`, `shutdown`, or on its own idle policy. Both satisfy
+/// this trait unchanged.
+///
+/// Methods are grouped by scope, in this order:
+/// - instance: `capabilities`, `client_version`, `list_models`, `list_providers`,
+///   `list_mcp_servers`, `reload_mcp_servers`, `start_mcp_oauth_login`, `discoveries`,
+///   `shutdown`;
+/// - thread, taking a `ThreadHandle`: `open_thread`, `claim_native_thread`, `subscribe`,
+///   `set_thread_name`, `set_thread_archived`, `delete_thread`, `compact_thread`, `interrupt`;
+/// - turn: `start_turn`, `respond_approval`, `respond_server_request`, `terminate_command`.
+///
+/// Three contracts follow from "one instance, any number of processes":
+/// - `subscribe` is synchronous and must return a stream for every handle this instance
+///   issued, before the native session has produced anything; a retained log the session's
+///   reader fills later satisfies it.
+/// - `ApprovalId` and `ServerRequestId` name a pending request within the instance, and the
+///   responses carry no thread. An adapter fronting several processes must make its native
+///   request ids unique across them before publishing them.
+/// - A thread's event stream ends when that thread's native session ends, and the server
+///   handles every stream end per thread. An adapter must not close other threads' streams
+///   because one session ended, and must close the ended thread's stream rather than leave it
+///   open.
+///
 /// Every method is dyn-compatible: `&self` receivers, no generic method params, no `Self`-by-value.
 /// The whole application holds harnesses as `Arc<dyn AgentHarness>`.
 #[async_trait]
 pub trait AgentHarness: Send + Sync {
+    // instance scope
     fn capabilities(&self) -> HarnessCapabilities;
+
+    /// The harness's own version, when it knows it.
+    ///
+    /// Only used to identify Giskard to a provider's `/models` endpoint as the harness would
+    /// (§8.3): a provider that serves the harness's richer catalog keys off the *harness* version,
+    /// not Giskard's, so this is the harness answering for itself rather than Giskard guessing.
+    fn client_version(&self) -> Option<String> {
+        None
+    }
 
     /// List models available through this harness/provider, if supported.
     async fn list_models(&self) -> Result<Vec<ModelDescriptor>, HarnessError>;
@@ -486,15 +526,6 @@ pub trait AgentHarness: Send + Sync {
         Err(HarnessError::Unsupported(
             "provider listing is not supported by this harness".into(),
         ))
-    }
-
-    /// The harness's own version, when it knows it.
-    ///
-    /// Only used to identify Giskard to a provider's `/models` endpoint as the harness would
-    /// (§8.3): a provider that serves the harness's richer catalog keys off the *harness* version,
-    /// not Giskard's, so this is the harness answering for itself rather than Giskard guessing.
-    fn client_version(&self) -> Option<String> {
-        None
     }
 
     /// List configured MCP servers and their visible tools/resources.
@@ -518,6 +549,18 @@ pub trait AgentHarness: Send + Sync {
         )))
     }
 
+    /// Native threads this harness bound from traffic, retained until consumed.
+    fn discoveries(&self) -> DiscoveryStream {
+        DiscoveryStream::closed()
+    }
+
+    /// Cleanly shut down the harness.
+    ///
+    /// Takes `&self` (not `self: Arc<Self>`) so the trait stays object-safe.
+    /// Idempotent: implementations perform teardown once and treat further calls as no-ops.
+    async fn shutdown(&self) -> Result<(), HarnessError>;
+
+    // thread scope
     /// Open (or resume) a thread.
     async fn open_thread(&self, opts: OpenThreadOptions) -> Result<ThreadHandle, HarnessError>;
 
@@ -539,57 +582,10 @@ pub trait AgentHarness: Send + Sync {
         ))
     }
 
-    /// Start a turn: send user input, applying per-turn overrides.
-    async fn start_turn(
-        &self,
-        thread: &ThreadHandle,
-        input: UserInput,
-        overrides: TurnOverrides,
-    ) -> Result<TurnId, HarnessError>;
-
     /// Subscribe to the stream of neutral events for a thread.
+    ///
+    /// Must succeed for any handle this instance issued, before the session has produced events.
     fn subscribe(&self, thread: &ThreadHandle) -> AgentEventStream;
-
-    /// Native threads this harness bound from traffic, retained until consumed.
-    fn discoveries(&self) -> DiscoveryStream {
-        DiscoveryStream::closed()
-    }
-
-    /// Respond to a pending approval request.
-    async fn respond_approval(
-        &self,
-        req: ApprovalId,
-        decision: ApprovalDecision,
-    ) -> Result<(), HarnessError>;
-
-    /// Respond to a pending non-approval server request.
-    async fn respond_server_request(
-        &self,
-        req: ServerRequestId,
-        response: ServerRequestResponse,
-    ) -> Result<(), HarnessError>;
-
-    /// Interrupt the active turn of a thread.
-    async fn interrupt(&self, thread: &ThreadHandle) -> Result<(), HarnessError>;
-
-    /// Ask the harness to compact the thread context, when supported.
-    async fn compact_thread(&self, thread: &ThreadHandle) -> Result<(), HarnessError> {
-        Err(HarnessError::Unsupported(format!(
-            "context compaction is not supported for thread {}",
-            thread.harness_thread_id
-        )))
-    }
-
-    /// Ask the harness to terminate a running command process, if it exposes a process handle.
-    async fn terminate_command(
-        &self,
-        _thread: &ThreadHandle,
-        process_id: &str,
-    ) -> Result<(), HarnessError> {
-        Err(HarnessError::Unsupported(format!(
-            "command termination is not supported for process {process_id}"
-        )))
-    }
 
     /// Rename a durable thread in the underlying harness, when supported.
     async fn set_thread_name(&self, thread: &ThreadHandle, name: &str) -> Result<(), HarnessError> {
@@ -620,11 +616,54 @@ pub trait AgentHarness: Send + Sync {
         )))
     }
 
-    /// Cleanly shut down the harness.
+    /// Ask the harness to compact the thread context, when supported.
+    async fn compact_thread(&self, thread: &ThreadHandle) -> Result<(), HarnessError> {
+        Err(HarnessError::Unsupported(format!(
+            "context compaction is not supported for thread {}",
+            thread.harness_thread_id
+        )))
+    }
+
+    /// Interrupt the active turn of a thread.
+    async fn interrupt(&self, thread: &ThreadHandle) -> Result<(), HarnessError>;
+
+    // turn scope
+    /// Start a turn: send user input, applying per-turn overrides.
+    async fn start_turn(
+        &self,
+        thread: &ThreadHandle,
+        input: UserInput,
+        overrides: TurnOverrides,
+    ) -> Result<TurnId, HarnessError>;
+
+    /// Respond to a pending approval request.
     ///
-    /// Takes `&self` (not `self: Arc<Self>`) so the trait stays object-safe.
-    /// Idempotent: implementations perform teardown once and treat further calls as no-ops.
-    async fn shutdown(&self) -> Result<(), HarnessError>;
+    /// The id is unique within this instance (see the trait doc).
+    async fn respond_approval(
+        &self,
+        req: ApprovalId,
+        decision: ApprovalDecision,
+    ) -> Result<(), HarnessError>;
+
+    /// Respond to a pending non-approval server request.
+    ///
+    /// The id is unique within this instance (see the trait doc).
+    async fn respond_server_request(
+        &self,
+        req: ServerRequestId,
+        response: ServerRequestResponse,
+    ) -> Result<(), HarnessError>;
+
+    /// Ask the harness to terminate a running command process, if it exposes a process handle.
+    async fn terminate_command(
+        &self,
+        _thread: &ThreadHandle,
+        process_id: &str,
+    ) -> Result<(), HarnessError> {
+        Err(HarnessError::Unsupported(format!(
+            "command termination is not supported for process {process_id}"
+        )))
+    }
 }
 
 #[cfg(test)]
