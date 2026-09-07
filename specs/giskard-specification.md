@@ -1607,8 +1607,8 @@ A single Cargo workspace with focused crates. Names are prefixed `giskard-`.
   design review, whose alternatives were checked against the then-pinned Codex CLI 0.142.5; only
   the selected crate is kept current, and its own line states the Codex CLI it is tested against
   today:
-  - **`codex-codes`** (v0.151.2) — **recommended first choice.** Typed Rust SDK for the Codex
-    CLI app-server JSON-RPC protocol, tested against Codex CLI 0.151.0.
+  - **`codex-codes`** (v0.153.4) — **recommended first choice.** Typed Rust SDK for the Codex
+    CLI app-server JSON-RPC protocol, tested against Codex CLI 0.153.4.
     Giskard uses its typed protocol envelopes and messages, app-server process builder, and
     generated request/response types while owning stdout, stdin, request correlation, and retained
     delivery in `StdioTransport`. Feature flags include `async-client` (Tokio) and `types`
@@ -4116,7 +4116,7 @@ Artifacts are version-pinned to the Codex binary that produced them; regenerate 
 > inside `ModelRef.reasoning_effort` (P1: no standalone effort field on `TurnOverrides`).
 > `TurnOverrides.permission_preset` is the thread preset snapshot (P3/AP1: not a per-turn override).
 
-**Client library:** use `codex-codes` (v0.151.2, tested against Codex CLI 0.151.0) with the
+**Client library:** use `codex-codes` (v0.153.4, tested against Codex CLI 0.153.4) with the
 `async-client` feature for protocol types and process construction. Giskard owns request
 correlation, a single continuous stdout reader, a single whole-frame stdin writer, and the retained
 transport-owned inbox. The Codex `turn/start` call uses the generic `request` path while

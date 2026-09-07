@@ -5909,6 +5909,7 @@ mod tests {
         let mapped = map_mcp_server_status(codex_codes::McpServerStatus {
             auth_status: codex_codes::McpAuthStatus::NotLoggedIn,
             runtime_status: None,
+            tools_error: None,
             name: "cf-mcp".into(),
             plugin_id: None,
             resource_templates: vec![codex_codes::ResourceTemplate {
