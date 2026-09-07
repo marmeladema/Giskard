@@ -4,6 +4,15 @@ Implementation plan for step 9 of [`design-straightening-review.md`](design-stra
 (finding C4). Written against `main` at `f830df8` (S8 merged); every file and line reference
 below was checked against that tree. Re-check them if the branch has moved.
 
+Revision 2, written after implementing: four corrections, all in the checks and the shorthand
+rather than in the design. (1) Exit check E asked for an `AgentHarness` import in `routes.rs`
+that the code does not need and the compiler rejects — see the pitfall. (2) Exit check D missed
+the multi-line call chains, the way S5's first cut did; it needs `-U`. (3) Exit check F counts 3,
+not 4: D3's own trait text says "unique across", so the phrase "unique within" lands in three
+places, not four. (4) The D2 table's shorthand for the two best-effort functions' error arms says
+`(None, Vec::new())`, but they return a `ModelListingWarning`; the arms are moved unchanged, as
+the sentence under the table already required. Every correction is applied below.
+
 This plan is written for discussion first. The mechanical half (D1, D2) is settled and verified;
 the contract half (D3, D4) states what the trait must promise so that an adapter with a different
 process model can implement it; and **Decisions to settle** lists the four choices that need an
@@ -220,16 +229,19 @@ the one `harness()` call. Per function:
 | Function | Today | After |
 | --- | --- | --- |
 | `refresh_project_model_catalog` `:3494` | `state.registry.client_version(project_config).await` (an `Option`, `None` on creation failure) | `state.registry.harness(project_config).await.ok().and_then(\|harness\| harness.client_version())` |
-| `harness_provider_table` `:3555-3592` | `match registry.capabilities(..)` (`Ok` without `provider_listing` → `(None, [])`; `Err` → warn + `(None, [])`), then `match registry.list_providers(..)` | `let harness = match registry.harness(..) { Ok(h) => h, Err(e) => { same warn; return (None, Vec::new()) } }; if !harness.capabilities().provider_listing { return (None, Vec::new()); } match harness.list_providers().await { .. }` |
-| `overlay_harness_metadata` `:3605-3624` | same shape with `model_listing` and `list_models` | same transformation |
+| `harness_provider_table` `:3555-3592` | `match registry.capabilities(..)` (`Ok` without `provider_listing` → `(None, [])`; `Err` → warn + `(None, vec![ModelListingWarning { .. }])`), then `match registry.list_providers(..)` | `let harness = match registry.harness(..) { Ok(h) => h, Err(e) => { the same warn and the same `(None, vec![ModelListingWarning { .. }])` } }; if !harness.capabilities().provider_listing { return (None, Vec::new()); } match harness.list_providers().await { .. }` |
+| `overlay_harness_metadata` `:3605-3624` | same shape with `model_listing` and `list_models`; its error arm returns `(base, Some(ModelListingWarning { .. }))` | same transformation, that arm likewise moved unchanged |
 | `list_mcp_servers` `:3663-3676` | `registry.capabilities(..).map_err(harness_api_error)?`, gate on `mcp_status`, `registry.list_mcp_servers(..)` | `let harness = registry.harness(&project_config).await.map_err(harness_api_error)?; let capabilities = harness.capabilities();` … `harness.list_mcp_servers().await.map_err(harness_api_error)?` |
 | `reload_mcp_servers` `:3712-3727` | same with `mcp_reload` | same |
 | `start_mcp_oauth_login` `:3756-3772` | same with `mcp_oauth_login` and `name` | same |
 | `harness_knows_provider` `:5838-5853` | `match registry.capabilities(..)` (`Err` → warn, `true`; no `provider_listing` → `true`), then `match registry.list_providers(..)` | `let harness = match registry.harness(..) { Ok(h) => h, Err(error) => { same warn; return true } }; if !harness.capabilities().provider_listing { return true; } match harness.list_providers().await { .. }` |
 
-Every warn keeps its text and fields. `routes.rs:33` becomes
-`use giskard_harness::{AgentHarness, HarnessProvider};` (the trait must be in scope to call its
-methods on `Arc<dyn AgentHarness>`); the test-module import at `:2106` stays.
+Every warn keeps its text, its fields, and the value it returns; the two best-effort functions'
+error arms move onto the `harness()` error arm as they stand, warning vector included.
+`routes.rs:33` stays `use giskard_harness::HarnessProvider;` and the test-module import at `:2106`
+stays: revision 1 asked for an `AgentHarness` import here, but a method call on `dyn AgentHarness`
+resolves through the trait object's principal trait without one, so the import is unused and
+`-D warnings` rejects it. See the pitfall.
 
 One observable difference, stated so it is not mistaken for a bug: today each function creates
 or fetches the harness twice (`capabilities` then `list_*`), after S9 once. A harness that is
@@ -344,7 +356,8 @@ one `#[tokio::test]` in `registry.rs`'s test module: `harness()` twice for one c
 
 ## Exit checks
 
-Run from the repository root. "Before" is `main` at `f830df8`.
+Run from the repository root. "Before" is `main` at `f830df8`. Check K compares against `main`,
+so run it against the remote's `main` rather than a stale local ref.
 
 ```sh
 R=crates/giskard-server/src/registry.rs
@@ -353,8 +366,8 @@ H=crates/giskard-harness/src/lib.rs
 A: rg -c 'pub async fn (list_mcp_servers|list_models|list_providers|client_version|capabilities|reload_mcp_servers|start_mcp_oauth_login)\(' $R
 B: rg -c 'pub async fn harness\(' $R
 C: rg -U -c 'registry\s*\.\s*(list_mcp_servers|list_models|list_providers|client_version|capabilities|reload_mcp_servers|start_mcp_oauth_login)\(' $S
-D: rg -c 'registry\s*\.\s*harness\(' $S
-E: rg -c '^use giskard_harness::\{AgentHarness, HarnessProvider\};' $S
+D: rg -U -c 'registry\s*\n?\s*\.\s*harness\(' $S
+E: rg -c '^use giskard_harness::HarnessProvider;' $S
 F: rg -c 'unique within' $H specs/giskard-specification.md
 G: rg -c '^    // (instance|thread|turn) scope' $H
 I: rg -c 'impl(<[^>]*>)? AgentHarness for' crates | awk -F: '{s+=$2} END{print s}'
@@ -369,8 +382,8 @@ L: cargo doc -p giskard-harness --no-deps 2>&1 | rg -c warning
 | B | 0 | 1 |
 | C, route calls to the seven | 13 | 0 |
 | D, route calls to `harness` | 0 | 7 (one per function in D2) |
-| E | 0 | 1 |
-| F, the request-id contract | 0 | 4 (trait doc, `respond_approval`, `respond_server_request`, spec) |
+| E, the import line unchanged | 1 | 1 |
+| F, the request-id contract | 0 | 3 (`respond_approval`, `respond_server_request`, spec; the trait doc states the same rule as "unique across them") |
 | G, scope comments | 0 | 3 |
 | I, adapter and fake impls | 9 | 9 (27 with decision A "split") |
 | J | 25 | 19 |
@@ -389,8 +402,11 @@ L: cargo doc -p giskard-harness --no-deps 2>&1 | rg -c warning
 - **Keep every warn.** The two `match` shapes in `harness_provider_table` and
   `harness_knows_provider` each carry a warn with `action = "provider_is_known"` or the
   provider-table wording; move them onto the `harness()` error arm unchanged.
-- **The trait must be in scope in `routes.rs`.** Without the `AgentHarness` import the method
-  calls fail to resolve; the import line is exit check E.
+- **Do not import `AgentHarness` into `routes.rs`.** Revision 1 said the trait must be in scope
+  to call its methods on `Arc<dyn AgentHarness>`. It does not: for a receiver of type
+  `dyn Trait` the principal trait's methods are inherent candidates, so the calls resolve with
+  no import, and adding one leaves it unused, which `-D warnings` rejects. D2's code never names
+  the type. Exit check E is now that `:33` is unchanged.
 - **Reordering trait methods is safe; renaming or re-signing is not.** D3 moves items and adds
   comments only.
 - **`cargo doc` must stay warning-free**: the new doc uses backticked names that exist; do not
