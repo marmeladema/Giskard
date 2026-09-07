@@ -9,7 +9,13 @@
 
 **Document status:** Implementation-ready specification.
 **Audience:** An AI coding agent (and its human reviewer) implementing the system.
-**Version:** 1.89
+**Version:** 1.90
+
+> **Amendment — pasted attachments (1.90).** Files pasted into the focused composer use the same
+> attachment ingestion, validation, limits, and pending tray as files selected with the attachment
+> button or dropped onto the composer. A paste containing files and text attaches every file and
+> inserts only its plain-text clipboard representation at the current selection. Text-only paste
+> retains the browser's native behavior.
 
 > **Amendment — deferred link retention (1.89).** A deferred reply-less sub-agent link whose parent
 > has no live owner is kept while the parent's thread file exists and dropped only once that file
@@ -161,6 +167,11 @@
 > the intended frontend for the foreseeable future; treat every Dioxus/WASM/`giskard-ui` reference
 > below as historical design context, not a current requirement. The wire contract (`giskard-proto`)
 > and all backend design remain authoritative.
+
+**Changelog (1.89 → 1.90), pasted attachments:**
+- **A2:** The focused composer accepts clipboard files through the existing attachment pipeline.
+  Mixed file-and-text clipboard content inserts its plain text and attaches every file, while
+  text-only paste remains native.
 
 **Changelog (1.88 → 1.89), deferred link retention:**
 - **AF4:** A deferred reply-less link is retried only against a live parent. While the parent is
@@ -3744,6 +3755,9 @@ held while awaiting harness, persistence, runtime publication, or owner shutdown
 > and that path is appended to the text prompt. The Codex adapter removes the directory with
 > `fs/remove` after the turn, an upload/start failure, stream loss, command/control channel closure,
 > or shutdown. It never writes upload bytes into the project workspace.
+> The focused browser composer accepts the same files from its attachment button, drag-and-drop,
+> or the clipboard. When clipboard files accompany text, it inserts the plain-text clipboard value
+> at the current selection and attaches every file.
 
 **Server → client** (examples): `Event { thread_id, agent_event }` (a serialized
 `WireAgentEvent` — the path-mirrored wire form of `AgentEvent`, §3.5),

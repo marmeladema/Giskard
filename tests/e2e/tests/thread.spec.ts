@@ -73,6 +73,20 @@ test.describe("projects and threads", () => {
     expect(sockets).toHaveLength(initialSocketCount);
     expect(ticketReads).toBe(1);
 
+    const stalePaste = await page.locator("#input").evaluate((element) => {
+      const transfer = new DataTransfer();
+      transfer.items.add(new File(["stale"], "stale.txt", { type: "text/plain" }));
+      const event = new ClipboardEvent("paste", {
+        bubbles: true,
+        cancelable: true,
+        clipboardData: transfer,
+      });
+      const dispatched = element.dispatchEvent(event);
+      return { dispatched, defaultPrevented: event.defaultPrevented };
+    });
+    expect(stalePaste).toEqual({ dispatched: true, defaultPrevented: false });
+    await expect(page.locator(".attachment-chip")).toHaveCount(0);
+
     await page.evaluate(() => window.dispatchEvent(new Event("online")));
     await page.waitForTimeout(100);
     expect(ticketReads).toBe(1);
@@ -507,6 +521,75 @@ test.describe("projects and threads", () => {
     await expect(page.locator(".attachment-chip", { hasText: "notes.pdf" })).toBeVisible();
     await page.getByRole("button", { name: "Remove notes.pdf" }).click();
     await expect(page.locator("#attachmentTray")).toBeHidden();
+  });
+
+  test("pastes files with plain text through the attachment pipeline", async ({ page }) => {
+    const project = page.locator(".proj", { hasText: "Demo" });
+    await project.locator(".project-add").click();
+    const input = page.locator("#input");
+    await expect(input).toBeVisible();
+    const pngBase64 =
+      "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=";
+
+    const paste = await input.evaluate((element, encodedPng) => {
+      const textarea = element as HTMLTextAreaElement;
+      textarea.value = "Before replace";
+      textarea.setSelectionRange(7, 14);
+      const transfer = new DataTransfer();
+      transfer.setData("text/plain", "screenshot");
+      const bytes = Uint8Array.from(atob(encodedPng), character => character.charCodeAt(0));
+      transfer.items.add(new File([bytes], "clipboard.png", {
+        type: "application/octet-stream",
+      }));
+      const event = new ClipboardEvent("paste", {
+        bubbles: true,
+        cancelable: true,
+        clipboardData: transfer,
+      });
+      const dispatched = textarea.dispatchEvent(event);
+      return { dispatched, defaultPrevented: event.defaultPrevented, value: textarea.value };
+    }, pngBase64);
+
+    expect(paste).toEqual({
+      dispatched: false,
+      defaultPrevented: true,
+      value: "Before screenshot",
+    });
+    await expect(page.locator(".attachment-chip", { hasText: "clipboard.png" })).toBeVisible();
+
+    const startRequest = page.waitForRequest((request) =>
+      request.method() === "POST" && request.url().endsWith("/threads/start"));
+    await page.locator("#sendBtn").click();
+    const body = (await startRequest).postDataJSON();
+    expect(body.text).toBe("Before screenshot");
+    expect(body.attachments).toEqual([expect.objectContaining({
+      name: "clipboard.png",
+      mime_type: "image/png",
+      kind: "image",
+      data_base64: pngBase64,
+    })]);
+  });
+
+  test("leaves text-only paste to the browser", async ({ page }) => {
+    const project = page.locator(".proj", { hasText: "Demo" });
+    await project.locator(".project-add").click();
+    const input = page.locator("#input");
+    await expect(input).toBeVisible();
+
+    const paste = await input.evaluate((element) => {
+      const transfer = new DataTransfer();
+      transfer.setData("text/plain", "ordinary text");
+      const event = new ClipboardEvent("paste", {
+        bubbles: true,
+        cancelable: true,
+        clipboardData: transfer,
+      });
+      const dispatched = element.dispatchEvent(event);
+      return { dispatched, defaultPrevented: event.defaultPrevented };
+    });
+
+    expect(paste).toEqual({ dispatched: true, defaultPrevented: false });
+    await expect(page.locator(".attachment-chip")).toHaveCount(0);
   });
 
   test("discards a file read after switching threads", async ({ page }) => {

@@ -2960,9 +2960,7 @@ function updateComposerControls() {
   const managedReadOnly = managedThreadReadOnly() && !draft;
   const readOnly = (state.threadReadOnly || managedReadOnly || threadMetadataPending()) && !draft;
   const attachmentsLoading = pendingAttachmentOperationCount() > 0;
-  const attachmentInputAllowed = hasThreadSurface && !readOnly && !state.updateRequired &&
-    !state.uiVersionCheckPending &&
-    !(draft && state.activeTurn);
+  const attachmentInputAllowed = composerCanAcceptAttachments();
   const modelUnresolved = draftModelUnresolved();
   // An empty composer with nothing attached has nothing to send. That was previously a silent
   // early return in `sendInput`: the button looked live, the click did nothing, and no message
@@ -9477,7 +9475,7 @@ if (!window.visualViewport) window.addEventListener("resize", autosizeComposer);
 $("gitStrategySel").onchange = (e) => setDraftGitStrategy(e.target.value);
 $("attachBtn").onclick = () => $("attachmentInput").click();
 $("attachmentInput").addEventListener("change", attachSelectedFiles);
-initComposerFileDrop();
+initComposerFileTransfers();
 
 // Whether the draft this send was issued for is no longer the one on screen: the user has since
 // opened another draft (same project or not), switched to a persisted thread, or changed projects.
@@ -9679,17 +9677,35 @@ function attachmentOperationIsCurrent(generation, draftKey) {
 function composerCanAcceptAttachments() {
   const draft = isDraftThread();
   const hasThreadSurface = !!state.threadId || draft;
-  return hasThreadSurface && !state.uiVersionCheckPending &&
-    !(state.threadReadOnly && !draft) && !(draft && state.activeTurn);
+  const managedReadOnly = managedThreadReadOnly() && !draft;
+  const readOnly = (state.threadReadOnly || managedReadOnly || threadMetadataPending()) && !draft;
+  return hasThreadSurface && !readOnly && !state.updateRequired &&
+    !state.uiVersionCheckPending && !(draft && state.activeTurn);
 }
 
-function initComposerFileDrop() {
+function initComposerFileTransfers() {
   const composer = $("composer");
+  const input = $("input");
   let dragDepth = 0;
   const clearDrag = () => {
     dragDepth = 0;
     composer.classList.remove("drag-over");
   };
+
+  input.addEventListener("paste", async (e) => {
+    const files = clipboardFiles(e);
+    if (!files.length || !composerCanAcceptAttachments()) return;
+    // Once files are present, own the whole paste so mixed clipboard content inserts only its
+    // plain-text representation. This avoids rich HTML or browser-specific file labels while
+    // keeping useful copied text alongside the attachments.
+    e.preventDefault();
+    const text = e.clipboardData ? e.clipboardData.getData("text/plain") : "";
+    if (text) {
+      input.setRangeText(text, input.selectionStart, input.selectionEnd, "end");
+      input.dispatchEvent(new Event("input", { bubbles: true }));
+    }
+    await attachFiles(files);
+  });
 
   composer.addEventListener("dragenter", (e) => {
     if (!dragEventHasFiles(e) || !composerCanAcceptAttachments()) return;
@@ -9715,6 +9731,17 @@ function initComposerFileDrop() {
     await attachFiles(Array.from(e.dataTransfer.files || []));
   });
   composer.addEventListener("dragend", clearDrag);
+}
+
+function clipboardFiles(e) {
+  const clipboard = e.clipboardData;
+  if (!clipboard) return [];
+  const files = Array.from(clipboard.files || []);
+  if (files.length) return files;
+  return Array.from(clipboard.items || [])
+    .filter(item => item.kind === "file")
+    .map(item => item.getAsFile())
+    .filter(Boolean);
 }
 
 function dragEventHasFiles(e) {

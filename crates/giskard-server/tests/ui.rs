@@ -91,11 +91,17 @@ async fn index_page_is_served_and_public() {
     );
     assert!(body.contains("send_input"), "composer wired to SendInput");
     assert!(
-        body.contains("initComposerFileDrop()")
+        body.contains("initComposerFileTransfers()")
             && body.contains("composer.addEventListener(\"drop\"")
             && body.contains("await attachFiles(Array.from(e.dataTransfer.files || []))")
             && body.contains(".composer.drag-over"),
         "composer accepts dragged files through the attachment pipeline"
+    );
+    assert!(
+        body.contains("input.addEventListener(\"paste\"")
+            && body.contains("const files = clipboardFiles(e);")
+            && body.contains("await attachFiles(files);"),
+        "composer accepts pasted files through the attachment pipeline"
     );
     assert!(
         body.contains("id=\"stopBtn\""),
