@@ -3454,7 +3454,7 @@ async fn thread_rename_updates_thread_summary_and_persistence() {
 #[tokio::test]
 async fn importing_subagent_thread_records_parent_and_reuses_native_child() {
     let harness = FakeHarness::new(ActivityScript::default());
-    let server = start_activity_server_on_available_port(harness.clone()).await;
+    let (server, mut probe) = start_activity_server_with_probe(harness.clone()).await;
     let state = &server.state;
     let base = server.base.clone();
     let client = reqwest::Client::new();
@@ -3493,32 +3493,7 @@ async fn importing_subagent_thread_records_parent_and_reuses_native_child() {
         .unwrap();
     let link_item_id = wait_for_live_item_id(state, parent_id, "subagent_activity_").await;
 
-    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
-    let child_id = loop {
-        let mut found = None;
-        for thread_id in state.store.list_threads(project_id).await.unwrap() {
-            let thread = state
-                .store
-                .load_thread(project_id, thread_id)
-                .await
-                .unwrap()
-                .unwrap();
-            if thread.harness_thread_id == "native-child"
-                && thread.kind == giskard_core::ThreadKind::Subagent
-                && thread.parent_thread_id == Some(parent_id)
-            {
-                found = Some(thread.id);
-                break;
-            }
-        }
-        if let Some(thread_id) = found {
-            break thread_id;
-        }
-        if tokio::time::Instant::now() >= deadline {
-            panic!("subagent activity did not auto-import native child thread");
-        }
-        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
-    };
+    let child_id = probe.expect_admitted("native-child").await;
     let saved = state
         .store
         .load_thread(project_id, child_id)
@@ -3738,7 +3713,7 @@ async fn route_and_forwarder_import_same_native_child_once() {
 #[tokio::test]
 async fn passive_subagent_command_start_streams_before_completion() {
     let harness = FakeHarness::new(ActivityScript::default());
-    let server = start_activity_server_on_available_port(harness.clone()).await;
+    let (server, mut probe) = start_activity_server_with_probe(harness.clone()).await;
     let state = &server.state;
     let port = server.addr.port();
     let base = server.base.clone();
@@ -3777,29 +3752,7 @@ async fn passive_subagent_command_start_streams_before_completion() {
         .await
         .unwrap();
 
-    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
-    let child_id = loop {
-        let mut found = None;
-        for thread_id in state.store.list_threads(project_id).await.unwrap() {
-            let thread = state
-                .store
-                .load_thread(project_id, thread_id)
-                .await
-                .unwrap()
-                .unwrap();
-            if thread.harness_thread_id == "native-child" {
-                found = Some(thread.id);
-                break;
-            }
-        }
-        if let Some(thread_id) = found {
-            break thread_id;
-        }
-        if tokio::time::Instant::now() >= deadline {
-            panic!("subagent activity did not auto-import native child thread");
-        }
-        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
-    };
+    let child_id = probe.expect_admitted("native-child").await;
 
     harness.core.wait_for_readers(child_id, 1).await;
 
@@ -4019,7 +3972,7 @@ async fn passive_subagent_command_start_streams_before_completion() {
 #[tokio::test]
 async fn collab_agent_spawn_start_imports_subagent_thread() {
     let harness = FakeHarness::new(ActivityScript::default());
-    let server = start_activity_server_on_available_port(harness.clone()).await;
+    let (server, mut probe) = start_activity_server_with_probe(harness.clone()).await;
     let state = &server.state;
     let base = server.base.clone();
     let client = reqwest::Client::new();
@@ -4057,30 +4010,14 @@ async fn collab_agent_spawn_start_imports_subagent_thread() {
         .await
         .unwrap();
 
-    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
-    let child = loop {
-        let mut found = None;
-        for thread_id in state.store.list_threads(project_id).await.unwrap() {
-            let thread = state
-                .store
-                .load_thread(project_id, thread_id)
-                .await
-                .unwrap()
-                .unwrap();
-            if thread.harness_thread_id == "native-collab-child"
-                && thread.kind == giskard_core::ThreadKind::Subagent
-            {
-                found = Some(thread);
-                break;
-            }
-        }
-        if let Some(thread) = found {
-            break thread;
-        }
-        if tokio::time::Instant::now() >= deadline {
-            panic!("sub-agent link did not auto-import native child thread");
-        }
-        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+    let child = {
+        let id = probe.expect_admitted("native-collab-child").await;
+        state
+            .store
+            .load_thread(project_id, id)
+            .await
+            .unwrap()
+            .unwrap()
     };
 
     assert_eq!(child.parent_thread_id, Some(parent_id));
@@ -4120,7 +4057,7 @@ async fn collab_agent_spawn_start_imports_subagent_thread() {
 #[tokio::test]
 async fn collab_agent_spawn_uses_tool_input_prompt_when_link_prompt_is_missing() {
     let harness = FakeHarness::new(ActivityScript::default());
-    let server = start_activity_server_on_available_port(harness.clone()).await;
+    let (server, mut probe) = start_activity_server_with_probe(harness.clone()).await;
     let state = &server.state;
     let port = server.addr.port();
     let base = server.base.clone();
@@ -4159,28 +4096,14 @@ async fn collab_agent_spawn_uses_tool_input_prompt_when_link_prompt_is_missing()
         .await
         .unwrap();
 
-    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
-    let child = loop {
-        let mut found = None;
-        for thread_id in state.store.list_threads(project_id).await.unwrap() {
-            let thread = state
-                .store
-                .load_thread(project_id, thread_id)
-                .await
-                .unwrap()
-                .unwrap();
-            if thread.harness_thread_id == "native-collab-child" {
-                found = Some(thread);
-                break;
-            }
-        }
-        if let Some(thread) = found {
-            break thread;
-        }
-        if tokio::time::Instant::now() >= deadline {
-            panic!("sub-agent link did not auto-import native child thread");
-        }
-        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+    let child = {
+        let id = probe.expect_admitted("native-collab-child").await;
+        state
+            .store
+            .load_thread(project_id, id)
+            .await
+            .unwrap()
+            .unwrap()
     };
 
     harness.core.wait_for_readers(child.id, 1).await;
@@ -4236,7 +4159,7 @@ async fn collab_agent_spawn_uses_tool_input_prompt_when_link_prompt_is_missing()
 #[tokio::test]
 async fn passive_subagent_prompt_updates_when_spawn_metadata_arrives_late() {
     let harness = FakeHarness::new(ActivityScript::default());
-    let server = start_activity_server_on_available_port(harness.clone()).await;
+    let (server, mut probe) = start_activity_server_with_probe(harness.clone()).await;
     let state = &server.state;
     let base = server.base.clone();
     let client = reqwest::Client::new();
@@ -4274,28 +4197,14 @@ async fn passive_subagent_prompt_updates_when_spawn_metadata_arrives_late() {
         .await
         .unwrap();
 
-    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
-    let child = loop {
-        let mut found = None;
-        for thread_id in state.store.list_threads(project_id).await.unwrap() {
-            let thread = state
-                .store
-                .load_thread(project_id, thread_id)
-                .await
-                .unwrap()
-                .unwrap();
-            if thread.harness_thread_id == "native-collab-child" {
-                found = Some(thread);
-                break;
-            }
-        }
-        if let Some(thread) = found {
-            break thread;
-        }
-        if tokio::time::Instant::now() >= deadline {
-            panic!("sub-agent activity did not auto-import native child thread");
-        }
-        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+    let child = {
+        let id = probe.expect_admitted("native-collab-child").await;
+        state
+            .store
+            .load_thread(project_id, id)
+            .await
+            .unwrap()
+            .unwrap()
     };
 
     harness.core.wait_for_readers(child.id, 1).await;
@@ -4540,7 +4449,7 @@ async fn subagent_link_open_rejects_unknown_and_non_link_items() {
 async fn terminal_subagent_link_does_not_synthesize_a_fallback_turn() {
     let harness = FakeHarness::new(ActivityScript::default());
     harness.script.hold_native_child_open();
-    let server = start_activity_server_on_available_port(harness.clone()).await;
+    let (server, mut probe) = start_activity_server_with_probe(harness.clone()).await;
     let state = &server.state;
     let base = server.base.clone();
     let client = reqwest::Client::new();
@@ -4600,29 +4509,14 @@ async fn terminal_subagent_link_does_not_synthesize_a_fallback_turn() {
     }
     harness.script.release_native_child_open();
 
-    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
-    let child = loop {
-        let mut found = None;
-        for thread_id in state.store.list_threads(project_id).await.unwrap() {
-            let thread = state
-                .store
-                .load_thread(project_id, thread_id)
-                .await
-                .unwrap()
-                .unwrap();
-            if thread.harness_thread_id != "native-terminal-child" {
-                continue;
-            }
-            found = Some(thread);
-            break;
-        }
-        if let Some(child) = found {
-            break child;
-        }
-        if tokio::time::Instant::now() >= deadline {
-            panic!("terminal sub-agent link was not materialized");
-        }
-        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+    let child = {
+        let id = probe.expect_admitted("native-terminal-child").await;
+        state
+            .store
+            .load_thread(project_id, id)
+            .await
+            .unwrap()
+            .unwrap()
     };
 
     assert_eq!(child.title, "Sub-agent: terminal-reviewer");
@@ -4641,7 +4535,7 @@ async fn terminal_subagent_link_does_not_synthesize_a_fallback_turn() {
 #[tokio::test]
 async fn persisted_or_interrupted_subagent_keeps_one_event_owner() {
     let harness = FakeHarness::new(ActivityScript::default());
-    let server = start_activity_server_on_available_port(harness.clone()).await;
+    let (server, mut probe) = start_activity_server_with_probe(harness.clone()).await;
     let state = &server.state;
     let base = server.base.clone();
     let client = reqwest::Client::new();
@@ -4679,28 +4573,14 @@ async fn persisted_or_interrupted_subagent_keeps_one_event_owner() {
         .await
         .unwrap();
 
-    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
-    let child = loop {
-        let mut found = None;
-        for thread_id in state.store.list_threads(project_id).await.unwrap() {
-            let thread = state
-                .store
-                .load_thread(project_id, thread_id)
-                .await
-                .unwrap()
-                .unwrap();
-            if thread.harness_thread_id == "native-child" {
-                found = Some(thread);
-                break;
-            }
-        }
-        if let Some(thread) = found {
-            break thread;
-        }
-        if tokio::time::Instant::now() >= deadline {
-            panic!("active sub-agent was not materialized");
-        }
-        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+    let child = {
+        let id = probe.expect_admitted("native-child").await;
+        state
+            .store
+            .load_thread(project_id, id)
+            .await
+            .unwrap()
+            .unwrap()
     };
 
     harness.core.wait_for_readers(child.id, 1).await;
@@ -4818,7 +4698,7 @@ async fn persisted_or_interrupted_subagent_keeps_one_event_owner() {
 async fn reverse_subagent_activity_preserves_parent_and_uses_one_forwarder() {
     install_registry_event_capture();
     let harness = FakeHarness::new(ActivityScript::default());
-    let server = start_activity_server_on_available_port(harness.clone()).await;
+    let (server, mut probe) = start_activity_server_with_probe(harness.clone()).await;
     let state = &server.state;
     let port = server.addr.port();
     let base = server.base.clone();
@@ -4857,28 +4737,14 @@ async fn reverse_subagent_activity_preserves_parent_and_uses_one_forwarder() {
         .await
         .unwrap();
 
-    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
-    let child = loop {
-        let mut found = None;
-        for thread_id in state.store.list_threads(project_id).await.unwrap() {
-            let thread = state
-                .store
-                .load_thread(project_id, thread_id)
-                .await
-                .unwrap()
-                .unwrap();
-            if thread.harness_thread_id == "native-collab-child" {
-                found = Some(thread);
-                break;
-            }
-        }
-        if let Some(thread) = found {
-            break thread;
-        }
-        if tokio::time::Instant::now() >= deadline {
-            panic!("collaboration child was not materialized");
-        }
-        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+    let child = {
+        let id = probe.expect_admitted("native-collab-child").await;
+        state
+            .store
+            .load_thread(project_id, id)
+            .await
+            .unwrap()
+            .unwrap()
     };
     harness.core.wait_for_readers(child.id, 1).await;
     assert!(state.registry.thread_has_active_turn(parent_id).await);
