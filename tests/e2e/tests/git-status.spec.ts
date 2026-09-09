@@ -2,8 +2,9 @@ import { test, expect } from "@playwright/test";
 import { SCRIPTED_REPLY, login } from "./helpers";
 
 // The Git status line above the composer. The replay server seeds its demo workspace as a real
-// repository on `main` with one modified tracked file (`src/main.rs`), so the line has a branch, a
-// change count and one row to list — see `seed_git_workspace` in `giskard-server-replay.rs`.
+// repository on `main` with one modified tracked file (`src/main.rs`), one untracked file
+// (`NOTES.md`) and one untracked directory (`scratch/`), so the line has a branch, a change count
+// and three rows to list — see `seed_git_workspace` in `giskard-server-replay.rs`.
 //
 // The suite shares one stateful server, so these assertions never assume a clean slate beyond that
 // seeded workspace: they identify the row under test by path and read the line's own fields.
@@ -18,7 +19,7 @@ test.describe("git status line", () => {
     // Collapsed, the line answers the common questions without being opened.
     await expect(page.locator("#gitBranch")).toHaveText("main");
     await expect(page.locator("#gitLine")).toHaveClass(/\bstate-dirty\b/);
-    await expect(page.locator("#gitCount")).toHaveText("1");
+    await expect(page.locator("#gitCount")).toHaveText("3");
     await expect(page.locator("#gitLineBody")).toBeHidden();
 
     // It expands in place rather than into a popover.
@@ -38,6 +39,63 @@ test.describe("git status line", () => {
     await row.click();
     await expect(page.locator("#codeOverlay")).toHaveClass(/\bopen\b/);
     await expect(page.locator("#codePath")).toHaveText("Diff: src/main.rs");
+  });
+
+  // Untracked entries are listed too, and the two kinds are not the same row: a file can be opened,
+  // a collapsed directory has no single file to open.
+  test("lists untracked entries and opens only the files among them", async ({ page }) => {
+    // The overlay reads a file as one thread's workspace sees it, so the row waits for a thread —
+    // on this draft it says so instead of doing nothing when clicked.
+    await page.locator("#gitLineToggle").click();
+    const draftRow = page.locator('.git-file[title^="NOTES.md"]');
+    await expect(draftRow).toBeDisabled();
+    await expect(draftRow).toHaveAttribute("title", /opens once this draft has a thread/);
+
+    await page.locator("#input").fill("Turn that settles this thread's workspace");
+    await page.locator("#sendBtn").click();
+    await expect(page.locator("#transcript .msg.agent", { hasText: SCRIPTED_REPLY })).toBeVisible();
+    await page.locator("#gitLineToggle").click();
+    await expect(page.locator("#gitLineBody")).toBeVisible();
+
+    // The collapsed directory stays inert, and says why.
+    const directory = page.locator('.git-file[title^="scratch/"]');
+    await expect(directory).toBeDisabled();
+    await expect(directory).toHaveAttribute("title", /untracked directory/);
+    await expect(page.locator('.git-file[data-git-file="scratch/"]')).toHaveCount(0);
+
+    // The file opens the source overlay — the file itself, not a diff it has nothing to diff
+    // against — and a Markdown file arrives rendered, with the source one click away.
+    const file = page.locator('.git-file[data-git-file="NOTES.md"]');
+    await expect(file).toHaveCount(1);
+    await expect(file.locator(".git-file-status")).toHaveText("?");
+    await file.click();
+    await expect(page.locator("#codeOverlay")).toHaveClass(/\bopen\b/);
+    await expect(page.locator("#codePath")).toHaveText("NOTES.md");
+    await expect(page.locator("#codeView .code-markdown")).toHaveCount(1);
+    await expect(page.locator("#codeView .diff-table")).toHaveCount(0);
+    await expect(page.locator("#codeSourceToggle")).toBeVisible();
+    await expect(page.locator("#codeSourceToggle")).toHaveText("Source");
+  });
+
+  // The rule the rows are built from, on the paths a working tree does not readily produce.
+  test("treats only files, and only with a thread, as openable", async ({ page }) => {
+    const openable = (path: string, hasThread: boolean) =>
+      page.evaluate(
+        ([p, t]) =>
+          (window as never as { gitFileOpenable: typeof gitFileOpenable }).gitFileOpenable(
+            p as string,
+            t as boolean,
+          ),
+        [path, hasThread] as [string, boolean],
+      );
+
+    expect(await openable("NOTES.md", true)).toBe(true);
+    expect(await openable("src/new/file.rs", true)).toBe(true);
+    // A collapsed untracked directory is not a file.
+    expect(await openable("scratch/", true)).toBe(false);
+    // No thread, no workspace to read the file through.
+    expect(await openable("NOTES.md", false)).toBe(false);
+    expect(await openable("", true)).toBe(false);
   });
 
   // The diff is laid out like a source file — two gutters and one row per line — rather than as a
@@ -431,6 +489,7 @@ test.describe("git status line", () => {
 
 declare function gitBranchParts(name: string, budget: number): { prefix: string; tail: string };
 declare function renderGitPath(path: string): string;
+declare function gitFileOpenable(path: string, hasThread: boolean): boolean;
 declare const state: { diffOverlayText: string | null };
 declare function openDiffOverlay(path: string, diff: string): void;
 declare function openCodeOverlay(path: string, line?: number): Promise<void>;

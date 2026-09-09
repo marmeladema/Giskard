@@ -47,7 +47,7 @@ test.describe("git checkout choice on a draft", () => {
    */
   test("says what stays behind when the project has uncommitted work", async ({ page }) => {
     await newDraft(page);
-    await expect(page.locator("#gitCount")).toHaveText("1");
+    await expect(page.locator("#gitCount")).toHaveText("3");
 
     const select = page.locator("#gitStrategySel");
     const warning = page.locator("#gitStrategyWarning");
@@ -59,9 +59,21 @@ test.describe("git checkout choice on a draft", () => {
     await select.selectOption("worktree");
     await expect(select).toHaveAttribute("title", /Starts from the last commit/);
     // Visible text, not a tooltip: this is the fact a phone has to be able to read.
-    // Singular count, singular verb — the sentence is asking to be trusted about what it drops.
     await expect(warning).toBeVisible();
-    await expect(warning).toHaveText("Your 1 uncommitted change stays in the project's checkout.");
+    await expect(warning).toHaveText("Your 3 uncommitted changes stay in the project's checkout.");
+
+    // The verb agrees with the count either way — the sentence is asking to be trusted about what
+    // it drops, and "1 uncommitted change stay" reads as a typo at exactly that moment. The seeded
+    // tree holds three changes, so the singular reading is checked on the sentence itself.
+    const sentence = (dirty: number) =>
+      page.evaluate(
+        (n) =>
+          (window as never as { uncommittedCostText: typeof uncommittedCostText }).uncommittedCostText(n),
+        dirty,
+      );
+    expect(await sentence(1)).toBe("Your 1 uncommitted change stays in the project's checkout.");
+    expect(await sentence(3)).toBe("Your 3 uncommitted changes stay in the project's checkout.");
+    expect(await sentence(0)).toBe("");
 
     // Choosing back is a full retraction: emptied, not merely hidden, or a screen reader meets it
     // again the next time the row comes back.
@@ -150,3 +162,5 @@ test.describe("git checkout choice on a draft", () => {
     ).toBeVisible();
   });
 });
+
+declare function uncommittedCostText(dirty: number): string;

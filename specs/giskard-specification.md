@@ -3407,8 +3407,10 @@ alongside raw token counts. Off by default; raw token counts are the primary met
 - The active project surface may expose a compact read-only Git status line above the composer:
   current branch or detached head, ahead/behind, conflicted and changed counts, and the working
   tree's diffstat. It expands in place into the changed files, grouped by conflicted/staged/
-  unstaged/untracked, each opening its own diff, plus the combined working-tree diff. An untracked
-  directory is listed as one entry rather than expanded file by file. The line refreshes as the
+  unstaged/untracked, plus the combined working-tree diff. A tracked row opens its own diff; an
+  untracked file has nothing to diff against, so its row opens the file itself in the code overlay
+  of §11.2 instead. An untracked directory is listed as one entry rather than expanded file by
+  file, and — having no single file to open — its row stays inert. The line refreshes as the
   working tree changes — when a turn completes, and as file changes stream during one — so it
   describes the tree now rather than when the thread was opened. Staging, committing, branch
   creation/switching, and hunk mutation stay out of scope.

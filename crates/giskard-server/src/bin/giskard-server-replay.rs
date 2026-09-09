@@ -1264,6 +1264,19 @@ fn seed_git_workspace(workspace: &Path) -> Result<(), String> {
         "fn main() {\n    println!(\"hello from demo\");\n    println!(\"edited for status\");\n}\n",
     )
     .map_err(|e| format!("cannot modify demo source: {e}"))?;
+
+    // Two untracked entries, because the status line treats them differently: a file is opened in
+    // the source overlay from its row (Markdown so the rendered view is exercised too), while a
+    // directory is reported collapsed and has no file to open.
+    std::fs::write(
+        workspace.join("NOTES.md"),
+        "# Demo notes\n\nAn uncommitted plan file, here to be read from the Git status line.\n",
+    )
+    .map_err(|e| format!("cannot write demo notes: {e}"))?;
+    std::fs::create_dir_all(workspace.join("scratch"))
+        .map_err(|e| format!("cannot create demo scratch dir: {e}"))?;
+    std::fs::write(workspace.join("scratch/draft.txt"), "scratch\n")
+        .map_err(|e| format!("cannot write demo scratch file: {e}"))?;
     Ok(())
 }
 

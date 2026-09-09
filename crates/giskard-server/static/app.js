@@ -3959,10 +3959,15 @@ function gitStrategyHintText() {
    is nothing to lose, so the row stays quiet in the ordinary case. */
 function gitStrategyWarningText() {
   if (state.draftGitStrategy !== "worktree") return "";
-  const dirty = gitDirtyCount(state.gitStatus);
+  return uncommittedCostText(gitDirtyCount(state.gitStatus));
+}
+
+/* The sentence itself, given a count — pure, so both of its readings can be checked without a
+   working tree that happens to hold exactly that many changes. Empty when there is nothing to lose.
+   The verb agrees with the count: "1 uncommitted change stay" reads as a typo at exactly the moment
+   the sentence is asking to be trusted about what it will not carry across. */
+function uncommittedCostText(dirty) {
   if (!dirty) return "";
-  // The verb agrees with the count too: "1 uncommitted change stay" reads as a typo at exactly the
-  // moment the sentence is asking to be trusted about what it will not carry across.
   return dirty === 1
     ? "Your 1 uncommitted change stays in the project's checkout."
     : `Your ${dirty} uncommitted changes stay in the project's checkout.`;
@@ -6378,6 +6383,11 @@ function renderGitLineBody() {
   body.querySelectorAll("[data-git-diff]").forEach(row => {
     row.onclick = () => openGitDiff(row.dataset.gitDiff, row.dataset.gitSide);
   });
+  // An untracked row opens the file itself, in the same overlay a path link uses: there is nothing
+  // to diff it against, and reading a new file is what the row is for.
+  body.querySelectorAll("[data-git-file]").forEach(row => {
+    row.onclick = () => openCodeOverlay(row.dataset.gitFile, null);
+  });
 }
 
 function renderGitSection(section, files) {
@@ -6388,14 +6398,18 @@ function renderGitSection(section, files) {
 function renderGitFileRow(file, sectionKey) {
   const path = String(file.path || "");
   const status = gitRowStatus(file, sectionKey);
-  // Untracked files have nothing to diff against, so the row stays inert rather than opening an
-  // overlay that would report an empty diff.
+  // Untracked files have nothing to diff against, so the row never opens a diff — an overlay that
+  // could only report an empty one. It opens the file instead; see gitFileOpenable.
   const canDiff = sectionKey !== "untracked";
-  const title = file.old_path ? `${file.old_path} → ${path}` : path;
+  const canOpen = !canDiff && gitFileOpenable(path, !!state.threadId);
+  const title = gitRowTitle(file, path, canDiff, canOpen);
   // The row carries its own side, so a path listed under both Staged and Not staged opens the diff
   // that matches the row's line counts rather than the two concatenated.
   const side = gitSectionSide(sectionKey);
-  return `<button type="button" class="git-file" title="${escapeAttr(title)}"${canDiff ? ` data-git-diff="${escapeAttr(path)}" data-git-side="${escapeAttr(side)}"` : " disabled"}>
+  const action = canDiff
+    ? ` data-git-diff="${escapeAttr(path)}" data-git-side="${escapeAttr(side)}"`
+    : (canOpen ? ` data-git-file="${escapeAttr(path)}"` : " disabled");
+  return `<button type="button" class="git-file" title="${escapeAttr(title)}"${action}>
     <span class="git-file-status status-${escapeAttr(status.kind)}">${escapeHtml(status.code)}</span>
     <span class="git-file-path">${renderGitPath(path)}</span>
     <span class="git-file-stat">${renderGitFileStat(file, sectionKey, canDiff)}</span>
@@ -6405,6 +6419,24 @@ function renderGitFileRow(file, sectionKey) {
 /* A conflict lives in the worktree, so it reads the unstaged side — same as its line counts. */
 function gitSectionSide(sectionKey) {
   return sectionKey === "staged" ? "staged" : "unstaged";
+}
+
+/* An untracked path has nothing to diff, but it is still a file worth reading — a new source file,
+   an uncommitted plan — so its row opens the source overlay rather than staying inert. Two paths
+   are not files to open: a collapsed untracked directory, which git reports with a trailing slash,
+   and any path while no thread is open, since the overlay reads a file as one thread's workspace
+   sees it and a draft has no thread to read it through yet. */
+function gitFileOpenable(path, hasThread) {
+  return !!hasThread && !!path && !String(path).endsWith("/");
+}
+
+/* A row that does nothing when clicked has to say why, so the two inert untracked cases name their
+   reason after the path; every other row is titled by the path alone. */
+function gitRowTitle(file, path, canDiff, canOpen) {
+  const name = file.old_path ? `${file.old_path} → ${path}` : path;
+  if (canDiff || canOpen) return name;
+  if (path.endsWith("/")) return `${name} — untracked directory`;
+  return `${name} — opens once this draft has a thread to read the file through`;
 }
 
 /* The basename is the identifier and the directory is context, so the directory is dimmed and
