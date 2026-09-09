@@ -26,6 +26,7 @@ use crate::AppState;
 use crate::auth::{TokenPurpose, get_session_token_from_header, sign_token, verify_token};
 use crate::hub::Outbound;
 use crate::log_fields::display_opt;
+use crate::registry::SteerTurnError;
 use crate::routes::{
     ApiError, ReadOnlyProviderContext, UI_VERSION, history_limit_or_default, load_thread,
     normalize_persisted_thread_model, project_model_catalog, provider_is_known, read_only_info,
@@ -200,6 +201,24 @@ fn harness_error_means_command_unmanaged(error: &HarnessError) -> bool {
     let message = message.to_ascii_lowercase();
     message.contains("no active command/exec for process id")
         || message.contains("no active turn to interrupt")
+}
+
+fn steer_ws_error(error: SteerTurnError, thread_id: ThreadId) -> WsError {
+    let (code, message) = match &error {
+        SteerTurnError::NotSteerable { .. }
+        | SteerTurnError::Harness(HarnessError::Unsupported(_)) => (
+            "turn_not_steerable",
+            "The running turn cannot accept that message.",
+        ),
+        _ => (
+            "turn_steer_failed",
+            "The message was not added to the running turn.",
+        ),
+    };
+    WsError::new(code, ErrorSeverity::Error, message)
+        .detail(error.to_string())
+        .thread(thread_id)
+        .action("steer_input")
 }
 
 /// Tell a just-connected client which threads are already waiting on it.
@@ -714,6 +733,61 @@ async fn handle_client_msg(
                 )
                 .await
                 .map_err(|e| WsError::from_harness(e, "send_input", Some(thread_id)))?;
+        }
+        ClientMessage::SteerInput {
+            thread_id,
+            turn_id,
+            text,
+        } => {
+            let project_id = project_for_readonly(state, thread_id, "steer_input").await?;
+            state
+                .registry
+                .ensure_thread_writable(project_id, thread_id)
+                .await
+                .map_err(|error| WsError::from_harness(error, "steer_input", Some(thread_id)))?;
+            let text = text.trim().to_string();
+            if text.is_empty() {
+                return Err(WsError::new(
+                    "empty_input",
+                    ErrorSeverity::Error,
+                    "Type a message to steer the running turn.",
+                )
+                .thread(thread_id)
+                .action("steer_input"));
+            }
+
+            // Do not hold this connection's receive loop while the harness answers. The user must
+            // still be able to press Stop from the same tab while steering is pending. Codex bounds
+            // its own JSON-RPC request; dropping an outer timeout future could report failure while
+            // the already-queued provider request later succeeds.
+            let state = state.clone();
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                if let Err(error) = state.registry.steer_turn(thread_id, turn_id, text).await {
+                    warn!(
+                        %project_id,
+                        %thread_id,
+                        %turn_id,
+                        action = "steer_input",
+                        %error,
+                        "steering input failed"
+                    );
+                    if tx
+                        .send(steer_ws_error(error, thread_id).into_server_message())
+                        .await
+                        .is_err()
+                    {
+                        debug!(
+                            %client_id,
+                            %project_id,
+                            %thread_id,
+                            %turn_id,
+                            action = "steer_input",
+                            "steering error could not be delivered because the WebSocket writer ended"
+                        );
+                    }
+                }
+            });
         }
         ClientMessage::SwitchMode {
             thread_id,
@@ -1324,7 +1398,7 @@ async fn ensure_thread_open(
         %action,
         "reopening persisted thread"
     );
-    let handle = if thread_file.kind == ThreadKind::Subagent {
+    let binding = if thread_file.kind == ThreadKind::Subagent {
         state
             .registry
             .attach_subagent_thread(&project_config, &thread_file)
@@ -1351,6 +1425,7 @@ async fn ensure_thread_open(
             .await
     }
     .map_err(|e| WsError::from_harness(e, action, Some(thread_id)))?;
+    let handle = binding.handle().clone();
 
     if handle.thread != thread_id {
         return Err(WsError::new(
@@ -1619,7 +1694,7 @@ async fn switch_provider_cold(
         "attempting verified cold-resume provider switch"
     );
 
-    let handle = state
+    let binding = state
         .registry
         .open_thread(
             &project_config,
@@ -1630,6 +1705,7 @@ async fn switch_provider_cold(
         )
         .await
         .map_err(|e| WsError::from_harness(e, "select_model", Some(thread_id)))?;
+    let handle = binding.handle().clone();
 
     let confirmed = handle.resumed_model.as_ref().is_some_and(|effective| {
         effective.provider == requested.provider && effective.model == requested.model
@@ -1855,4 +1931,45 @@ async fn save_plan(
         .strip_prefix(&workspace_root)
         .map(|p| p.to_string_lossy().to_string())
         .unwrap_or_else(|_| target.to_string_lossy().to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use giskard_core::ids::TurnId;
+
+    #[test]
+    fn steering_error_codes_distinguish_authority_and_harness_failures() {
+        let thread_id = ThreadId::new();
+        let expected_turn = TurnId::new();
+        let authority_error = steer_ws_error(
+            SteerTurnError::NotSteerable {
+                thread_id,
+                expected_turn,
+                active_turn: None,
+            },
+            thread_id,
+        );
+        assert_eq!(authority_error.info.code, "turn_not_steerable");
+        assert!(
+            !authority_error
+                .info
+                .detail
+                .as_deref()
+                .unwrap_or_default()
+                .contains("capability not offered")
+        );
+
+        let unsupported = steer_ws_error(
+            SteerTurnError::Harness(HarnessError::Unsupported("steering disabled".into())),
+            thread_id,
+        );
+        assert_eq!(unsupported.info.code, "turn_not_steerable");
+
+        let provider_failure = steer_ws_error(
+            SteerTurnError::Harness(HarnessError::Protocol("provider rejected steering".into())),
+            thread_id,
+        );
+        assert_eq!(provider_failure.info.code, "turn_steer_failed");
+    }
 }

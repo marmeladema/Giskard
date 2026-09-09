@@ -50,6 +50,8 @@ pub struct HarnessCapabilities {
     pub mcp_oauth_login: bool,
     /// Manual context compaction can be requested for a thread.
     pub context_compaction: bool,
+    /// Additional text input can be sent to an acknowledged active turn.
+    pub turn_steering: bool,
 }
 
 /// A provider the harness is configured to route turns to (spec §8.2).
@@ -486,7 +488,8 @@ impl DiscoveryStream {
 ///   `shutdown`;
 /// - thread, taking a `ThreadHandle`: `open_thread`, `claim_native_thread`, `subscribe`,
 ///   `set_thread_name`, `set_thread_archived`, `delete_thread`, `compact_thread`, `interrupt`;
-/// - turn: `start_turn`, `respond_approval`, `respond_server_request`, `terminate_command`.
+/// - turn: `start_turn`, `steer_turn`, `respond_approval`, `respond_server_request`,
+///   `terminate_command`.
 ///
 /// Three contracts follow from "one instance, any number of processes":
 /// - `subscribe` is synchronous and must return a stream for every handle this instance
@@ -635,6 +638,20 @@ pub trait AgentHarness: Send + Sync {
         input: UserInput,
         overrides: TurnOverrides,
     ) -> Result<TurnId, HarnessError>;
+
+    /// Send additional text input to the exact acknowledged turn that is still active.
+    async fn steer_turn(
+        &self,
+        thread: &ThreadHandle,
+        expected_turn: TurnId,
+        text: String,
+    ) -> Result<(), HarnessError> {
+        let _ = text;
+        Err(HarnessError::Unsupported(format!(
+            "turn steering is not supported for thread {} turn {expected_turn}",
+            thread.thread
+        )))
+    }
 
     /// Respond to a pending approval request.
     ///

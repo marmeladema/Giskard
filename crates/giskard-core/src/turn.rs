@@ -151,7 +151,8 @@ pub enum TurnStatusKind {
     Failed,
 }
 
-/// One unit of agent work initiated by a single user input (spec §4.5, B1).
+/// One unit of agent work initiated by user input and optionally steered while active
+/// (spec §4.5, B1, TS1).
 ///
 /// Persisted inside the thread file (§5.3) as an element of `Thread.turns`, and the unit the
 /// diff viewer / token gauge read from.

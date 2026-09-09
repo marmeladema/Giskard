@@ -1,4 +1,4 @@
-use super::{CodexTransport, HarnessError};
+use super::{CodexRequestFuture, CodexTransport, HarnessError};
 use crate::rpc::{CodexStreamError, NON_JSON_STDOUT_PREVIEW_BYTES, bounded_utf8_preview};
 use async_trait::async_trait;
 use codex_codes::jsonrpc::{
@@ -194,16 +194,15 @@ impl StdioTransport {
 
 #[async_trait]
 impl CodexTransport for StdioTransport {
-    async fn request_json(&mut self, method: &str, params: Value) -> Result<Value, HarnessError> {
-        request_json(
+    fn start_request_json(&mut self, method: &str, params: Value) -> CodexRequestFuture {
+        Box::pin(request_json(
             self.writer_tx.as_ref().cloned(),
             self.waiters.clone(),
             self.next_id.clone(),
-            method,
+            method.to_owned(),
             params,
             None,
-        )
-        .await
+        ))
     }
 
     async fn next_message(&mut self) -> Result<Option<ServerMessage>, CodexStreamError> {
@@ -311,7 +310,7 @@ async fn request_json(
     writer_tx: Option<mpsc::Sender<Frame>>,
     waiters: Waiters,
     next_id: Arc<AtomicI64>,
-    method: &str,
+    method: String,
     params: Value,
     abandoned_states: Option<Arc<Mutex<Vec<u8>>>>,
 ) -> Result<Value, HarnessError> {
@@ -322,14 +321,14 @@ async fn request_json(
     let mut registration = Registration {
         waiters,
         id: id.clone(),
-        method: method.to_owned(),
+        method: method.clone(),
         state: state.clone(),
         abandoned_states,
         armed: true,
     };
     let line = match serialize_line(&JsonRpcRequest {
         id: id.clone(),
-        method: method.to_owned(),
+        method: method.clone(),
         params: Some(params),
     }) {
         Ok(line) => line,
@@ -764,7 +763,7 @@ mod tests {
             Some(writer.clone()),
             waiters.clone(),
             next_id.clone(),
-            "request/first",
+            "request/first".into(),
             json!({}),
             None,
         );
@@ -772,7 +771,7 @@ mod tests {
             Some(writer),
             waiters,
             next_id,
-            "request/second",
+            "request/second".into(),
             json!({}),
             None,
         );
@@ -823,7 +822,7 @@ mod tests {
                     Some(request_sender),
                     waiters,
                     next_id,
-                    &format!("request/{index}"),
+                    format!("request/{index}"),
                     json!({"body":"x".repeat(4096)}),
                     None,
                 )
@@ -910,7 +909,7 @@ mod tests {
                 transport.writer_tx.as_ref().cloned(),
                 transport.waiters.clone(),
                 transport.next_id.clone(),
-                "written",
+                "written".into(),
                 json!({}),
                 Some(written_states.clone()),
             ),
@@ -963,7 +962,7 @@ mod tests {
                     Some(sender),
                     transport.waiters.clone(),
                     transport.next_id.clone(),
-                    "not-queued",
+                    "not-queued".into(),
                     json!({}),
                     Some(unqueued_states.clone()),
                 ),
@@ -981,7 +980,7 @@ mod tests {
             transport.writer_tx.as_ref().cloned(),
             transport.waiters.clone(),
             transport.next_id.clone(),
-            "pending",
+            "pending".into(),
             json!({}),
             None,
         );

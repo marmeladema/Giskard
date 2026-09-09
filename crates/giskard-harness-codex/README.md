@@ -13,10 +13,10 @@ identifiers.
 
 `CodexHarness` is the cloneable public API handle. Each project app-server process has exactly one
 non-cloneable `CodexInstance`, owned by exactly one Tokio task, that owns its transport, mapper,
-active turns, pending compactions and context restores, workspace configuration, command/control
-receivers, and worker lifecycle. It serves every native thread on that process and is unrelated to
-the Primary/sub-agent hierarchy. Helper futures borrow its protocol state through `&mut self`; no
-independent worker mutates that state.
+active turns, pending steering requests, pending compactions and context restores, workspace
+configuration, command/control receivers, and worker lifecycle. It serves every native thread on
+that process and is unrelated to the Primary/sub-agent hierarchy. Helper futures borrow its
+protocol state through `&mut self`; no independent worker mutates that state.
 
 The transport may own internal reader and writer tasks for stdio and request correlation; they
 never access mapper, route, turn, compaction, or context-restore state.
@@ -361,6 +361,18 @@ directory, not the project workspace. The adapter removes it through
 Cleanup failures are logged but do not replace the turn result. Giskard omits
 raw attachment bytes from persisted history and the parsed in-memory history
 cache.
+
+## Turn steering
+
+The adapter advertises `turn_steering` and sends text-only steering input through `turn/steer`.
+The request remains task-owned pending state while the transport correlates its response, so a
+hung steering response does not block interrupt or other worker controls. Its queue token remains
+observable until the response, timeout, or shutdown resolves it. The caller supplies the expected
+Giskard `TurnId`; the adapter requires it to equal the acknowledged active turn, resolves that
+turn's Codex-native ID, sends the native ID as `expectedTurnId`, and requires the response to echo
+it exactly. A missing, completed, or stale turn, a missing native mapping, a response mismatch, and
+a timeout all fail the steering request without changing the active turn or its mapper state.
+Steering does not apply turn overrides or upload attachments and does not create another turn.
 
 Harness shutdown is completion-based: every caller waits until the single worker has cleaned active
 turn uploads and closed the Codex transport. Transport shutdown is bounded; on timeout the adapter

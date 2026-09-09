@@ -5,9 +5,9 @@ use crate::uploads::{cleanup_active_turn_upload, cleanup_all_active_turn_uploads
 /// One task-owned runtime for one Codex app-server process.
 ///
 /// Exactly one instance is created for each spawned transport and moved into exactly one Tokio
-/// task. Its mapper, active turns, pending compactions, and pending context restores never leave
-/// that task; helper futures may borrow this state only through `&mut self`. No independent worker
-/// may mutate protocol state.
+/// task. Its mapper, active turns, pending steering requests, pending compactions, and pending
+/// context restores never leave that task; helper futures may borrow this state only through
+/// `&mut self`. No independent worker may mutate protocol state.
 ///
 /// This runtime serves every native thread on the process and is unrelated to a primary-thread or
 /// sub-agent hierarchy.
@@ -21,6 +21,7 @@ pub(super) struct CodexInstance<C> {
     writable_roots: Vec<PathBuf>,
     mapper: CodexMapper,
     active_turns: ActiveTurns,
+    pending_steers: Vec<PendingSteer>,
     pending_compactions: HashMap<ThreadId, PendingCompaction>,
     pending_context_restores: HashMap<NativeThreadId, PendingContextRestore>,
 }
@@ -48,6 +49,7 @@ impl<C> CodexInstance<C> {
             writable_roots,
             mapper,
             active_turns: HashMap::new(),
+            pending_steers: Vec::new(),
             pending_compactions: HashMap::new(),
             pending_context_restores: HashMap::new(),
         };
@@ -112,6 +114,7 @@ where
             tokio::select! {
                 biased;
                 _ = wait_for_shutdown_request(&mut self.receivers.shutdown) => {
+                    self.fail_pending_steers("Codex harness shut down before turn steering completed");
                     cleanup_all_active_turn_uploads(&mut self.client, &mut self.active_turns).await;
                     shutdown_codex_transport(self.client, &self.workspace_root).await;
                     self.worker_queue.close();
@@ -206,6 +209,10 @@ where
                         }
                     }
                 }
+                completed = poll_pending_steer(&mut self.pending_steers), if !self.pending_steers.is_empty() => {
+                    let (index, result) = completed;
+                    self.finish_pending_steer(index, result);
+                }
                 queued = self.receivers.commands.recv() => {
                     let queued = match queued {
                         Some(queued) => queued,
@@ -226,14 +233,16 @@ where
                     };
                     self.worker_queue.mark_started(queued.token);
                     let token = queued.token;
-                    self.handle_control_command(queued.command).await;
-                    self.worker_queue.mark_finished(token);
+                    if self.handle_control_command(queued.command, token).await {
+                        self.worker_queue.mark_finished(token);
+                    }
                 }
                 _ = first_event_warn_tick.tick(), if !self.active_turns.is_empty() => {
                     warn_slow_first_events(&mut self.active_turns);
                 }
             }
         }
+        self.fail_pending_steers("Codex worker stopped before turn steering completed");
         self.worker_queue.close();
         self.discoveries.close();
         self.receivers.done.send_replace(true);
@@ -573,7 +582,68 @@ impl<C> CodexInstance<C>
 where
     C: CodexTransport,
 {
-    async fn handle_control_command(&mut self, control: ControlCommand) {
+    fn finish_pending_steer(&mut self, index: usize, result: Result<(), HarnessError>) {
+        let pending = self.pending_steers.swap_remove(index);
+        match &result {
+            Ok(()) => debug!(
+                thread_id = %pending.thread.thread,
+                harness_thread_id = %pending.thread.harness_thread_id,
+                turn_id = %pending.expected_turn,
+                native_turn_id = %pending.native_turn_id,
+                elapsed_ms = pending.started_at.elapsed().as_millis(),
+                "Codex accepted turn steering input"
+            ),
+            Err(HarnessError::Timeout(_)) => warn!(
+                action = "steer_turn",
+                method = codex_codes::protocol::methods::TURN_STEER,
+                thread_id = %pending.thread.thread,
+                harness_thread_id = %pending.thread.harness_thread_id,
+                turn_id = %pending.expected_turn,
+                native_turn_id = %pending.native_turn_id,
+                elapsed_ms = pending.started_at.elapsed().as_millis(),
+                timeout_ms = CODEX_JSON_RPC_TIMEOUT.as_millis(),
+                "Codex turn steering request timed out; worker continued processing controls"
+            ),
+            Err(error) => warn!(
+                action = "steer_turn",
+                method = codex_codes::protocol::methods::TURN_STEER,
+                thread_id = %pending.thread.thread,
+                harness_thread_id = %pending.thread.harness_thread_id,
+                turn_id = %pending.expected_turn,
+                native_turn_id = %pending.native_turn_id,
+                error = %error,
+                elapsed_ms = pending.started_at.elapsed().as_millis(),
+                "Codex turn steering request failed"
+            ),
+        }
+        let _ = pending.response.send(result);
+        self.worker_queue.mark_finished(pending.token);
+    }
+
+    fn fail_pending_steers(&mut self, message: &str) {
+        for pending in self.pending_steers.drain(..) {
+            warn!(
+                action = "steer_turn",
+                thread_id = %pending.thread.thread,
+                harness_thread_id = %pending.thread.harness_thread_id,
+                turn_id = %pending.expected_turn,
+                native_turn_id = %pending.native_turn_id,
+                error = message,
+                elapsed_ms = pending.started_at.elapsed().as_millis(),
+                "abandoning pending Codex turn steering request"
+            );
+            let _ = pending
+                .response
+                .send(Err(HarnessError::Transport(message.to_owned())));
+            self.worker_queue.mark_finished(pending.token);
+        }
+    }
+
+    async fn handle_control_command(
+        &mut self,
+        control: ControlCommand,
+        token: WorkerQueueToken,
+    ) -> bool {
         match control {
             ControlCommand::ClaimNativeThread {
                 thread,
@@ -649,6 +719,68 @@ where
                 }
                 let _ = response.send(result);
             }
+            ControlCommand::SteerTurn {
+                thread,
+                expected_turn,
+                text,
+                response,
+            } => {
+                let active = match self.active_turns.get(&thread.thread) {
+                    Some(active) => active,
+                    None => {
+                        let _ = response.send(Err(HarnessError::Protocol(format!(
+                            "cannot steer turn {expected_turn}: thread {} has no active turn",
+                            thread.thread
+                        ))));
+                        return true;
+                    }
+                };
+                if active.acknowledged_turn != expected_turn {
+                    let _ = response.send(Err(HarnessError::Protocol(format!(
+                        "cannot steer stale turn {expected_turn}: active turn for thread {} is {}",
+                        thread.thread, active.acknowledged_turn
+                    ))));
+                    return true;
+                }
+                let Some(native_turn_id) = self
+                    .mapper
+                    .active_native_turn_for_thread(thread.thread)
+                    .map(str::to_owned)
+                else {
+                    let _ = response.send(Err(HarnessError::Protocol(format!(
+                            "cannot steer turn {expected_turn}: Codex has no active native turn for thread {}",
+                            thread.thread
+                        ))));
+                    return true;
+                };
+                let request =
+                    match start_steer_request(&mut self.client, &thread, &native_turn_id, &text) {
+                        Ok(request) => request,
+                        Err(error) => {
+                            warn!(
+                                action = "steer_turn",
+                                thread_id = %thread.thread,
+                                harness_thread_id = %thread.harness_thread_id,
+                                turn_id = %expected_turn,
+                                native_turn_id,
+                                error = %error,
+                                "could not start Codex turn steering request"
+                            );
+                            let _ = response.send(Err(error));
+                            return true;
+                        }
+                    };
+                self.pending_steers.push(PendingSteer {
+                    token,
+                    response,
+                    thread,
+                    expected_turn,
+                    native_turn_id,
+                    started_at: Instant::now(),
+                    request,
+                });
+                return false;
+            }
             ControlCommand::TerminateCommand {
                 thread,
                 process_id,
@@ -674,7 +806,7 @@ where
                     let _ = response.send(Err(HarnessError::Unsupported(
                         "context compaction is not available during an active turn".into(),
                     )));
-                    return;
+                    return true;
                 }
                 let started = Instant::now();
                 info!(
@@ -804,5 +936,6 @@ where
                 let _ = response.send(result);
             }
         }
+        true
     }
 }

@@ -2366,6 +2366,7 @@ mod tests {
             LoadedThreadBinding {
                 project_id,
                 handle: ThreadHandle::detached(thread_id, format!("native-{thread_id}")),
+                turn_steering: false,
                 native_model: None,
             },
             classification,
@@ -3950,6 +3951,7 @@ mod tests {
             super::LoadedThreadBinding {
                 project_id,
                 handle: ThreadHandle::detached(thread_id, "native-orphan".into()),
+                turn_steering: false,
                 native_model: Some(initial_model),
             },
             super::ClassificationPhase::Orphan,
@@ -5712,6 +5714,7 @@ mod tests {
             super::LoadedThreadBinding {
                 project_id,
                 handle: native_handle.clone(),
+                turn_steering: false,
                 native_model: Some(model),
             },
             super::ClassificationPhase::Primary,
@@ -5780,6 +5783,7 @@ mod tests {
             super::LoadedThreadBinding {
                 project_id,
                 handle: native_handle,
+                turn_steering: false,
                 native_model: Some(ModelRef {
                     provider: "openai".into(),
                     model: "test".into(),

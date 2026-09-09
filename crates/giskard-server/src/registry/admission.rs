@@ -41,6 +41,7 @@ fn admitted(
     project_id: giskard_core::ids::ProjectId,
     handle: ThreadHandle,
     file: &ThreadFile,
+    turn_steering: bool,
 ) -> Admitted {
     Admitted {
         binding: LoadedThreadBinding {
@@ -49,6 +50,7 @@ fn admitted(
                 .resumed_model
                 .clone()
                 .or_else(|| file.current_model.as_known().cloned()),
+            turn_steering,
             handle,
         },
         classification: ClassificationPhase::from(file.kind),
@@ -97,6 +99,7 @@ pub(super) async fn admit(
     project_id: giskard_core::ids::ProjectId,
     source: Admission,
 ) -> Result<Option<Admitted>, HarnessError> {
+    let turn_steering = harness.capabilities().turn_steering;
     let project = shared
         .services
         .store
@@ -219,7 +222,7 @@ pub(super) async fn admit(
                     .publish_created(project_id, &file)
                     .await;
             }
-            return Ok(Some(admitted(project_id, handle, &file)));
+            return Ok(Some(admitted(project_id, handle, &file, turn_steering)));
         }
     };
 
@@ -265,7 +268,7 @@ pub(super) async fn admit(
                 warn!(%project_id, parent_thread_id = %parent.id,
                     linked_harness_thread_id = %handle.harness_thread_id,
                     "refusing to materialize a sub-agent under an invalid parent chain");
-                return Ok(Some(admitted(project_id, handle, &file)));
+                return Ok(Some(admitted(project_id, handle, &file, turn_steering)));
             }
             if let Some(native_parent) = handle.parent_harness_thread_id.as_deref()
                 && native_parent != parent.harness_thread_id
@@ -275,7 +278,7 @@ pub(super) async fn admit(
                     reported_parent_harness_thread_id = %native_parent,
                     linked_harness_thread_id = %handle.harness_thread_id,
                     "refusing to materialize a native thread under a mismatched parent");
-                return Ok(Some(admitted(project_id, handle, &file)));
+                return Ok(Some(admitted(project_id, handle, &file, turn_steering)));
             }
             let desired_title = subagent_thread_title(&subagent_info_with_agent_name(
                 link.info.clone(),
@@ -345,5 +348,5 @@ pub(super) async fn admit(
         return Ok(None);
     }
 
-    Ok(Some(admitted(project_id, handle, &file)))
+    Ok(Some(admitted(project_id, handle, &file, turn_steering)))
 }

@@ -8,6 +8,8 @@ export const PASSWORD = process.env.GISKARD_REPLAY_PASSWORD ?? "giskard";
  * `SCRIPTED_REPLY` in `crates/giskard-server/src/bin/giskard-server-replay.rs`.
  */
 export const SCRIPTED_REPLY = "Hello from the scripted replay harness!";
+export const SCRIPTED_STEERING_TRIGGER = "Hold this turn open for scripted steering.";
+export const SCRIPTED_STEERING_REPLY = "Scripted steering accepted on the active turn.";
 export const SCRIPTED_DIFF_TRIGGER = "Trigger two scripted lazy diffs.";
 export const SCRIPTED_DIFF_PATH = "src/lazy-diff.rs";
 export const SCRIPTED_SUBAGENT_TRIGGER = "Spawn the scripted linked sub-agent.";

@@ -26,7 +26,9 @@ use transport::StdioTransport;
 use uploads::{cleanup_codex_upload_dir, prepare_user_input_for_codex_uploads};
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::sync::{Arc, Mutex as StdMutex, MutexGuard as StdMutexGuard, Weak};
 use std::time::{Duration, Instant};
 
@@ -172,6 +174,21 @@ struct QueuedControlCommand {
     command: ControlCommand,
 }
 
+type CodexRequestFuture =
+    Pin<Box<dyn Future<Output = Result<Value, HarnessError>> + Send + 'static>>;
+
+type PendingSteerFuture = Pin<Box<dyn Future<Output = Result<(), HarnessError>> + Send + 'static>>;
+
+struct PendingSteer {
+    token: WorkerQueueToken,
+    response: oneshot::Sender<Result<(), HarnessError>>,
+    thread: ThreadHandle,
+    expected_turn: TurnId,
+    native_turn_id: String,
+    started_at: Instant,
+    request: PendingSteerFuture,
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ThreadBackgroundTerminalsTerminateParams {
@@ -217,6 +234,12 @@ enum ControlCommand {
     },
     Interrupt {
         thread: ThreadHandle,
+        response: oneshot::Sender<Result<(), HarnessError>>,
+    },
+    SteerTurn {
+        thread: ThreadHandle,
+        expected_turn: TurnId,
+        text: String,
         response: oneshot::Sender<Result<(), HarnessError>>,
     },
     TerminateCommand {
@@ -387,11 +410,16 @@ impl<'a> CodexOperationContext<'a> {
 
 #[async_trait]
 trait CodexTransport: Send {
+    fn start_request_json(&mut self, method: &str, params: serde_json::Value)
+    -> CodexRequestFuture;
+
     async fn request_json(
         &mut self,
         method: &str,
         params: serde_json::Value,
-    ) -> Result<serde_json::Value, HarnessError>;
+    ) -> Result<serde_json::Value, HarnessError> {
+        self.start_request_json(method, params).await
+    }
 
     async fn next_message(
         &mut self,
@@ -536,6 +564,7 @@ impl CodexHarness {
                 mcp_reload: true,
                 mcp_oauth_login: true,
                 context_compaction: true,
+                turn_steering: true,
             },
         });
 
@@ -573,6 +602,7 @@ impl CodexHarness {
         let thread_id = match &command {
             ControlCommand::ClaimNativeThread { thread, .. } => Some(*thread),
             ControlCommand::Interrupt { thread, .. }
+            | ControlCommand::SteerTurn { thread, .. }
             | ControlCommand::TerminateCommand { thread, .. }
             | ControlCommand::CompactThread { thread, .. }
             | ControlCommand::SetThreadName { thread, .. }
@@ -1053,6 +1083,27 @@ impl AgentHarness for CodexHarness {
             "interrupt",
             ControlCommand::Interrupt {
                 thread: thread.clone(),
+                response: tx,
+            },
+        )
+        .await?;
+        rx.await
+            .map_err(|_| HarnessError::Transport("background task dropped response".into()))?
+    }
+
+    async fn steer_turn(
+        &self,
+        thread: &ThreadHandle,
+        expected_turn: TurnId,
+        text: String,
+    ) -> Result<(), HarnessError> {
+        let (tx, rx) = oneshot::channel();
+        self.enqueue_control(
+            "steer_turn",
+            ControlCommand::SteerTurn {
+                thread: thread.clone(),
+                expected_turn,
+                text,
                 response: tx,
             },
         )
@@ -2145,6 +2196,55 @@ async fn handle_interrupt(
     .await
 }
 
+fn start_steer_request(
+    client: &mut dyn CodexTransport,
+    thread: &ThreadHandle,
+    native_turn_id: &str,
+    text: &str,
+) -> Result<PendingSteerFuture, HarnessError> {
+    let params = codex_codes::TurnSteerParams {
+        thread_id: thread.harness_thread_id.clone(),
+        expected_turn_id: native_turn_id.to_owned(),
+        input: vec![codex_codes::UserInput::Text {
+            text: text.to_owned(),
+            text_elements: None,
+        }],
+        ..Default::default()
+    };
+    let params =
+        serde_json::to_value(params).map_err(|error| HarnessError::Protocol(error.to_string()))?;
+    let request = client.start_request_json(codex_codes::protocol::methods::TURN_STEER, params);
+    let expected_native_turn_id = native_turn_id.to_owned();
+    Ok(Box::pin(async move {
+        let response = tokio::time::timeout(CODEX_JSON_RPC_TIMEOUT, request)
+            .await
+            .map_err(|_| {
+                HarnessError::Timeout("Codex JSON-RPC request turn/steer timed out".into())
+            })??;
+        let response: codex_codes::TurnSteerResponse = serde_json::from_value(response)
+            .map_err(|error| HarnessError::Protocol(error.to_string()))?;
+        if response.turn_id != expected_native_turn_id {
+            return Err(HarnessError::Protocol(format!(
+                "turn/steer response named native turn {:?}, expected {:?}",
+                response.turn_id, expected_native_turn_id
+            )));
+        }
+        Ok(())
+    }))
+}
+
+async fn poll_pending_steer(pending: &mut [PendingSteer]) -> (usize, Result<(), HarnessError>) {
+    std::future::poll_fn(|context| {
+        for (index, pending) in pending.iter_mut().enumerate() {
+            if let std::task::Poll::Ready(result) = pending.request.as_mut().poll(context) {
+                return std::task::Poll::Ready((index, result));
+            }
+        }
+        std::task::Poll::Pending
+    })
+    .await
+}
+
 async fn handle_terminate_command(
     client: &mut dyn CodexTransport,
     thread: &ThreadHandle,
@@ -2745,6 +2845,7 @@ mod tests {
         command_exec_terminate_error: Option<String>,
         thread_delete_error: Option<String>,
         thread_resume_missing_rollout_failures: usize,
+        steer_response_turn_id: Option<String>,
         model_list_error: Option<String>,
         config_read_error: Option<String>,
         /// `model_provider` in the `config/read` payload; `None` omits the key, as a config that
@@ -2818,6 +2919,10 @@ mod tests {
 
         async fn resume_method(&self, method: &'static str) {
             self.state.lock().await.hang_methods.remove(method);
+        }
+
+        async fn steer_response_turn_id(&self, turn_id: Option<&str>) {
+            self.state.lock().await.steer_response_turn_id = turn_id.map(str::to_owned);
         }
 
         async fn background_terminal_terminate_result(&self, result: bool) {
@@ -2903,6 +3008,16 @@ mod tests {
 
     #[async_trait]
     impl CodexTransport for FakeCodexTransport {
+        fn start_request_json(&mut self, method: &str, params: Value) -> CodexRequestFuture {
+            let (_events_tx, events_rx) = mpsc::channel(1);
+            let mut transport = FakeCodexTransport {
+                state: self.state.clone(),
+                events_rx,
+            };
+            let method = method.to_owned();
+            Box::pin(async move { transport.request_json(&method, params).await })
+        }
+
         async fn request_json(
             &mut self,
             method: &str,
@@ -2969,6 +3084,12 @@ mod tests {
                             }
                         }))
                     }
+                    codex_codes::protocol::methods::TURN_STEER => Ok(json!({
+                        "turnId": state
+                            .steer_response_turn_id
+                            .clone()
+                            .unwrap_or_else(|| params["expectedTurnId"].as_str().unwrap_or_default().to_owned())
+                    })),
                     codex_codes::protocol::methods::THREAD_COMPACT_START
                     | codex_codes::protocol::methods::THREAD_ARCHIVE
                     | codex_codes::protocol::methods::THREAD_UNARCHIVE
@@ -3574,6 +3695,268 @@ mod tests {
                 &completed_event(ThreadId::new(), first_turn)
             ),
             None
+        );
+    }
+
+    #[tokio::test]
+    async fn codex_worker_steers_the_exact_active_turn_on_the_control_lane() {
+        let (harness, controller) = spawn_fake_harness();
+        assert!(harness.capabilities().turn_steering);
+        let thread = harness
+            .open_thread(open_opts(ThreadId::new(), None))
+            .await
+            .unwrap();
+        let turn = harness
+            .start_turn(
+                &thread,
+                UserInput::text("initial input"),
+                build_turn_overrides(),
+            )
+            .await
+            .unwrap();
+        let native_turn = controller.started_turns().await[0].native_turn_id.clone();
+
+        timeout(
+            Duration::from_secs(1),
+            harness.steer_turn(&thread, turn, "additional direction".into()),
+        )
+        .await
+        .expect("steering must be serviced while the turn is active")
+        .unwrap();
+
+        let requests = controller.requests().await;
+        let steer = requests
+            .iter()
+            .find(|request| request.method == codex_codes::protocol::methods::TURN_STEER)
+            .expect("turn/steer request should be recorded");
+        assert_eq!(steer.params["threadId"], thread.harness_thread_id);
+        assert_eq!(steer.params["expectedTurnId"], native_turn);
+        assert_eq!(
+            steer.params["input"],
+            json!([{ "type": "text", "text": "additional direction" }])
+        );
+
+        harness
+            .steer_turn(&thread, turn, "one more detail".into())
+            .await
+            .expect("accepted steering must not clear the active turn");
+    }
+
+    #[tokio::test]
+    async fn codex_worker_rejects_missing_and_stale_local_turns_without_an_rpc() {
+        let (harness, controller) = spawn_fake_harness();
+        let thread = harness
+            .open_thread(open_opts(ThreadId::new(), None))
+            .await
+            .unwrap();
+        let no_active = harness
+            .steer_turn(&thread, TurnId::new(), "too soon".into())
+            .await
+            .expect_err("a thread without an active turn cannot be steered");
+        assert!(
+            matches!(no_active, HarnessError::Protocol(message) if message.contains("no active turn"))
+        );
+
+        let turn = harness
+            .start_turn(&thread, UserInput::text("initial"), build_turn_overrides())
+            .await
+            .unwrap();
+        let stale = TurnId::new();
+        assert_ne!(turn, stale);
+        let stale_error = harness
+            .steer_turn(&thread, stale, "wrong turn".into())
+            .await
+            .expect_err("a stale local turn id must be rejected");
+        assert!(
+            matches!(stale_error, HarnessError::Protocol(message) if message.contains("stale turn"))
+        );
+        assert_eq!(
+            controller
+                .requests()
+                .await
+                .iter()
+                .filter(|request| request.method == codex_codes::protocol::methods::TURN_STEER)
+                .count(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn codex_worker_rejects_a_mismatched_steer_response_without_clearing_active_turn() {
+        let (harness, controller) = spawn_fake_harness();
+        let thread = harness
+            .open_thread(open_opts(ThreadId::new(), None))
+            .await
+            .unwrap();
+        let turn = harness
+            .start_turn(&thread, UserInput::text("initial"), build_turn_overrides())
+            .await
+            .unwrap();
+        controller
+            .steer_response_turn_id(Some("foreign-native-turn"))
+            .await;
+
+        let error = harness
+            .steer_turn(&thread, turn, "direction".into())
+            .await
+            .expect_err("Codex must echo the exact native active turn id");
+        assert!(
+            matches!(error, HarnessError::Protocol(message) if message.contains("foreign-native-turn"))
+        );
+
+        controller.steer_response_turn_id(None).await;
+        harness
+            .steer_turn(&thread, turn, "retry".into())
+            .await
+            .expect("a response mismatch must not clear active turn state");
+    }
+
+    #[tokio::test]
+    async fn codex_worker_recovers_after_hung_steer_request() {
+        let (harness, controller) = spawn_fake_harness();
+        let thread = harness
+            .open_thread(open_opts(ThreadId::new(), None))
+            .await
+            .unwrap();
+        let turn = harness
+            .start_turn(&thread, UserInput::text("initial"), build_turn_overrides())
+            .await
+            .unwrap();
+        controller
+            .hang_method(codex_codes::protocol::methods::TURN_STEER)
+            .await;
+
+        let error = timeout(
+            Duration::from_secs(1),
+            harness.steer_turn(&thread, turn, "will time out".into()),
+        )
+        .await
+        .expect("worker-side timeout must answer the steering caller")
+        .expect_err("hung turn/steer should return a timeout");
+        assert!(matches!(error, HarnessError::Timeout(_)));
+
+        controller
+            .resume_method(codex_codes::protocol::methods::TURN_STEER)
+            .await;
+        harness
+            .steer_turn(&thread, turn, "retry".into())
+            .await
+            .expect("a steering timeout must not clear active turn state");
+    }
+
+    #[tokio::test]
+    async fn codex_worker_interrupts_before_a_hung_steer_times_out() {
+        let (harness, controller) = spawn_fake_harness();
+        let thread = harness
+            .open_thread(open_opts(ThreadId::new(), None))
+            .await
+            .unwrap();
+        let turn = harness
+            .start_turn(&thread, UserInput::text("initial"), build_turn_overrides())
+            .await
+            .unwrap();
+        controller
+            .hang_method(codex_codes::protocol::methods::TURN_STEER)
+            .await;
+
+        let steer_harness = harness.clone();
+        let steer_thread = thread.clone();
+        let steer = tokio::spawn(async move {
+            steer_harness
+                .steer_turn(&steer_thread, turn, "pending direction".into())
+                .await
+        });
+        timeout(Duration::from_secs(1), async {
+            loop {
+                if controller
+                    .requests()
+                    .await
+                    .iter()
+                    .any(|request| request.method == codex_codes::protocol::methods::TURN_STEER)
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the pending turn/steer request must be issued");
+
+        harness
+            .interrupt(&thread)
+            .await
+            .expect("interrupt must bypass a pending steering response");
+        assert!(
+            !steer.is_finished(),
+            "interrupt must finish before the hung steering request times out"
+        );
+        let requests = controller.requests().await;
+        let methods: Vec<_> = requests
+            .iter()
+            .map(|request| request.method.as_str())
+            .collect();
+        let steer_position = methods
+            .iter()
+            .position(|method| *method == codex_codes::protocol::methods::TURN_STEER)
+            .expect("turn/steer request position");
+        let interrupt_position = methods
+            .iter()
+            .position(|method| *method == codex_codes::protocol::methods::TURN_INTERRUPT)
+            .expect("turn/interrupt request position");
+        assert!(steer_position < interrupt_position);
+
+        let steering_error = steer
+            .await
+            .expect("steering task should join")
+            .expect_err("the still-hung steering request should time out");
+        assert!(matches!(steering_error, HarnessError::Timeout(_)));
+    }
+
+    #[tokio::test]
+    async fn codex_worker_shutdown_fails_pending_steering_without_waiting_for_its_timeout() {
+        let (harness, controller) = spawn_fake_harness();
+        let thread = harness
+            .open_thread(open_opts(ThreadId::new(), None))
+            .await
+            .unwrap();
+        let turn = harness
+            .start_turn(&thread, UserInput::text("initial"), build_turn_overrides())
+            .await
+            .unwrap();
+        controller
+            .hang_method(codex_codes::protocol::methods::TURN_STEER)
+            .await;
+
+        let steer_harness = harness.clone();
+        let steer_thread = thread.clone();
+        let steer = tokio::spawn(async move {
+            steer_harness
+                .steer_turn(&steer_thread, turn, "pending direction".into())
+                .await
+        });
+        timeout(Duration::from_secs(1), async {
+            loop {
+                if controller
+                    .requests()
+                    .await
+                    .iter()
+                    .any(|request| request.method == codex_codes::protocol::methods::TURN_STEER)
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the pending turn/steer request must be issued");
+
+        harness.shutdown().await.expect("shutdown should complete");
+        let steering_error = steer
+            .await
+            .expect("steering task should join")
+            .expect_err("shutdown must fail pending steering");
+        assert!(
+            matches!(steering_error, HarnessError::Transport(message) if message.contains("shut down"))
         );
     }
 

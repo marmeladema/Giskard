@@ -91,6 +91,10 @@ async fn index_page_is_served_and_public() {
     );
     assert!(body.contains("send_input"), "composer wired to SendInput");
     assert!(
+        body.contains("type:\"steer_input\"") && body.contains("turn_steering"),
+        "composer is wired to capability-gated same-turn steering"
+    );
+    assert!(
         body.contains("initComposerFileTransfers()")
             && body.contains("composer.addEventListener(\"drop\"")
             && body.contains("await attachFiles(Array.from(e.dataTransfer.files || []))")
@@ -1089,9 +1093,9 @@ async fn index_page_is_served_and_public() {
     );
     assert!(
         body.contains("const attachmentsLoading = pendingAttachmentOperationCount() > 0")
-            && body.contains(
-                "readOnly || state.activeTurn || state.updateRequired || state.uiVersionCheckPending ||"
-            )
+            && body.contains("const steering = state.activeTurn && !draft")
+            && body.contains("? readOnly || !canSteer || !state.currentRenderTurnId")
+            && body.contains("readOnly || state.updateRequired || state.uiVersionCheckPending ||")
             && body.contains("attachmentsLoading || modelUnresolved || nothingToSend ||")
             && body.contains("!hasThreadSurface || (!ready && !draft)")
             && body.contains("if (isDraftThread()) {")
@@ -1948,6 +1952,7 @@ fn browser_resubscribe_replaces_transient_transcript_state() {
         "$(\"transcript\").innerHTML=\"\";",
         "state.pendingUserEl = null;",
         "state.pendingUserText = null;",
+        "state.pendingSteer = null;",
         "state.pendingOlder = false;",
         "state.loadingHistory = false;",
         "state.oldestTurnId = null;",
@@ -1995,6 +2000,114 @@ fn browser_marks_turn_active_when_send_is_accepted() {
             "if (msg.action===\"send_input\") {\n        setTurnActive(msg.code === \"thread_turn_active\");\n      }"
         ),
         "send_input errors must reconcile optimistic active-turn state"
+    );
+}
+
+#[test]
+fn browser_steers_only_an_acknowledged_supported_active_turn() {
+    let body = app_js();
+    let open_thread = between(
+        body,
+        "async function openThread(pid, tid, title, opts) {",
+        "function clearWsReconnectTimer()",
+    );
+    assert!(open_thread.contains("state.turnSteering = !!res.turn_steering;"));
+
+    let controls = between(
+        body,
+        "function updateComposerControls() {",
+        "function setTurnActive(active) {",
+    );
+    assert!(controls.contains(
+        "? readOnly || !canSteer || !state.currentRenderTurnId || !!state.pendingSteer ||"
+    ));
+    assert!(controls.contains("$(\"sendBtn\").hidden = steering && (!canSteer || !steeringText);"));
+    assert!(controls.contains("$(\"stopBtn\").hidden = !state.activeTurn || draft;"));
+
+    let send_input = between(
+        body,
+        "function sendInput() {",
+        "$(\"sendBtn\").onclick = sendInput;",
+    );
+    assert_order(
+        send_input,
+        "if (state.activeTurn) {",
+        "const attachments = state.pendingAttachments.slice();",
+    );
+    assert!(send_input.contains(
+        "send({ type:\"steer_input\", thread_id:state.threadId, turn_id:turnId, text })"
+    ));
+    assert!(send_input.contains("if (!state.currentRenderTurnId)"));
+    assert!(send_input.contains("if (state.pendingSteer)"));
+    assert!(send_input.contains("state.pendingSteer = { turnId, text, element };"));
+
+    let attachment_gate = between(
+        body,
+        "function composerCanAcceptAttachments() {",
+        "function initComposerFileTransfers()",
+    );
+    assert!(attachment_gate.contains("!state.uiVersionCheckPending && !state.activeTurn"));
+}
+
+#[test]
+fn browser_reconciles_pending_steering_without_clearing_the_active_turn() {
+    let body = app_js();
+    let fail_steer = between(
+        body,
+        "function failPendingSteer() {",
+        "function serverMessageThreadId(msg)",
+    );
+    assert!(fail_steer.contains("pending.element.classList.add(\"failed\");"));
+    assert!(fail_steer.contains("state.pendingSteer = null;"));
+    assert!(!fail_steer.contains("setTurnActive("));
+    assert!(!fail_steer.contains("pendingUser"));
+
+    let error_case = between(body, "case \"error\":", "      break;\n  }");
+    assert!(error_case.contains("if (msg.action===\"steer_input\") failPendingSteer();"));
+
+    let add_item = between(
+        body,
+        "function addItem(item, turnId, fromHistory) {",
+        "function scopedItemKey",
+    );
+    assert!(add_item.contains("String(turnId || \"\") === state.pendingSteer.turnId &&"));
+    assert!(add_item.contains("p.text === state.pendingSteer.text"));
+    assert!(add_item.contains("state.pendingSteer = null;"));
+
+    let reset = between(
+        body,
+        "function resetTranscriptForAuthoritativeSnapshot() {",
+        "const MODE_LABELS",
+    );
+    let reconcile = between(
+        body,
+        "function reconcileInFlightTurn() {",
+        "function firstLiveTurnRow",
+    );
+    assert!(reset.contains("state.pendingSteer = null;"));
+    assert!(reconcile.contains("state.pendingSteer = null;"));
+}
+
+#[test]
+fn browser_reconciles_identical_delayed_initial_echo_before_steering_echo() {
+    let body = app_js();
+    let add_item = between(
+        body,
+        "function addItem(item, turnId, fromHistory) {",
+        "function scopedItemKey",
+    );
+
+    // Both optimistic rows may contain identical text. The ordered first UserMessage must consume
+    // the initiating row; only the later echo may reach the steering-row matcher.
+    assert_order(
+        add_item,
+        "if (state.pendingUserEl &&\n        (p.text===state.pendingUserText",
+        "if (state.pendingSteer && String(turnId || \"\") === state.pendingSteer.turnId",
+    );
+    assert_order(
+        add_item,
+        "state.pendingUserEl = null;\n      state.pendingUserText = null;",
+        "p.text === state.pendingSteer.text",
     );
 }
 

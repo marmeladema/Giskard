@@ -9,7 +9,15 @@
 
 **Document status:** Implementation-ready specification.
 **Audience:** An AI coding agent (and its human reviewer) implementing the system.
-**Version:** 1.90
+**Version:** 1.91
+
+> **Amendment — active-turn steering (1.91).** Once a normal user turn has an acknowledged turn
+> ID, the composer may append text to that exact turn through a distinct `SteerInput` action and
+> the harness's same-turn steering operation. Steering never reserves another turn, applies new
+> overrides, or queues a later turn. The expected turn ID is mandatory at the browser, server, and
+> provider boundaries, so completion races fail instead of redirecting input into a successor.
+> Steered messages are ordinary same-turn user-message items in live state and history. This first
+> slice is text-only; attachments remain disabled while a turn is active.
 
 > **Amendment — pasted attachments (1.90).** Files pasted into the focused composer use the same
 > attachment ingestion, validation, limits, and pending tray as files selected with the attachment
@@ -168,6 +176,16 @@
 > below as historical design context, not a current requirement. The wire contract (`giskard-proto`)
 > and all backend design remain authoritative.
 
+**Changelog (1.90 → 1.91), active-turn steering:**
+- **TS1:** `SteerInput { thread_id, turn_id, text }` appends text only to the exact acknowledged
+  active user turn. It is not a second `SendInput`, a new turn, or a queued follow-up.
+- **TS2:** `AgentHarness::steer_turn` is capability-gated. Codex maps it to `turn/steer` with the
+  exact native `expectedTurnId` and verifies the response returns that same turn.
+- **TS3:** While an active steerable turn has composer text, Send appears beside the always-usable
+  Stop control. Only one optimistic steer is pending per browser tab; failures leave the real turn
+  active. Attachments, unacknowledged starts, manual compactions, and persistence-blocked turns are
+  not steerable.
+
 **Changelog (1.89 → 1.90), pasted attachments:**
 - **A2:** The focused composer accepts clipboard files through the existing attachment pipeline.
   Mixed file-and-text clipboard content inserts its plain text and attaches every file, while
@@ -225,7 +243,7 @@
   - Both Codex spellings of the extended OpenAI MCP elicitation form (`openai/form` and
     `openaiForm`) preserve request routing and MCP approval promotion.
   Everything else the release adds — paginated `thread/items/list`, `thread/turns/list` and
-  `thread/revert`, a typed `turn/steer` helper, `McpServerStatus.runtimeStatus`, the realtime item
+  `thread/revert`, `McpServerStatus.runtimeStatus`, the realtime item
   timeline, and the newly typed `project/changed`, `thread/queue/changed`, `thread/reverted`,
   `mcpServer/event/stream/notification`, auth-recovery notifications, asynchronous agent-message
   questions, persisted thread model/reasoning metadata, plugin reconciliation and response-usage
@@ -318,7 +336,7 @@
   `rust-toolchain.toml`, so nothing enforces the manifest's claim — the bump is deliberate.
 
 **Changelog (1.66 → 1.67), per-turn payload files with a versioned header:**
-- **Motivation:** a turn's *count* is human-scaled (someone types each prompt) while a turn's
+- **Motivation:** a turn's *count* is human-scaled (someone starts each turn) while a turn's
   *contents* are agent-driven and unbounded (command output, diffs, tool JSON). Writing both to one
   append-only file put them on the same durability mechanism, and the large one broke it: a whole
   turn written with one `write_all` can be torn by a crash or a full disk, the next append
@@ -1512,7 +1530,7 @@ Robot series). The Cargo workspace uses `giskard-*` crate names throughout (see 
 | **Project** | A working context bound to exactly one filesystem **directory**. Holds metadata, configuration, and a set of threads. Backed by one harness process instance. |
 | **Workspace root** | The directory the agent is allowed to read/write within (the harness sandbox boundary). Defaults to the project directory; overridable per project. |
 | **Thread** | A durable conversation within a project (maps to a Codex *Thread*). Contains an ordered sequence of turns. Resumable across restarts. |
-| **Turn** | One unit of agent work initiated by a single user input (maps to a Codex *Turn*). Produces a sequence of items and ends with a completion carrying token usage. |
+| **Turn** | One unit of agent work initiated by user input (maps to a Codex *Turn*). It may receive additional steering messages while active, produces a sequence of items, and ends with a completion carrying token usage. |
 | **Item** | The atomic unit of agent input/output within a turn: a user message, an agent message, a reasoning note, a command execution, a file change, an approval request, a diff. Has a lifecycle: `started` → optional `delta`s → `completed`. |
 | **Mode** | A thread-level collaboration state: **Plan** (the agent analyzes and proposes) or **Build** (the agent implements). Switchable within a thread (§7.4). |
 | **Approval** | A server-initiated request from the harness asking the user to allow or deny a command execution or file change. Handled per the thread's permission preset (§9). |
@@ -1527,7 +1545,7 @@ Config (global)
     ├── ProjectConfig (workspace root, harness kind, …)
     └── Thread (durable conversation)
         ├── ThreadState (mode, current model, permission preset, token totals, context window)
-        └── Turn (one user input → agent work)
+        └── Turn (initial user input → agent work + optional steering messages)
             └── Item (message / reasoning / command / file-change / diff / approval)
 ```
 
@@ -1741,6 +1759,8 @@ pub struct HarnessCapabilities {
     pub mcp_oauth_login: bool,
     /// Manual context compaction can be requested for a thread.
     pub context_compaction: bool,
+    /// Text can be appended to an exact acknowledged active user turn.
+    pub turn_steering: bool,
 }
 ```
 
@@ -1798,6 +1818,14 @@ pub trait AgentHarness: Send + Sync {
         input: UserInput,
         overrides: TurnOverrides,
     ) -> Result<TurnId, HarnessError>;
+
+    /// Append text to the exact acknowledged active turn without starting another turn.
+    async fn steer_turn(
+        &self,
+        thread: &ThreadHandle,
+        expected_turn: TurnId,
+        text: String,
+    ) -> Result<(), HarnessError>;
 
     /// Subscribe to the stream of neutral events for a thread.
     /// Implemented as a cursor over a retained log of `AgentEvent` values.
@@ -1976,8 +2004,8 @@ pub struct TurnStatus {              // outcome of a completed turn
 pub enum TurnStatusKind { Completed, Interrupted, Failed }
 
 // ---- Turn (B1) ----
-/// One unit of agent work initiated by a single user input. Persisted inside the thread file
-/// (§5.3) as an element of `Thread.turns`, and the unit the diff viewer / token gauge read from.
+/// One unit of agent work initiated by `user_input` and optionally extended by steering messages.
+/// `user_input` retains the initiating input; later same-turn user messages remain ordered items.
 pub struct Turn {
     pub id: TurnId,
     pub user_input: UserInput,
@@ -2253,6 +2281,7 @@ The `CodexHarness` maps the Codex app-server JSON-RPC protocol onto the above. K
 | `initialize` + `initialized` handshake | **once per process** (per project), during process spawn — not per thread (S1) |
 | `thread/start`, `thread/resume` | `open_thread` (S1: this is the per-thread call, distinct from the handshake) |
 | `turn/start` (with model/effort/permissions per turn) | `start_turn` + `TurnOverrides` (P1: effort lives in `ModelRef`, not `TurnOverrides`) |
+| `turn/steer` (with exact `expectedTurnId`) | `steer_turn` on the existing Giskard turn; emitted user messages stay in that turn |
 | `item/started`, `item/*/delta`, `item/completed` | `ItemStarted` / `ItemDelta` / `ItemCompleted` |
 | `turn/diff/updated` | `DiffUpdated` |
 | `item/commandExecution/requestApproval`, `item/fileChange/requestApproval`, `item/permissions/requestApproval` | `ApprovalRequested` |
@@ -2740,6 +2769,10 @@ yet, so there is no catalog to choose from (§8.3).
 - **Send input:** user submits a message; server builds a `TurnOverrides` snapshot from the
   thread's persisted state (mode, current model — which carries effort) and calls `start_turn`.
   A turn begins.
+- **Steer:** after a normal user turn has an acknowledged ID, text submitted while it remains
+  active calls `steer_turn` with that exact ID. The harness appends the input as another user
+  message in the same turn. Steering does not snapshot settings again, reserve another lease,
+  create another persisted turn, or fall back to a queued follow-up when it is rejected.
 - **Stream:** `AgentEvent`s flow to the UI (§13.6) and update persisted state.
 - **Complete:** on `TurnCompleted`, token usage is folded into the ledgers (§10) and the
   thread file is rewritten atomically.
@@ -2751,8 +2784,8 @@ yet, so there is no catalog to choose from (§8.3).
   the selected model, then provider/config metadata, then the conservative fallback. A later turn
   replaces that value when the harness reports its effective window.
 - **Interrupt:** user can interrupt an in-flight turn (`turn/interrupt`). The UI exposes this as a
-  live-turn Stop control; sending another user message while a turn is still live is a separate
-  queueing policy and is not implied by interrupt support.
+  live-turn Stop control. For a steerable active turn, non-empty composer text also reveals Send
+  beside Stop; an empty composer retains Stop alone. Steering and interrupt remain independent.
 - **Archive / unarchive:** the thread list exposes an actions menu (`...`) per thread. Archive calls
   the harness lifecycle operation first (Codex `thread/archive`) and marks the local thread
   metadata `archived = true` only after success. Unarchive is the reverse operation (Codex
@@ -3708,6 +3741,7 @@ deletion; all other native deletion errors stop the cascade before deleting that
 **Client → server** (examples): `Subscribe { thread_id, since? }` (`since` is the incremental-resync
 cursor, H8), `Unsubscribe { thread_id }`,
 `SendInput { thread_id, text, attachments? }`,
+`SteerInput { thread_id, turn_id, text }`,
 `SwitchMode { thread_id, request_id, mode }`,
 `SelectModel { thread_id, request_id, model_ref }`,
 `SetPermissionPreset { thread_id, request_id, preset }`,
@@ -3724,6 +3758,15 @@ state: multiple tabs or reconnect races must not be able to start overlapping na
 thread. The browser marks a turn active immediately after successfully sending `SendInput`, before
 any harness `TurnStarted` event, and clears that optimistic state if the server rejects the send for
 anything other than `thread_turn_active`.
+
+`SteerInput` is valid only when `turn_id` is the exact acknowledged active normal user turn and the
+harness advertises `turn_steering`. It carries text only. The server rejects an unacknowledged
+start, manual compaction, persistence-blocked owner, stale/completed turn, read-only thread, or
+unsupported harness without calling `start_turn`. Steering calls the harness directly because it
+does not admit a turn or reserve a lease; both the server runtime and provider re-check the exact
+turn ID across the race. A successful provider `UserMessage` item is the ordered acceptance
+evidence and enters the existing live buffer and completed payload. A steering failure is a direct
+error for the initiating browser and never clears active-turn ownership.
 
 The long-lived event owner serializes primary turn admission with externally observed native turns.
 `SendInput` and `CompactContext` enqueue bounded intents to that owner. The owner rejects overlapping
@@ -3757,7 +3800,8 @@ held while awaiting harness, persistence, runtime publication, or owner shutdown
 > or shutdown. It never writes upload bytes into the project workspace.
 > The focused browser composer accepts the same files from its attachment button, drag-and-drop,
 > or the clipboard. When clipboard files accompany text, it inserts the plain-text clipboard value
-> at the current selection and attaches every file.
+> at the current selection and attaches every file. Attachment ingestion is disabled during an
+> active turn because `SteerInput` is text-only in this milestone.
 
 **Server → client** (examples): `Event { thread_id, agent_event }` (a serialized
 `WireAgentEvent` — the path-mirrored wire form of `AgentEvent`, §3.5),
@@ -3790,9 +3834,12 @@ control state for commands and tool/MCP calls still known to be running, includi
 outlived an interrupted turn),
 `Error { code, severity, message, detail?, thread_id?, action? }`, `Pong`.
 
-`OpenThreadResponse` may also carry `warning: ErrorInfo?` with the same `code` / `severity` /
-`message` shape when the requested thread was opened but degraded (for example, Codex resume
-failed and Giskard started a fresh native session while keeping persisted history).
+`OpenThreadResponse` and `StartThreadResponse` carry `turn_steering`, sampled from the attached
+harness capabilities, so the composer does not offer an action the provider cannot perform. A
+read-only degraded open reports `false`. `OpenThreadResponse` may also carry
+`warning: ErrorInfo?` with the same `code` / `severity` / `message` shape when the requested thread
+was opened but degraded (for example, Codex resume failed and Giskard started a fresh native
+session while keeping persisted history).
 
 **Request resolution invariant (RT2):** approval and server requests may be visible in multiple
 tabs. A response first atomically claims the request in its owning thread. Every tab follows the
@@ -4092,6 +4139,8 @@ turn/start { threadId, input:[…], model?, effort?, sandbox? }
     ⇢ item/commandExecution/requestApproval  |  item/fileChange/requestApproval
                                               |  item/permissions/requestApproval   (server→client request)
     ⇠ (client responds with a decision)
+turn/steer { threadId, expectedTurnId, input:[{type:"text",text:…}] }
+    ⇢ item/started + item/completed for another UserMessage in the same turn
 turn/completed { usage, … }
 turn/interrupt { threadId }                            (to cancel)
 ```

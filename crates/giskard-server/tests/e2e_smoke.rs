@@ -477,6 +477,7 @@ fn started_inputs(core: &FakeCore) -> Vec<String> {
 impl Script for UnsupportedCompactionScript {
     fn capabilities(&self) -> HarnessCapabilities {
         HarnessCapabilities {
+            turn_steering: false,
             live_approvals: false,
             plan_build_modes: false,
             per_turn_model: false,
@@ -1192,6 +1193,7 @@ impl Script for CountingScript {
 impl Script for NoMcpScript {
     fn capabilities(&self) -> HarnessCapabilities {
         HarnessCapabilities {
+            turn_steering: false,
             live_approvals: false,
             plan_build_modes: false,
             per_turn_model: false,
@@ -3836,6 +3838,14 @@ async fn passive_subagent_command_start_streams_before_completion() {
                 thread_id: child_id,
             },
             "compact_context",
+        ),
+        (
+            ClientMessage::SteerInput {
+                thread_id: child_id,
+                turn_id: TurnId::new(),
+                text: "must not steer a read-only child".into(),
+            },
+            "steer_input",
         ),
     ];
     for (message, action) in mutations {
@@ -7029,8 +7039,8 @@ async fn concurrent_cold_opens_install_one_native_owner() {
         model,
     );
     let (first, second) = tokio::join!(first, second);
-    assert_eq!(first.unwrap().harness_thread_id, "native-thread");
-    assert_eq!(second.unwrap().harness_thread_id, "native-thread");
+    assert_eq!(first.unwrap().handle().harness_thread_id, "native-thread");
+    assert_eq!(second.unwrap().handle().harness_thread_id, "native-thread");
     assert_eq!(
         open_calls(&harness.core),
         1,
@@ -7102,8 +7112,8 @@ async fn concurrent_subagent_cold_opens_install_one_native_owner() {
     let first = state.registry.attach_subagent_thread(&config, &child);
     let second = state.registry.attach_subagent_thread(&config, &child);
     let (first, second) = tokio::join!(first, second);
-    assert_eq!(first.unwrap().harness_thread_id, "native-child");
-    assert_eq!(second.unwrap().harness_thread_id, "native-child");
+    assert_eq!(first.unwrap().handle().harness_thread_id, "native-child");
+    assert_eq!(second.unwrap().handle().harness_thread_id, "native-child");
     assert_eq!(open_calls(&harness.core), 0);
     assert_eq!(harness.script.new_claims.load(Ordering::SeqCst), 1);
 }

@@ -149,5 +149,7 @@ Playwright, change **both**:
 - `@playwright/test` in `tests/e2e/package.json`, and
 - the `mcr.microsoft.com/playwright:vX.Y.Z-noble` tag in `tests/e2e/Dockerfile`.
 
-The scripted reply asserted by `tests/thread.spec.ts` is defined once in the replay binary
-(`SCRIPTED_REPLY`) and mirrored in `tests/helpers.ts`; keep the two in step.
+The scripted replies and special prompts asserted by the browser specs are defined in the replay
+binary and mirrored in `tests/helpers.ts`; keep the two in step. The turn-steering fixture starts a
+turn with `SCRIPTED_STEERING_TRIGGER`, holds it active until text is steered into that exact turn,
+then emits a same-turn user message, `SCRIPTED_STEERING_REPLY`, and one completion.

@@ -203,6 +203,7 @@ impl RegistryTaskTracker {
 pub struct LoadedThreadBinding {
     project_id: ProjectId,
     handle: ThreadHandle,
+    turn_steering: bool,
     /// The model the harness reports this native thread is on. `None` when neither the caller nor
     /// the harness named one — callers already treat an unknown native model the same as an
     /// unbound thread.
@@ -218,8 +219,52 @@ impl LoadedThreadBinding {
         &self.handle
     }
 
+    pub(crate) fn turn_steering(&self) -> bool {
+        self.turn_steering
+    }
+
     pub fn native_model(&self) -> Option<&ModelRef> {
         self.native_model.as_ref()
+    }
+}
+
+#[derive(Debug)]
+pub(crate) enum SteerTurnError {
+    NotSteerable {
+        thread_id: ThreadId,
+        expected_turn: TurnId,
+        active_turn: Option<TurnId>,
+    },
+    Harness(HarnessError),
+}
+
+impl fmt::Display for SteerTurnError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NotSteerable {
+                thread_id,
+                expected_turn,
+                active_turn: Some(active_turn),
+            } => write!(
+                formatter,
+                "turn {expected_turn} is not steerable for thread {thread_id}; the acknowledged active user turn is {active_turn}"
+            ),
+            Self::NotSteerable {
+                thread_id,
+                expected_turn,
+                active_turn: None,
+            } => write!(
+                formatter,
+                "turn {expected_turn} is not steerable for thread {thread_id}; there is no acknowledged active user turn"
+            ),
+            Self::Harness(error) => error.fmt(formatter),
+        }
+    }
+}
+
+impl From<HarnessError> for SteerTurnError {
+    fn from(error: HarnessError) -> Self {
+        Self::Harness(error)
     }
 }
 
@@ -776,6 +821,29 @@ impl HarnessRegistry {
         Ok(HarnessBootstrap { known_threads })
     }
 
+    /// Attach a persisted provider-owned child without resuming or nudging native work.
+    pub async fn attach_subagent_thread(
+        &self,
+        config: &ProjectConfig,
+        thread: &ThreadFile,
+    ) -> Result<LoadedThreadBinding, HarnessError> {
+        if thread.kind != ThreadKind::Subagent {
+            return Err(HarnessError::Protocol(format!(
+                "thread {} is not a sub-agent",
+                thread.id
+            )));
+        }
+        let harness = self.get_or_create_harness(config.id, config).await?;
+        ensure_subagent_thread_open(
+            config,
+            thread,
+            &self.shared,
+            &harness,
+            ClassificationPhase::from(thread.kind),
+        )
+        .await
+    }
+
     pub async fn open_thread(
         &self,
         config: &ProjectConfig,
@@ -783,45 +851,7 @@ impl HarnessRegistry {
         thread: ThreadId,
         resume: Option<String>,
         initial_model: ModelRef,
-    ) -> Result<ThreadHandle, HarnessError> {
-        self.open_primary_thread(config, workspace_root, thread, resume, initial_model)
-            .await
-    }
-
-    /// Attach a persisted provider-owned child without resuming or nudging native work.
-    pub async fn attach_subagent_thread(
-        &self,
-        config: &ProjectConfig,
-        thread: &ThreadFile,
-    ) -> Result<ThreadHandle, HarnessError> {
-        if thread.kind != ThreadKind::Subagent {
-            return Err(HarnessError::Protocol(format!(
-                "thread {} is not a sub-agent",
-                thread.id
-            )));
-        }
-        self.get_or_create_harness(config.id, config).await?;
-        ensure_subagent_thread_open(
-            config,
-            thread,
-            &self.shared,
-            ClassificationPhase::from(thread.kind),
-        )
-        .await?;
-        self.loaded_thread_binding(thread.id)
-            .await
-            .map(|binding| binding.handle)
-            .ok_or(HarnessError::ThreadNotFound(thread.id))
-    }
-
-    async fn open_primary_thread(
-        &self,
-        config: &ProjectConfig,
-        workspace_root: &str,
-        thread: ThreadId,
-        resume: Option<String>,
-        initial_model: ModelRef,
-    ) -> Result<ThreadHandle, HarnessError> {
+    ) -> Result<LoadedThreadBinding, HarnessError> {
         debug!(
             project_id = %config.id,
             thread_id = %thread,
@@ -833,14 +863,15 @@ impl HarnessRegistry {
         // losing open may invalidate the stream already owned by the winner.
         let _owner_guard = lock_thread_owner(&self.shared.threads, thread).await;
         if let Some(existing) = self.shared.coordinator(thread).await {
-            return existing
+            existing
                 .reusable_handle(
                     config.id,
                     thread,
                     resume.as_deref(),
                     ClassificationPhase::Primary,
                 )
-                .await;
+                .await?;
+            return Ok(existing.binding().await);
         }
         let harness = self.get_or_create_harness(config.id, config).await?;
         let (updates, update_stream) = thread_update_channel();
@@ -878,12 +909,13 @@ impl HarnessRegistry {
         let binding = LoadedThreadBinding {
             project_id: config.id,
             handle: handle.clone(),
+            turn_steering: harness.capabilities().turn_steering,
             native_model: Some(native_model),
         };
         let owner_installed = install_event_owner(
             &self.shared,
             &harness,
-            binding,
+            binding.clone(),
             ClassificationPhase::Primary,
         )
         .await?;
@@ -906,7 +938,7 @@ impl HarnessRegistry {
             "harness thread opened"
         );
 
-        Ok(handle)
+        Ok(binding)
     }
 
     pub async fn start_turn(
@@ -1117,6 +1149,78 @@ impl HarnessRegistry {
     ) {
         self.publish_request_state(thread_id, &RuntimeRequestId::Approval(request_id))
             .await;
+    }
+
+    /// Append text to an exact acknowledged user turn without reserving another turn lease.
+    pub(crate) async fn steer_turn(
+        &self,
+        thread_id: ThreadId,
+        expected_turn: TurnId,
+        text: String,
+    ) -> Result<(), SteerTurnError> {
+        let resolved = self
+            .shared
+            .resolve_loaded_thread(thread_id)
+            .await
+            .ok_or(HarnessError::ThreadNotFound(thread_id))?;
+        let project_id = resolved.binding.project_id;
+        self.ensure_thread_writable(project_id, thread_id).await?;
+
+        let runtime =
+            ResolvedThreadRuntime::new(self.shared.services.runtime.clone(), resolved.authority);
+        let active_turn = runtime.steerable_turn_id();
+        if active_turn != Some(expected_turn) {
+            return Err(SteerTurnError::NotSteerable {
+                thread_id,
+                expected_turn,
+                active_turn,
+            });
+        }
+
+        let harness = self
+            .shared
+            .active_harness(project_id)
+            .await
+            .ok_or(HarnessError::ThreadNotFound(thread_id))?;
+        if !harness.capabilities().turn_steering {
+            return Err(SteerTurnError::Harness(HarnessError::Unsupported(
+                "active-turn steering is not supported by this harness".into(),
+            )));
+        }
+
+        let handle = resolved.binding.handle;
+        let started = Instant::now();
+        info!(
+            %project_id,
+            %thread_id,
+            turn_id = %expected_turn,
+            harness_thread_id = %handle.harness_thread_id,
+            action = "steer_turn",
+            "sending steering input to harness"
+        );
+        let result = harness.steer_turn(&handle, expected_turn, text).await;
+        match &result {
+            Ok(()) => info!(
+                %project_id,
+                %thread_id,
+                turn_id = %expected_turn,
+                harness_thread_id = %handle.harness_thread_id,
+                elapsed_ms = started.elapsed().as_millis(),
+                action = "steer_turn",
+                "harness accepted steering input"
+            ),
+            Err(error) => warn!(
+                %project_id,
+                %thread_id,
+                turn_id = %expected_turn,
+                harness_thread_id = %handle.harness_thread_id,
+                elapsed_ms = started.elapsed().as_millis(),
+                action = "steer_turn",
+                %error,
+                "harness rejected steering input"
+            ),
+        }
+        result.map_err(SteerTurnError::Harness)
     }
 
     pub async fn interrupt(&self, thread_id: ThreadId) -> Result<(), HarnessError> {
@@ -1792,12 +1896,9 @@ async fn ensure_subagent_thread_open(
     project_config: &ProjectConfig,
     thread_file: &ThreadFile,
     shared: &Arc<RegistryShared>,
+    harness: &Arc<dyn AgentHarness>,
     classification: ClassificationPhase,
-) -> Result<Option<String>, HarnessError> {
-    let harness = shared
-        .active_harness(project_config.id)
-        .await
-        .ok_or(HarnessError::ThreadNotFound(thread_file.id))?;
+) -> Result<LoadedThreadBinding, HarnessError> {
     // A sub-agent is provider-owned and read-only. Reattach its durable identity to this harness
     // lifetime without issuing thread/resume or otherwise nudging native work.
     let workspace_root =
@@ -1805,7 +1906,7 @@ async fn ensure_subagent_thread_open(
             .await
             .map_err(|error| HarnessError::Protocol(error.to_string()))?;
     if let Some(coordinator) = shared.coordinator(thread_file.id).await {
-        let handle = coordinator
+        coordinator
             .reusable_handle(
                 project_config.id,
                 thread_file.id,
@@ -1813,7 +1914,7 @@ async fn ensure_subagent_thread_open(
                 classification,
             )
             .await?;
-        return Ok(handle.agent_name);
+        return Ok(coordinator.binding().await);
     }
     let handle = harness
         .claim_native_thread(
@@ -1832,19 +1933,14 @@ async fn ensure_subagent_thread_open(
         .resumed_model
         .clone()
         .or_else(|| thread_file.current_model.as_known().cloned());
-    let agent_name = handle.agent_name.clone();
-    install_event_owner(
-        shared,
-        &harness,
-        LoadedThreadBinding {
-            project_id: project_config.id,
-            handle,
-            native_model,
-        },
-        classification,
-    )
-    .await?;
-    Ok(agent_name)
+    let binding = LoadedThreadBinding {
+        project_id: project_config.id,
+        handle,
+        turn_steering: harness.capabilities().turn_steering,
+        native_model,
+    };
+    install_event_owner(shared, harness, binding.clone(), classification).await?;
+    Ok(binding)
 }
 
 async fn install_event_owner(
@@ -2505,6 +2601,7 @@ mod tests {
                 super::LoadedThreadBinding {
                     project_id: project,
                     handle: ThreadHandle::opened(thread, native.into(), PathBuf::from("/tmp/test")),
+                    turn_steering: false,
                     native_model: None,
                 },
                 super::ClassificationPhase::Primary,
@@ -3607,6 +3704,7 @@ mod tests {
             super::LoadedThreadBinding {
                 project_id: ProjectId::new(),
                 handle: ThreadHandle::detached(ThreadId::new(), "native-test".into()),
+                turn_steering: false,
                 native_model: None,
             },
             classification,
@@ -3838,6 +3936,7 @@ mod tests {
             super::LoadedThreadBinding {
                 project_id,
                 handle: ThreadHandle::detached(thread_id, "native-a".into()),
+                turn_steering: true,
                 native_model: Some(model_a.clone()),
             },
             super::ClassificationPhase::Primary,
@@ -3859,6 +3958,7 @@ mod tests {
             super::LoadedThreadBinding {
                 project_id,
                 handle: ThreadHandle::detached(thread_id, "native-b".into()),
+                turn_steering: false,
                 native_model: Some(model_b.clone()),
             },
             super::ClassificationPhase::Primary,
@@ -3872,9 +3972,11 @@ mod tests {
         );
 
         assert_eq!(snapshot_a.handle().harness_thread_id, "native-a");
+        assert!(snapshot_a.turn_steering());
         assert_eq!(snapshot_a.native_model(), Some(&model_a));
         let snapshot_b = registry.loaded_thread_binding(thread_id).await.unwrap();
         assert_eq!(snapshot_b.handle().harness_thread_id, "native-b");
+        assert!(!snapshot_b.turn_steering());
         assert_eq!(snapshot_b.native_model(), Some(&model_b));
     }
 
@@ -3901,6 +4003,7 @@ mod tests {
             super::LoadedThreadBinding {
                 project_id,
                 handle: ThreadHandle::detached(thread_id, "native-unknown".into()),
+                turn_steering: false,
                 native_model: None,
             },
             super::ClassificationPhase::Primary,
@@ -3923,6 +4026,7 @@ mod tests {
             super::LoadedThreadBinding {
                 project_id,
                 handle: ThreadHandle::detached(thread_id, "native-known".into()),
+                turn_steering: false,
                 native_model: Some(model.clone()),
             },
             super::ClassificationPhase::Primary,

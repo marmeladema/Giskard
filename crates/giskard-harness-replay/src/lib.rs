@@ -147,6 +147,9 @@ impl ReplayHarness {
                 mcp_reload: true,
                 mcp_oauth_login: false,
                 context_compaction: true,
+                // Recorded fixtures are drained by `start_turn`; they cannot accept interactive
+                // input in the middle of that immutable event sequence.
+                turn_steering: false,
             },
             threads: Mutex::new(Vec::new()),
             fixtures: Mutex::new(fixtures),

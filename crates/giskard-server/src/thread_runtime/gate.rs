@@ -75,6 +75,19 @@ impl TurnGate {
         self.active.is_some()
     }
 
+    /// The exact acknowledged user turn that may accept same-turn steering.
+    ///
+    /// A reservation that has not been acknowledged cannot supply the provider precondition yet;
+    /// manual compaction and persistence-blocked owners are active for lifecycle purposes but are
+    /// not steerable user turns.
+    pub fn steerable_turn_id(&self) -> Option<TurnId> {
+        self.active.as_ref().and_then(|owner| {
+            (owner.reservation.context_kind == "user" && owner.persistence_blocked.is_none())
+                .then_some(owner.acknowledged_turn)
+                .flatten()
+        })
+    }
+
     /// The clock a restore permit compares against to prove no newer lifecycle superseded it.
     pub fn lifecycle_revision(&self) -> u64 {
         self.lifecycle_revision

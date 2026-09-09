@@ -174,7 +174,7 @@ let state = {
   // point: a resync rebuilds the same items under the same keys, so the choices still apply. They
   // are dropped only when the thread they belong to is left (see clearReasoningChoices).
   reasoningChoicesByRowKey:new Map(),
-  linkifyCache:new Map(), markdownCache:new Map(), codePath:null, codeLine:null, codeOverlaySource:null, outputOverlay:null, outputOverlayRequestSeq:0, activeTurn:false, interruptPending:false, compactPending:false,
+  linkifyCache:new Map(), markdownCache:new Map(), codePath:null, codeLine:null, codeOverlaySource:null, outputOverlay:null, outputOverlayRequestSeq:0, activeTurn:false, turnSteering:false, pendingSteer:null, interruptPending:false, compactPending:false,
   awaitingInitialThreadState:false, awaitingThreadResync:false, awaitingIncrementalResync:false, resyncStickBottom:false, contextWindow:0, contextUsed:null, permissionPreset:"ask_first", currentModel:null,
   threadAuthorities:new Map(), pendingDetailConflictResyncs:new Set(),
   pendingMetadataActions:new Map(), threadListRefreshes:new Map(),
@@ -2109,6 +2109,8 @@ function clearThreadView(tid) {
   state.draftThread = null;
   state.firstTurnStartingThreadId = null;
   state.pendingUserEl = null; state.pendingUserText = null;
+  state.turnSteering = false;
+  state.pendingSteer = null;
   state.compactPending = false;
   state.currentModel = null;
   state.currentModelUnreported = false;
@@ -2523,6 +2525,8 @@ function openDraftThread(pid) {
   state.firstTurnStartingThreadId = null;
   state.pendingUserEl = null;
   state.pendingUserText = null;
+  state.turnSteering = false;
+  state.pendingSteer = null;
   state.compactPending = false;
   state.currentModel = null;
   state.currentModelUnreported = false;
@@ -2602,6 +2606,8 @@ async function openThread(pid, tid, title, opts) {
   closeCodeOverlay();
   setActiveViewIdentity(pid, tid);
   state.pendingUserEl = null; state.pendingUserText = null;
+  state.turnSteering = !!res.turn_steering;
+  state.pendingSteer = null;
   renderParentThreadButton();
   state.threadReadOnly = false; state.readOnlyProvider = null; state.readOnlyMessage = null;
   updateReadOnlyBanner();
@@ -2962,23 +2968,32 @@ function updateComposerControls() {
   const attachmentsLoading = pendingAttachmentOperationCount() > 0;
   const attachmentInputAllowed = composerCanAcceptAttachments();
   const modelUnresolved = draftModelUnresolved();
+  const steering = state.activeTurn && !draft;
+  const steeringText = $("input").value.trim();
+  const canSteer = steering && state.turnSteering;
   // An empty composer with nothing attached has nothing to send. That was previously a silent
   // early return in `sendInput`: the button looked live, the click did nothing, and no message
   // said why — so a composer emptied unexpectedly (as one used to be by a draft opening mid-typing)
   // read as a dead button. Disabling it puts the state on screen instead.
   const nothingToSend = !$("input").value.trim() && state.pendingAttachments.length === 0;
-  $("sendBtn").disabled =
-    readOnly || state.activeTurn || state.updateRequired || state.uiVersionCheckPending ||
-    attachmentsLoading || modelUnresolved || nothingToSend ||
-    !hasThreadSurface || (!ready && !draft);
-  // The send arrow and the stop square share one slot: hide the arrow while a turn is running so
-  // only the red stop square is visible (no disabled send button alongside it).
-  $("sendBtn").hidden = state.activeTurn && !draft;
+  $("sendBtn").disabled = steering
+    ? readOnly || !canSteer || !state.currentRenderTurnId || !!state.pendingSteer ||
+      state.updateRequired || state.uiVersionCheckPending || !steeringText || !ready
+    : readOnly || state.updateRequired || state.uiVersionCheckPending ||
+      attachmentsLoading || modelUnresolved || nothingToSend ||
+      !hasThreadSurface || (!ready && !draft);
+  // A steering-capable active turn keeps Stop available and adds Send only while there is text to
+  // steer with. Unsupported turns retain the single Stop control, as do empty active composers.
+  $("sendBtn").hidden = steering && (!canSteer || !steeringText);
   $("sendBtn").title = managedReadOnly ? "Agent-owned threads are read-only." :
     readOnly ? "Read-only thread — pick a model from a configured provider to reactivate it." :
+    steering && state.pendingSteer ? "Wait for the current steering input to be accepted." :
+    steering && !state.currentRenderTurnId ? "Wait for the running turn to be acknowledged." :
+    steering ? "Send input to the running turn" :
     attachmentsLoading ? "Wait for attached files to finish loading." :
     modelUnresolved ? draftModelUnavailableReason() :
     nothingToSend ? "Type a message, or attach a file, to send." : "Send";
+  $("sendBtn").setAttribute("aria-label", steering ? "Send input to the running turn" : "Send");
   $("stopBtn").hidden = !state.activeTurn || draft;
   $("stopBtn").disabled = !ready || state.interruptPending;
   // The stop button shows a Unicode black square (■) glyph; the "stopping" state is conveyed via
@@ -3003,6 +3018,7 @@ function updateComposerControls() {
   $("input").placeholder =
     managedReadOnly ? "Agent-owned threads are read-only." :
     readOnly ? "Read-only thread — pick a model above to reactivate it." :
+    state.activeTurn && state.turnSteering ? "Send input to the running turn…" :
     state.activeTurn ? "Draft your next message…" :
     draft ? `Ask Giskard…  (${COMPOSER_HINT})` :
     state.wsStatus==="open" ? `Ask Giskard…  (${COMPOSER_HINT})` :
@@ -3119,6 +3135,20 @@ function failPendingUserMessage(text) {
   if (text) notice(text, "error");
 }
 
+// A steering send is browser-local until Codex echoes it as a same-turn user_message. Keep that
+// optimistic row separate from the ordinary turn-start row: a steer rejection must never make the
+// real turn look idle or fail the prompt that started it.
+function failPendingSteer() {
+  const pending = state.pendingSteer;
+  if (!pending) return;
+  if (pending.element && pending.element.isConnected) {
+    pending.element.classList.remove("pending");
+    pending.element.classList.add("failed");
+  }
+  state.pendingSteer = null;
+  updateComposerControls();
+}
+
 function serverMessageThreadId(msg) {
   if (!msg) return null;
   if (msg.thread_id !== undefined && msg.thread_id !== null) return String(msg.thread_id);
@@ -3190,6 +3220,7 @@ function handleServer(msg, ws) {
     case "request_state": handleRequestState(msg); break;
     case "error":
       finishMetadataAction(msg.request_id);
+      if (msg.action==="steer_input") failPendingSteer();
       if (msg.code === "thread_read_only") {
         state.threadReadOnly = true;
         state.readOnlyMessage = msg.message || state.readOnlyMessage || "This thread is read-only.";
@@ -3838,6 +3869,7 @@ function resetTranscriptForAuthoritativeSnapshot() {
   $("transcript").innerHTML="";
   state.pendingUserEl = null;
   state.pendingUserText = null;
+  state.pendingSteer = null;
   state.pendingOlder = false;
   state.loadingHistory = false;
   state.oldestTurnId = null;
@@ -4077,6 +4109,7 @@ function reconcileInFlightTurn() {
   rebuildRenderTrackingFromDom();
   state.pendingUserEl = null;
   state.pendingUserText = null;
+  state.pendingSteer = null;
   state.currentRenderTurnId = null;
   setTurnActive(false);
   state.streamEl = null;
@@ -4330,6 +4363,8 @@ function handleEvent(ev) {
       break;
     case "turn_completed":
       state.firstTurnStartingThreadId = null;
+      // Without its user_message acknowledgement, a pending steer lost the completion race.
+      failPendingSteer();
       // This turn is now persisted; advance the high-water cursor and stop stamping rows to it.
       if (ev.turn) state.newestPersistedTurnId = ev.turn;
       state.currentRenderTurnId = null;
@@ -4384,6 +4419,7 @@ function handleEvent(ev) {
         setTurnActive(false);
       }
       failPendingUserMessage(null);   // resolve the optimistic bubble to a failed state
+      failPendingSteer();
       errorBubble(errorText(ev.error));
       break;
     // A non-fatal advisory: show it as a warning, and do NOT fail the pending message — otherwise
@@ -7223,6 +7259,9 @@ function addItem(item, turnId, fromHistory) {
     return;
   }
   if (p.kind==="user_message") {
+    // UserMessage events are ordered within the turn. Reconcile the initiating prompt first: a
+    // user can steer with identical text before its delayed initial echo arrives, and matching the
+    // steer first would attach that initial item to the later optimistic row.
     if (state.pendingUserEl && !state.pendingUserEl.isConnected) {
       state.pendingUserEl = null;
       state.pendingUserText = null;
@@ -7237,6 +7276,22 @@ function addItem(item, turnId, fromHistory) {
       registerRenderedItemBody(pendingBody, item, turnId);
       state.pendingUserEl = null;
       state.pendingUserText = null;
+      markRenderedItem(item, turnId);
+      return;
+    }
+    if (state.pendingSteer && state.pendingSteer.element &&
+        !state.pendingSteer.element.isConnected) {
+      state.pendingSteer = null;
+    }
+    if (state.pendingSteer && String(turnId || "") === state.pendingSteer.turnId &&
+        p.text === state.pendingSteer.text) {
+      const pending = state.pendingSteer;
+      pending.element.classList.remove("pending");
+      const pendingBody = pending.element.querySelector(".body");
+      renderItemBodyForItem(pendingBody, item, turnId);
+      registerRenderedItemBody(pendingBody, item, turnId);
+      state.pendingSteer = null;
+      updateComposerControls();
       markRenderedItem(item, turnId);
       return;
     }
@@ -9405,6 +9460,10 @@ $("codeOverlay").addEventListener("click", (e) => { if (e.target === $("codeOver
 function sendInput() {
   const ta = $("input");
   const text = ta.value.trim();
+  if (state.activeTurn) {
+    steerInput(text);
+    return;
+  }
   const attachments = state.pendingAttachments.slice();
   if (pendingAttachmentOperationCount() > 0) {
     notice("Wait for attached files to finish loading.", "warning");
@@ -9419,10 +9478,6 @@ function sendInput() {
   // — no title is set for it, since a hidden button's tooltip is not something a user can read.
   if (!state.threadId && !isDraftThread()) return;
   if (state.updateRequired || state.uiVersionCheckPending) return;
-  if (state.activeTurn) {
-    notice("Wait for the current turn to finish, or stop it first.", "warning");
-    return;
-  }
   if (isDraftThread()) {
     startDraftThread(text, attachments);
     return;
@@ -9448,6 +9503,41 @@ function sendInput() {
   state.pendingUserText = text;
   clearComposerDraft(draftKey);
   clearPendingAttachments();
+}
+
+function steerInput(text) {
+  if (!text || !state.threadId || isDraftThread()) return;
+  if (!state.turnSteering) {
+    notice("This agent does not support input during an active turn.", "warning");
+    return;
+  }
+  if (!state.currentRenderTurnId) {
+    notice("Wait for the running turn to be acknowledged before sending more input.", "warning");
+    return;
+  }
+  if (state.pendingSteer) {
+    notice("Wait for the current steering input to be accepted.", "warning");
+    return;
+  }
+  if (!wsCanSend()) {
+    notice(`Steering input not sent: WebSocket is ${state.wsStatus}.`, "warning");
+    reconnectIfNeeded("steering requested while disconnected");
+    return;
+  }
+  const turnId = String(state.currentRenderTurnId);
+  const draftKey = composerDraftKey();
+  const body = bubble("user pending", "you");
+  body.textContent = text;
+  const element = body.parentElement;
+  if (!send({ type:"steer_input", thread_id:state.threadId, turn_id:turnId, text })) {
+    element.classList.remove("pending");
+    element.classList.add("failed");
+    notice(`Steering input not sent: WebSocket is ${state.wsStatus}.`, "error");
+    return;
+  }
+  state.pendingSteer = { turnId, text, element };
+  clearComposerDraft(draftKey);
+  updateComposerControls();
 }
 $("sendBtn").onclick = sendInput;
 $("input").addEventListener("keydown", (e) => {
@@ -9559,6 +9649,7 @@ async function startDraftThread(text, attachments) {
       return;
     }
     state.firstTurnStartingThreadId = String(tid);
+    state.turnSteering = !!res.turn_steering;
     clearComposerDraft(draftKey);
     clearPendingAttachments();
     state.draftThread = null;
@@ -9680,7 +9771,7 @@ function composerCanAcceptAttachments() {
   const managedReadOnly = managedThreadReadOnly() && !draft;
   const readOnly = (state.threadReadOnly || managedReadOnly || threadMetadataPending()) && !draft;
   return hasThreadSurface && !readOnly && !state.updateRequired &&
-    !state.uiVersionCheckPending && !(draft && state.activeTurn);
+    !state.uiVersionCheckPending && !state.activeTurn;
 }
 
 function initComposerFileTransfers() {

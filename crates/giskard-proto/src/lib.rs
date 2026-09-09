@@ -63,6 +63,13 @@ pub enum ClientMessage {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         attachments: Vec<UserAttachment>,
     },
+    /// Append text to an already acknowledged active turn. `turn_id` is an exact precondition:
+    /// a late frame must fail rather than steering whichever turn happens to be active next.
+    SteerInput {
+        thread_id: ThreadId,
+        turn_id: TurnId,
+        text: String,
+    },
     SwitchMode {
         thread_id: ThreadId,
         request_id: String,
@@ -528,6 +535,8 @@ pub struct OpenSubagentLinkResponse {
 pub struct OpenThreadResponse {
     pub thread_id: ThreadId,
     pub harness_thread_id: String,
+    /// Whether this attached harness accepts text input during an active turn.
+    pub turn_steering: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub warning: Option<ErrorInfo>,
 }
@@ -576,6 +585,8 @@ pub struct StartThreadResponse {
     pub title: String,
     pub harness_thread_id: String,
     pub turn_id: TurnId,
+    /// Whether this attached harness accepts text input during an active turn.
+    pub turn_steering: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub warning: Option<ErrorInfo>,
 }
@@ -783,6 +794,36 @@ mod tests {
                 assert_eq!(attachments.len(), 1);
                 assert_eq!(attachments[0].kind, AttachmentKind::Image);
                 assert_eq!(attachments[0].data_base64, "aW1hZ2U=");
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn client_message_steer_input_serde() {
+        let thread_id = ThreadId::new();
+        let turn_id = TurnId::new();
+        let msg = ClientMessage::SteerInput {
+            thread_id,
+            turn_id,
+            text: "Use the existing helper instead".into(),
+        };
+        let json = serde_json::to_value(&msg).unwrap();
+        assert_eq!(json["type"], "steer_input");
+        assert_eq!(json["thread_id"], thread_id.to_string());
+        assert_eq!(json["turn_id"], turn_id.to_string());
+        assert!(json.get("attachments").is_none());
+
+        let back: ClientMessage = serde_json::from_value(json).unwrap();
+        match back {
+            ClientMessage::SteerInput {
+                thread_id: actual_thread,
+                turn_id: actual_turn,
+                text,
+            } => {
+                assert_eq!(actual_thread, thread_id);
+                assert_eq!(actual_turn, turn_id);
+                assert_eq!(text, "Use the existing helper instead");
             }
             _ => panic!("wrong variant"),
         }

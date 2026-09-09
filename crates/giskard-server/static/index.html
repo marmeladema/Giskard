@@ -207,11 +207,10 @@
              (2 by default), which would floor every measurement at two lines. The at-rest 40px is
              CSS min-height, not rows. -->
         <textarea id="input" rows="1" placeholder="Ask Giskard…  (Enter to send, Shift+Enter for newline)"></textarea>
-        <!-- The send and stop buttons occupy the same slot (only one is visible at a time): an
-             up-pointing paper-plane arrow to send, morphing into a red filled square to interrupt a
-            running turn. Both are square buttons sized to match the composer's at-rest height,
-            mirroring the ＋ attach button on the left side; the textarea grows with what is typed
-            (see autosizeComposer in app.js) and they stay aligned to its bottom edge. -->
+        <!-- Send is normally the composer's trailing action. During a steering-capable active turn,
+             Stop stays visible and Send appears beside it only when there is text to steer with.
+             Both are square buttons sized to match the composer's at-rest height; the textarea
+             grows with what is typed (see autosizeComposer in app.js) and they stay bottom-aligned. -->
         <button class="send-arrow" id="sendBtn" type="button" title="Send" aria-label="Send">
           <!-- A black right-pointing pointer (U+25BA) rotated -90deg so it points up (north),
                matching the weight of the ＋ attach button on the other side. The glyph is wrapped

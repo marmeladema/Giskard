@@ -1275,6 +1275,7 @@ mod tests {
         LoadedThreadBinding {
             project_id,
             handle: ThreadHandle::opened(thread_id, native.into(), PathBuf::from("/tmp/test")),
+            turn_steering: false,
             native_model: None,
         }
     }

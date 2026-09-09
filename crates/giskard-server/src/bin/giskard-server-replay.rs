@@ -107,6 +107,10 @@ const SCRIPTED_SERVER_REQUEST_THEN_ERROR_MESSAGE: &str = "Scripted non-fatal har
 const SCRIPTED_REASONING_TRIGGER: &str = "Think out loud before replying.";
 const SCRIPTED_REASONING_SUMMARY: &str = "Weighing the scripted options";
 const SCRIPTED_REASONING_DETAIL: &str = "Then answering with the deterministic scripted reply.";
+/// Starts a turn which emits `TurnStarted` and then waits for `steer_turn`. The accepted steering
+/// text is echoed as a same-turn user-message item before the deterministic reply and completion.
+const SCRIPTED_STEERING_TRIGGER: &str = "Hold this turn open for scripted steering.";
+const SCRIPTED_STEERING_REPLY: &str = "Scripted steering accepted on the active turn.";
 /// A harness that speaks the neutral protocol but has no backend: every turn streams the same
 /// canned agent message, so the browser-visible transcript is fully deterministic.
 struct ScriptedHarness {
@@ -132,6 +136,13 @@ struct ScriptedHarness {
     /// would let the later one overwrite the earlier and misattribute its ack. Shared, because a
     /// sub-agent's approval is raised from the detached task that drives the child's turn.
     active_approvals: ActiveApprovals,
+    // ENTITY-AUTHORITY-EXCEPTION:
+    // Role: Remember the exact scripted turn waiting for deterministic steering input.
+    // Source of truth: The steering trigger starts the turn; steer, interrupt, and delete clear it.
+    // Structural reason: A provider adapter must validate the expected turn before accepting input.
+    // Synchronization: The mutex makes validation and removal one atomic operation.
+    // Invalidation/removal: Acceptance, interruption, thread deletion, or harness drop removes it.
+    active_steering_turns: tokio::sync::Mutex<HashMap<ThreadId, TurnId>>,
 }
 
 type ActiveApprovals = Arc<tokio::sync::Mutex<HashMap<ApprovalId, (ThreadId, TurnId)>>>;
@@ -148,6 +159,7 @@ impl ScriptedHarness {
         }
         Ok(Self {
             capabilities: HarnessCapabilities {
+                turn_steering: true,
                 live_approvals: true,
                 plan_build_modes: true,
                 per_turn_model: true,
@@ -167,6 +179,7 @@ impl ScriptedHarness {
             threads: tokio::sync::Mutex::new(Vec::new()),
             native_bindings: tokio::sync::Mutex::new(native_bindings),
             active_approvals: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
+            active_steering_turns: tokio::sync::Mutex::new(HashMap::new()),
         })
     }
 
@@ -564,11 +577,27 @@ impl AgentHarness for ScriptedHarness {
             input_text == Some(SCRIPTED_SERVER_REQUEST_TRIGGER) || raise_server_request_then_error;
         let raise_lazy_diffs = input_text == Some(SCRIPTED_DIFF_TRIGGER);
         let stream_reasoning = input_text == Some(SCRIPTED_REASONING_TRIGGER);
+        let wait_for_steering = input_text == Some(SCRIPTED_STEERING_TRIGGER);
+
+        if wait_for_steering {
+            self.active_steering_turns
+                .lock()
+                .await
+                .insert(thread_id, turn);
+        }
 
         // Stream the canned reply the way a real harness would: start, incremental deltas, then a
         // completed item and a turn-completed with token usage. Emitted off-task with yields so the
         // WebSocket layer observes distinct frames (the transcript renders progressively).
         tokio::spawn(async move {
+            if wait_for_steering {
+                let _ = sender.append(AgentEvent::TurnStarted {
+                    thread: thread_id,
+                    turn,
+                });
+                return;
+            }
+
             if raise_lazy_diffs {
                 let item_id = ItemId::new();
                 let file_change = |diff: &str, status: &str| Item {
@@ -874,6 +903,64 @@ impl AgentHarness for ScriptedHarness {
         Ok(turn)
     }
 
+    async fn steer_turn(
+        &self,
+        thread: &ThreadHandle,
+        expected_turn: TurnId,
+        text: String,
+    ) -> Result<(), HarnessError> {
+        let Some(sender) = self.sender_for(thread.thread).await else {
+            return Err(HarnessError::ThreadNotFound(thread.thread));
+        };
+        let mut active_steering_turns = self.active_steering_turns.lock().await;
+        if active_steering_turns.get(&thread.thread) != Some(&expected_turn) {
+            return Err(HarnessError::Protocol(format!(
+                "scripted thread {} is not waiting for steering on turn {expected_turn}",
+                thread.thread
+            )));
+        }
+        active_steering_turns.remove(&thread.thread);
+        drop(active_steering_turns);
+
+        let thread_id = thread.thread;
+        tokio::spawn(async move {
+            let _ = sender.append(AgentEvent::ItemCompleted {
+                thread: thread_id,
+                turn: expected_turn,
+                item: Item {
+                    id: ItemId::new(),
+                    harness_item_id: format!("scripted_steering_user_{expected_turn}"),
+                    payload: ItemPayload::UserMessage { text },
+                    created_at: chrono::Utc::now(),
+                },
+            });
+            tokio::task::yield_now().await;
+            let _ = sender.append(AgentEvent::ItemCompleted {
+                thread: thread_id,
+                turn: expected_turn,
+                item: Item {
+                    id: ItemId::new(),
+                    harness_item_id: format!("scripted_steering_reply_{expected_turn}"),
+                    payload: ItemPayload::AgentMessage {
+                        text: SCRIPTED_STEERING_REPLY.into(),
+                    },
+                    created_at: chrono::Utc::now(),
+                },
+            });
+            tokio::task::yield_now().await;
+            let _ = sender.append(AgentEvent::TurnCompleted {
+                thread: thread_id,
+                turn: expected_turn,
+                usage: TokenUsage::new(24, 7),
+                status: TurnStatus {
+                    kind: TurnStatusKind::Completed,
+                    message: None,
+                },
+            });
+        });
+        Ok(())
+    }
+
     fn subscribe(&self, thread: &ThreadHandle) -> AgentEventStream {
         if let Ok(threads) = self.threads.try_lock()
             && let Some((_, tx)) = threads.iter().find(|(id, _)| *id == thread.thread)
@@ -927,11 +1014,19 @@ impl AgentHarness for ScriptedHarness {
         Ok(())
     }
 
-    async fn interrupt(&self, _thread: &ThreadHandle) -> Result<(), HarnessError> {
+    async fn interrupt(&self, thread: &ThreadHandle) -> Result<(), HarnessError> {
+        self.active_steering_turns
+            .lock()
+            .await
+            .remove(&thread.thread);
         Ok(())
     }
 
     async fn delete_thread(&self, thread: &ThreadHandle) -> Result<(), HarnessError> {
+        self.active_steering_turns
+            .lock()
+            .await
+            .remove(&thread.thread);
         self.threads
             .lock()
             .await

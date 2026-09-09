@@ -52,7 +52,9 @@ tell.
 
 `POST /api/projects/{id}/threads/start` creates the durable thread from the first user message or
 attachment set, persists a deterministic title generated from the prompt or first attachment name,
-and returns the title with the new thread and turn identifiers. The request accepts optional
+and returns the title with the new thread and turn identifiers. Both this response and the existing
+thread open response include `turn_steering`, sampled from the attached harness; a degraded
+read-only open reports `false`. The request accepts optional
 transient attachment payloads; Giskard validates them and does not persist raw attachment bytes.
 Image MIME types must match PNG, JPEG, GIF, or WebP file signatures. Raw bytes are also redacted
 before turns enter the parsed in-memory history cache. The Codex adapter transfers non-image files
@@ -138,6 +140,15 @@ history, and `LiveTurnSnapshot`. Approval decisions and
 server-request responses both include `thread_id` so the runtime registry can validate and claim
 the request atomically instead of consulting a global request-to-thread routing map.
 See [Sub-agent threads](subagents.md) for the full contract.
+
+The WebSocket distinguishes starting work from steering it. `SendInput { thread_id, text,
+attachments? }` starts a new turn and remains rejected with `thread_turn_active` if one already
+owns the thread. `SteerInput { thread_id, turn_id, text }` appends text to that exact acknowledged
+active user turn; it never creates a new turn or queues a follow-up. Steering rejects stale or
+unacknowledged IDs, manual compaction, persistence-blocked and read-only threads, and unsupported
+harnesses. Success appears through the ordinary same-turn `UserMessage` item. A direct steering
+error is sent only to the initiating client and does not clear the real active turn. Attachments
+are disabled while a turn is active because steering is text-only.
 
 `GET /api/projects/{id}/threads/{thread_id}/history` returns completed turns oldest-first as
 `{ thread_id, turns, has_more }`. `before=<TurnId>` selects the page immediately before that turn;

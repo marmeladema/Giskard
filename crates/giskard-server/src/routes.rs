@@ -659,6 +659,7 @@ async fn open_thread(
         return Ok(Json(OpenThreadResponse {
             thread_id: handle.thread,
             harness_thread_id: handle.harness_thread_id.clone(),
+            turn_steering: binding.turn_steering(),
             warning: None,
         }));
     }
@@ -696,8 +697,8 @@ async fn open_thread(
             )
             .await
     };
-    let handle = match open_result {
-        Ok(handle) => handle,
+    let binding = match open_result {
+        Ok(binding) => binding,
         Err(error) => {
             warn!(
                 %project_id,
@@ -724,6 +725,7 @@ async fn open_thread(
             return Ok(Json(OpenThreadResponse {
                 thread_id,
                 harness_thread_id: thread_file.harness_thread_id,
+                turn_steering: false,
                 warning: Some(read_only_info(
                     context.as_ref(),
                     Some(error.to_string()),
@@ -733,6 +735,8 @@ async fn open_thread(
             }));
         }
     };
+    let turn_steering = binding.turn_steering();
+    let handle = binding.handle().clone();
 
     if handle.thread != thread_id {
         return Err(ApiError::Internal(format!(
@@ -763,6 +767,7 @@ async fn open_thread(
     Ok(Json(OpenThreadResponse {
         thread_id,
         harness_thread_id: handle.harness_thread_id,
+        turn_steering,
         warning,
     }))
 }
@@ -873,17 +878,19 @@ async fn start_thread_with_message(
         .map(|w| w.workspace_root())
         .unwrap_or(project_ws_root);
 
-    let handle = match state
+    let binding = match state
         .registry
         .open_thread(&project_config, ws_root, thread_id, None, model_ref.clone())
         .await
     {
-        Ok(handle) => handle,
+        Ok(binding) => binding,
         Err(error) => {
             remove_worktree_after_start_failure(worktree.as_ref(), thread_id, "open_thread").await;
             return Err(harness_api_error(error));
         }
     };
+    let turn_steering = binding.turn_steering();
+    let handle = binding.handle().clone();
     if handle.thread != thread_id {
         cleanup_new_thread_after_start_failure(
             &state,
@@ -1001,6 +1008,7 @@ async fn start_thread_with_message(
         title,
         harness_thread_id: handle.harness_thread_id,
         turn_id,
+        turn_steering,
         warning,
     }))
 }

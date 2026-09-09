@@ -129,7 +129,10 @@ Then open **http://127.0.0.1:8787**, log in, and:
    focused composer
    to include images, PDFs, or other files with the message. A message accepts up to eight files
    and 25 MiB total. The first send creates the Codex thread with the selected
-   provider/model and starts the turn. Existing threads show the **Tasks** menu for running
+   provider/model and starts the turn. While an ordinary Codex turn is running, type text to reveal
+   **Send** beside **Stop** and append that message to the same turn; an empty composer keeps the
+   single Stop control. Active-turn steering is text-only, so attachments become available again
+   after the turn completes. Existing threads show the **Tasks** menu for running
    commands/tools, **Sub-agents** monitor, **MCP** status menu, and **Context** usage button;
    scrolling the transcript to the top lazy-loads older history. Completed command rows carry only
    a bounded preview; opening one fetches its retained output and resolves path links by command

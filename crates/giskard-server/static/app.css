@@ -644,18 +644,15 @@
     background:var(--scroll-thumb); border:2px solid var(--scroll-track); border-radius:999px;
   }
   .composer textarea::-webkit-scrollbar-thumb:hover { background:var(--scroll-thumb-hover); }
-  /* Send (up-pointing paper-plane arrow) and Stop (red filled square) are flex siblings; only one
-     is ever visible (the other has [hidden]), so they occupy the same 40px slot. Both match the
-     composer's at-rest height, mirroring the ＋ attach button on the left for a symmetric composer;
-     when the textarea grows they keep that height and stay aligned to its bottom edge. */
+  /* Send (up-pointing paper-plane arrow) and Stop (red filled square) are flex siblings. They share
+     the trailing action position while idle or unsupported, and sit side-by-side when non-empty
+     steering input is available. Both remain bottom-aligned when the textarea grows. */
   .composer #sendBtn,
   .composer #stopBtn {
     width:40px; min-width:40px; height:40px; margin:0; padding:0;
     display:flex; align-items:center; justify-content:center; border-radius:6px; line-height:1;
   }
-  /* The [hidden] attribute's default display:none is overridden by the display:flex above, so
-     re-assert display:none for hidden buttons — otherwise the send arrow stays visible alongside
-     the stop square during a running turn. */
+  /* The icon rules override the [hidden] attribute's default display:none, so re-assert it. */
   .composer #sendBtn[hidden],
   .composer #stopBtn[hidden] { display:none; }
   /* Both icon buttons render a Unicode glyph at the same size, matching the ＋ attach button. */
