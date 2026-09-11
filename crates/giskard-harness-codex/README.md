@@ -492,6 +492,18 @@ skipped without hiding valid providers; a malformed table fails provider listing
   Giskard can run it when it needs a discovery token.
   `experimental_bearer_token` is not reported: an inline secret stays in Codex's
   config rather than being copied into another process.
+- **Discovery headers follow Codex** — `http_headers` carries literal name/value
+  pairs and `env_http_headers` carries header-name/environment-variable pairs.
+  Literal values are sensitive and necessarily enter Giskard's memory so its own
+  `/models` request can send them; debug output and warnings redact them, and they
+  are never persisted or exposed through the browser. At request time a non-empty
+  environment value overrides a literal header with the same name
+  case-insensitively. An unset or blank environment variable leaves the literal
+  fallback intact. Invalid names or values are skipped individually and warned
+  without printing values. Case-insensitive duplicates within either source are
+  all skipped, avoiding a choice based on map iteration order while preserving
+  the environment-over-literal rule across sources. Bearer authentication is applied after these headers,
+  so `env_key` or command auth wins an `Authorization` collision.
 - **`auth` wins over `env_key`** — Codex's own `ModelProviderInfo::validate`
   rejects a provider declaring both, so at most one is ever present. Preferring
   `auth` keeps a config Codex would refuse to load from authenticating discovery

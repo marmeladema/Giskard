@@ -267,7 +267,8 @@ reads `~/.codex/config.toml` for real provider/auth, so any model you select mus
 actually reach.
 
 Because Codex already owns that file, Giskard does not ask you to restate any of it. A provider's
-display name, `base_url`, and where its key comes from are read back from Codex, so a
+display name, `base_url`, request headers, and where its key comes from are read back from Codex,
+so a
 `[providers.<id>]` table declares only whether to run discovery and which models to offer — the id
 is the table key, quoted if it is not a bare TOML key (`[providers."openrouter.ai"]`, since the
 unquoted form would read as a provider `openrouter` with a sub-table). Keys Giskard does not
@@ -283,6 +284,17 @@ environment variable; one with `[model_providers.<id>.auth]` has its command run
 sent as the bearer token, recomputed each time rather than cached. A key set inline as
 `experimental_bearer_token` is deliberately not read — discovery against such a provider needs
 `env_key` or `auth` instead.
+
+Discovery also inherits Codex's `http_headers` and `env_http_headers`. Literal `http_headers`
+values are sensitive and necessarily exist in Giskard's memory while it prepares the request, but
+are never logged, persisted, or sent to the browser. Each `env_http_headers` entry names an
+environment variable whose non-empty value overrides a literal header with the same name
+case-insensitively; an unset or blank variable leaves the literal fallback intact. Invalid header
+names or values are skipped with a warning that names the provider and header, never the value.
+Case-insensitive duplicate names within either header table are all skipped rather than choosing
+one nondeterministically; this does not prevent an environment header overriding a literal one.
+Bearer authentication is applied last, so `env_key` or `auth` wins if custom headers also set
+`Authorization`.
 
 Discovery reads both shapes the endpoint may answer with — the OpenAI-compatible
 `{"data": [...]}` and the richer catalog (`{"models": [...]}`) a provider serves to a caller that

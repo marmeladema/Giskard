@@ -899,6 +899,23 @@ async fn discover_provider(
     };
     let url = models_url(base_url, client_version);
 
+    let mut invalid_metadata_models = Vec::new();
+
+    let (mut headers, header_warnings) = provider_headers(known);
+    for message in header_warnings {
+        warn!(
+            provider = %id,
+            %url,
+            %message,
+            action = "discover_models",
+            "invalid provider header was skipped"
+        );
+        warnings.push(ModelListingWarning {
+            source: format!("provider:{id}"),
+            message,
+        });
+    }
+
     let mut fail = |message: String| {
         warn!(provider = %id, %url, %message, "model discovery failed; skipping provider");
         warnings.push(ModelListingWarning {
@@ -906,7 +923,6 @@ async fn discover_provider(
             message,
         });
     };
-    let mut invalid_metadata_models = Vec::new();
 
     // Attach the provider's discovery key for endpoints that require auth — e.g. a LiteLLM
     // proxy with a master key returns 401 otherwise. A command-backed key that cannot be
@@ -919,8 +935,15 @@ async fn discover_provider(
             return (models, warnings);
         }
     };
-    let mut request = client.get(&url);
+    if key.is_some() {
+        // `RequestBuilder::bearer_auth` appends rather than replaces an existing value supplied
+        // through `headers`, so remove the custom value explicitly to preserve Codex precedence.
+        headers.remove(reqwest::header::AUTHORIZATION);
+    }
+    let mut request = client.get(&url).headers(headers);
     if let Some(key) = key {
+        // Authentication is applied after custom headers, matching Codex: a resolved bearer token
+        // owns `Authorization` when both mechanisms configure it.
         request = request.bearer_auth(key);
     }
 
@@ -979,6 +1002,92 @@ async fn discover_provider(
     (models, warnings)
 }
 
+/// Resolve the provider's literal and environment-backed headers without exposing their values.
+///
+/// Environment entries are applied second, so a usable value overrides a literal entry with the
+/// same case-insensitive name. An absent, blank, or invalid environment value leaves the literal
+/// fallback untouched.
+fn provider_headers(provider: &HarnessProvider) -> (reqwest::header::HeaderMap, Vec<String>) {
+    use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
+
+    fn unique_entries<'a>(
+        entries: &'a HashMap<String, String>,
+        source: &str,
+        warnings: &mut Vec<String>,
+    ) -> Vec<(HeaderName, &'a str, &'a str)> {
+        let mut raw_entries: Vec<_> = entries.iter().collect();
+        raw_entries.sort_by_key(|(header, _)| *header);
+
+        let mut parsed = Vec::with_capacity(raw_entries.len());
+        let mut counts = HashMap::<HeaderName, usize>::new();
+        for (header, value) in raw_entries {
+            match HeaderName::try_from(header) {
+                Ok(name) => {
+                    *counts.entry(name.clone()).or_default() += 1;
+                    parsed.push((name, header.as_str(), value.as_str()));
+                }
+                Err(_) => warnings.push(format!("ignored invalid HTTP header name `{header}`")),
+            }
+        }
+
+        let mut warned = HashSet::new();
+        parsed
+            .into_iter()
+            .filter_map(|(name, header, value)| {
+                if counts.get(&name).copied().unwrap_or_default() == 1 {
+                    return Some((name, header, value));
+                }
+                if warned.insert(name.clone()) {
+                    warnings.push(format!(
+                        "ignored case-insensitive duplicate HTTP header name `{name}` in {source}"
+                    ));
+                }
+                None
+            })
+            .collect()
+    }
+
+    let mut headers = HeaderMap::new();
+    let mut warnings = Vec::new();
+    let literal = unique_entries(
+        provider.http_headers.literal(),
+        "literal headers",
+        &mut warnings,
+    );
+    let environment = unique_entries(
+        provider.http_headers.from_env(),
+        "environment-backed headers",
+        &mut warnings,
+    );
+    let mut insert = |name: HeaderName, header: &str, value: &str, origin: Option<&str>| {
+        let value = match HeaderValue::try_from(value) {
+            Ok(value) => value,
+            Err(_) => {
+                let source = origin
+                    .map(|var| format!(" resolved from ${var}"))
+                    .unwrap_or_default();
+                warnings.push(format!(
+                    "ignored invalid value for HTTP header `{header}`{source}"
+                ));
+                return;
+            }
+        };
+        headers.insert(name, value);
+    };
+
+    for (name, header, value) in literal {
+        insert(name, header, value, None);
+    }
+    for (name, header, variable) in environment {
+        if let Ok(value) = std::env::var(variable)
+            && !value.trim().is_empty()
+        {
+            insert(name, header, &value, Some(variable));
+        }
+    }
+    (headers, warnings)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -989,7 +1098,127 @@ mod tests {
             name: None,
             base_url: base_url.map(str::to_string),
             auth: None,
+            http_headers: giskard_harness::ProviderHttpHeaders::default(),
         }
+    }
+
+    #[test]
+    fn provider_headers_apply_environment_overrides_and_literal_fallbacks() {
+        let mut provider = harness_provider("p", Some("http://example.test"));
+        provider.http_headers = giskard_harness::ProviderHttpHeaders::new(
+            HashMap::from([
+                ("X-Override".into(), "literal".into()),
+                ("X-Fallback".into(), "kept".into()),
+                ("Authorization".into(), "Custom token".into()),
+            ]),
+            HashMap::from([
+                ("x-override".into(), "GISKARD_TEST_DISCOVERY_KEY".into()),
+                (
+                    "x-fallback".into(),
+                    "GISKARD_DEFINITELY_UNSET_HEADER".into(),
+                ),
+            ]),
+        );
+
+        let (headers, warnings) = provider_headers(&provider);
+        assert!(warnings.is_empty());
+        assert_eq!(headers["x-override"], "secret-key");
+        assert_eq!(headers["x-fallback"], "kept");
+        assert_eq!(headers["authorization"], "Custom token");
+    }
+
+    #[test]
+    fn provider_headers_skip_invalid_entries_with_redacted_warnings() {
+        let mut provider = harness_provider("p", Some("http://example.test"));
+        provider.http_headers = giskard_harness::ProviderHttpHeaders::new(
+            HashMap::from([
+                ("X-Good".into(), "kept".into()),
+                ("bad header".into(), "name-secret".into()),
+                ("X-Bad-Value".into(), "value-secret\ninvalid".into()),
+            ]),
+            HashMap::new(),
+        );
+
+        let (headers, warnings) = provider_headers(&provider);
+        assert_eq!(headers["x-good"], "kept");
+        assert_eq!(warnings.len(), 2);
+        let joined = warnings.join(" | ");
+        assert!(joined.contains("bad header"));
+        assert!(joined.contains("X-Bad-Value"));
+        assert!(!joined.contains("name-secret"));
+        assert!(!joined.contains("value-secret"));
+    }
+
+    #[test]
+    fn blank_environment_header_value_leaves_literal_fallback() {
+        let mut provider = harness_provider("p", Some("http://example.test"));
+        provider.http_headers = giskard_harness::ProviderHttpHeaders::new(
+            HashMap::from([("X-Fallback".into(), "kept".into())]),
+            HashMap::from([("x-fallback".into(), "GISKARD_TEST_BLANK_KEY".into())]),
+        );
+
+        let (headers, warnings) = provider_headers(&provider);
+        assert!(warnings.is_empty());
+        assert_eq!(headers["x-fallback"], "kept");
+    }
+
+    #[test]
+    fn invalid_environment_header_value_leaves_literal_fallback_and_warns() {
+        let mut provider = harness_provider("p", Some("http://example.test"));
+        provider.http_headers = giskard_harness::ProviderHttpHeaders::new(
+            HashMap::from([("X-Fallback".into(), "kept".into())]),
+            HashMap::from([("x-fallback".into(), "GISKARD_TEST_UNUSABLE_KEY".into())]),
+        );
+
+        let (headers, warnings) = provider_headers(&provider);
+        assert_eq!(headers["x-fallback"], "kept");
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("x-fallback"));
+        assert!(warnings[0].contains("GISKARD_TEST_UNUSABLE_KEY"));
+        assert!(!warnings[0].contains("two"));
+        assert!(!warnings[0].contains("lines"));
+    }
+
+    #[test]
+    fn case_insensitive_literal_duplicates_are_all_rejected() {
+        let mut provider = harness_provider("p", Some("http://example.test"));
+        provider.http_headers = giskard_harness::ProviderHttpHeaders::new(
+            HashMap::from([
+                ("X-Duplicate".into(), "first-secret".into()),
+                ("x-duplicate".into(), "second-secret".into()),
+                ("X-Good".into(), "kept".into()),
+            ]),
+            HashMap::new(),
+        );
+
+        let (headers, warnings) = provider_headers(&provider);
+        assert!(!headers.contains_key("x-duplicate"));
+        assert_eq!(headers["x-good"], "kept");
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("x-duplicate"));
+        assert!(warnings[0].contains("literal headers"));
+        assert!(!warnings[0].contains("first-secret"));
+        assert!(!warnings[0].contains("second-secret"));
+    }
+
+    #[test]
+    fn case_insensitive_environment_duplicates_leave_literal_fallback() {
+        let mut provider = harness_provider("p", Some("http://example.test"));
+        provider.http_headers = giskard_harness::ProviderHttpHeaders::new(
+            HashMap::from([("X-Duplicate".into(), "literal-fallback".into())]),
+            HashMap::from([
+                ("X-Duplicate".into(), "GISKARD_TEST_DISCOVERY_KEY".into()),
+                ("x-duplicate".into(), "GISKARD_TEST_PADDED_KEY".into()),
+                ("X-Good".into(), "GISKARD_TEST_DISCOVERY_KEY".into()),
+            ]),
+        );
+
+        let (headers, warnings) = provider_headers(&provider);
+        assert_eq!(headers["x-duplicate"], "literal-fallback");
+        assert_eq!(headers["x-good"], "secret-key");
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("x-duplicate"));
+        assert!(warnings[0].contains("environment-backed headers"));
     }
 
     fn target_ids(config: &Config, table: &[HarnessProvider]) -> Vec<String> {

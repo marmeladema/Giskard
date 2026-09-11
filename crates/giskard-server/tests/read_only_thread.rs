@@ -111,6 +111,7 @@ async fn a_provider_the_harness_does_not_know_is_named_as_the_cause() {
             name: None,
             base_url: None,
             auth: None,
+            http_headers: giskard_harness::ProviderHttpHeaders::default(),
         }];
         attach_fails_factory(Some(providers))
     })

@@ -457,6 +457,7 @@ impl AgentHarness for ScriptedHarness {
             name: Some("Replay (scripted)".into()),
             base_url: None,
             auth: None,
+            http_headers: giskard_harness::ProviderHttpHeaders::default(),
         }])
     }
 
