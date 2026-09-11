@@ -84,6 +84,18 @@ struct OpenThreadOutcome {
     resume_replay_model: Option<ModelRef>,
 }
 
+/// Deserialize an optional config value into its concrete default.
+///
+/// Codex's `config/read` serializes absent optional maps as JSON `null`, while older versions may
+/// omit them. Both forms mean the same thing to this normalized compatibility projection.
+fn deserialize_null_default<'de, D, T>(deserializer: D) -> Result<T, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de> + Default,
+{
+    Option::<T>::deserialize(deserializer).map(Option::unwrap_or_default)
+}
+
 /// The subset of Codex's `ModelProviderInfo` Giskard needs: a name for the picker and the endpoint
 /// plus key location for `/v1/models` discovery.
 ///
@@ -101,9 +113,9 @@ struct CodexModelProvider {
     /// `[model_providers.<id>.auth]` — a command whose stdout is the provider's bearer token.
     #[serde(default)]
     auth: Option<CodexProviderAuth>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_null_default")]
     http_headers: HashMap<String, String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_null_default")]
     env_http_headers: HashMap<String, String>,
 }
 
@@ -4678,7 +4690,12 @@ mod tests {
         config.additional.insert(
             "model_providers".into(),
             serde_json::json!({
-                "valid": { "name": "Valid", "env_key": "VALID_KEY" },
+                "valid": {
+                    "name": "Valid",
+                    "env_key": "VALID_KEY",
+                    "http_headers": null,
+                    "env_http_headers": null
+                },
                 "malformed": { "name": ["not", "a", "string"] }
             }),
         );
@@ -4690,6 +4707,39 @@ mod tests {
                 .get("valid")
                 .and_then(|provider| provider.name.as_deref()),
             Some("Valid")
+        );
+        let valid = providers.get("valid").unwrap();
+        assert!(valid.http_headers.is_empty());
+        assert!(valid.env_http_headers.is_empty());
+    }
+
+    #[test]
+    fn provider_header_maps_normalize_missing_and_null_to_empty() {
+        for value in [
+            serde_json::json!({}),
+            serde_json::json!({ "http_headers": null, "env_http_headers": null }),
+        ] {
+            let provider: CodexModelProvider = serde_json::from_value(value)
+                .unwrap_or_else(|error| panic!("empty header maps should decode: {error}"));
+            assert!(provider.http_headers.is_empty());
+            assert!(provider.env_http_headers.is_empty());
+        }
+
+        let provider: CodexModelProvider = serde_json::from_value(serde_json::json!({
+            "http_headers": { "X-Literal": "value" },
+            "env_http_headers": { "X-Environment": "HEADER_ENV" }
+        }))
+        .unwrap_or_else(|error| panic!("populated header maps should decode: {error}"));
+        assert_eq!(
+            provider.http_headers.get("X-Literal").map(String::as_str),
+            Some("value")
+        );
+        assert_eq!(
+            provider
+                .env_http_headers
+                .get("X-Environment")
+                .map(String::as_str),
+            Some("HEADER_ENV")
         );
     }
 
