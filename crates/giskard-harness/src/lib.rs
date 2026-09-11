@@ -3,6 +3,7 @@
 mod event_log;
 pub use event_log::{EVENT_LOG_RETAIN_LIMIT, EventLog, EventLogReader, EventStreamError};
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -60,9 +61,9 @@ pub struct HarnessCapabilities {
 /// the harness's own configuration and are read back through [`AgentHarness::list_providers`]
 /// rather than restated in `config.toml`.
 ///
-/// Deliberately carries *where the key comes from*, never the key itself: a harness config may
-/// hold an inline secret, and copying it into Giskard would spread it across another process's
-/// memory and logs for no benefit.
+/// Bearer auth deliberately carries *where the key comes from*, never the key itself. Literal
+/// provider headers are the exception: Giskard must apply them to the model-list request it makes
+/// itself, so their values cross into memory but remain redacted from diagnostics.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HarnessProvider {
     /// Routing id. A Giskard `[providers.<id>]` key must match one of these to be reachable.
@@ -73,6 +74,47 @@ pub struct HarnessProvider {
     pub base_url: Option<String>,
     /// Where this provider's discovery key comes from, when the harness names a source.
     pub auth: Option<ProviderAuth>,
+    /// Additional headers the harness applies to requests for this provider.
+    pub http_headers: ProviderHttpHeaders,
+}
+
+/// Provider request headers inherited from the harness configuration.
+///
+/// Literal values may be credentials, so the custom `Debug` implementation exposes header names
+/// but never their values. Environment-backed entries retain only the variable name and resolve
+/// its value immediately before each discovery request.
+#[derive(Clone, Default, PartialEq, Eq)]
+pub struct ProviderHttpHeaders {
+    literal: HashMap<String, String>,
+    from_env: HashMap<String, String>,
+}
+
+impl ProviderHttpHeaders {
+    pub fn new(literal: HashMap<String, String>, from_env: HashMap<String, String>) -> Self {
+        Self { literal, from_env }
+    }
+
+    pub fn literal(&self) -> &HashMap<String, String> {
+        &self.literal
+    }
+
+    pub fn from_env(&self) -> &HashMap<String, String> {
+        &self.from_env
+    }
+}
+
+impl std::fmt::Debug for ProviderHttpHeaders {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mut literal_names: Vec<_> = self.literal.keys().collect();
+        literal_names.sort();
+        let mut environment_headers: Vec<_> = self.from_env.iter().collect();
+        environment_headers.sort();
+        formatter
+            .debug_struct("ProviderHttpHeaders")
+            .field("literal_header_names", &literal_names)
+            .field("environment_headers", &environment_headers)
+            .finish()
+    }
 }
 
 /// Where a provider's discovery key comes from.
@@ -698,6 +740,7 @@ mod tests {
                 cwd: None,
                 timeout,
             })),
+            http_headers: ProviderHttpHeaders::default(),
         }
     }
 
@@ -831,6 +874,7 @@ mod tests {
             name: None,
             base_url: None,
             auth: Some(ProviderAuth::Env(var.into())),
+            http_headers: ProviderHttpHeaders::default(),
         }
     }
 
@@ -884,7 +928,21 @@ mod tests {
             name: None,
             base_url: None,
             auth: None,
+            http_headers: ProviderHttpHeaders::default(),
         };
         assert_eq!(provider.resolve_api_key().await.unwrap(), None);
+    }
+
+    #[test]
+    fn provider_http_headers_redact_literal_values_from_debug() {
+        let headers = ProviderHttpHeaders::new(
+            HashMap::from([("X-Secret".into(), "literal-secret-never-log".into())]),
+            HashMap::from([("X-Tenant".into(), "TENANT_ID".into())]),
+        );
+
+        let debug = format!("{headers:?}");
+        assert!(debug.contains("X-Secret"));
+        assert!(debug.contains("TENANT_ID"));
+        assert!(!debug.contains("literal-secret-never-log"));
     }
 }

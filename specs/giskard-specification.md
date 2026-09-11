@@ -2957,8 +2957,9 @@ the id a TOML key rather than a string value, so an id that is not a bare key mu
 turns the unquoted form (a provider `openrouter` with a stray sub-table) into an error naming the
 offending segment rather than a provider silently offering no models.
 
-**The harness owns provider configuration.** A provider's display name, endpoint, and key
-location already exist in the harness's own configuration, and Giskard reads them back through
+**The harness owns provider configuration.** A provider's display name, endpoint, request headers,
+and key location already exist in the harness's own configuration, and Giskard reads them back
+through
 `AgentHarness::list_providers` (behind the `provider_listing` capability) rather than asking the
 user to restate them. Restating them is not merely redundant: two copies of an endpoint drift,
 and the copy Giskard holds is not the one that routes turns. A harness that cannot introspect its
@@ -2983,6 +2984,20 @@ token. A command that fails, times out, or prints nothing is reported as itself 
 not attempted — sending it unauthenticated would bury the cause under a 401 blaming the endpoint.
 The same vetting applies to a key read from an environment variable: either source is trimmed and
 must be usable as a header value, and the failure names whichever one it came from.
+
+Provider request headers are inherited too. Literal `http_headers` name/value pairs are sensitive
+and necessarily enter Giskard's memory because discovery is Giskard's HTTP request, but their
+values are excluded from debug output, logs, warnings, persistence, and browser interfaces.
+`env_http_headers` maps each header name to an environment variable. For every discovery request,
+Giskard applies literal headers first, then each non-empty environment value, which overrides a
+literal header of the same name case-insensitively. An unset or blank environment variable leaves
+the literal fallback intact. Invalid names and values are skipped individually, preserving other
+headers, and produce provider-scoped warnings that may name the header but never its value. The
+case-insensitive duplicate names within either source are all skipped so map iteration order never
+chooses a credential; this does not prevent an environment header overriding a literal header from
+the other source. The
+bearer token from `env_key` or `auth` is applied last, so it wins any custom `Authorization`
+header; without a bearer source, a custom `Authorization` header remains effective.
 
 **Id validation.** A `[providers.<id>]` key is the routing id sent to the harness, so an id the
 harness does not know cannot route. Giskard checks the configured ids against the harness's
@@ -3020,7 +3035,8 @@ are wrong.
   supports_reasoning_effort = true
   ```
 - **Discovery is on for every provider the harness reports**, refreshing the list from
-  `GET {base_url}/models` and merging the results over the static list. The `base_url` and the key
+  `GET {base_url}/models` and merging the results over the static list. The `base_url`, headers,
+  and key
   come from the harness's provider table (§8.2), so discovery is a per-project operation: there is
   no endpoint to query until a harness can name one. A manual "refresh models" action triggers
   this; results are cached in memory per project.

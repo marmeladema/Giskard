@@ -57,7 +57,7 @@ use giskard_core::{AttachmentKind, UserAttachment, UserInput};
 use giskard_harness::{
     AgentEventStream, AgentHarness, DiscoveryStream, EventLog, HarnessBootstrap,
     HarnessCapabilities, HarnessNotice, HarnessProvider, OpenThreadOptions, ProviderAuth,
-    ProviderAuthCommand, ThreadDiscovered, ThreadHandle, ThreadUpdate,
+    ProviderAuthCommand, ProviderHttpHeaders, ThreadDiscovered, ThreadHandle, ThreadUpdate,
 };
 
 use mapping::CodexMapper;
@@ -87,9 +87,10 @@ struct OpenThreadOutcome {
 /// The subset of Codex's `ModelProviderInfo` Giskard needs: a name for the picker and the endpoint
 /// plus key location for `/v1/models` discovery.
 ///
-/// `experimental_bearer_token` is deliberately not read. Codex discourages it, and an inline secret
-/// is the one field worth leaving where it already lives.
-#[derive(Debug, Deserialize)]
+/// `experimental_bearer_token` is deliberately not read. Codex discourages it; provider headers
+/// must cross this boundary because they affect the request Giskard makes itself, while that
+/// bearer token duplicates the existing auth mechanisms.
+#[derive(Deserialize)]
 struct CodexModelProvider {
     #[serde(default)]
     name: Option<String>,
@@ -100,6 +101,10 @@ struct CodexModelProvider {
     /// `[model_providers.<id>.auth]` — a command whose stdout is the provider's bearer token.
     #[serde(default)]
     auth: Option<CodexProviderAuth>,
+    #[serde(default)]
+    http_headers: HashMap<String, String>,
+    #[serde(default)]
+    env_http_headers: HashMap<String, String>,
 }
 
 /// Codex's `ModelProviderAuthInfo`. `refresh_interval_ms` is not read: Giskard reruns the command
@@ -2441,15 +2446,21 @@ async fn handle_list_providers(
             name: None,
             base_url: None,
             auth: None,
+            http_headers: ProviderHttpHeaders::default(),
         })
         .collect();
 
     for (id, provider) in configured_providers {
+        let http_headers = ProviderHttpHeaders::new(
+            provider.http_headers.clone(),
+            provider.env_http_headers.clone(),
+        );
         let entry = HarnessProvider {
             id: id.clone(),
             name: non_empty(provider.name.clone()),
             base_url: non_empty(provider.base_url.clone()),
             auth: provider.auth(),
+            http_headers,
         };
         match providers.iter_mut().find(|existing| existing.id == id) {
             Some(existing) => *existing = entry,
@@ -3139,6 +3150,12 @@ mod tests {
                                             "name": "LiteLLM",
                                             "base_url": "http://127.0.0.1:4000/v1",
                                             "env_key": "LITELLM_KEY",
+                                            "http_headers": {
+                                                "X-Literal": "literal-secret-never-log"
+                                            },
+                                            "env_http_headers": {
+                                                "X-Tenant": "LITELLM_TENANT"
+                                            },
                                             "wire_api": "responses"
                                         },
                                         "unnamed": {
@@ -4560,6 +4577,26 @@ mod tests {
             Some(ProviderAuth::Env("LITELLM_KEY".into())),
             "env_key should map to the env arm"
         );
+        assert_eq!(
+            litellm
+                .http_headers
+                .literal()
+                .get("X-Literal")
+                .map(String::as_str),
+            Some("literal-secret-never-log")
+        );
+        assert_eq!(
+            litellm
+                .http_headers
+                .from_env()
+                .get("X-Tenant")
+                .map(String::as_str),
+            Some("LITELLM_TENANT")
+        );
+        assert!(
+            !format!("{litellm:?}").contains("literal-secret-never-log"),
+            "provider diagnostics must redact literal header values"
+        );
 
         // Codex defaults an omitted `name` to "", which is absence, not a display name.
         let unnamed = by_id("unnamed");
@@ -4630,7 +4667,8 @@ mod tests {
             Err(HarnessError::Protocol(message)) => {
                 assert!(message.contains("invalid model_providers table"));
             }
-            other => panic!("expected protocol error, got {other:?}"),
+            Ok(_) => panic!("expected protocol error, got providers"),
+            Err(other) => panic!("expected protocol error, got {other}"),
         }
     }
 

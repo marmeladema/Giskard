@@ -87,8 +87,8 @@ idle_shutdown_secs = 0
 #
 # Models are found without it. Every provider Codex has a base_url for is discovered from that
 # provider's GET /v1/models, and the provider Codex routes to (`model_provider`, or the openai
-# built-in) also contributes its own model/list catalog. Display name, base_url, and API key
-# already live in Codex's own ~/.codex/config.toml, and Giskard reads them back from Codex rather
+# built-in) also contributes its own model/list catalog. Display name, base_url, request headers,
+# and API key already live in Codex's own ~/.codex/config.toml, and Giskard reads them back rather
 # than asking for them twice — so a provider you have already declared to Codex needs no mention
 # here at all.
 #
@@ -110,7 +110,13 @@ idle_shutdown_secs = 0
 #
 # Discovery authenticates however Codex says to: `env_key` names an environment variable, and
 # [model_providers.<id>.auth] names a command whose stdout is the bearer token — Giskard runs it
-# each time it needs one. Nothing to configure here either way.
+# each time it needs one. Codex's `http_headers` and `env_http_headers` are also sent. A non-empty
+# environment-backed value overrides a literal header of the same name; an unset or blank one
+# leaves the literal fallback intact. Bearer authentication is applied last and therefore wins an
+# `Authorization` collision. Literal header values are sensitive: Giskard holds them in memory to
+# make the request, but does not log, persist, or expose them. Case-insensitive duplicate names
+# within either header table are skipped rather than resolved by map iteration order. Nothing to
+# configure here either way.
 
 # The table is keyed by the routing id, mirroring Codex's own `[model_providers.<id>]`. An id that
 # is not a bare TOML key — one with a dot in it, say — must be quoted: [providers."openrouter.ai"],

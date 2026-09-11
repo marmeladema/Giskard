@@ -6,12 +6,13 @@
 //! harness's own provider table (§8.2), so every test here goes through
 //! `GET /api/projects/{id}/models` rather than the no-project baseline.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
 use axum::{Router, response::Json as AxumJson, routing::get};
 use giskard_core::ids::{ProjectId, ThreadId};
-use giskard_harness::{HarnessProvider, ProviderAuth, ProviderAuthCommand};
+use giskard_harness::{HarnessProvider, ProviderAuth, ProviderAuthCommand, ProviderHttpHeaders};
 use giskard_harness_replay::{ReplayFixture, ReplayHarness};
 use giskard_testenv::{TestServer, factory, fixtures};
 
@@ -85,6 +86,7 @@ model_listing = true
             name: Some("Mock".into()),
             base_url: Some(format!("http://{mock_addr}")),
             auth: None,
+            http_headers: giskard_harness::ProviderHttpHeaders::default(),
         }],
         client_version: None,
         harness_models: Vec::new(),
@@ -228,7 +230,10 @@ async fn dynamic_model_refresh_sends_api_key() {
             let expected = format!("Bearer {key}");
             let authorized =
                 headers.get("authorization").and_then(|v| v.to_str().ok()) == Some(&*expected);
-            let data = if authorized {
+            let custom_headers = headers.get("x-literal").and_then(|v| v.to_str().ok())
+                == Some("literal-value")
+                && headers.get("x-env").and_then(|v| v.to_str().ok()) == Some(&*key);
+            let data = if authorized && custom_headers {
                 serde_json::json!([{ "id": "secured-model" }])
             } else {
                 serde_json::json!([])
@@ -253,6 +258,13 @@ model_listing = true
             name: Some("Secured".into()),
             base_url: Some(format!("http://{mock_addr}")),
             auth: Some(ProviderAuth::Env(KEY_ENV.into())),
+            http_headers: ProviderHttpHeaders::new(
+                HashMap::from([
+                    ("X-Literal".into(), "literal-value".into()),
+                    ("Authorization".into(), "Custom token".into()),
+                ]),
+                HashMap::from([("X-Env".into(), KEY_ENV.into())]),
+            ),
         }],
     }
     .into_factory();
@@ -284,7 +296,7 @@ model_listing = true
         .collect();
     assert!(
         ids.contains(&"secured-model"),
-        "authorized discovery should list the model (bearer key sent): {ids:?}"
+        "discovery should send custom headers and bearer auth last: {ids:?}"
     );
 }
 
@@ -319,6 +331,7 @@ model_listing = true
             name: Some("Secured".into()),
             base_url: Some(format!("http://{mock_addr}")),
             auth: None,
+            http_headers: giskard_harness::ProviderHttpHeaders::default(),
         }],
     }
     .into_factory();
@@ -379,6 +392,7 @@ async fn unknown_provider_id_is_reported_against_the_harness_table() {
             name: None,
             base_url: None,
             auth: None,
+            http_headers: giskard_harness::ProviderHttpHeaders::default(),
         }],
     }
     .into_factory();
@@ -648,6 +662,7 @@ model_listing = true
             name: Some("Secured".into()),
             base_url: Some(format!("http://{mock_addr}")),
             auth: Some(auth),
+            http_headers: giskard_harness::ProviderHttpHeaders::default(),
         }],
     }
     .into_factory();
@@ -783,6 +798,7 @@ async fn discover_catalog_with(
             name: Some("OpenCodex".into()),
             base_url: Some(format!("http://{mock_addr}")),
             auth: None,
+            http_headers: giskard_harness::ProviderHttpHeaders::default(),
         }],
         client_version: client_version.map(str::to_string),
         harness_models: Vec::new(),
@@ -948,6 +964,7 @@ async fn providers_are_queried_concurrently() {
             name: None,
             base_url: Some(format!("http://{addr}")),
             auth: None,
+            http_headers: giskard_harness::ProviderHttpHeaders::default(),
         });
     }
 
@@ -1002,6 +1019,7 @@ async fn a_stock_harness_catalog_fills_the_picker_on_its_own() {
             name: None,
             base_url: None,
             auth: None,
+            http_headers: giskard_harness::ProviderHttpHeaders::default(),
         }],
     }
     .into_factory();
@@ -1050,6 +1068,7 @@ async fn an_empty_picker_explains_itself() {
             name: None,
             base_url: None,
             auth: None,
+            http_headers: giskard_harness::ProviderHttpHeaders::default(),
         }],
     }
     .into_factory();

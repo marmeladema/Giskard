@@ -24,12 +24,14 @@ fn harness_providers(mock_addr: &str) -> Vec<HarnessProvider> {
             name: Some("OpenAI".into()),
             base_url: None,
             auth: None,
+            http_headers: giskard_harness::ProviderHttpHeaders::default(),
         },
         HarnessProvider {
             id: "mock".into(),
             name: Some("Mock".into()),
             base_url: Some(format!("http://{mock_addr}")),
             auth: None,
+            http_headers: giskard_harness::ProviderHttpHeaders::default(),
         },
     ]
 }
