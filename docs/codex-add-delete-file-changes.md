@@ -6,9 +6,11 @@ tree. The branch has since been rebased onto `dcb2128`, which added the Git line
 about 330 lines to `app.js`, so the `app.js` references below have shifted downward — the function
 names are still the addresses that matter. Everything else still resolves.
 
-**Status: implemented** — option A plus the client guard, as recommended below, with **one part of
+**Status: implemented** — option A plus the client guard, as recommended below, with **two parts of
 the plan rejected in review**: the harness translates on Codex's change kind alone, not on a test
-of the body's shape. See **Correction: the shape check belongs only in the browser**. Three smaller
+of the body's shape (**Correction: the shape check belongs only in the browser**), and the
+descriptor's line counts were deleted rather than fixed, because nothing read them
+(**Correction: the descriptor's line counts had no reader**). Three smaller
 things also landed beyond the plan as written, each noted in place: `unified_stats` became
 hunk-aware, the whole-file listing relabels the copy button rather than hiding it, and the replay
 harness got its own trigger instead of extending the lazy-diff turn.
@@ -45,10 +47,9 @@ them standing:
    `{"kind":"unified"}`, so every consumer is entitled to parse it as a patch.
 2. **The line counts are wrong.** `unified_stats` (`crates/giskard-core/src/diff.rs:183`) derives
    `additions`/`deletions` by counting `+`/`-` prefixes. Over raw content those counts are
-   arbitrary: a new 400-line file with two `+`-prefixed lines reports `+2 −0`. The counts are
-   persisted in the descriptor and sent on the wire
-   (`crates/giskard-proto/src/wire.rs:250`); today nothing in `app.js` reads them, but they are
-   part of the stored record and of the documented descriptor contract.
+   arbitrary: a new 400-line file with two `+`-prefixed lines reports `+2 −0`. The counts ride the
+   descriptor onto the wire (`crates/giskard-proto/src/wire.rs:250`), and nothing in `app.js` reads
+   them. *(Resolved by deletion — see **Correction: the descriptor's line counts had no reader**.)*
 3. **The overlay mis-renders it.** `openCapturedDiff` (`crates/giskard-server/static/app.js:8011`)
    takes `content.kind === "unified"` at face value and passes the text to `openDiffOverlay`
    (`:8857`), which runs `diffStats` (`:8602`) for the header and `parseUnifiedDiff` (`:8764`) for
@@ -154,8 +155,8 @@ with `\ No newline at end of file` when the content has no trailing newline, and
 belongs only in the browser** for why this paragraph originally said to test the body's shape
 instead, and why that was wrong.
 
-- Every downstream concern — content kind, `additions`/`deletions`, the overlay, **Copy diff** —
-  becomes correct with no change to the wire types, the payload format, or the persistence schema.
+- Every downstream concern — content kind, the overlay, **Copy diff** — becomes correct with no
+  change to the payload format or the persistence schema.
   `TURN_PAYLOAD_FORMAT` stays at 1.
 - **Copy diff** starts handing back something `git apply` accepts, which it does not today.
 - The Codex-specific knowledge ("`add`/`delete` mean raw content") stays inside
@@ -197,6 +198,43 @@ It is not a substitute, though: it fixes (3) and leaves (1) and (2) — the misl
 and the wrong persisted counts — exactly as they are, and it turns **Copy diff** into a button that
 copies something that is not a diff. It is a display refinement worth doing *on top of* a correct
 body, not instead of one.
+
+## Correction: the descriptor's line counts had no reader
+
+This plan treated the wrong `additions`/`deletions` as a defect to fix, and step 2 made
+`unified_stats` hunk-aware so a translated body would be counted correctly. Review of the finished
+branch asked the obvious question the plan never did: **who reads those numbers?**
+
+Nobody. `additions`/`deletions` were computed in `giskard-core`, projected through
+`giskard-proto` onto the wire, delivered to the browser, and read by no production code in either
+language — only by tests. Nor were they stored: `turn_with_inline_diffs` strips the descriptor
+before writing and `captured_diff_contents` discards it on read, so a descriptor is derived in
+memory on every delivery. A live server made the waste concrete — two entries of one file-change
+item, as the browser actually receives them:
+
+```json
+{ "path": "src/created-translated.md", "byte_size": 113, "additions": 3, "deletions": 0 }
+{ "path": "src/created-raw.md",        "byte_size":  48, "additions": 1, "deletions": 1 }
+```
+
+The second body is a three-line file, every line new; `+1 −1` is what counting its own `-` and `+`
+content lines produces, and it is what every pre-translation `add`/`delete` descriptor looked like.
+The overlay showed "3 lines" for it regardless, because it counts the body it renders.
+
+So the field was a number that could be wrong without anyone noticing — and keeping it correct
+meant keeping two counters, one per language, agreeing line for line. That pairing produced this
+branch's own worst bug: mirroring the hunk-awareness into `diffStats` latched a flag that made a
+two-file `git diff` report `+3 −3`.
+
+Both fields are therefore deleted, along with `unified_stats` and the `full_text_line_count`
+helper. `capture_structured_diff` no longer reads `FileDiff.hunks` at all. One counter remains —
+`diffStats` in `app.js` — in the one place the number is rendered, so there is nothing left to keep
+in sync. No migration: the fields were never on disk.
+
+`FileDiff.hunks` is the same story one size larger and is left alone here: `parse_diff_hunks` parses
+Codex's turn diff into hunks that ride the content record at about 2.2x its size, and
+`structuredCapturedDiffText` returns the original `new_text` verbatim without looking at them.
+Removing it touches the structured content record and wants its own change.
 
 ## Recommendation
 
@@ -243,12 +281,9 @@ file; and `file_change_previews` holds no bodies while still producing the right
 the harness as the place that guarantees the input shape. This is the comment that stops the next
 harness from re-introducing the same defect.
 
-**Beyond the plan:** `unified_stats` also became hunk-aware. Its `!line.starts_with("+++")` guard
-ran over the whole body, so inside a hunk it dropped any changed line whose own text begins `++` or
-`--` — which a translated whole-file body produces the moment the file contains a line starting
-`+` or `-`, exactly the content this change is about. It now skips `---`/`+++` only before the
-first hunk, where they really are headers, and counts by the marker column inside one.
-`diffStats` in `app.js` was given the same rule so the overlay header agrees with the descriptor.
+**Superseded:** `unified_stats` was first made hunk-aware here, then deleted outright — see
+**Correction: the descriptor's line counts had no reader**. `diffStats` in `app.js` keeps the
+hunk-aware rule, because it is the counter whose output is displayed.
 
 ### 3. `giskard-server/static/app.js` — refuse to mis-render
 
@@ -298,9 +333,8 @@ Turns written before this change keep raw content inline in `threads/<id>/turns/
 `captured_diff_contents` (`crates/giskard-persist/src/history.rs:361`) will keep re-deriving
 `CapturedDiffContent::Unified` from it with the same wrong counts. That is deliberate: rewriting
 persisted turns to fix a rendering defect is not worth a migration, and the client guard (step 3)
-makes the old bodies render correctly and honestly anyway. The stale `additions`/`deletions` on
-those old descriptors stay stale; nothing reads them today, and a reader added later would be
-reading a historical record, not a live one.
+makes the old bodies render correctly and honestly anyway. The counts that used to be derived from
+those bodies are gone entirely, so there is no stale number left to mislead a later reader.
 
 If that is judged not good enough, the alternative is a lazy per-turn migration at read time —
 `TURN_PAYLOAD_FORMAT` exists per file precisely to allow it (`crates/giskard-persist/src/layout.rs:19-23`)

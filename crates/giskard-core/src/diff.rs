@@ -22,8 +22,6 @@ pub struct CapturedDiffDescriptor {
     pub available: bool,
     /// UTF-8 bytes for unified text, or canonical JSON bytes for structured content.
     pub byte_size: u64,
-    pub additions: u64,
-    pub deletions: u64,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub binary: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -56,7 +54,6 @@ pub fn capture_unified_diff(
     item_id: Option<ItemId>,
     text: String,
 ) -> (CapturedDiffDescriptor, CapturedDiffRecord) {
-    let (additions, deletions) = unified_stats(&text);
     let byte_size = text.len() as u64;
     let content = CapturedDiffContent::Unified { text };
     let id = captured_diff_id(&path, change, &content);
@@ -67,8 +64,6 @@ pub fn capture_unified_diff(
         content_kind: DiffContentKind::Unified,
         available: true,
         byte_size,
-        additions,
-        deletions,
         binary: false,
         item_id,
     };
@@ -78,26 +73,6 @@ pub fn capture_unified_diff(
 
 pub fn capture_structured_diff(mut diff: FileDiff) -> (FileDiff, CapturedDiffRecord) {
     diff.captured = None;
-    let (additions, deletions) = if diff.hunks.is_empty() && !diff.binary {
-        (
-            full_text_line_count(diff.new_text.as_deref()),
-            full_text_line_count(diff.old_text.as_deref()),
-        )
-    } else {
-        let additions = diff
-            .hunks
-            .iter()
-            .flat_map(|hunk| &hunk.lines)
-            .filter(|line| matches!(line, DiffLine::Added(_)))
-            .count() as u64;
-        let deletions = diff
-            .hunks
-            .iter()
-            .flat_map(|hunk| &hunk.lines)
-            .filter(|line| matches!(line, DiffLine::Removed(_)))
-            .count() as u64;
-        (additions, deletions)
-    };
     let content = CapturedDiffContent::Structured { diff: diff.clone() };
     let canonical_content = canonical_content(&content);
     let content_bytes = serialized_bytes(&canonical_content);
@@ -110,8 +85,6 @@ pub fn capture_structured_diff(mut diff: FileDiff) -> (FileDiff, CapturedDiffRec
         content_kind: DiffContentKind::Structured,
         available: true,
         byte_size,
-        additions,
-        deletions,
         binary: diff.binary,
         item_id: None,
     };
@@ -125,20 +98,6 @@ pub fn capture_structured_diff(mut diff: FileDiff) -> (FileDiff, CapturedDiffRec
         captured: Some(descriptor),
     };
     (projected, CapturedDiffRecord { id, content })
-}
-
-fn full_text_line_count(text: Option<&str>) -> u64 {
-    let Some(text) = text else {
-        return 0;
-    };
-    let without_final_newline = text
-        .strip_suffix("\r\n")
-        .or_else(|| text.strip_suffix('\n'))
-        .unwrap_or(text);
-    if without_final_newline.is_empty() {
-        return 0;
-    }
-    without_final_newline.split('\n').count() as u64
 }
 
 /// Stable identity for the canonical, complete captured representation.
@@ -184,47 +143,6 @@ fn serialized_bytes(value: &impl Serialize) -> Vec<u8> {
     // Canonical paths have already been normalized to UTF-8 and these domain types otherwise
     // contain only JSON-supported strings, integers, booleans, sequences, structs, and enums.
     serde_json::to_vec(value).expect("captured diff domain types always serialize as JSON")
-}
-
-/// Count the added and removed lines of a unified diff.
-///
-/// Hunk-aware: inside a hunk the first column is the marker and nothing else, so a body line that
-/// happens to read `+++` or `---` is counted rather than mistaken for a file header. Outside a
-/// hunk only `---`/`+++` header pairs are skipped, which keeps the headerless patches an agent can
-/// hand over counting the way they render (see `parseUnifiedDiff` in `app.js`, which colours the
-/// same lines by the same rule). A `git diff` over several files is one body with a header block
-/// per file, so a `diff --git` line closes the previous file's hunks; every line inside a hunk
-/// carries a marker, so a bare `diff ` at column 0 is always that boundary. A multi-file patch
-/// carrying no `diff` lines at all has no boundary to find, and its second and later header pairs
-/// count as a change each — every producer here emits them, and reading the hunks' declared line
-/// budgets instead would mis-end a hunk whenever an agent miscounts one.
-///
-/// The counts are meaningful only over a unified diff. A harness whose file-change bodies are not
-/// patches must translate them before capture — `giskard-harness-codex` does this for Codex's
-/// whole-file `add`/`delete` content — or these numbers describe nothing.
-fn unified_stats(text: &str) -> (u64, u64) {
-    let mut additions = 0;
-    let mut deletions = 0;
-    let mut in_hunk = false;
-    for line in text.lines() {
-        if line.starts_with("diff ") {
-            in_hunk = false;
-            continue;
-        }
-        if line.starts_with("@@") {
-            in_hunk = true;
-            continue;
-        }
-        if !in_hunk && (line.starts_with("+++") || line.starts_with("---")) {
-            continue;
-        }
-        if line.starts_with('+') {
-            additions += 1;
-        } else if line.starts_with('-') {
-            deletions += 1;
-        }
-    }
-    (additions, deletions)
 }
 
 /// A structured file diff for the side-by-side viewer (spec §11.1).
@@ -362,107 +280,6 @@ mod tests {
     }
 
     #[test]
-    fn full_text_only_structured_diff_stats_match_rendered_lines() {
-        let cases = [
-            ("created", None, Some("one\ntwo\n"), 2, 0),
-            ("deleted", Some("one\ntwo"), None, 0, 2),
-            ("modified", Some("before\n"), Some("after\nnext"), 2, 1),
-            ("empty", Some(""), Some(""), 0, 0),
-            (
-                "crlf",
-                Some("before\r\nsecond\r\n"),
-                Some("after\r\n"),
-                1,
-                2,
-            ),
-            ("unicode", Some("旧\n"), Some("新\n✅\n"), 2, 1),
-            (
-                "trailing newline",
-                Some("one\ntwo\n"),
-                Some("three\n"),
-                1,
-                2,
-            ),
-            ("only newline", Some("\r\n"), Some("\n"), 0, 0),
-            ("standalone carriage return", Some("\r"), Some("\r"), 1, 1),
-        ];
-
-        for (name, old_text, new_text, additions, deletions) in cases {
-            let mut diff = structured_diff();
-            diff.old_text = old_text.map(str::to_owned);
-            diff.new_text = new_text.map(str::to_owned);
-
-            let (projected, _) = capture_structured_diff(diff);
-            let descriptor = projected.captured.as_ref().unwrap();
-            assert_eq!(descriptor.additions, additions, "{name} additions");
-            assert_eq!(descriptor.deletions, deletions, "{name} deletions");
-        }
-    }
-
-    #[test]
-    fn binary_full_text_does_not_report_text_stats() {
-        let mut diff = structured_diff();
-        diff.old_text = Some("before\n".into());
-        diff.new_text = Some("after\n".into());
-        diff.binary = true;
-
-        let (projected, _) = capture_structured_diff(diff);
-        let descriptor = projected.captured.as_ref().unwrap();
-        assert_eq!((descriptor.additions, descriptor.deletions), (0, 0));
-    }
-
-    #[test]
-    fn unified_stats_count_body_lines_that_look_like_file_headers() {
-        // Inside a hunk the first column is the marker and the rest is content, so a whole-file
-        // capture of a patch file — every line prefixed with `+` — counts every line.
-        let diff = concat!(
-            "--- /dev/null\n",
-            "+++ b/fixture.patch\n",
-            "@@ -0,0 +1,4 @@\n",
-            "+--- a/src/main.rs\n",
-            "++++ b/src/main.rs\n",
-            "+@@ -1 +1 @@\n",
-            "+-old\n",
-        );
-        let (descriptor, _) = capture_unified_diff(
-            "/fixture.patch".into(),
-            FileChangeKind::Created,
-            None,
-            diff.into(),
-        );
-        assert_eq!((descriptor.additions, descriptor.deletions), (4, 0));
-    }
-
-    #[test]
-    fn unified_stats_skip_headers_and_count_headerless_patches() {
-        let cases = [
-            ("--- a/f\n+++ b/f\n@@ -1 +1 @@\n-old\n+new\n", (1, 1)),
-            // An agent can hand over a patch with no hunk header at all; the markers are still
-            // all there is to go on, and this is how the overlay colours it.
-            ("-old\n+new\n", (1, 1)),
-            ("\\ No newline at end of file\n", (0, 0)),
-            ("", (0, 0)),
-            // Several files in one body: each file's own header pair is a header, not a change.
-            (
-                concat!(
-                    "diff --git a/a.txt b/a.txt\n--- a/a.txt\n+++ b/a.txt\n@@ -1 +1 @@\n-x\n+y\n",
-                    "diff --git a/b.txt b/b.txt\n--- a/b.txt\n+++ b/b.txt\n@@ -1 +1 @@\n-p\n+q\n",
-                ),
-                (2, 2),
-            ),
-        ];
-        for (diff, expected) in cases {
-            let (descriptor, _) =
-                capture_unified_diff("/f".into(), FileChangeKind::Modified, None, diff.to_owned());
-            assert_eq!(
-                (descriptor.additions, descriptor.deletions),
-                expected,
-                "{diff:?}"
-            );
-        }
-    }
-
-    #[test]
     fn structured_id_distinguishes_hunk_partitioning() {
         let mut one_hunk = structured_diff();
         one_hunk.hunks = vec![DiffHunk {
@@ -518,8 +335,6 @@ mod tests {
             content_kind: DiffContentKind::Unified,
             available: false,
             byte_size: 999,
-            additions: 99,
-            deletions: 99,
             binary: true,
             item_id: None,
         });

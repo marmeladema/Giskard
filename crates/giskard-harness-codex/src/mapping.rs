@@ -4453,16 +4453,22 @@ mod tests {
         }
     }
 
-    /// The line counts the server would persist and send for this body, so the translation is
-    /// checked against the consumer that actually derives numbers from it.
-    fn stats(diff: &str) -> (u64, u64) {
-        let (descriptor, _) = giskard_core::capture_unified_diff(
-            PathBuf::from("f"),
-            FileChangeKind::Modified,
-            None,
-            diff.to_owned(),
-        );
-        (descriptor.additions, descriptor.deletions)
+    /// The `+`/`-` lines of a synthesized patch's body, counted past its header and hunk line.
+    ///
+    /// Asserting the exact bytes already pins the translation; this states the property those
+    /// bytes are for — every line of the file is a change on one side, including the lines whose
+    /// own text reads like a marker or a header.
+    fn body_markers(diff: &str) -> (usize, usize) {
+        let body = diff
+            .split_once("@@\n")
+            .map(|(_, body)| body)
+            .unwrap_or_default();
+        body.lines()
+            .fold((0, 0), |(added, removed), line| match line.chars().next() {
+                Some('+') => (added + 1, removed),
+                Some('-') => (added, removed + 1),
+                _ => (added, removed),
+            })
     }
 
     fn file_change_entries(notif: &Notification, mapper: &mut CodexMapper) -> Vec<FileChangeEntry> {
@@ -4510,7 +4516,7 @@ mod tests {
                 "+@@ not a hunk\n",
             ))
         );
-        assert_eq!(stats(changes[0].diff.as_deref().unwrap()), (5, 0));
+        assert_eq!(body_markers(changes[0].diff.as_deref().unwrap()), (5, 0));
     }
 
     #[test]
@@ -4565,7 +4571,7 @@ mod tests {
                 "-+two\n",
             ))
         );
-        assert_eq!(stats(changes[0].diff.as_deref().unwrap()), (0, 2));
+        assert_eq!(body_markers(changes[0].diff.as_deref().unwrap()), (0, 2));
     }
 
     #[test]
@@ -4605,7 +4611,7 @@ mod tests {
             ))
         );
         // Every line of the fixture is an addition, including the ones that read as headers.
-        assert_eq!(stats(changes[0].diff.as_deref().unwrap()), (5, 0));
+        assert_eq!(body_markers(changes[0].diff.as_deref().unwrap()), (5, 0));
     }
 
     #[test]

@@ -254,8 +254,6 @@ pub struct WireCapturedDiffDescriptor {
     pub content_kind: DiffContentKind,
     pub available: bool,
     pub byte_size: u64,
-    pub additions: u64,
-    pub deletions: u64,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub binary: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -700,8 +698,6 @@ impl From<CapturedDiffDescriptor> for WireCapturedDiffDescriptor {
             content_kind: d.content_kind,
             available: d.available,
             byte_size: d.byte_size,
-            additions: d.additions,
-            deletions: d.deletions,
             binary: d.binary,
             item_id: d.item_id,
         }
@@ -717,8 +713,6 @@ impl From<FileDiff> for WireFileDiff {
             content_kind: DiffContentKind::Structured,
             available: false,
             byte_size: 0,
-            additions: 0,
-            deletions: 0,
             binary: d.binary,
             item_id: None,
         })
