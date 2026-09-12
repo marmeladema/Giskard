@@ -9,7 +9,21 @@
 
 **Document status:** Implementation-ready specification.
 **Audience:** An AI coding agent (and its human reviewer) implementing the system.
-**Version:** 1.91
+**Version:** 1.92
+
+> **Amendment — file-change bodies are diffs (1.92).** A captured file-change body is a unified
+> diff. A harness whose
+> protocol reports a created or deleted file as whole-file content rather than as a patch must
+> translate it at its own boundary, before capture: Codex does report `add` and `delete` that way,
+> and `giskard-harness-codex` translates them into a diff against `/dev/null`. The protocol's own
+> change kind decides that, never the body's text, so a created file that merely contains a patch
+> is translated like any other. A body stored before that translation existed is still raw content
+> and carries no discriminator, so the browser falls back to testing its shape when opening one and
+> shows it as a whole-file listing rather than colouring its leading `+`/`-` characters as changes.
+> The captured-diff descriptor drops its `additions`/`deletions` counts, which no client read and
+> which no layer persisted: a descriptor is derived in memory on every delivery, so the browser
+> counts a diff's lines from the body it renders, once, where the number is shown. The payload
+> format and every endpoint are unchanged.
 
 > **Amendment — active-turn steering (1.91).** Once a normal user turn has an acknowledged turn
 > ID, the composer may append text to that exact turn through a distinct `SteerInput` action and
@@ -1374,7 +1388,10 @@ authoritative replacement runtime overview.
   `live_approvals` and the stored preset needs live approval support, the effective preset is
   coerced for that session without overwriting the stored value, and a notice is surfaced (§9.4).
 - **S6:** Approval diff preview in Phase 3 uses the **raw diff string** from the harness; structured
-  `FileDiff` parsing is deferred to Phase 4 (§9.2, §15).
+  `FileDiff` parsing is deferred to Phase 4 (§9.2, §15). *(Not implemented, and superseded: a
+  Codex file-change approval carries no body at all — `ApprovalKind::FileChange` holds a path and a
+  change kind, and the card names the changed paths it recovers from the preceding file-change
+  item. The diff itself is read from the transcript row's own captured body.)*
 - **S7:** When `plan_build_modes = false`, `Mode` resolves to the Build-equivalent single mode, so
   `TurnOverrides` is well-defined for every harness (§7.5, §13.5).
 
@@ -2116,6 +2133,9 @@ pub enum ItemPayload {
         metadata: Option<serde_json::Value>,
     },
 }
+// `diff` is a unified diff, whatever the change kind. A harness that reports a created or deleted
+// file as whole-file content translates it before the entry reaches the server (see the
+// file-change bodies amendment).
 pub struct FileChangeEntry { path: PathBuf, change: FileChangeKind, diff: Option<String> }
 pub enum FileChangeKind { Created, Modified, Deleted }
 
@@ -3278,11 +3298,12 @@ read-only sandboxing. The selected permission preset controls what the agent may
    `CodexHarness` maps it to `AgentEvent::ApprovalRequested` with the details (command, cwd,
    reason, target path, and the set of available decisions). Codex approval/item/call ids are
    retained for routing/protocol responses, not shown as card metadata.
-2. UI shows a non-blocking prompt scoped to the thread (with the command/diff preview).
-   **Phase 3 (S6):** the preview uses the **raw diff string** from the harness (the text carried
-   in the `ApprovalRequest`'s reason/detail). Structured `FileDiff` parsing and the side-by-side
-   diff viewer are Phase 4 (§11, §15); the dependency is stated here so it is not discovered as a
-   gap later.
+2. UI shows a non-blocking prompt scoped to the thread (with the command preview).
+   **Phase 3 (S6)** planned a diff preview built from the **raw diff string** carried in the
+   `ApprovalRequest`. It was never built and no longer applies: a Codex file-change approval
+   carries no body, so `ApprovalKind::FileChange` holds a path and a change kind and the card names
+   the changed paths recovered from the preceding file-change item. The diff is read from that
+   item's own row, through the captured-diff endpoint.
 3. User chooses a decision; server calls `respond_approval`.
 
 Codex also has server-initiated requests that are not approval decisions:

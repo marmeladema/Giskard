@@ -22,8 +22,6 @@ pub struct CapturedDiffDescriptor {
     pub available: bool,
     /// UTF-8 bytes for unified text, or canonical JSON bytes for structured content.
     pub byte_size: u64,
-    pub additions: u64,
-    pub deletions: u64,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub binary: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -44,13 +42,18 @@ pub struct CapturedDiffRecord {
     pub content: CapturedDiffContent,
 }
 
+/// Capture a unified-diff body behind its content identity.
+///
+/// The body must actually be a unified diff: the content kind recorded here tells every later
+/// layer — the descriptor's line counts, persistence, the lazy-diff endpoint, the overlay — that it
+/// may be parsed as a patch. A harness that receives whole-file content instead (Codex does, for
+/// `add` and `delete` file changes) translates it at its own boundary, before this point.
 pub fn capture_unified_diff(
     path: PathBuf,
     change: FileChangeKind,
     item_id: Option<ItemId>,
     text: String,
 ) -> (CapturedDiffDescriptor, CapturedDiffRecord) {
-    let (additions, deletions) = unified_stats(&text);
     let byte_size = text.len() as u64;
     let content = CapturedDiffContent::Unified { text };
     let id = captured_diff_id(&path, change, &content);
@@ -61,8 +64,6 @@ pub fn capture_unified_diff(
         content_kind: DiffContentKind::Unified,
         available: true,
         byte_size,
-        additions,
-        deletions,
         binary: false,
         item_id,
     };
@@ -72,26 +73,6 @@ pub fn capture_unified_diff(
 
 pub fn capture_structured_diff(mut diff: FileDiff) -> (FileDiff, CapturedDiffRecord) {
     diff.captured = None;
-    let (additions, deletions) = if diff.hunks.is_empty() && !diff.binary {
-        (
-            full_text_line_count(diff.new_text.as_deref()),
-            full_text_line_count(diff.old_text.as_deref()),
-        )
-    } else {
-        let additions = diff
-            .hunks
-            .iter()
-            .flat_map(|hunk| &hunk.lines)
-            .filter(|line| matches!(line, DiffLine::Added(_)))
-            .count() as u64;
-        let deletions = diff
-            .hunks
-            .iter()
-            .flat_map(|hunk| &hunk.lines)
-            .filter(|line| matches!(line, DiffLine::Removed(_)))
-            .count() as u64;
-        (additions, deletions)
-    };
     let content = CapturedDiffContent::Structured { diff: diff.clone() };
     let canonical_content = canonical_content(&content);
     let content_bytes = serialized_bytes(&canonical_content);
@@ -104,8 +85,6 @@ pub fn capture_structured_diff(mut diff: FileDiff) -> (FileDiff, CapturedDiffRec
         content_kind: DiffContentKind::Structured,
         available: true,
         byte_size,
-        additions,
-        deletions,
         binary: diff.binary,
         item_id: None,
     };
@@ -119,20 +98,6 @@ pub fn capture_structured_diff(mut diff: FileDiff) -> (FileDiff, CapturedDiffRec
         captured: Some(descriptor),
     };
     (projected, CapturedDiffRecord { id, content })
-}
-
-fn full_text_line_count(text: Option<&str>) -> u64 {
-    let Some(text) = text else {
-        return 0;
-    };
-    let without_final_newline = text
-        .strip_suffix("\r\n")
-        .or_else(|| text.strip_suffix('\n'))
-        .unwrap_or(text);
-    if without_final_newline.is_empty() {
-        return 0;
-    }
-    without_final_newline.split('\n').count() as u64
 }
 
 /// Stable identity for the canonical, complete captured representation.
@@ -178,18 +143,6 @@ fn serialized_bytes(value: &impl Serialize) -> Vec<u8> {
     // Canonical paths have already been normalized to UTF-8 and these domain types otherwise
     // contain only JSON-supported strings, integers, booleans, sequences, structs, and enums.
     serde_json::to_vec(value).expect("captured diff domain types always serialize as JSON")
-}
-
-fn unified_stats(text: &str) -> (u64, u64) {
-    text.lines().fold((0, 0), |(additions, deletions), line| {
-        if line.starts_with('+') && !line.starts_with("+++") {
-            (additions + 1, deletions)
-        } else if line.starts_with('-') && !line.starts_with("---") {
-            (additions, deletions + 1)
-        } else {
-            (additions, deletions)
-        }
-    })
 }
 
 /// A structured file diff for the side-by-side viewer (spec §11.1).
@@ -327,56 +280,6 @@ mod tests {
     }
 
     #[test]
-    fn full_text_only_structured_diff_stats_match_rendered_lines() {
-        let cases = [
-            ("created", None, Some("one\ntwo\n"), 2, 0),
-            ("deleted", Some("one\ntwo"), None, 0, 2),
-            ("modified", Some("before\n"), Some("after\nnext"), 2, 1),
-            ("empty", Some(""), Some(""), 0, 0),
-            (
-                "crlf",
-                Some("before\r\nsecond\r\n"),
-                Some("after\r\n"),
-                1,
-                2,
-            ),
-            ("unicode", Some("旧\n"), Some("新\n✅\n"), 2, 1),
-            (
-                "trailing newline",
-                Some("one\ntwo\n"),
-                Some("three\n"),
-                1,
-                2,
-            ),
-            ("only newline", Some("\r\n"), Some("\n"), 0, 0),
-            ("standalone carriage return", Some("\r"), Some("\r"), 1, 1),
-        ];
-
-        for (name, old_text, new_text, additions, deletions) in cases {
-            let mut diff = structured_diff();
-            diff.old_text = old_text.map(str::to_owned);
-            diff.new_text = new_text.map(str::to_owned);
-
-            let (projected, _) = capture_structured_diff(diff);
-            let descriptor = projected.captured.as_ref().unwrap();
-            assert_eq!(descriptor.additions, additions, "{name} additions");
-            assert_eq!(descriptor.deletions, deletions, "{name} deletions");
-        }
-    }
-
-    #[test]
-    fn binary_full_text_does_not_report_text_stats() {
-        let mut diff = structured_diff();
-        diff.old_text = Some("before\n".into());
-        diff.new_text = Some("after\n".into());
-        diff.binary = true;
-
-        let (projected, _) = capture_structured_diff(diff);
-        let descriptor = projected.captured.as_ref().unwrap();
-        assert_eq!((descriptor.additions, descriptor.deletions), (0, 0));
-    }
-
-    #[test]
     fn structured_id_distinguishes_hunk_partitioning() {
         let mut one_hunk = structured_diff();
         one_hunk.hunks = vec![DiffHunk {
@@ -432,8 +335,6 @@ mod tests {
             content_kind: DiffContentKind::Unified,
             available: false,
             byte_size: 999,
-            additions: 99,
-            deletions: 99,
             binary: true,
             item_id: None,
         });

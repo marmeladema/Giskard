@@ -179,7 +179,7 @@ let state = {
   threadAuthorities:new Map(), pendingDetailConflictResyncs:new Set(),
   pendingMetadataActions:new Map(), threadListRefreshes:new Map(),
   pendingLiveSnapshotReconcile:false,
-  diffOverlayText:null, diffSelectionToken:0,
+  diffOverlayText:null, diffOverlayCopyLabel:null, diffSelectionToken:0,
   gitStatus:null, gitLoading:false, gitError:null, gitRequestSeq:0,
   draftGitStrategy:"shared",
   gitExpanded:false, gitRepoByWorkspace:new Map(), gitResizeTimer:null, gitBodyHtml:null, gitDiffPending:false, gitRefreshTimer:null,
@@ -8313,6 +8313,19 @@ async function openCapturedDiff(descriptor, turnId, sourceRow) {
       notice("This captured diff has no displayable text.", "warning");
       return;
     }
+    // A `unified` body that is not a patch is a whole file, stored by a turn captured before the
+    // mapper began translating Codex's raw `add`/`delete` content. Both signals must agree before
+    // the listing is used — the change kind says which side the file belongs on, the shape says it
+    // was never a patch — so a translated body, which is a patch, keeps taking the ordinary path.
+    const change = String(descriptor.change || "");
+    if (
+      content.kind === "unified" &&
+      (change === "created" || change === "deleted") &&
+      !looksLikeUnifiedDiff(text)
+    ) {
+      openWholeFileOverlay(descriptor.path || "File change", text, change);
+      return;
+    }
     openDiffOverlay(descriptor.path || "File change", text);
   } catch (e) {
     if (token !== state.diffSelectionToken || state.projectId !== pid || state.threadId !== threadId || !rowAdvertisesCapturedDiff(sourceRow, diffId)) return;
@@ -8899,12 +8912,27 @@ document.addEventListener("click", (e) => {
 function threadFileUrl(kind, path) {
   return `/api/projects/${state.projectId}/threads/${state.threadId}/${kind}?path=${encodeURIComponent(path)}`;
 }
+/* Count a unified diff's added and removed lines, the same way `unified_stats` counts them in
+   `giskard-core`: inside a hunk the first column is the marker and nothing else, so a body line
+   reading `+++` or `---` is a change rather than a file header. Outside a hunk the headers are
+   skipped, which leaves the headerless patches an agent can hand over counted the way
+   parseUnifiedDiff colours them.
+
+   `git diff` over several files is one body with a header block per file, so a `diff --git` line
+   closes the previous file's hunks and puts the next pair of headers back outside one. Every line
+   inside a hunk carries a marker, so a bare `diff ` at column 0 is always that boundary. A
+   multi-file patch carrying no `diff` lines at all has no boundary to find, and its second and
+   later header pairs count as a change each — every producer here emits them, and reading the
+   hunks' declared line budgets instead would mis-end a hunk whenever an agent miscounts one. */
 function diffStats(diff) {
   let added = 0;
   let removed = 0;
+  let inHunk = false;
   const lines = String(diff || "").split(/\r?\n/);
   for (const line of lines) {
-    if (line.startsWith("+++") || line.startsWith("---")) continue;
+    if (line.startsWith("diff ")) { inHunk = false; continue; }
+    if (line.startsWith("@@")) { inHunk = true; continue; }
+    if (!inHunk && (line.startsWith("+++") || line.startsWith("---"))) continue;
     if (line.startsWith("+")) added += 1;
     else if (line.startsWith("-")) removed += 1;
   }
@@ -8962,6 +8990,7 @@ async function openCodeOverlay(path, line) {
   setCodeSourceToggle(false);
   setCodeCopyDiff(false);
   state.diffOverlayText = null;
+  state.diffOverlayCopyLabel = null;
 
   const projectId = state.projectId;
   const threadId = state.threadId;
@@ -9095,6 +9124,15 @@ function parseUnifiedDiff(diff) {
       rows.push({ kind:"meta", text });
       continue;
     }
+    // A `git diff` over several files is one body with a header block per file. The `diff --git`
+    // line closes the previous file's hunks, so the next file's `---`/`+++` pair is read as the
+    // header it is rather than coloured as a deletion and an addition. Every line inside a hunk
+    // carries a marker, so a bare `diff ` at column 0 is always that boundary.
+    if (text.startsWith("diff ")) {
+      inHunk = false;
+      rows.push({ kind:"meta", text });
+      continue;
+    }
     if (!inHunk) {
       // Before the first hunk comes the file header, where `---` and `+++` are filenames rather
       // than changes. An agent can also hand over a diff with no `@@` at all, though: colour those
@@ -9151,39 +9189,106 @@ function renderDiffRows(rows) {
   return table;
 }
 
-/* The diff is rendered directly, like source: line numbers down the side and one row per line,
-   rather than a markdown code block nested in the overlay. That also drops a server round trip —
-   the colouring is by line kind, which is all the previous markdown rendering gave it. */
-function openDiffOverlay(path, diff) {
-  diff = String(diff || "");
-  if (!state.projectId || !diff.trim()) return;
+/* Both text views — a patch and a whole file — take over the same overlay in the same way, and
+   differ only in their title, their meta line, what the copy button says, and how the rows are
+   built. */
+function prepareTextOverlay(title, copyText, copyLabel) {
   state.diffSelectionToken++;
   state.codePath = null;
   state.codeLine = null;
   state.codeOverlaySource = null;
   releaseOutputOverlay();
   cancelOutputOverlayRefresh();
-  state.diffOverlayText = diff;
+  state.diffOverlayText = copyText;
+  state.diffOverlayCopyLabel = copyLabel;
   $("codeOverlay").classList.add("open");
   delete $("codeOverlay").dataset.requestId;
   setCodeSourceToggle(false);
-  setCodeCopyDiff(true);
+  setCodeCopyDiff(true, copyLabel);
+  $("codePath").textContent = title;
+  $("codeDownload").disabled = true;
+}
+/* The diff is rendered directly, like source: line numbers down the side and one row per line,
+   rather than a markdown code block nested in the overlay. That also drops a server round trip —
+   the colouring is by line kind, which is all the previous markdown rendering gave it. */
+function openDiffOverlay(path, diff) {
+  diff = String(diff || "");
+  if (!state.projectId || !diff.trim()) return;
   // Truncate the workspace prefix from the title the same way the transcript diff row does, so
   // the overlay header does not carry the checkout/worktree path.
-  const titlePath = displayPathForWorkspace(path) || "File change";
-  $("codePath").textContent = `Diff: ${titlePath}`;
+  prepareTextOverlay(`Diff: ${displayPathForWorkspace(path) || "File change"}`, diff, "Copy diff");
   const stats = diffStats(diff);
   $("codeMeta").textContent = `+${stats.added} −${stats.removed} · ${stats.lines.toLocaleString()} lines`;
-  $("codeDownload").disabled = true;
   $("codeView").replaceChildren(renderDiffRows(parseUnifiedDiff(diff)));
   $("codeView").scrollTop = 0;
 }
 
-function setCodeCopyDiff(visible) {
+/* Whether a captured body is a unified diff.
+ *
+ * A real hunk header, or a `---` line immediately followed by a `+++` line. The hunk pattern is
+ * the one parseUnifiedDiff matches, so prose that merely opens with `@@ ` is not mistaken for the
+ * start of a patch.
+ *
+ * Guessing from content is a last resort, and this is the one place that has no alternative.
+ * `giskard-harness-codex` decides from Codex's change kind, which is the protocol's own
+ * discriminator, and translates whole-file `add`/`delete` content into a patch before it is ever
+ * captured. But a turn captured before that translation existed stored raw content in the same
+ * field, under the same `unified` content kind, with nothing in the record to tell the two apart.
+ * So the shape is all there is. It is wrong for a created `.patch` file stored back then — which
+ * renders as the diff it contains, exactly as it did before this check existed — and right for
+ * everything else, which is why the check is here and not in the mapper. */
+function looksLikeUnifiedDiff(text) {
+  const lines = String(text || "").split(/\r?\n/);
+  for (let i = 0; i < lines.length; i++) {
+    if (/^(@{2,}) (.+?) \1/.test(lines[i])) return true;
+    if (lines[i].startsWith("---") && String(lines[i + 1] || "").startsWith("+++")) return true;
+  }
+  return false;
+}
+
+function splitFileLines(text) {
+  const lines = String(text || "").split(/\r?\n/);
+  // `split` leaves an empty final element for the trailing newline a file usually ends with.
+  if (lines.length && lines[lines.length - 1] === "") lines.pop();
+  return lines;
+}
+
+/* Lay whole-file content out as the file it is: one uniform colour for the whole thing, real file
+   line numbers on the side the file exists on, and no marker column to misread. */
+function wholeFileRows(lines, change) {
+  const kind = change === "deleted" ? "del" : "add";
+  const side = change === "deleted" ? "oldNo" : "newNo";
+  const rows = [];
+  for (let i = 0; i < lines.length; i++) {
+    if (rows.length >= DIFF_MAX_ROWS) {
+      rows.push({ kind:"meta", text:`… ${(lines.length - rows.length).toLocaleString()} more lines not shown. Use Copy file for the whole file.` });
+      break;
+    }
+    rows.push({ kind, text:lines[i], [side]:i + 1 });
+  }
+  return rows;
+}
+
+/* A captured body that is not a patch is shown as a file, not run through the diff parser. The
+   header counts lines rather than claiming a +N −M it has no way to derive, and the copy button
+   hands back the file rather than calling it a diff. */
+function openWholeFileOverlay(path, text, change) {
+  text = String(text || "");
+  if (!state.projectId || !text.trim()) return;
+  const displayPath = displayPathForWorkspace(path) || "File change";
+  const verb = change === "deleted" ? "Deleted" : "Created";
+  prepareTextOverlay(`${verb}: ${displayPath}`, text, "Copy file");
+  const lines = splitFileLines(text);
+  $("codeMeta").textContent = `${lines.length.toLocaleString()} line${lines.length === 1 ? "" : "s"}`;
+  $("codeView").replaceChildren(renderDiffRows(wholeFileRows(lines, change)));
+  $("codeView").scrollTop = 0;
+}
+
+function setCodeCopyDiff(visible, label) {
   const btn = $("codeCopyDiff");
   btn.hidden = !visible;
   btn.disabled = !visible;
-  if (!visible) btn.textContent = "Copy diff";
+  btn.textContent = visible ? (label || "Copy diff") : "Copy diff";
 }
 function closeCodeOverlay() {
   state.diffSelectionToken++;
@@ -9196,6 +9301,7 @@ function closeCodeOverlay() {
   state.codeOverlaySource = null;
   releaseOutputOverlay();
   state.diffOverlayText = null;
+  state.diffOverlayCopyLabel = null;
   setCodeSourceToggle(false);
   setCodeCopyDiff(false);
   cancelOutputOverlayRefresh();
@@ -9235,7 +9341,11 @@ $("codeCopyDiff").onclick = async () => {
     const sameView = outputText != null
       ? state.outputOverlay === ov
       : state.outputOverlay == null && state.diffOverlayText === diffText;
-    if (sameView && !btn.hidden) btn.textContent = outputText != null ? "Copy output" : "Copy diff";
+    if (sameView && !btn.hidden) {
+      btn.textContent = outputText != null
+        ? "Copy output"
+        : (state.diffOverlayCopyLabel || "Copy diff");
+    }
   }, 1500);
 };
 
@@ -9500,6 +9610,7 @@ function openOutputOverlay(itemId, kind) {
   setCodeSourceToggle(false);
   setCodeCopyDiff(false);
   state.diffOverlayText = null;
+  state.diffOverlayCopyLabel = null;
   // Clear any leftover source/diff content so the first render's scroll-pin check starts from an
   // empty view (and a running command opens scrolled to its streaming tail).
   $("codeView").replaceChildren();

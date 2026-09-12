@@ -147,7 +147,9 @@ pub struct CodexMapper {
     // Invalidation/removal: Command completion removes entries; shutdown drops remaining entries.
     running_commands: HashSet<NativeItemKey>,
     /// File-change items arrive before approval requests, whose payloads only identify the item.
-    /// Retain their structured changes so the approval card can name what it will modify.
+    /// Retain their changed paths and kinds so the approval card can name what it will modify.
+    /// Deliberately body-free: the approval card reads only `path` and `change`, so carrying the
+    /// diffs would hold a second copy of every added file for the length of the turn.
     // ENTITY-AUTHORITY-EXCEPTION:
     // Role: Correlate file-change previews with later native approval requests.
     // Source of truth: Codex file-change items provide the structured preview.
@@ -520,7 +522,7 @@ impl CodexMapper {
                 if let codex_codes::ThreadItem::FileChange { id, changes, .. } = item {
                     self.file_change_previews.insert(
                         NativeItemKey::new(thread, turn, NativeItemId::new(id.clone())),
-                        map_file_changes(changes),
+                        map_file_change_previews(changes),
                     );
                 }
                 let (harness_item_id, kind, command, tool) =
@@ -553,8 +555,13 @@ impl CodexMapper {
                 let turn = self.resolve_turn(thread, turn_id);
                 let harness_item_id = thread_item_id(item);
                 let id = self.resolve_item(thread, turn, &harness_item_id);
-                let giskard_item =
-                    map_thread_item_complete(item, id, harness_item_id, *completed_at_ms);
+                let giskard_item = map_thread_item_complete(
+                    &self.workspace_root,
+                    item,
+                    id,
+                    harness_item_id,
+                    *completed_at_ms,
+                );
                 if let Some(link) = completed_item_subagent_link(&giskard_item) {
                     self.track_native_parentage(thread_id, &link.harness_thread_id);
                 }
@@ -606,7 +613,7 @@ impl CodexMapper {
                 let turn = self.resolve_turn(thread, &n.turn_id);
                 self.file_change_previews.insert(
                     NativeItemKey::new(thread, turn, NativeItemId::new(n.item_id.clone())),
-                    map_file_changes(&n.changes),
+                    map_file_change_previews(&n.changes),
                 );
                 self.map_text_delta(&n.thread_id, &n.turn_id, &n.item_id, &text, fallback_thread)?
             }
@@ -2717,6 +2724,7 @@ fn map_thread_item_start(
 }
 
 fn map_thread_item_complete(
+    workspace_root: &Path,
     item: &codex_codes::ThreadItem,
     id: ItemId,
     harness_item_id: String,
@@ -2778,7 +2786,7 @@ fn map_thread_item_complete(
         codex_codes::ThreadItem::FileChange {
             changes, status, ..
         } => {
-            let changes = map_file_changes(changes);
+            let changes = map_file_changes(workspace_root, changes);
             let first = changes.first().cloned();
             ItemPayload::FileChange {
                 path: first.as_ref().map(|c| c.path.clone()).unwrap_or_default(),
@@ -3227,16 +3235,159 @@ fn path_from_json_value(value: &Value) -> PathBuf {
     }
 }
 
-fn map_file_changes(changes: &[codex_codes::FileUpdateChange]) -> Vec<FileChangeEntry> {
+/// Translate a native file-change list into browser-facing entries carrying real unified diffs.
+///
+/// Codex puts a unified diff in `FileUpdateChange::diff` only for `update`. For `add` and `delete`
+/// the field holds the file's **raw content**, the shape the legacy approval protocol still names
+/// outright (`FileChange::Add { content }` / `Delete { content }`). Nothing downstream can tell the
+/// two apart — the body is stored, counted, and rendered as a patch — so raw content whose lines
+/// begin with `+` or `-` (a Markdown list, a changelog, a YAML sequence) would be painted with
+/// additions and deletions that never happened. The translation happens here, at the one boundary
+/// that knows which harness produced the body, so every later layer can trust the content kind.
+fn map_file_changes(
+    workspace_root: &Path,
+    changes: &[codex_codes::FileUpdateChange],
+) -> Vec<FileChangeEntry> {
+    changes
+        .iter()
+        .map(|change| {
+            let kind = map_patch_change_kind(&change.kind);
+            FileChangeEntry {
+                path: PathBuf::from(&change.path),
+                change: kind,
+                diff: file_change_body(
+                    workspace_root,
+                    &change.path,
+                    &change.kind,
+                    kind,
+                    &change.diff,
+                ),
+                captured_diff: None,
+            }
+        })
+        .collect()
+}
+
+/// The same entries with their bodies dropped.
+///
+/// `file_change_previews` exists only so a later approval request can name the changed paths; it
+/// reads `path` and `change` and never the body. Keeping the bodies would hold a second copy of
+/// every added file for the length of the turn, for no reader.
+fn map_file_change_previews(changes: &[codex_codes::FileUpdateChange]) -> Vec<FileChangeEntry> {
     changes
         .iter()
         .map(|change| FileChangeEntry {
             path: PathBuf::from(&change.path),
             change: map_patch_change_kind(&change.kind),
-            diff: (!change.diff.is_empty()).then(|| change.diff.clone()),
+            diff: None,
             captured_diff: None,
         })
         .collect()
+}
+
+/// The unified-diff body for one native change, or `None` when Codex sent nothing.
+///
+/// The native change kind decides this, and nothing else. `kind` is the protocol's own required,
+/// typed discriminator, so it says what the body is; the body's own text does not. Inspecting the
+/// content instead would get a created file that happens to *contain* a patch — a `.patch`
+/// fixture, a test case, a document with a diff in a fenced block — exactly wrong, which is the
+/// defect this translation exists to fix. `codex-codes` is a pinned dependency, so a body shape
+/// that stops matching its kind arrives through a deliberate version bump; that bump is where it
+/// gets caught, not here.
+fn file_change_body(
+    workspace_root: &Path,
+    path: &str,
+    native_kind: &codex_codes::PatchChangeKind,
+    change: FileChangeKind,
+    body: &str,
+) -> Option<String> {
+    if body.is_empty() {
+        return None;
+    }
+    match native_kind {
+        codex_codes::PatchChangeKind::Update { .. } => Some(body.to_owned()),
+        codex_codes::PatchChangeKind::Add | codex_codes::PatchChangeKind::Delete => {
+            debug!(
+                path,
+                change = file_change_label(change),
+                "translating whole-file Codex content into a unified diff"
+            );
+            Some(unified_diff_for_whole_file(
+                &patch_path(workspace_root, path),
+                change,
+                body,
+            ))
+        }
+    }
+}
+
+/// The path as a patch names it: relative to the workspace, the way `git diff` writes it.
+///
+/// Codex reports absolute paths, so interpolating one straight into a `+++ b/` header would give
+/// `b//home/user/project/src/x.rs` — a doubled separator, an untrimmed absolute path on the
+/// overlay's first line where every other path is workspace-relative, and a patch `git apply`
+/// cannot place at any `-p` level. A path outside the workspace keeps its own spelling, minus the
+/// leading separator that would double; `app.js`'s `displayPathForWorkspace` trims the same
+/// prefix for display.
+fn patch_path(workspace_root: &Path, path: &str) -> String {
+    if let Ok(relative) = Path::new(path).strip_prefix(workspace_root) {
+        let relative = relative.to_string_lossy();
+        if !relative.is_empty() {
+            return relative.into_owned();
+        }
+    }
+    path.trim_start_matches('/').to_owned()
+}
+
+/// Render whole-file content as a unified diff against `/dev/null`.
+///
+/// Line endings are preserved: the marker is prefixed to the line as it arrived, so CRLF content
+/// stays CRLF. A body with no trailing newline gets the `\ No newline at end of file` marker git
+/// writes in the same place.
+fn unified_diff_for_whole_file(path: &str, change: FileChangeKind, content: &str) -> String {
+    let ends_with_newline = content.ends_with('\n');
+    let body = if ends_with_newline {
+        content.strip_suffix('\n').unwrap_or(content)
+    } else {
+        content
+    };
+    // Emptiness is decided on the original content, not on `body`: stripping the final newline
+    // from a file that holds exactly one empty line also leaves `body` empty, and that file has a
+    // line to show.
+    let lines: Vec<&str> = if content.is_empty() {
+        Vec::new()
+    } else {
+        body.split('\n').collect()
+    };
+    let count = lines.len();
+    let created = matches!(change, FileChangeKind::Created);
+    let marker = if created { '+' } else { '-' };
+
+    let mut out = String::with_capacity(content.len() + count + 64);
+    if created {
+        out.push_str("--- /dev/null\n");
+        out.push_str(&format!("+++ b/{path}\n"));
+        out.push_str(&format!(
+            "@@ -0,0 +{},{count} @@\n",
+            if count == 0 { 0 } else { 1 }
+        ));
+    } else {
+        out.push_str(&format!("--- a/{path}\n"));
+        out.push_str("+++ /dev/null\n");
+        out.push_str(&format!(
+            "@@ -{},{count} +0,0 @@\n",
+            if count == 0 { 0 } else { 1 }
+        ));
+    }
+    for line in lines {
+        out.push(marker);
+        out.push_str(line);
+        out.push('\n');
+    }
+    if !ends_with_newline && count > 0 {
+        out.push_str("\\ No newline at end of file\n");
+    }
+    out
 }
 
 fn map_patch_change_kind(kind: &codex_codes::PatchChangeKind) -> FileChangeKind {
@@ -4300,6 +4451,238 @@ mod tests {
             },
             other => panic!("expected item completion, got {other:?}"),
         }
+    }
+
+    /// The `+`/`-` lines of a synthesized patch's body, counted past its header and hunk line.
+    ///
+    /// Asserting the exact bytes already pins the translation; this states the property those
+    /// bytes are for — every line of the file is a change on one side, including the lines whose
+    /// own text reads like a marker or a header.
+    fn body_markers(diff: &str) -> (usize, usize) {
+        let body = diff
+            .split_once("@@\n")
+            .map(|(_, body)| body)
+            .unwrap_or_default();
+        body.lines()
+            .fold((0, 0), |(added, removed), line| match line.chars().next() {
+                Some('+') => (added + 1, removed),
+                Some('-') => (added, removed + 1),
+                _ => (added, removed),
+            })
+    }
+
+    fn file_change_entries(notif: &Notification, mapper: &mut CodexMapper) -> Vec<FileChangeEntry> {
+        match mapper.map_notification(notif, ThreadId::new()).unwrap() {
+            AgentEvent::ItemCompleted { item, .. } => match item.payload {
+                ItemPayload::FileChange { changes, .. } => changes,
+                other => panic!("expected file change, got {other:?}"),
+            },
+            other => panic!("expected item completion, got {other:?}"),
+        }
+    }
+
+    fn whole_file_item(kind: &str, path: &str, content: &str) -> Notification {
+        completed_item(serde_json::json!({
+            "type": "fileChange",
+            "id": "fc-whole",
+            "status": "completed",
+            "changes": [ { "path": path, "kind": { "type": kind }, "diff": content } ]
+        }))
+    }
+
+    #[test]
+    fn added_file_content_becomes_a_unified_diff_that_adds_every_line() {
+        // Content whose own lines start with the diff markers: read as a patch, `-gone` and the
+        // `@@` line would be a deletion and a hunk header of a change that never happened.
+        let content = "# Notes\n- kept\n+ added\n-gone\n@@ not a hunk\n";
+        let mut mapper = CodexMapper::new(PathBuf::from("/tmp"));
+        let changes = file_change_entries(
+            &whole_file_item("add", "docs/notes.md", content),
+            &mut mapper,
+        );
+
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].change, FileChangeKind::Created);
+        assert_eq!(
+            changes[0].diff.as_deref(),
+            Some(concat!(
+                "--- /dev/null\n",
+                "+++ b/docs/notes.md\n",
+                "@@ -0,0 +1,5 @@\n",
+                "+# Notes\n",
+                "+- kept\n",
+                "++ added\n",
+                "+-gone\n",
+                "+@@ not a hunk\n",
+            ))
+        );
+        assert_eq!(body_markers(changes[0].diff.as_deref().unwrap()), (5, 0));
+    }
+
+    #[test]
+    fn synthesized_headers_name_the_path_the_way_a_patch_does() {
+        // Codex reports absolute paths. Interpolating one straight into the header would give
+        // `+++ b//tmp/ws/src/new.rs`: a doubled separator, an absolute path on the overlay's first
+        // line where every other path is workspace-relative, and a patch `git apply` cannot place.
+        let mut mapper = CodexMapper::new(PathBuf::from("/tmp/ws"));
+        let changes = file_change_entries(
+            &whole_file_item("add", "/tmp/ws/src/new.rs", "fn main() {}\n"),
+            &mut mapper,
+        );
+
+        assert_eq!(
+            changes[0].diff.as_deref(),
+            Some("--- /dev/null\n+++ b/src/new.rs\n@@ -0,0 +1,1 @@\n+fn main() {}\n")
+        );
+        // The entry's own path is untouched; only the patch header is rewritten.
+        assert_eq!(changes[0].path, PathBuf::from("/tmp/ws/src/new.rs"));
+    }
+
+    #[test]
+    fn a_path_outside_the_workspace_keeps_its_own_spelling() {
+        let mut mapper = CodexMapper::new(PathBuf::from("/tmp/ws"));
+        let changes = file_change_entries(
+            &whole_file_item("delete", "/etc/elsewhere.conf", "gone\n"),
+            &mut mapper,
+        );
+
+        assert_eq!(
+            changes[0].diff.as_deref(),
+            Some("--- a/etc/elsewhere.conf\n+++ /dev/null\n@@ -1,1 +0,0 @@\n-gone\n")
+        );
+    }
+
+    #[test]
+    fn deleted_file_content_becomes_a_unified_diff_that_removes_every_line() {
+        let mut mapper = CodexMapper::new(PathBuf::from("/tmp"));
+        let changes = file_change_entries(
+            &whole_file_item("delete", "src/old.rs", "one\n+two\n"),
+            &mut mapper,
+        );
+
+        assert_eq!(changes[0].change, FileChangeKind::Deleted);
+        assert_eq!(
+            changes[0].diff.as_deref(),
+            Some(concat!(
+                "--- a/src/old.rs\n",
+                "+++ /dev/null\n",
+                "@@ -1,2 +0,0 @@\n",
+                "-one\n",
+                "-+two\n",
+            ))
+        );
+        assert_eq!(body_markers(changes[0].diff.as_deref().unwrap()), (0, 2));
+    }
+
+    #[test]
+    fn updated_file_diff_is_passed_through_unchanged() {
+        let diff = "--- a/src/main.rs\n+++ b/src/main.rs\n@@ -1 +1 @@\n-old\n+new\n";
+        let mut mapper = CodexMapper::new(PathBuf::from("/tmp"));
+        let changes =
+            file_change_entries(&whole_file_item("update", "src/main.rs", diff), &mut mapper);
+
+        assert_eq!(changes[0].change, FileChangeKind::Modified);
+        assert_eq!(changes[0].diff.as_deref(), Some(diff));
+    }
+
+    #[test]
+    fn a_created_file_whose_content_is_a_patch_is_still_translated() {
+        // The change kind decides, not the content. A `.patch` fixture is an ordinary thing for an
+        // agent to create, and reading its content to decide would show it as the diff it merely
+        // contains — the defect this translation exists to fix.
+        let fixture = "--- a/src/main.rs\n+++ b/src/main.rs\n@@ -1 +1 @@\n-old\n+new\n";
+        let mut mapper = CodexMapper::new(PathBuf::from("/tmp"));
+        let changes = file_change_entries(
+            &whole_file_item("add", "tests/fixture.patch", fixture),
+            &mut mapper,
+        );
+
+        assert_eq!(
+            changes[0].diff.as_deref(),
+            Some(concat!(
+                "--- /dev/null\n",
+                "+++ b/tests/fixture.patch\n",
+                "@@ -0,0 +1,5 @@\n",
+                "+--- a/src/main.rs\n",
+                "++++ b/src/main.rs\n",
+                "+@@ -1 +1 @@\n",
+                "+-old\n",
+                "++new\n",
+            ))
+        );
+        // Every line of the fixture is an addition, including the ones that read as headers.
+        assert_eq!(body_markers(changes[0].diff.as_deref().unwrap()), (5, 0));
+    }
+
+    #[test]
+    fn whole_file_translation_covers_newline_and_emptiness_edges() {
+        let cases = [
+            // An empty body carries nothing to show, so Codex sending one means "no content".
+            ("add", "", None),
+            (
+                "add",
+                "\n",
+                Some("--- /dev/null\n+++ b/f\n@@ -0,0 +1,1 @@\n+\n"),
+            ),
+            (
+                "add",
+                "no trailing newline",
+                Some(concat!(
+                    "--- /dev/null\n+++ b/f\n@@ -0,0 +1,1 @@\n",
+                    "+no trailing newline\n",
+                    "\\ No newline at end of file\n",
+                )),
+            ),
+            (
+                "add",
+                "crlf\r\nlines\r\n",
+                Some("--- /dev/null\n+++ b/f\n@@ -0,0 +1,2 @@\n+crlf\r\n+lines\r\n"),
+            ),
+            (
+                "delete",
+                "gone",
+                Some(concat!(
+                    "--- a/f\n+++ /dev/null\n@@ -1,1 +0,0 @@\n",
+                    "-gone\n",
+                    "\\ No newline at end of file\n",
+                )),
+            ),
+        ];
+
+        for (kind, content, expected) in cases {
+            let mut mapper = CodexMapper::new(PathBuf::from("/tmp"));
+            let changes = file_change_entries(&whole_file_item(kind, "f", content), &mut mapper);
+            assert_eq!(
+                changes[0].diff.as_deref(),
+                expected,
+                "{kind} of {content:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn file_change_previews_carry_no_diff_bodies() {
+        let mut mapper = CodexMapper::new(PathBuf::from("/tmp"));
+        let thread = ThreadId::new();
+        mapper.register_thread("th1".into(), thread);
+        let started = started_item(serde_json::json!({
+            "type": "fileChange",
+            "id": "fc1",
+            "status": "inProgress",
+            "changes": [ { "path": "src/new.rs", "kind": { "type": "add" }, "diff": "fn main() {}\n" } ]
+        }));
+        mapper
+            .map_notification(&started, thread)
+            .expect("file-change start should map");
+
+        let preview = mapper
+            .file_change_previews
+            .values()
+            .next()
+            .expect("a preview was stored");
+        assert_eq!(preview[0].path, PathBuf::from("src/new.rs"));
+        assert_eq!(preview[0].change, FileChangeKind::Created);
+        assert_eq!(preview[0].diff, None);
     }
 
     #[test]
