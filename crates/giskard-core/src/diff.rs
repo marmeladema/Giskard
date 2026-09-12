@@ -194,7 +194,10 @@ fn serialized_bytes(value: &impl Serialize) -> Vec<u8> {
 /// hand over counting the way they render (see `parseUnifiedDiff` in `app.js`, which colours the
 /// same lines by the same rule). A `git diff` over several files is one body with a header block
 /// per file, so a `diff --git` line closes the previous file's hunks; every line inside a hunk
-/// carries a marker, so a bare `diff ` at column 0 is always that boundary.
+/// carries a marker, so a bare `diff ` at column 0 is always that boundary. A multi-file patch
+/// carrying no `diff` lines at all has no boundary to find, and its second and later header pairs
+/// count as a change each — every producer here emits them, and reading the hunks' declared line
+/// budgets instead would mis-end a hunk whenever an agent miscounts one.
 ///
 /// The counts are meaningful only over a unified diff. A harness whose file-change bodies are not
 /// patches must translate them before capture — `giskard-harness-codex` does this for Codex's

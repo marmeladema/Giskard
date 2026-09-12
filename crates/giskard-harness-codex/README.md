@@ -645,7 +645,11 @@ unified diff against `/dev/null` before the entry leaves the crate, so every
 later layer — the captured content kind, the descriptor's added/removed counts,
 the browser's diff overlay, its copy button — can trust that a file-change body
 is a patch. Line endings are preserved and a body with no trailing newline gets
-the `\ No newline at end of file` marker. Without the translation, content whose
+the `\ No newline at end of file` marker. The header names the path relative to
+the workspace, the way `git diff` writes it, since Codex reports absolute paths
+and one interpolated straight into `+++ b/` would double the separator and give
+a patch `git apply` could not place. The entry's own path is left absolute; only
+the header is rewritten. Without the translation, content whose
 own lines open with `+` or `-` (a Markdown list, a changelog) is painted with
 additions and deletions that never happened.
 

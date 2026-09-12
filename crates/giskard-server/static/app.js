@@ -8920,7 +8920,10 @@ function threadFileUrl(kind, path) {
 
    `git diff` over several files is one body with a header block per file, so a `diff --git` line
    closes the previous file's hunks and puts the next pair of headers back outside one. Every line
-   inside a hunk carries a marker, so a bare `diff ` at column 0 is always that boundary. */
+   inside a hunk carries a marker, so a bare `diff ` at column 0 is always that boundary. A
+   multi-file patch carrying no `diff` lines at all has no boundary to find, and its second and
+   later header pairs count as a change each — every producer here emits them, and reading the
+   hunks' declared line budgets instead would mis-end a hunk whenever an agent miscounts one. */
 function diffStats(diff) {
   let added = 0;
   let removed = 0;

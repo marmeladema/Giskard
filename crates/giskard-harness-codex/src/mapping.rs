@@ -555,8 +555,13 @@ impl CodexMapper {
                 let turn = self.resolve_turn(thread, turn_id);
                 let harness_item_id = thread_item_id(item);
                 let id = self.resolve_item(thread, turn, &harness_item_id);
-                let giskard_item =
-                    map_thread_item_complete(item, id, harness_item_id, *completed_at_ms);
+                let giskard_item = map_thread_item_complete(
+                    &self.workspace_root,
+                    item,
+                    id,
+                    harness_item_id,
+                    *completed_at_ms,
+                );
                 if let Some(link) = completed_item_subagent_link(&giskard_item) {
                     self.track_native_parentage(thread_id, &link.harness_thread_id);
                 }
@@ -2719,6 +2724,7 @@ fn map_thread_item_start(
 }
 
 fn map_thread_item_complete(
+    workspace_root: &Path,
     item: &codex_codes::ThreadItem,
     id: ItemId,
     harness_item_id: String,
@@ -2780,7 +2786,7 @@ fn map_thread_item_complete(
         codex_codes::ThreadItem::FileChange {
             changes, status, ..
         } => {
-            let changes = map_file_changes(changes);
+            let changes = map_file_changes(workspace_root, changes);
             let first = changes.first().cloned();
             ItemPayload::FileChange {
                 path: first.as_ref().map(|c| c.path.clone()).unwrap_or_default(),
@@ -3238,7 +3244,10 @@ fn path_from_json_value(value: &Value) -> PathBuf {
 /// begin with `+` or `-` (a Markdown list, a changelog, a YAML sequence) would be painted with
 /// additions and deletions that never happened. The translation happens here, at the one boundary
 /// that knows which harness produced the body, so every later layer can trust the content kind.
-fn map_file_changes(changes: &[codex_codes::FileUpdateChange]) -> Vec<FileChangeEntry> {
+fn map_file_changes(
+    workspace_root: &Path,
+    changes: &[codex_codes::FileUpdateChange],
+) -> Vec<FileChangeEntry> {
     changes
         .iter()
         .map(|change| {
@@ -3246,7 +3255,13 @@ fn map_file_changes(changes: &[codex_codes::FileUpdateChange]) -> Vec<FileChange
             FileChangeEntry {
                 path: PathBuf::from(&change.path),
                 change: kind,
-                diff: file_change_body(&change.path, &change.kind, kind, &change.diff),
+                diff: file_change_body(
+                    workspace_root,
+                    &change.path,
+                    &change.kind,
+                    kind,
+                    &change.diff,
+                ),
                 captured_diff: None,
             }
         })
@@ -3280,6 +3295,7 @@ fn map_file_change_previews(changes: &[codex_codes::FileUpdateChange]) -> Vec<Fi
 /// that stops matching its kind arrives through a deliberate version bump; that bump is where it
 /// gets caught, not here.
 fn file_change_body(
+    workspace_root: &Path,
     path: &str,
     native_kind: &codex_codes::PatchChangeKind,
     change: FileChangeKind,
@@ -3296,9 +3312,31 @@ fn file_change_body(
                 change = file_change_label(change),
                 "translating whole-file Codex content into a unified diff"
             );
-            Some(unified_diff_for_whole_file(path, change, body))
+            Some(unified_diff_for_whole_file(
+                &patch_path(workspace_root, path),
+                change,
+                body,
+            ))
         }
     }
+}
+
+/// The path as a patch names it: relative to the workspace, the way `git diff` writes it.
+///
+/// Codex reports absolute paths, so interpolating one straight into a `+++ b/` header would give
+/// `b//home/user/project/src/x.rs` — a doubled separator, an untrimmed absolute path on the
+/// overlay's first line where every other path is workspace-relative, and a patch `git apply`
+/// cannot place at any `-p` level. A path outside the workspace keeps its own spelling, minus the
+/// leading separator that would double; `app.js`'s `displayPathForWorkspace` trims the same
+/// prefix for display.
+fn patch_path(workspace_root: &Path, path: &str) -> String {
+    if let Ok(relative) = Path::new(path).strip_prefix(workspace_root) {
+        let relative = relative.to_string_lossy();
+        if !relative.is_empty() {
+            return relative.into_owned();
+        }
+    }
+    path.trim_start_matches('/').to_owned()
 }
 
 /// Render whole-file content as a unified diff against `/dev/null`.
@@ -4473,6 +4511,39 @@ mod tests {
             ))
         );
         assert_eq!(stats(changes[0].diff.as_deref().unwrap()), (5, 0));
+    }
+
+    #[test]
+    fn synthesized_headers_name_the_path_the_way_a_patch_does() {
+        // Codex reports absolute paths. Interpolating one straight into the header would give
+        // `+++ b//tmp/ws/src/new.rs`: a doubled separator, an absolute path on the overlay's first
+        // line where every other path is workspace-relative, and a patch `git apply` cannot place.
+        let mut mapper = CodexMapper::new(PathBuf::from("/tmp/ws"));
+        let changes = file_change_entries(
+            &whole_file_item("add", "/tmp/ws/src/new.rs", "fn main() {}\n"),
+            &mut mapper,
+        );
+
+        assert_eq!(
+            changes[0].diff.as_deref(),
+            Some("--- /dev/null\n+++ b/src/new.rs\n@@ -0,0 +1,1 @@\n+fn main() {}\n")
+        );
+        // The entry's own path is untouched; only the patch header is rewritten.
+        assert_eq!(changes[0].path, PathBuf::from("/tmp/ws/src/new.rs"));
+    }
+
+    #[test]
+    fn a_path_outside_the_workspace_keeps_its_own_spelling() {
+        let mut mapper = CodexMapper::new(PathBuf::from("/tmp/ws"));
+        let changes = file_change_entries(
+            &whole_file_item("delete", "/etc/elsewhere.conf", "gone\n"),
+            &mut mapper,
+        );
+
+        assert_eq!(
+            changes[0].diff.as_deref(),
+            Some("--- a/etc/elsewhere.conf\n+++ /dev/null\n@@ -1,1 +0,0 @@\n-gone\n")
+        );
     }
 
     #[test]
