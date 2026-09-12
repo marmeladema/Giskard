@@ -58,6 +58,30 @@ test.describe("git status line", () => {
     await expect(page.locator("#gitLineBody")).toBeHidden();
   });
 
+  // The row is divided into clickable sections, not a strip with buttons resting on it: every
+  // control fills the row's full height, so the box it draws when hovered, focused or pressed is
+  // the section itself. Left to their own content these came out at three different heights — a
+  // 12px glyph, a line of digits, a select's own metrics — which read as mismatched lozenges.
+  test("divides the row into full-height sections", async ({ page }) => {
+    for (const width of [1280, 390]) {
+      await page.setViewportSize({ width, height: 800 });
+      const measured = await page.evaluate(() =>
+        ["#gitReviewTree", "#gitRefresh", ".git-line-head"].map((selector) => {
+          const rect = document.querySelector(selector)?.getBoundingClientRect();
+          return rect ? { height: rect.height, top: rect.top } : null;
+        }),
+      );
+      expect(measured.every(Boolean), `a control is missing at ${width}px`).toBe(true);
+      const [review, refresh, row] = measured as { height: number; top: number }[];
+
+      // Each section is the row, top and bottom, and they are the same section as each other.
+      expect(review.height, `review is not full height at ${width}px`).toBe(row.height);
+      expect(refresh.height, `refresh is not full height at ${width}px`).toBe(row.height);
+      expect(review.top, `sections are not aligned at ${width}px`).toBe(refresh.top);
+      expect(review.top, `sections do not start at the row at ${width}px`).toBe(row.top);
+    }
+  });
+
   // Dirty is not reviewable. The whole-tree diff is `git diff` plus `git diff --cached`, and neither
   // reports an untracked file — so a tree holding nothing but new files would offer a button that
   // opens an empty diff. The rule is checked directly rather than through a fixture, because the
