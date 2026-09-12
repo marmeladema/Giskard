@@ -41,6 +41,67 @@ test.describe("git status line", () => {
     await expect(page.locator("#codePath")).toHaveText("Diff: src/main.rs");
   });
 
+  // The row's own figures are the control that reviews them — there is no word to press — so the
+  // count has to be a button, and it has to say what it opens somewhere other than on its face.
+  test("reviews the working tree from the count itself", async ({ page }) => {
+    const review = page.locator("#gitReviewTree");
+    await expect(review).toBeVisible();
+    await expect(review).toHaveAttribute(
+      "aria-label",
+      "Review the working tree — 3 changed files, 1 line added, 0 removed",
+    );
+
+    await review.click();
+    await expect(page.locator("#codeOverlay")).toHaveClass(/\bopen\b/);
+    await expect(page.locator("#codePath")).toHaveText("Diff: Working tree");
+    // Reviewing is not expanding: the figures open a diff, the branch beside them opens the list.
+    await expect(page.locator("#gitLineBody")).toBeHidden();
+  });
+
+  // Dirty is not reviewable. The whole-tree diff is `git diff` plus `git diff --cached`, and neither
+  // reports an untracked file — so a tree holding nothing but new files would offer a button that
+  // opens an empty diff. The rule is checked directly rather than through a fixture, because the
+  // suite shares one stateful workspace and committing its edits to reach this state would move the
+  // counts every other test reads.
+  test("offers the review control only when there is a tracked diff behind it", async ({ page }) => {
+    const reviewable = (counts: Record<string, number>) =>
+      page.evaluate(
+        (status) =>
+          (window as never as { gitHasWorkingDiff: typeof gitHasWorkingDiff }).gitHasWorkingDiff(
+            status,
+          ),
+        { staged_count: 0, unstaged_count: 0, conflicted_count: 0, ...counts },
+      );
+
+    // The seeded tree: one modified tracked file among the untracked entries.
+    expect(await reviewable({ unstaged_count: 1 })).toBe(true);
+    expect(await reviewable({ staged_count: 2 })).toBe(true);
+    // A conflict lives in the worktree and does show in the diff.
+    expect(await reviewable({ conflicted_count: 1 })).toBe(true);
+    // Untracked entries are counted as dirty by the server but are absent from both diffs.
+    expect(await reviewable({})).toBe(false);
+    expect(await page.evaluate(() => (window as never as { gitHasWorkingDiff: typeof gitHasWorkingDiff }).gitHasWorkingDiff(null))).toBe(false);
+  });
+
+  // The diffstat is the first segment the row sheds under width pressure, so the button holding it
+  // must not be shed with it — on a phone the bare count is still the way into the diff, and it has
+  // to be big enough to hit with a thumb.
+  test("keeps the review control, and its target, at phone width", async ({ page }) => {
+    await page.setViewportSize({ width: 390, height: 780 });
+    await expect(page.locator("#gitDiffstat")).toBeHidden();
+
+    const review = page.locator("#gitReviewTree");
+    await expect(review).toBeVisible();
+    await expect(review.locator("#gitCount")).toHaveText("3");
+    const box = await review.boundingBox();
+    expect(box).not.toBeNull();
+    expect(box!.height).toBeGreaterThanOrEqual(24);
+    expect(box!.width).toBeGreaterThanOrEqual(34);
+
+    await review.click();
+    await expect(page.locator("#codePath")).toHaveText("Diff: Working tree");
+  });
+
   // Untracked entries are listed too, and the two kinds are not the same row: a file can be opened,
   // a collapsed directory has no single file to open.
   test("lists untracked entries and opens only the files among them", async ({ page }) => {

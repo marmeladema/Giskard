@@ -6319,26 +6319,40 @@ function renderGitLine() {
     ].filter(Boolean).join(" · ");
   }
 
-  const count = $("gitCount");
+  // The working tree's figures live in one of two nodes: a button while there is a diff behind them
+  // to open, and a plain span while there is not — still loading, unreadable, or clean. Two nodes
+  // rather than one button that disables, so a clean row carries no control at all.
   const countLabel = gitCountLabel(status, stateName, dirty);
-  $("gitSep").hidden = stateName === "error" || !countLabel;
-  if (loadingFirst) count.innerHTML = `<span class="git-skeleton" style="width:26px"></span>`;
-  else count.textContent = countLabel;
+  const reviewTree = $("gitReviewTree");
+  const countStatic = $("gitCountStatic");
+  // Dirty is not the same as reviewable: an untracked-only tree is dirty, but `git diff` and
+  // `git diff --cached` do not report untracked files, so the whole-tree diff comes back empty.
+  const reviewable = expandable && !loadingFirst && gitHasWorkingDiff(status);
+  reviewTree.hidden = !reviewable;
+  countStatic.hidden = reviewable || !countLabel;
+  if (loadingFirst) countStatic.innerHTML = `<span class="git-skeleton" style="width:26px"></span>`;
+  else if (reviewable) $("gitCount").textContent = countLabel;
+  else countStatic.textContent = countLabel;
 
   const diffstat = $("gitDiffstat");
   const added = status && status.added_total ? status.added_total : 0;
   const deleted = status && status.deleted_total ? status.deleted_total : 0;
-  diffstat.hidden = !expandable || (!added && !deleted);
-  if (!diffstat.hidden) {
-    diffstat.innerHTML = gitDiffstatHtml(added, deleted);
-    diffstat.title = `${added} line${added === 1 ? "" : "s"} added, ${deleted} removed across the working tree`;
+  // Hidden outright below 820px too — see app.css. The count beside it is what keeps the button
+  // itself on screen at every width.
+  diffstat.hidden = !reviewable || (!added && !deleted);
+  if (!diffstat.hidden) diffstat.innerHTML = gitDiffstatHtml(added, deleted);
+  // The chip is figures alone, so what it opens is said in its name and its tooltip rather than on
+  // its face. Set on the button, not on the diffstat inside it, so one hover gives one answer.
+  if (reviewable) {
+    const label = gitReviewTreeLabel(dirty, added, deleted);
+    reviewTree.title = label;
+    reviewTree.setAttribute("aria-label", label);
   }
 
   const toggle = $("gitLineToggle");
   toggle.disabled = !expandable;
   toggle.setAttribute("aria-expanded", state.gitExpanded && expandable ? "true" : "false");
   toggle.title = gitLineTitle(status, stateName, dirty);
-  $("gitReviewAll").hidden = !expandable;
   $("gitRefresh").hidden = false;
 
   if (!expandable && state.gitExpanded) setGitExpanded(false, { skipRender:true });
@@ -6356,6 +6370,29 @@ function gitCountLabel(status, stateName, dirty) {
     return conflicts === dirty ? label : `${label} · ${dirty}`;
   }
   return status && status.dirty ? String(dirty) : "clean";
+}
+
+/* Whether the whole-tree diff has anything in it. `dirty` is not that question: it is
+   `!files.is_empty()`, and untracked files are in `files` — but the diff endpoint runs
+   `git diff --cached` and `git diff`, and neither reports a file Git is not tracking. So a tree
+   holding nothing but new files is dirty, lists its rows, and has an empty diff behind them.
+   The three tracked counts are exactly what those two commands can show, and the parser already
+   excludes untracked entries from each of them. */
+function gitHasWorkingDiff(status) {
+  if (!status) return false;
+  return ((status.staged_count || 0) + (status.unstaged_count || 0) + (status.conflicted_count || 0)) > 0;
+}
+
+/* What the figures open, spelled out for the tooltip and the accessible name — the row has no width
+   for it, and a number on its own does not say it can be clicked. The line counts are dropped when
+   there are none to report (a binary-only or wholly untracked change) rather than printed as a pair
+   of zeroes. */
+function gitReviewTreeLabel(dirty, added, deleted) {
+  const files = `${dirty} changed file${dirty === 1 ? "" : "s"}`;
+  const lines = added || deleted
+    ? `, ${added} line${added === 1 ? "" : "s"} added, ${deleted} removed`
+    : "";
+  return `Review the working tree — ${files}${lines}`;
 }
 
 function gitLineTitle(status, stateName, dirty) {
@@ -6602,7 +6639,7 @@ async function openGitWorkingDiff() {
 
 $("gitLineToggle").onclick = () => setGitExpanded(!state.gitExpanded);
 $("gitRefresh").onclick = () => loadGitStatus(state.projectId);
-$("gitReviewAll").onclick = () => openGitWorkingDiff();
+$("gitReviewTree").onclick = () => openGitWorkingDiff();
 /* The branch's character budget is width-tiered, so re-render the collapsed line when the viewport
    crosses a tier. Debounced because this also fires continuously while dragging a window edge. */
 window.addEventListener("resize", () => {

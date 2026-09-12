@@ -533,8 +533,6 @@
   .git-sync[hidden] { display:none; }
   .git-ahead { color:#7ee787; }
   .git-behind { color:#f0d98c; }
-  .git-sep { flex:none; width:1px; height:11px; background:var(--border); }
-  .git-sep[hidden] { display:none; }
   .git-count { flex:none; font-variant-numeric:tabular-nums; }
   .git-diffstat { flex:none; display:inline-flex; gap:5px; font-size:11px; font-variant-numeric:tabular-nums; }
   .git-diffstat[hidden] { display:none; }
@@ -561,6 +559,23 @@
   .git-act:hover { border-color:var(--border); background:var(--panel2); color:var(--fg); }
   .git-act[hidden] { display:none; }
   .git-act-icon { display:inline-flex; align-items:center; padding:3px 5px; }
+  /* The working tree's own figures, as the control that reviews it. Transparent until hovered, so
+     a row at rest still reads as a status line rather than as a toolbar — the figures are what the
+     eye comes here for, and the hover edge is what says they can be opened. Sized to sit among this
+     row's chips: same border radius and type size as `.git-act` beside it. */
+  .git-review {
+    flex:none; display:inline-flex; align-items:center; gap:6px;
+    padding:2px 6px; border:1px solid transparent; border-radius:5px;
+    background:transparent; color:var(--muted);
+    font:inherit; font-size:11.5px; line-height:1.5; cursor:pointer;
+  }
+  .git-review:hover, .git-review:focus-visible { border-color:var(--border); background:var(--panel2); }
+  .git-review[hidden] { display:none; }
+  /* The same figures with no diff behind them — a clean tree, or a tree Git could not read. It is a
+     span rather than a disabled button so the row carries no control at all in that state, and it
+     keeps `.git-count`'s own class so the state colours still reach it. */
+  .git-count-static { padding:2px 6px; font-size:11.5px; }
+  .git-count-static[hidden] { display:none; }
   /* The draft's checkout choice, sized to sit among this row's actions rather than to look like a
      form field: the row is 27px tall and every other control on it is a small muted chip. */
   .git-strategy {
@@ -1033,8 +1048,16 @@
     header.thr #gauge { display:none; }
 
     /* The Git line sheds its widest segments before it starts eating into the branch name: the
-       total diffstat first, then the ahead/behind counts. Both are still in the expanded list. */
+       total diffstat first, then the ahead/behind counts. Both are still in the expanded list.
+       What never sheds is the changed-file count — which is also the review control, so the way
+       into the working-tree diff survives every width. That is the reason the count sits inside
+       `#gitReviewTree` rather than the diffstat alone: shedding the diffstat must not shed the
+       button with it. */
     .git-line .git-diffstat { display:none; }
+    /* With the diffstat gone the chip is one digit wide, which is not a thumb-sized target, so on
+       phones it trades its tight padding for a comfortable one. The row is `min-height`, not a
+       fixed height, so it accommodates the taller chip instead of clipping it. */
+    .git-line .git-review { padding:5px 12px; min-width:40px; justify-content:center; }
     .git-line-head { padding-left:10px; }
     .git-line-body { padding-left:10px; padding-right:10px; }
 
@@ -1089,7 +1112,8 @@
   /* Last segment to go before the branch itself starts shrinking. The threshold matches
      `gitBranchBudget` in app.js, which tightens the branch to its narrowest budget below the same
      width — set them together, or the branch starts losing characters while this is still shown.
-     The counts stay: "is it dirty" is the question the line exists to answer. */
+     The counts stay: "is it dirty" is the question the line exists to answer, and the count is also
+     the way into the diff. */
   @media (max-width:480px) {
-    .git-line .git-sync, .git-line .git-sep { display:none; }
+    .git-line .git-sync { display:none; }
   }
