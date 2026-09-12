@@ -3271,6 +3271,14 @@ fn map_file_change_previews(changes: &[codex_codes::FileUpdateChange]) -> Vec<Fi
 }
 
 /// The unified-diff body for one native change, or `None` when Codex sent nothing.
+///
+/// The native change kind decides this, and nothing else. `kind` is the protocol's own required,
+/// typed discriminator, so it says what the body is; the body's own text does not. Inspecting the
+/// content instead would get a created file that happens to *contain* a patch — a `.patch`
+/// fixture, a test case, a document with a diff in a fenced block — exactly wrong, which is the
+/// defect this translation exists to fix. `codex-codes` is a pinned dependency, so a body shape
+/// that stops matching its kind arrives through a deliberate version bump; that bump is where it
+/// gets caught, not here.
 fn file_change_body(
     path: &str,
     native_kind: &codex_codes::PatchChangeKind,
@@ -3283,63 +3291,14 @@ fn file_change_body(
     match native_kind {
         codex_codes::PatchChangeKind::Update { .. } => Some(body.to_owned()),
         codex_codes::PatchChangeKind::Add | codex_codes::PatchChangeKind::Delete => {
-            // The protocol schema types this field as a bare string and documents nothing about
-            // its shape, so trust what arrived over the change kind: a body that is already a
-            // patch is passed through rather than wrapped in a second one.
-            if looks_like_unified_diff(body) {
-                warn!(
-                    path,
-                    change = file_change_label(change),
-                    "Codex sent a unified diff for a whole-file change; passing it through \
-                     unwrapped (upstream may have changed shape)"
-                );
-                Some(body.to_owned())
-            } else {
-                debug!(
-                    path,
-                    change = file_change_label(change),
-                    "translating whole-file Codex content into a unified diff"
-                );
-                Some(unified_diff_for_whole_file(path, change, body))
-            }
+            debug!(
+                path,
+                change = file_change_label(change),
+                "translating whole-file Codex content into a unified diff"
+            );
+            Some(unified_diff_for_whole_file(path, change, body))
         }
     }
-}
-
-/// Whether `text` is already a unified diff.
-///
-/// A real hunk header, or a `---` line immediately followed by a `+++` line. `app.js`'s
-/// `looksLikeUnifiedDiff` applies the same rule to captured bodies on the way to the overlay;
-/// change the two together.
-fn looks_like_unified_diff(text: &str) -> bool {
-    let mut lines = text.lines().peekable();
-    while let Some(line) = lines.next() {
-        if is_hunk_header(line) {
-            return true;
-        }
-        if line.starts_with("---") && lines.peek().is_some_and(|next| next.starts_with("+++")) {
-            return true;
-        }
-    }
-    false
-}
-
-/// `@@ <ranges> @@`, with one extra `@` per parent for the combined diffs a conflicted path
-/// produces. Matched as strictly as `parseUnifiedDiff` matches it, so prose beginning `@@ ` is not
-/// mistaken for the start of a patch.
-fn is_hunk_header(line: &str) -> bool {
-    let markers = line.len() - line.trim_start_matches('@').len();
-    if markers < 2 {
-        return false;
-    }
-    let rest = &line[markers..];
-    let Some(ranges) = rest.strip_prefix(' ') else {
-        return false;
-    };
-    let closing = &line[..markers];
-    ranges
-        .find(closing)
-        .is_some_and(|at| ranges[..at].ends_with(' '))
 }
 
 /// Render whole-file content as a unified diff against `/dev/null`.
@@ -4550,12 +4509,32 @@ mod tests {
     }
 
     #[test]
-    fn whole_file_body_that_is_already_a_diff_is_not_wrapped_again() {
-        let diff = "--- /dev/null\n+++ b/src/new.rs\n@@ -0,0 +1 @@\n+fn main() {}\n";
+    fn a_created_file_whose_content_is_a_patch_is_still_translated() {
+        // The change kind decides, not the content. A `.patch` fixture is an ordinary thing for an
+        // agent to create, and reading its content to decide would show it as the diff it merely
+        // contains — the defect this translation exists to fix.
+        let fixture = "--- a/src/main.rs\n+++ b/src/main.rs\n@@ -1 +1 @@\n-old\n+new\n";
         let mut mapper = CodexMapper::new(PathBuf::from("/tmp"));
-        let changes = file_change_entries(&whole_file_item("add", "src/new.rs", diff), &mut mapper);
+        let changes = file_change_entries(
+            &whole_file_item("add", "tests/fixture.patch", fixture),
+            &mut mapper,
+        );
 
-        assert_eq!(changes[0].diff.as_deref(), Some(diff));
+        assert_eq!(
+            changes[0].diff.as_deref(),
+            Some(concat!(
+                "--- /dev/null\n",
+                "+++ b/tests/fixture.patch\n",
+                "@@ -0,0 +1,5 @@\n",
+                "+--- a/src/main.rs\n",
+                "++++ b/src/main.rs\n",
+                "+@@ -1 +1 @@\n",
+                "+-old\n",
+                "++new\n",
+            ))
+        );
+        // Every line of the fixture is an addition, including the ones that read as headers.
+        assert_eq!(stats(changes[0].diff.as_deref().unwrap()), (5, 0));
     }
 
     #[test]
@@ -4627,24 +4606,6 @@ mod tests {
         assert_eq!(preview[0].path, PathBuf::from("src/new.rs"));
         assert_eq!(preview[0].change, FileChangeKind::Created);
         assert_eq!(preview[0].diff, None);
-    }
-
-    #[test]
-    fn unified_diff_detection_matches_the_shapes_the_overlay_parses() {
-        assert!(looks_like_unified_diff("@@ -1 +1 @@\n-a\n+b\n"));
-        assert!(looks_like_unified_diff("--- a/f\n+++ b/f\n@@ -1 +1 @@\n"));
-        // A body with headers but no hunk is still a patch to every reader of it.
-        assert!(looks_like_unified_diff("--- a/f\n+++ b/f\n"));
-        assert!(!looks_like_unified_diff("+ a markdown bullet\n- another\n"));
-        assert!(!looks_like_unified_diff(
-            "--- a horizontal rule\n\nsome prose\n"
-        ));
-        assert!(!looks_like_unified_diff("@@not a hunk header\n"));
-        assert!(!looks_like_unified_diff(
-            "@@ prose that merely opens with the markers\n"
-        ));
-        assert!(looks_like_unified_diff("@@@ -1,2 -1,2 +1,2 @@@\n"));
-        assert!(!looks_like_unified_diff(""));
     }
 
     #[test]

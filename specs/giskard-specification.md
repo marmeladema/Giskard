@@ -79,11 +79,12 @@
 > diff, and the descriptor's added/removed counts are derived on that basis. A harness whose
 > protocol reports a created or deleted file as whole-file content rather than as a patch must
 > translate it at its own boundary, before capture: Codex does report `add` and `delete` that way,
-> and `giskard-harness-codex` translates them into a diff against `/dev/null`, guarded by the
-> body's shape rather than by its change kind. A body stored before that translation existed is
-> still raw content; the browser applies the same shape test when opening one and shows it as a
-> whole-file listing rather than colouring its leading `+`/`-` characters as changes. No wire type,
-> payload format, or endpoint changes.
+> and `giskard-harness-codex` translates them into a diff against `/dev/null`. The protocol's own
+> change kind decides that, never the body's text, so a created file that merely contains a patch
+> is translated like any other. A body stored before that translation existed is still raw content
+> and carries no discriminator, so the browser falls back to testing its shape when opening one and
+> shows it as a whole-file listing rather than colouring its leading `+`/`-` characters as changes.
+> No wire type, payload format, or endpoint changes.
 
 > **Amendment — turn intents (1.82).** Starting a turn or context compaction sends a bounded
 > `TurnIntent` to the thread's long-lived event owner. That owner alone admits the operation,

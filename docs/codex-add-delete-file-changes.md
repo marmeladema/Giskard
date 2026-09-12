@@ -4,10 +4,12 @@ Plan for a defect in how Codex file-change items reach the diff overlay. Written
 `dbd4834` with `codex-codes` 0.153.4; every file and line reference below was checked against that
 tree. Re-check them if the branch has moved.
 
-**Status: implemented** — option A plus the client guard, as recommended below. Three things landed
-beyond the plan as written, each noted in place: `unified_stats` became hunk-aware, the whole-file
-listing relabels the copy button rather than hiding it, and the replay harness got its own trigger
-instead of extending the lazy-diff turn.
+**Status: implemented** — option A plus the client guard, as recommended below, with **one part of
+the plan rejected in review**: the harness translates on Codex's change kind alone, not on a test
+of the body's shape. See **Correction: the shape check belongs only in the browser**. Three smaller
+things also landed beyond the plan as written, each noted in place: `unified_stats` became
+hunk-aware, the whole-file listing relabels the copy button rather than hiding it, and the replay
+harness got its own trigger instead of extending the lazy-diff turn.
 
 ## The defect
 
@@ -52,12 +54,12 @@ them standing:
    which deliberately colours a leading `+` as an addition and a leading `-` as a deletion — the
    right call for a headerless patch from an agent, the wrong one for a file that was never a patch.
 
-Nothing about `diff` is guaranteed by the protocol. The upstream JSON Schema declares it as a bare
+Nothing about the *shape* of `diff` is written down. The upstream JSON Schema declares it as a bare
 `{"type": "string"}` with no description, and the doc comment that does call it "a unified-diff
 snippet" is on `codex_codes::io::items::FileUpdateChange`, the JSONL exec-protocol type, which
-Giskard does not use (`codex_codes` re-exports the *generated* type through `protocol::*`). So the
-fix must not simply invert the current assumption and trust `kind` instead: it should check the
-shape of what actually arrived.
+Giskard does not use (`codex_codes` re-exports the *generated* type through `protocol::*`). That is
+because `kind` carries the meaning: it is a required, typed discriminator, and reading it is how a
+client learns what the body is. The bug is that Giskard ignores it.
 
 ## Where raw content reaches the browser
 
@@ -82,6 +84,41 @@ Approvals are also unaffected: `ApprovalKind::FileChange`
 (`crates/giskard-core/src/approval.rs:28`) carries a path and a change kind, no body, and the legacy
 `apply_patch` metadata path (`mapping.rs:1874`) only reads paths. Spec §S6 still describes an
 approval preview built from "the raw diff string"; no such preview exists in the code.
+
+## Correction: the shape check belongs only in the browser
+
+The plan argued that because the schema types `diff` as a bare string and documents nothing about
+its shape, the mapper should test the body rather than trust `kind`. That is the wrong conclusion
+from a true premise, and the implementation does not do it.
+
+`kind` is the protocol's own required, typed discriminator. It is not a hint about the body — it is
+the statement of what the body is, and the shape of that field is undocumented precisely because
+`kind` already says. Testing the content instead trades a guarantee for a guess, and the guess has
+a failure mode the guarantee does not: **a created file that merely contains a patch.** A `.patch`
+or `.diff` fixture, a test case, a README with a diff in a fenced block — all ordinary things for a
+coding agent to write, all of which the shape test would wave through untranslated, to be rendered
+as the diff they contain. That is the original defect, reintroduced for a plausible class of file,
+silently, on ordinary content.
+
+What the shape test was meant to protect against — a future Codex that sends a real patch for
+`add`, double-wrapped into a diff of a diff — is both less likely and much cheaper. `codex-codes`
+is a pinned dependency (`AGENTS.md`: raising it is a deliberate act), so a change of that kind
+arrives through a version bump, which is where it gets caught; and its failure is conspicuous
+rather than silent. Trading a silent wrong answer on today's ordinary content for a loud wrong
+answer on a hypothetical future protocol is a bad trade.
+
+So `file_change_body` matches on `kind` and translates every `add`/`delete` body. The unit test
+that asserted a patch-shaped body passes through unwrapped was replaced by one asserting the
+opposite: a created `tests/fixture.patch` is translated like any other file, and all five of its
+lines — including the ones reading `---`, `+++`, and `@@` — count as additions.
+
+The browser keeps its shape test, because there it is not a choice between a guess and a
+discriminator. A turn captured before this translation existed stored raw content in the same
+field, under the same `unified` content kind, with nothing in the record to distinguish it. The
+shape is the only signal that exists, its worst case (a created `.patch` stored back then, still
+shown as a diff) is exactly the status quo for that data rather than a regression, and it goes away
+as old turns age out. Step 3 below is unchanged; step 1's `looks_like_unified_diff` was never
+written.
 
 ## Options
 
@@ -111,12 +148,9 @@ and for a `delete`:
 ```
 
 with `\ No newline at end of file` when the content has no trailing newline, and an empty body with
-`@@ -0,0 +0,0 @@` for an empty file. Guard it with a shape check rather than `kind` alone: if the
-text already contains a `@@ ` hunk header at a line start **or** a `---` line immediately followed
-by a `+++` line, pass it through unchanged, so a future Codex that starts sending real patches for `add`
-is not double-wrapped. `app.js:7964-7966` runs a near-identical sniff for structured bodies, but
-with `&&` rather than `||`, because it is answering a different question — whether the supplied text
-can stand as the whole patch. Comment both so the difference is deliberate rather than drift.
+`@@ -0,0 +0,0 @@` for an empty file. Drive it from `kind` — see **Correction: the shape check
+belongs only in the browser** for why this paragraph originally said to test the body's shape
+instead, and why that was wrong.
 
 - Every downstream concern — content kind, `additions`/`deletions`, the overlay, **Copy diff** —
   becomes correct with no change to the wire types, the payload format, or the persistence schema.
@@ -184,13 +218,9 @@ is.
   content (`@@ -0,0 +0,0 @@`, no body lines), no trailing newline (`\ No newline at end of file`),
   CRLF content (prefix the marker, do not rewrite the line ending), and a final newline (which must
   not produce a trailing empty `+` line).
-- Add `looks_like_unified_diff(text: &str) -> bool` — a `@@ ` hunk header at a line start, or a
-  `---` line immediately followed by a `+++` line. Comment it next to `app.js`'s sniff so the pair
-  is findable from either side.
-- In `map_file_changes`, for `PatchChangeKind::Add | Delete` with a non-empty body that does not
-  already look like a diff, store the synthesised text. `Update` is untouched. Log at `debug` when
-  a body is synthesised and at `warn` when an `add`/`delete` body *does* already look like a patch,
-  because that means upstream changed shape and this code should be revisited.
+- In `map_file_changes`, for `PatchChangeKind::Add | Delete` with a non-empty body, store the
+  synthesised text; `Update` is untouched. The change kind decides, with no test of the body — see
+  **Correction: the shape check belongs only in the browser**. Log the translation at `debug`.
 - Give the preview call sites (`:521`, `:607`) a body-free variant — `map_file_change_previews`, or
   a flag on `map_file_changes` — so `file_change_previews` stores path and kind only. Update the
   field's doc comment (`:157`) to say the previews deliberately carry no bodies.
@@ -198,9 +228,9 @@ is.
 Tests in the same file's `mod tests`: an `add` whose content contains `+`/`-`/`@@`-prefixed lines
 round-trips to a diff whose only additions are every line; a `delete` likewise; an `update` body is
 byte-identical to what Codex sent; an empty `add`; content with and without a trailing newline;
-CRLF content; an `add` whose body is already a unified diff passes through unchanged and warns; and
-`file_change_previews` holds no bodies while still producing the right approval metadata (extend
-`file_change_previews_are_replaced_scoped_and_cleared`, `:4865`).
+CRLF content; a created `.patch` fixture — a body that *is* a diff — is translated like any other
+file; and `file_change_previews` holds no bodies while still producing the right approval metadata
+(extend `file_change_previews_are_replaced_scoped_and_cleared`, `:4865`).
 
 ### 2. `giskard-core` — say what the counts assume
 

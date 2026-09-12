@@ -649,14 +649,20 @@ the `\ No newline at end of file` marker. Without the translation, content whose
 own lines open with `+` or `-` (a Markdown list, a changelog) is painted with
 additions and deletions that never happened.
 
-The protocol schema types `diff` as a bare string and documents nothing about its
-shape, so the translation is guarded by the body's shape rather than by its
-change kind: an `add` or `delete` body that already looks like a patch — a hunk
-header, or a `---`/`+++` header pair — is passed through unwrapped and logged at
-`warn`, because that means upstream changed shape. `app.js` applies the same
-shape test to captured bodies on the way to the overlay, so a body stored before
-this translation existed is shown as a file listing rather than mis-coloured;
-change the two together.
+The change kind decides this and nothing else. `kind` is the protocol's own
+required, typed discriminator, so it says what the body is; the body's own text
+does not. Inspecting the content instead would get a created file that happens to
+*contain* a patch — a `.patch` fixture, a test case, a document with a diff in a
+fenced block — exactly wrong, which is the defect the translation exists to fix.
+`codex-codes` is a pinned dependency, so a body shape that stops matching its
+kind arrives through a deliberate version bump, and that bump is where it gets
+caught.
+
+The browser does test the shape, for the one case that has no discriminator to
+read: a turn captured before this translation existed stored raw content in the
+same field under the same content kind, with nothing in the record to tell the
+two apart. `app.js` shows such a body as a whole-file listing rather than
+mis-colouring it.
 
 Current Codex file-change approval requests identify the associated item but do
 not carry its changed paths. With current Codex app-server ordering, the adapter

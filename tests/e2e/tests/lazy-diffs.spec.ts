@@ -146,8 +146,9 @@ test.describe("lazy agent diffs", () => {
 
   /* A created file is not a patch. Codex sends its raw content, and content whose own lines open
      with `+` or `-` — a changelog, a Markdown list — must never be coloured as additions and
-     deletions that never happened. The mapper now translates that content into a real diff; turns
-     captured before it did still hold the raw content, and the overlay shows those as files. */
+     deletions that never happened. The mapper translates that content into a real diff, deciding
+     from Codex's change kind; turns captured before it did still hold raw content under the same
+     content kind, so the overlay falls back to the body's shape and shows those as files. */
   test.describe("whole-file changes", () => {
     async function startWholeFileTurn(page: Page) {
       await page.locator("#input").fill(SCRIPTED_WHOLE_FILE_TRIGGER);

@@ -8313,11 +8313,10 @@ async function openCapturedDiff(descriptor, turnId, sourceRow) {
       notice("This captured diff has no displayable text.", "warning");
       return;
     }
-    // A `unified` body that is not a patch is a whole file: Codex sends raw content for an `add`
-    // or a `delete`, and turns captured before the mapper started translating it still hold that
-    // content. Both signals must agree before the listing is used — the change kind says which
-    // side the file belongs on, the shape test says it was never a patch — so a translated body,
-    // which does look like a patch, keeps taking the ordinary path.
+    // A `unified` body that is not a patch is a whole file, stored by a turn captured before the
+    // mapper began translating Codex's raw `add`/`delete` content. Both signals must agree before
+    // the listing is used — the change kind says which side the file belongs on, the shape says it
+    // was never a patch — so a translated body, which is a patch, keeps taking the ordinary path.
     const change = String(descriptor.change || "");
     if (
       content.kind === "unified" &&
@@ -9209,11 +9208,18 @@ function openDiffOverlay(path, diff) {
 
 /* Whether a captured body is a unified diff.
  *
- * A real hunk header, or a `---` line immediately followed by a `+++` line — the same rule
- * `looks_like_unified_diff` applies in `giskard-harness-codex`'s mapper, which is where Codex's
- * whole-file `add`/`delete` content is translated into a patch before it is ever captured. Change
- * the two together. The hunk pattern is the one parseUnifiedDiff matches, so prose that merely
- * opens with `@@ ` is not mistaken for the start of a patch. */
+ * A real hunk header, or a `---` line immediately followed by a `+++` line. The hunk pattern is
+ * the one parseUnifiedDiff matches, so prose that merely opens with `@@ ` is not mistaken for the
+ * start of a patch.
+ *
+ * Guessing from content is a last resort, and this is the one place that has no alternative.
+ * `giskard-harness-codex` decides from Codex's change kind, which is the protocol's own
+ * discriminator, and translates whole-file `add`/`delete` content into a patch before it is ever
+ * captured. But a turn captured before that translation existed stored raw content in the same
+ * field, under the same `unified` content kind, with nothing in the record to tell the two apart.
+ * So the shape is all there is. It is wrong for a created `.patch` file stored back then — which
+ * renders as the diff it contains, exactly as it did before this check existed — and right for
+ * everything else, which is why the check is here and not in the mapper. */
 function looksLikeUnifiedDiff(text) {
   const lines = String(text || "").split(/\r?\n/);
   for (let i = 0; i < lines.length; i++) {
