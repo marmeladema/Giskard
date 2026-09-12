@@ -2,7 +2,9 @@
 
 Plan for a defect in how Codex file-change items reach the diff overlay. Written against `main` at
 `dbd4834` with `codex-codes` 0.153.4; every file and line reference below was checked against that
-tree. Re-check them if the branch has moved.
+tree. The branch has since been rebased onto `dcb2128`, which added the Git line's commit list and
+about 330 lines to `app.js`, so the `app.js` references below have shifted downward — the function
+names are still the addresses that matter. Everything else still resolves.
 
 **Status: implemented** — option A plus the client guard, as recommended below, with **one part of
 the plan rejected in review**: the harness translates on Codex's change kind alone, not on a test

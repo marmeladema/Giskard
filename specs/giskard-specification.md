@@ -9,7 +9,18 @@
 
 **Document status:** Implementation-ready specification.
 **Audience:** An AI coding agent (and its human reviewer) implementing the system.
-**Version:** 1.91
+**Version:** 1.92
+
+> **Amendment — file-change bodies are diffs (1.92).** A captured file-change body is a unified
+> diff, and the descriptor's added/removed counts are derived on that basis. A harness whose
+> protocol reports a created or deleted file as whole-file content rather than as a patch must
+> translate it at its own boundary, before capture: Codex does report `add` and `delete` that way,
+> and `giskard-harness-codex` translates them into a diff against `/dev/null`. The protocol's own
+> change kind decides that, never the body's text, so a created file that merely contains a patch
+> is translated like any other. A body stored before that translation existed is still raw content
+> and carries no discriminator, so the browser falls back to testing its shape when opening one and
+> shows it as a whole-file listing rather than colouring its leading `+`/`-` characters as changes.
+> No wire type, payload format, or endpoint changes.
 
 > **Amendment — active-turn steering (1.91).** Once a normal user turn has an acknowledged turn
 > ID, the composer may append text to that exact turn through a distinct `SteerInput` action and
@@ -74,17 +85,6 @@
 > idempotent claim operation. Every claimed identity is recorded durably: a validating link makes
 > it a managed sub-agent, while an invalid or incompatible relationship leaves it as a hidden
 > orphan.
-
-> **Amendment — file-change bodies are diffs (1.83).** A captured file-change body is a unified
-> diff, and the descriptor's added/removed counts are derived on that basis. A harness whose
-> protocol reports a created or deleted file as whole-file content rather than as a patch must
-> translate it at its own boundary, before capture: Codex does report `add` and `delete` that way,
-> and `giskard-harness-codex` translates them into a diff against `/dev/null`. The protocol's own
-> change kind decides that, never the body's text, so a created file that merely contains a patch
-> is translated like any other. A body stored before that translation existed is still raw content
-> and carries no discriminator, so the browser falls back to testing its shape when opening one and
-> shows it as a whole-file listing rather than colouring its leading `+`/`-` characters as changes.
-> No wire type, payload format, or endpoint changes.
 
 > **Amendment — turn intents (1.82).** Starting a turn or context compaction sends a bounded
 > `TurnIntent` to the thread's long-lived event owner. That owner alone admits the operation,
