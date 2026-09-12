@@ -8916,13 +8916,18 @@ function threadFileUrl(kind, path) {
    `giskard-core`: inside a hunk the first column is the marker and nothing else, so a body line
    reading `+++` or `---` is a change rather than a file header. Outside a hunk the headers are
    skipped, which leaves the headerless patches an agent can hand over counted the way
-   parseUnifiedDiff colours them. */
+   parseUnifiedDiff colours them.
+
+   `git diff` over several files is one body with a header block per file, so a `diff --git` line
+   closes the previous file's hunks and puts the next pair of headers back outside one. Every line
+   inside a hunk carries a marker, so a bare `diff ` at column 0 is always that boundary. */
 function diffStats(diff) {
   let added = 0;
   let removed = 0;
   let inHunk = false;
   const lines = String(diff || "").split(/\r?\n/);
   for (const line of lines) {
+    if (line.startsWith("diff ")) { inHunk = false; continue; }
     if (line.startsWith("@@")) { inHunk = true; continue; }
     if (!inHunk && (line.startsWith("+++") || line.startsWith("---"))) continue;
     if (line.startsWith("+")) added += 1;
@@ -9113,6 +9118,15 @@ function parseUnifiedDiff(diff) {
     }
     if (text.startsWith("\\")) {
       // "\ No newline at end of file" belongs to the line above, not to either side.
+      rows.push({ kind:"meta", text });
+      continue;
+    }
+    // A `git diff` over several files is one body with a header block per file. The `diff --git`
+    // line closes the previous file's hunks, so the next file's `---`/`+++` pair is read as the
+    // header it is rather than coloured as a deletion and an addition. Every line inside a hunk
+    // carries a marker, so a bare `diff ` at column 0 is always that boundary.
+    if (text.startsWith("diff ")) {
+      inHunk = false;
       rows.push({ kind:"meta", text });
       continue;
     }

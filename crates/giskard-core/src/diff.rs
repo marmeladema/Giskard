@@ -192,7 +192,9 @@ fn serialized_bytes(value: &impl Serialize) -> Vec<u8> {
 /// happens to read `+++` or `---` is counted rather than mistaken for a file header. Outside a
 /// hunk only `---`/`+++` header pairs are skipped, which keeps the headerless patches an agent can
 /// hand over counting the way they render (see `parseUnifiedDiff` in `app.js`, which colours the
-/// same lines by the same rule).
+/// same lines by the same rule). A `git diff` over several files is one body with a header block
+/// per file, so a `diff --git` line closes the previous file's hunks; every line inside a hunk
+/// carries a marker, so a bare `diff ` at column 0 is always that boundary.
 ///
 /// The counts are meaningful only over a unified diff. A harness whose file-change bodies are not
 /// patches must translate them before capture — `giskard-harness-codex` does this for Codex's
@@ -202,6 +204,10 @@ fn unified_stats(text: &str) -> (u64, u64) {
     let mut deletions = 0;
     let mut in_hunk = false;
     for line in text.lines() {
+        if line.starts_with("diff ") {
+            in_hunk = false;
+            continue;
+        }
         if line.starts_with("@@") {
             in_hunk = true;
             continue;
@@ -433,6 +439,14 @@ mod tests {
             ("-old\n+new\n", (1, 1)),
             ("\\ No newline at end of file\n", (0, 0)),
             ("", (0, 0)),
+            // Several files in one body: each file's own header pair is a header, not a change.
+            (
+                concat!(
+                    "diff --git a/a.txt b/a.txt\n--- a/a.txt\n+++ b/a.txt\n@@ -1 +1 @@\n-x\n+y\n",
+                    "diff --git a/b.txt b/b.txt\n--- a/b.txt\n+++ b/b.txt\n@@ -1 +1 @@\n-p\n+q\n",
+                ),
+                (2, 2),
+            ),
         ];
         for (diff, expected) in cases {
             let (descriptor, _) =
