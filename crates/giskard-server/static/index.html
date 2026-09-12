@@ -164,11 +164,23 @@
             <svg class="git-icon" id="gitIcon" viewBox="0 0 16 16" aria-hidden="true"><use href="#gi-branch" /></svg>
             <span class="git-branch mono" id="gitBranch"></span>
             <span class="git-sync mono" id="gitSync" hidden></span>
-            <span class="git-sep" id="gitSep" aria-hidden="true" hidden></span>
-            <span class="git-count mono" id="gitCount"></span>
-            <span class="git-diffstat mono" id="gitDiffstat" hidden></span>
           </button>
           <div class="git-line-actions">
+            <!-- The working tree's own figures, and the control that reviews it. The counts already
+                 say how much there is to review, so they are the button rather than a label beside
+                 one: a row 27px tall has no width for a word that repeats what the number next to
+                 it just said.
+                 Sibling of the toggle, never inside it — a button cannot nest in a button — and the
+                 toggle keeps `flex:1`, so the whole left side of the row still expands the line.
+                 Absent, not disabled, when there is no diff behind the figures: they move to the
+                 plain `#gitCountStatic` span instead, so a clean row carries no control at all. -->
+            <button type="button" class="git-review" id="gitReviewTree" hidden>
+              <span class="git-count mono" id="gitCount"></span>
+              <span class="git-diffstat mono" id="gitDiffstat" hidden></span>
+            </button>
+            <!-- The same figures with nothing to open. Kept as a separate node rather than a
+                 `disabled` button so a clean line carries no control at all. -->
+            <span class="git-count git-count-static mono" id="gitCountStatic" hidden></span>
             <!-- Only a draft can choose this: a thread's workspace is fixed once it exists, so the
                  control is absent for open threads rather than shown disabled. It sits on this row
                  because this row describes the very tree the choice is about — the branch a worktree
@@ -183,8 +195,6 @@
               <option value="shared">Shared</option>
               <option value="worktree">Worktree</option>
             </select>
-            <button type="button" class="git-act" id="gitReviewAll" hidden
-                    title="Open the whole working-tree diff">Review all</button>
             <button type="button" class="git-act git-act-icon" id="gitRefresh"
                     title="Refresh Git status" aria-label="Refresh Git status">
               <svg class="git-icon" viewBox="0 0 16 16" aria-hidden="true"><use href="#gi-refresh" /></svg>
