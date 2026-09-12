@@ -223,7 +223,8 @@ yields no links, so `render` still returns correct Markdown.
 `GET /api/projects/{id}/git/status` returns best-effort, read-only Git metadata for a workspace,
 parsed from `git status --porcelain=v2 -z`: the current branch (reported
 even on an unborn one), `detached` with the short commit in `head`, ahead/behind counts when Git
-reports an upstream, staged/unstaged/untracked and conflicted counts, and the changed file list.
+reports an upstream, staged/unstaged/untracked and conflicted counts, the changed file list, and the
+commits the current branch holds that its base does not.
 
 Which workspace it reads is decided by the optional `?thread_id=...`: with it, the named thread's
 workspace — its own Git worktree when the thread was started with one, or its parent's when the
@@ -249,6 +250,45 @@ returned without line counts. Non-Git workspaces return
 reported, so `error` means only that the status could not be determined (git could not be run, or
 timed out).
 
+The branch's own commits come with `base` (the ref they are counted against), `commit_count` (the
+true total), `commits` (the most recent 25, newest first) and `commits_truncated` when the cap was
+reached. Each entry carries `sha`, `title`, `is_merge`, `files_changed`, `added` and `deleted`; a
+merge reports zeroes, because `git log` prints no diff for one and there is no single parent to
+print it against. All four fields are omitted when the branch holds nothing above its base, so a
+workspace on its own base branch — and one that is not a repository — answers exactly the fields it
+answered before commits were listed. The read is *not* skipped for a clean tree: a branch whose work
+is committed is precisely the case this describes.
+
+`base` is resolved as a ref, freshly, on every status read — never stored. A thread worktree's
+recorded `base_commit` is deliberately not used: a rebase onto a newer base leaves that commit
+behind, and because it stays an ancestor of the rewritten HEAD the range does not fail, it silently
+grows (a branch of two commits rebased onto a base that gained three reports five). Resolution reads
+which candidate refs exist, and what `refs/remotes/origin/HEAD` points at, in a single
+`git for-each-ref` — the endpoint is re-read whenever a turn touches a file, and probing candidates
+one at a time cost a subprocess each with the full git timeout behind every miss. Names are then
+tried in order: the remote's own default first, then `main`, `master`, `develop`, `trunk`. For each
+name the remote-tracking and local forms are considered together, the checked-out branch is skipped
+— a branch is never its own base — and a candidate with no merge base against `HEAD` is dropped, so
+an unrelated or shallow-truncated ref cannot win by "containing" none of it. The one that forks
+closest to `HEAD` wins *within* a name, which settles a branch rebased onto `origin/main` while
+local `main` lags; ranking across names is deliberately not done, or a long-diverged `develop` would
+beat `main` on a repository that has both. The first name that yields a candidate wins, including at
+a distance of zero — the branch holds nothing that ref lacks. No candidate, or no commits above it,
+means the fields are absent.
+
+`GET /api/projects/{id}/git/commit?sha=...` lists the files one commit touched, taking the same
+`?thread_id=...` scope: `path`, `old_path` for a rename, `status` in the same vocabulary the status
+file list uses, `added`/`deleted`, and `binary`. The counts are omitted both for a binary file and
+when the numstat read failed, so `binary` is stated rather than inferred from their absence: without
+it a failed read would mark every file in the commit as binary, and binary files are the ones with
+no diff to open. Read on demand, when a commit's row
+is opened, rather than shipped with the status — which is polled, and where 25 commits' file lists
+would be far more than the collapsed rows show. Status letters and line counts come from separate
+`git show --name-status` and `git show --numstat` invocations, run together and merged by path,
+because the two options cannot be combined in one call. `sha` must be a hex object name of 4 to 40
+characters; anything else is a 400, including revisions git would otherwise resolve (`HEAD`,
+`@{-1}`, a branch name).
+
 `GET /api/projects/{id}/git/diff` takes the same `?thread_id=...` scope, on the same terms, so a
 diff describes the tree the status row that opened it described. It returns the combined staged and
 unstaged diff for the whole working tree; with `?path=...` it returns that diff for one
@@ -258,3 +298,12 @@ worktree, so a path that is both staged and modified again can be diffed one sid
 other value is rejected. The path is lexical workspace-relative only: absolute paths and `..`
 escapes are rejected, so deleted files can still be diffed without allowing access outside the
 workspace.
+
+Two parameters read history instead of the working tree, and neither has sides to combine.
+`?commit=<sha>` returns that commit's diff (`git show`), or with `?path=...` that one file's diff
+within it — the whole-commit form keeps git's commit header, where the author and message are part
+of what is being reviewed, and the single-file form suppresses it so the diff is shaped like every
+other file diff. The sha is validated as above. `?range=branch` returns everything the branch added
+on top of its base, as `git diff <base>...HEAD` — three dots, so what the base has gained since the
+branch left it is not folded in. The range is a keyword rather than a revision on purpose: the base
+is resolved on the server, and a client that could name one endpoint could name any.

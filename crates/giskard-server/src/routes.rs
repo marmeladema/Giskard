@@ -24,7 +24,8 @@ use giskard_core::thread::ThreadKind;
 use giskard_core::turn::{TurnMode, TurnModel, TurnOverrides};
 use giskard_core::user_input::UserInput;
 use giskard_git_parser::{
-    GitNumstatEntry, apply_numstat_counts, index_numstat, parse_git_numstat, parse_git_status,
+    GitNumstatEntry, apply_numstat_counts, index_numstat, parse_git_log_numstat,
+    parse_git_name_status, parse_git_numstat, parse_git_ref_listing, parse_git_status,
 };
 use giskard_harness::HarnessProvider;
 use giskard_persist::Config;
@@ -148,6 +149,7 @@ pub fn protected_routes(state: AppState) -> Router<AppState> {
         )
         .route("/api/projects/{id}/git/status", get(git_status))
         .route("/api/projects/{id}/git/diff", get(git_diff))
+        .route("/api/projects/{id}/git/commit", get(git_commit_files))
         .route(
             "/api/projects/{id}/threads/{thread_id}/linkify",
             post(linkify),
@@ -2545,6 +2547,33 @@ mod tests {
         assert!(safe_git_relative_path("").is_none());
     }
 
+    /// The commit a diff is read from is the first argument this module hands git that is neither a
+    /// literal nor a path through `safe_git_relative_path`, and git resolves far more than object
+    /// names in that position. Anything that is not hex is refused rather than passed through.
+    #[test]
+    fn git_diff_commit_accepts_only_object_names() {
+        assert_eq!(safe_git_sha("dbd4834").as_deref(), Some("dbd4834"));
+        assert_eq!(safe_git_sha("  dbd4834  ").as_deref(), Some("dbd4834"));
+        assert_eq!(
+            safe_git_sha("dbd4834c193c58f2ca8d6a15f24ec57dd0a878a9").as_deref(),
+            Some("dbd4834c193c58f2ca8d6a15f24ec57dd0a878a9")
+        );
+        // Revisions git would happily resolve, and which the UI never produces.
+        assert!(safe_git_sha("HEAD").is_none());
+        assert!(safe_git_sha("HEAD~3").is_none());
+        assert!(safe_git_sha("@{-1}").is_none());
+        assert!(safe_git_sha("main@{upstream}").is_none());
+        assert!(safe_git_sha("main").is_none());
+        // Anything that could reach past the revision into git's own argument list.
+        assert!(safe_git_sha("--output=/tmp/x").is_none());
+        assert!(safe_git_sha("dbd4834 --").is_none());
+        assert!(safe_git_sha("dbd4834;rm -rf /").is_none());
+        // Too short to be unambiguous, too long to be an object name, or absent.
+        assert!(safe_git_sha("abc").is_none());
+        assert!(safe_git_sha(&"a".repeat(41)).is_none());
+        assert!(safe_git_sha("").is_none());
+    }
+
     #[test]
     fn thread_title_uses_first_meaningful_prompt_line() {
         let title = thread_title_from_first_prompt(
@@ -3045,6 +3074,27 @@ struct GitDiffQuery {
     /// side; without this the row would open a combined diff that does not match the row's own
     /// line counts.
     side: Option<String>,
+    /// One commit's diff, rather than the working tree's. Combines with `path` to diff a single
+    /// file inside that commit; `side` is meaningless here and is ignored.
+    commit: Option<String>,
+    /// `branch` for everything this branch added on top of its base — the whole `base...HEAD`
+    /// range. The range is a keyword rather than a revision because the base is resolved on the
+    /// server; accepting endpoints from the browser would hand git a string it did not choose.
+    range: Option<String>,
+}
+
+/// Accept an abbreviated or full object name and nothing else.
+///
+/// Every other argument this module hands git is either a literal or a path through
+/// `safe_git_relative_path`. A sha from the browser is the first that is neither, and git resolves
+/// far more than object names in that position — `HEAD`, `@{-1}`, `main@{upstream}`, a path after
+/// `--`. Hex, bounded, or rejected.
+fn safe_git_sha(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    let long_enough = trimmed.len() >= 4;
+    let short_enough = trimmed.len() <= 40;
+    let hex = trimmed.chars().all(|c| c.is_ascii_hexdigit());
+    (long_enough && short_enough && hex).then(|| trimmed.to_string())
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -3073,6 +3123,124 @@ impl GitDiffSide {
     fn includes_unstaged(self) -> bool {
         matches!(self, Self::Unstaged | Self::Both)
     }
+}
+
+#[derive(Deserialize)]
+struct GitCommitQuery {
+    /// The thread whose workspace to read, matching the row the commit was listed on.
+    thread_id: Option<ThreadId>,
+    /// The commit to list. Abbreviated as the status response abbreviated it.
+    sha: String,
+}
+
+/// `GET /api/projects/{id}/git/commit` — the files one commit touched.
+///
+/// Read on demand rather than shipped with the status: a status response is polled, and 25 commits'
+/// file lists would send far more than the collapsed row ever shows. Status letters and line counts
+/// come from two different git invocations — `--name-status` and `--numstat` cannot be combined in
+/// one call, the later option simply wins — so they run together and are merged by path, the same
+/// pairing the working-tree list already uses.
+async fn git_commit_files(
+    State(state): State<AppState>,
+    AxumPath(project_id): AxumPath<ProjectId>,
+    Query(q): Query<GitCommitQuery>,
+) -> Result<Json<GitCommitFilesResponse>, ApiError> {
+    let project = state
+        .store
+        .load_project(project_id)
+        .await?
+        .ok_or(ApiError::NotFound)?;
+    let workspace_root = workspace_for_query(
+        &state,
+        &project,
+        &WorkspaceQuery {
+            thread_id: q.thread_id,
+        },
+    )
+    .await?;
+    let sha = safe_git_sha(&q.sha)
+        .ok_or_else(|| ApiError::BadRequest(format!("invalid commit {:?}", q.sha)))?;
+
+    let name_status_args = ["show", "--name-status", "-z", "--format=", sha.as_str()];
+    let numstat_args = ["show", "--numstat", "-z", "--format=", sha.as_str()];
+    let (name_status, numstat) = tokio::join!(
+        run_git(&workspace_root, &name_status_args, &[]),
+        run_git(&workspace_root, &numstat_args, &[]),
+    );
+    let name_status = name_status?;
+    if !name_status.status.success() {
+        let stderr =
+            first_non_empty_stderr(&[&name_status]).unwrap_or_else(|| "git show failed".into());
+        warn!(
+            %project_id,
+            workspace = %workspace_root.display(),
+            action = "git_commit_files",
+            %sha,
+            stderr = %stderr,
+            "could not list a commit's files"
+        );
+        return Err(ApiError::BadRequest(stderr));
+    }
+    // Line counts are a nicety here, not the answer: a commit whose numstat read failed still lists
+    // its files, with no figures beside them, exactly as a binary file does.
+    let counts = match numstat {
+        Ok(output) if output.status.success() => index_numstat(parse_git_numstat(&output.stdout)),
+        _ => Default::default(),
+    };
+
+    let files = parse_git_name_status(&name_status.stdout)
+        .into_iter()
+        .map(|entry| {
+            let counted = counts.get(&entry.path);
+            GitCommitFile {
+                status: entry.kind,
+                old_path: entry.old_path,
+                added: counted.and_then(|entry| entry.added),
+                deleted: counted.and_then(|entry| entry.deleted),
+                // Only a file numstat actually reported, with `-` for both counts, is binary. A
+                // file missing from the map has counts nobody read — which is every file when the
+                // numstat call above failed, and none of them are binary.
+                binary: counted
+                    .is_some_and(|entry| entry.added.is_none() && entry.deleted.is_none()),
+                path: entry.path,
+            }
+        })
+        .collect();
+    Ok(Json(GitCommitFilesResponse { sha, files }))
+}
+
+/// Run one diff-producing git command and shape its output like every other diff response.
+///
+/// The working-tree read below concatenates two invocations; a commit or a range is a single one,
+/// and this keeps the empty-diff and failure handling identical between them rather than letting
+/// history reads grow their own.
+async fn git_diff_response(
+    project_id: ProjectId,
+    workspace_root: &Path,
+    args: &[&str],
+    pathspec: &[&str],
+    relative_path: Option<String>,
+) -> Result<Json<GitDiffResponse>, ApiError> {
+    let output = run_git(workspace_root, args, pathspec).await?;
+    if !output.status.success() {
+        let stderr = first_non_empty_stderr(&[&output]).unwrap_or_else(|| "git diff failed".into());
+        warn!(
+            %project_id,
+            workspace = %workspace_root.display(),
+            action = "git_diff",
+            path = relative_path.as_deref().unwrap_or("<whole revision>"),
+            stderr = %stderr,
+            "git diff failed"
+        );
+        return Err(ApiError::BadRequest(stderr));
+    }
+    let diff = String::from_utf8_lossy(&output.stdout).to_string();
+    let is_empty = diff.trim().is_empty();
+    Ok(Json(GitDiffResponse {
+        path: relative_path,
+        diff,
+        is_empty,
+    }))
 }
 
 async fn git_diff(
@@ -3107,6 +3275,65 @@ async fn git_diff(
         Some(path) => &[path],
         None => &[],
     };
+
+    // A commit, or the whole branch, rather than the working tree. Both read history, so neither
+    // touches the index and neither has a staged and an unstaged side to combine.
+    if let Some(commit) = q.commit.as_deref().map(str::trim).filter(|c| !c.is_empty()) {
+        let sha = safe_git_sha(commit)
+            .ok_or_else(|| ApiError::BadRequest(format!("invalid commit {commit:?}")))?;
+        // One file's diff is shaped like every other file diff in the app, so the commit header is
+        // suppressed for it — the overlay's own title already names the commit. The whole-commit
+        // read keeps the header, where the author and message are the context being reviewed.
+        let args: &[&str] = match relative_path.is_some() {
+            true => &["show", "--no-ext-diff", "--format=", &sha, "--"],
+            false => &["show", "--no-ext-diff", &sha],
+        };
+        return git_diff_response(
+            project_id,
+            &workspace_root,
+            args,
+            pathspec,
+            relative_path.clone(),
+        )
+        .await;
+    }
+    if let Some(range) = q.range.as_deref().map(str::trim).filter(|r| !r.is_empty()) {
+        if range != "branch" {
+            return Err(ApiError::BadRequest(format!(
+                "unknown diff range {range:?}; expected \"branch\""
+            )));
+        }
+        // Resolved here, not taken from the client: the base is the server's answer to "what was
+        // this branch cut from", and a browser that could name one could name any revision.
+        let branch = run_git(
+            &workspace_root,
+            &["symbolic-ref", "--quiet", "--short", "HEAD"],
+            &[],
+        )
+        .await
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
+        .filter(|branch| !branch.is_empty());
+        let base = git_base_ref(&workspace_root, branch.as_deref())
+            .await
+            .ok_or_else(|| ApiError::Unavailable("no base branch to compare against".into()))?;
+        // Three dots, not two: `base...HEAD` is what the branch added, while `base..HEAD` would
+        // fold in whatever the base has gained since the branch left it.
+        let spec = format!("{base}...HEAD");
+        let args: &[&str] = match relative_path.is_some() {
+            true => &["diff", "--no-ext-diff", &spec, "--"],
+            false => &["diff", "--no-ext-diff", &spec],
+        };
+        return git_diff_response(
+            project_id,
+            &workspace_root,
+            args,
+            pathspec,
+            relative_path.clone(),
+        )
+        .await;
+    }
 
     let staged_args: &[&str] = if relative_path.is_some() {
         &["diff", "--cached", "--no-ext-diff", "--"]
@@ -3218,6 +3445,237 @@ async fn run_git_numstat(workspace_root: &Path, args: &[&str]) -> Vec<GitNumstat
     }
 }
 
+/// Branch names probed for a base, remote-tracking first. A remote-tracking ref is preferred over
+/// the local branch of the same name because a branch is normally rebased onto what the remote has,
+/// not onto a local copy that may be behind — but both are candidates, and the tiebreak below
+/// decides between them on evidence rather than on this order.
+const GIT_BASE_CANDIDATES: [&str; 4] = ["main", "master", "develop", "trunk"];
+/// How many commits the Git line lists. The count beside it is the true total; this only bounds the
+/// rows, the `git log` that builds them, and the JSON that carries them.
+const GIT_COMMIT_LIST_LIMIT: usize = 25;
+
+/// The ref this branch's commits are counted against, resolved fresh on every status read.
+///
+/// Resolved as a *ref*, never as a stored commit. The obvious alternative — the worktree record's
+/// `base_commit`, written when the thread branched — breaks on the workflow it matters most for: a
+/// rebase onto a newer `main` leaves that commit behind, and because it stays an ancestor of the
+/// rewritten HEAD the range does not fail, it silently grows. Measured on a scratch repository, a
+/// thread with two commits rebased onto a `main` that had gained three reported five, listing the
+/// three it did not write. A ref re-read each time reports two.
+///
+/// Candidates are gathered in order, filtered to those that actually share history with `HEAD`, and
+/// then ranked by how close they fork. The ranking is what settles the common case of this
+/// workflow: rebasing onto `origin/main` while local `main` lags leaves both resolvable and
+/// disagreeing, and the one that forks closest is the one the branch actually sits on.
+async fn git_base_ref(workspace_root: &Path, branch: Option<&str>) -> Option<String> {
+    // Which candidates exist, and what the remote calls its default, in one call. Probing them one
+    // at a time cost a subprocess per candidate on an endpoint that is re-read whenever a turn
+    // touches a file, and every miss paid the full git timeout before the next probe started.
+    let mut patterns: Vec<String> = Vec::with_capacity(GIT_BASE_CANDIDATES.len() * 2 + 1);
+    for name in GIT_BASE_CANDIDATES {
+        patterns.push(format!("refs/remotes/origin/{name}"));
+        patterns.push(format!("refs/heads/{name}"));
+    }
+    // `git clone` writes this one and nothing else does, so it is absent more often than its status
+    // suggests — but when it is there it is the remote's own answer, and it outranks the guesses.
+    patterns.push("refs/remotes/origin/HEAD".to_string());
+    // NUL between the fields, not a printable byte: git permits a pipe, a space and a quote inside
+    // a ref name, so any of those would let a branch forge a field boundary.
+    let mut args: Vec<&str> = vec![
+        "for-each-ref",
+        "--format=%(refname:short)%00%(symref:short)",
+    ];
+    args.extend(patterns.iter().map(String::as_str));
+    let refs = run_git(workspace_root, &args, &[]).await.ok()?;
+    if !refs.status.success() {
+        return None;
+    }
+    let listing = parse_git_ref_listing(&refs.stdout);
+    let mut present: Vec<String> = listing.names;
+
+    // The remote's default may be a name the patterns above never asked about — `dev`, `release`,
+    // `stable`. Its remote form exists by construction, because git resolved the symbolic ref to
+    // it; only the local counterpart has to be looked up, and only in that case, so a repository
+    // with a conventional default still costs the one call.
+    let mut default_name: Option<String> = None;
+    if let Some(target) = listing.symref_target {
+        let name = target
+            .strip_prefix("origin/")
+            .unwrap_or(&target)
+            .to_string();
+        if !present.contains(&target) {
+            present.push(target);
+        }
+        if !GIT_BASE_CANDIDATES.contains(&name.as_str()) {
+            let local = format!("refs/heads/{name}");
+            if let Ok(extra) = run_git(
+                workspace_root,
+                &[
+                    "for-each-ref",
+                    "--format=%(refname:short)%00%(symref:short)",
+                    &local,
+                ],
+                &[],
+            )
+            .await
+                && extra.status.success()
+            {
+                present.extend(parse_git_ref_listing(&extra.stdout).names);
+            }
+        }
+        default_name = Some(name);
+    }
+
+    // Names are tried in order, and the fork-distance ranking below decides only *within* one name.
+    // Ranking across names would let a long-diverged `develop` beat `main` on a repository that has
+    // both, and report the branch as hundreds of commits deep on a base it never sat on.
+    let mut names: Vec<&str> = Vec::new();
+    if let Some(default) = default_name.as_deref() {
+        names.push(default);
+    }
+    names.extend(GIT_BASE_CANDIDATES);
+
+    let mut seen: Vec<&str> = Vec::new();
+    for name in names {
+        if seen.contains(&name) {
+            continue;
+        }
+        seen.push(name);
+        let remote = format!("origin/{name}");
+        let mut best: Option<(usize, String)> = None;
+        // The two forms of one name are independent questions, and so are the two commands each
+        // needs, so all of it runs at once — the same shape the two sides of a combined diff use.
+        // Sequentially this was four commands deep on a read the browser repeats whenever a turn
+        // touches a file, each carrying the full git timeout.
+        //
+        // A branch is never its own base. Skipping it is also what lets a checkout sitting on
+        // `main` report the commits the remote does not have, rather than resolving itself at zero
+        // and reporting nothing.
+        let remote_usable =
+            present.iter().any(|known| known == &remote) && branch != Some(remote.as_str());
+        let local_usable = present.iter().any(|known| known == name) && branch != Some(name);
+        let (remote_distance, local_distance) = tokio::join!(
+            git_base_distance(workspace_root, remote_usable.then_some(remote.as_str())),
+            git_base_distance(workspace_root, local_usable.then_some(name)),
+        );
+        // Remote before local, so a tie goes to the ref the branch was most likely rebased onto.
+        for (distance, candidate) in [(remote_distance, remote.as_str()), (local_distance, name)] {
+            let Some(distance) = distance else { continue };
+            if best.as_ref().is_none_or(|(best, _)| distance < *best) {
+                best = Some((distance, candidate.to_string()));
+            }
+        }
+        // Zero is an answer, and the closest one there is: the branch holds nothing this ref lacks.
+        // The caller finds an empty range and omits the section, rather than falling through to a
+        // more distant ref that would manufacture one.
+        if let Some((_, candidate)) = best {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+/// How many commits `HEAD` holds that `candidate` does not, or `None` if it is not a usable base.
+///
+/// `None` in means the candidate was ruled out before asking git — absent, or the checked-out
+/// branch itself — which keeps the decision at the call site and lets both forms of a name be
+/// probed with one `join!` whether or not either exists.
+///
+/// The two commands are independent and each carries the full git timeout, so they run together.
+/// That does mean the count is computed even for a ref that turns out to share no history: a wasted
+/// walk in the rare case, paid to halve the latency of the common one.
+async fn git_base_distance(workspace_root: &Path, candidate: Option<&str>) -> Option<usize> {
+    let candidate = candidate?;
+    let range = format!("{candidate}..HEAD");
+    let merge_base_args = ["merge-base", candidate, "HEAD"];
+    let count_args = ["rev-list", "--count", range.as_str()];
+    let (merge_base, count) = tokio::join!(
+        run_git(workspace_root, &merge_base_args, &[]),
+        run_git(workspace_root, &count_args, &[]),
+    );
+    // An unrelated history — a shallow clone whose base is not in it, or a repository with two
+    // roots — has no merge base, and without this it would win the ranking outright by "containing"
+    // none of HEAD and so counting all of it. No common ancestor, no base.
+    if !merge_base.ok()?.status.success() {
+        return None;
+    }
+    let count = count.ok()?;
+    if !count.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&count.stdout).trim().parse().ok()
+}
+
+/// Read the commits `base..HEAD` holds, newest first, and the true total behind them.
+///
+/// `base..HEAD` means "reachable from HEAD, not from base", which is what makes this survive a
+/// rebase with no cache to invalidate: the rewritten commits are exactly what is left.
+async fn git_commits_for_workspace(
+    workspace_root: &Path,
+    base: &str,
+) -> (usize, Vec<GitCommitSummary>) {
+    let range = format!("{base}..HEAD");
+    let limit = GIT_COMMIT_LIST_LIMIT.to_string();
+    // The count is the whole range and the log is the capped head of it, so they answer different
+    // questions and are run together rather than one after the other — the same way the two sides
+    // of a combined diff are.
+    let count_args = ["rev-list", "--count", range.as_str()];
+    let log_args = [
+        "log",
+        "-z",
+        "--format=%x01%h%x1f%s%x1f%P",
+        "--numstat",
+        "--max-count",
+        limit.as_str(),
+        range.as_str(),
+    ];
+    let (count, log) = tokio::join!(
+        run_git(workspace_root, &count_args, &[]),
+        run_git(workspace_root, &log_args, &[]),
+    );
+
+    let total = match count {
+        Ok(output) if output.status.success() => String::from_utf8_lossy(&output.stdout)
+            .trim()
+            .parse::<usize>()
+            .unwrap_or(0),
+        _ => 0,
+    };
+    if total == 0 {
+        return (0, Vec::new());
+    }
+    let commits = match log {
+        Ok(output) if output.status.success() => parse_git_log_numstat(&output.stdout)
+            .into_iter()
+            .map(|commit| GitCommitSummary {
+                sha: commit.sha,
+                title: commit.title,
+                is_merge: commit.is_merge,
+                files_changed: commit.files_changed,
+                added: commit.added,
+                deleted: commit.deleted,
+            })
+            .collect(),
+        Ok(output) => {
+            warn!(
+                workspace = %workspace_root.display(),
+                stderr = %String::from_utf8_lossy(&output.stderr).trim(),
+                "git log failed; branch commits omitted"
+            );
+            Vec::new()
+        }
+        Err(error) => {
+            warn!(
+                workspace = %workspace_root.display(),
+                %error,
+                "could not run git log; branch commits omitted"
+            );
+            Vec::new()
+        }
+    };
+    (total, commits)
+}
+
 async fn git_status_for_workspace(workspace_root: &Path) -> GitStatusResponse {
     let status = match run_git(
         workspace_root,
@@ -3256,6 +3714,21 @@ async fn git_status_for_workspace(workspace_root: &Path) -> GitStatusResponse {
     let mut parsed = parse_git_status(&status.stdout);
     if parsed.dirty {
         apply_git_numstat(workspace_root, &mut parsed).await;
+    }
+    // Deliberately outside the `dirty` guard above: a branch whose work is committed has a clean
+    // tree, and that is exactly the state this section exists to describe. Gating it on dirtiness
+    // would hide the commits the moment the last edit was committed.
+    if let Some(base) = git_base_ref(workspace_root, parsed.branch.as_deref()).await {
+        let (count, commits) = git_commits_for_workspace(workspace_root, &base).await;
+        if count > 0 {
+            // Only a list that actually came back can be truncated. A failed or timed-out `git log`
+            // returns nothing, and reporting that as "0 of 12 shown" would dress a read failure up
+            // as a cap.
+            parsed.commits_truncated = !commits.is_empty() && count > commits.len();
+            parsed.commit_count = count;
+            parsed.commits = commits;
+            parsed.base = Some(base);
+        }
     }
     parsed
 }
@@ -3309,6 +3782,10 @@ fn git_status_unavailable(error: Option<String>) -> GitStatusResponse {
         added_total: 0,
         deleted_total: 0,
         files: Vec::new(),
+        base: None,
+        commit_count: 0,
+        commits: Vec::new(),
+        commits_truncated: false,
         error,
     }
 }

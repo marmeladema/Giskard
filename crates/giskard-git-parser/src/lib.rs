@@ -5,10 +5,13 @@
 //! I/O, no logging — which is what lets every format quirk below be covered by a unit test against
 //! bytes captured from real `git` output.
 //!
-//! The formats parsed here are `git status --porcelain=v2 -z` and `git diff --numstat -z`. Both are
-//! documented stability contracts, and `-z` makes them unambiguous: records are NUL-terminated and
-//! paths are emitted verbatim, so a filename containing a space, quote or newline survives
-//! round-tripping intact.
+//! The formats parsed here are `git status --porcelain=v2 -z`, `git diff --numstat -z`,
+//! `git log --numstat -z` with an explicit `--format`, `git show --name-status -z`, and
+//! `git for-each-ref` with an explicit `--format`. Each is a documented stability contract, and
+//! every one of them is read with NUL separators — `-z`, or `%00` in a format string — because that
+//! is what makes them unambiguous: records are NUL-terminated and names are emitted verbatim, so a
+//! path or a ref containing a space, quote, pipe or newline survives round-tripping intact. Git
+//! permits all of those in a ref name; NUL is the one byte it does not.
 
 use std::collections::HashMap;
 
@@ -164,6 +167,12 @@ pub fn parse_git_status(output: &[u8]) -> GitStatusResponse {
         added_total: 0,
         deleted_total: 0,
         files,
+        // Status output says nothing about the branch's own history; the caller reads that
+        // separately and fills these in.
+        base: None,
+        commit_count: 0,
+        commits: Vec::new(),
+        commits_truncated: false,
         error: None,
     }
 }
@@ -293,6 +302,203 @@ fn parse_numstat_count(field: &str) -> Option<u32> {
     field.parse().ok()
 }
 
+/// One commit on the branch, above whatever it was branched from, as the Git line lists it.
+///
+/// Carries only what the collapsed row shows. The files are not here: listing 25 commits' paths on
+/// an endpoint the browser polls would cost far more than the row displays, so a commit's file list
+/// is read separately when its row is opened — see [`parse_git_name_status`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GitCommitEntry {
+    pub sha: String,
+    pub title: String,
+    /// More than one parent means a merge, which has no honest diffstat against any single one of
+    /// them — `git log` prints no numstat for it, so its counts stay zero and the row says so.
+    pub is_merge: bool,
+    pub files_changed: usize,
+    pub added: u32,
+    pub deleted: u32,
+}
+
+/// The byte that marks the start of a commit record in [`parse_git_log_numstat`]'s input.
+///
+/// `-z` NUL-terminates every record, commit headers and numstat lines alike, so the two are
+/// otherwise indistinguishable — a path is just as much a record as a header is. Git has no option
+/// to tell them apart, but `--format` passes a literal through, so the caller writes one in with
+/// `%x01` and the parser reads it back. SOH is chosen because it cannot occur in a path (Git
+/// rejects control characters in filenames) and would have to be typed deliberately into a commit
+/// subject to appear there.
+pub const GIT_LOG_RECORD_MARK: u8 = 0x01;
+/// Separates the fields inside one commit record. A subject may contain tabs and quotes, so the
+/// separator has to be something a person will not type; US is the unit separator for exactly this.
+pub const GIT_LOG_FIELD_MARK: char = '\u{1f}';
+
+/// Parse `git log -z --format='%x01%h%x1f%s%x1f%P' --numstat` output.
+///
+/// Records are NUL-separated. A commit record opens with [`GIT_LOG_RECORD_MARK`] and holds the
+/// abbreviated sha, the subject and the parent shas; every record after it, until the next mark, is
+/// one numstat line for that commit. Git separates the header from its numstat block with a
+/// newline, which lands at the *start* of the following record rather than the end of the header,
+/// so leading newlines are trimmed before a record is classified.
+///
+/// A merge contributes a header and nothing else: `git log` prints no diff for one unless asked,
+/// and asking would report it against an arbitrary parent.
+pub fn parse_git_log_numstat(output: &[u8]) -> Vec<GitCommitEntry> {
+    let mut commits: Vec<GitCommitEntry> = Vec::new();
+    let mut records = output
+        .split(|byte| *byte == 0)
+        .map(|record| {
+            // The newline Git writes after a commit header belongs to no field.
+            let start = record
+                .iter()
+                .position(|byte| *byte != b'\n')
+                .unwrap_or(record.len());
+            &record[start..]
+        })
+        .filter(|record| !record.is_empty());
+
+    while let Some(record) = records.next() {
+        if record[0] == GIT_LOG_RECORD_MARK {
+            let text = String::from_utf8_lossy(&record[1..]);
+            let mut fields = text.split(GIT_LOG_FIELD_MARK);
+            let (Some(sha), Some(title)) = (fields.next(), fields.next()) else {
+                continue;
+            };
+            if sha.is_empty() {
+                continue;
+            }
+            // An unborn repository's root commit has no parents, so the field is empty rather than
+            // absent; anything with a second one is a merge.
+            let parents = fields.next().unwrap_or_default();
+            commits.push(GitCommitEntry {
+                sha: sha.to_string(),
+                title: title.to_string(),
+                is_merge: parents.split_whitespace().count() > 1,
+                files_changed: 0,
+                added: 0,
+                deleted: 0,
+            });
+            continue;
+        }
+
+        // A numstat line for the commit opened above. Output that begins with one — a truncated
+        // capture, or a caller that forgot the mark — has no commit to attribute it to.
+        let Some(commit) = commits.last_mut() else {
+            continue;
+        };
+        let text = String::from_utf8_lossy(record);
+        let mut fields = text.splitn(3, '\t');
+        let (Some(added), Some(deleted), Some(rest)) =
+            (fields.next(), fields.next(), fields.next())
+        else {
+            continue;
+        };
+        if rest.is_empty() {
+            // A rename or copy puts its two paths in the two records that follow, which must be
+            // consumed here or they would be read as malformed numstat lines of their own.
+            records.next();
+            if records.next().is_none() {
+                continue;
+            }
+        }
+        commit.files_changed += 1;
+        // A binary file reports `-` for both counts. It still changed, so it is counted as a file;
+        // it contributes no lines because it has none to contribute.
+        commit.added += parse_numstat_count(added).unwrap_or(0);
+        commit.deleted += parse_numstat_count(deleted).unwrap_or(0);
+    }
+    commits
+}
+
+/// One file in a commit, from `git show --name-status`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GitNameStatusEntry {
+    /// Git's single-letter status, lowercased into the same vocabulary `parse_git_status` uses so
+    /// both lists colour their rows from one set of names.
+    pub kind: String,
+    pub path: String,
+    /// Where a rename or copy came from.
+    pub old_path: Option<String>,
+}
+
+/// Which of the asked-for refs exist, and where a symbolic one points.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GitRefListing {
+    /// Short names of the refs that resolved, in the order git listed them.
+    pub names: Vec<String>,
+    /// The short name a symbolic ref points at — `refs/remotes/origin/HEAD`, the only symbolic ref
+    /// Giskard asks about, whose target is the remote's own default branch.
+    pub symref_target: Option<String>,
+}
+
+/// Parse `git for-each-ref --format='%(refname:short)%00%(symref:short)'` output.
+///
+/// One line per ref that exists, so the absent ones are simply missing — which is the whole point
+/// of asking for them in one call rather than probing each in turn. A symbolic ref carries its
+/// target in the second field and is not a candidate itself; `refs/remotes/origin/HEAD` reports its
+/// own name as the bare remote, `origin`.
+///
+/// The field separator is NUL rather than a printable character because git permits a pipe, a
+/// space and a quote inside a ref name — `main|evil` is a legal branch — and any of those would let
+/// a ref name forge a field boundary.
+pub fn parse_git_ref_listing(output: &[u8]) -> GitRefListing {
+    let mut listing = GitRefListing::default();
+    for line in output.split(|byte| *byte == b'\n') {
+        if line.is_empty() {
+            continue;
+        }
+        let mut fields = line.splitn(2, |byte| *byte == 0);
+        let Some(name) = fields.next().filter(|name| !name.is_empty()) else {
+            continue;
+        };
+        let symref = fields.next().unwrap_or_default();
+        if !symref.is_empty() {
+            listing.symref_target = Some(String::from_utf8_lossy(symref).to_string());
+            continue;
+        }
+        listing
+            .names
+            .push(String::from_utf8_lossy(name).to_string());
+    }
+    listing
+}
+
+/// Parse `git show --name-status -z --format=` output.
+///
+/// Each entry is a status record followed by its path: `M\0path\0`. A rename or copy carries a
+/// similarity score on the letter (`R100`) and two paths, old then new — the same shape
+/// [`parse_git_numstat`] handles, and for the same reason.
+pub fn parse_git_name_status(output: &[u8]) -> Vec<GitNameStatusEntry> {
+    let mut entries = Vec::new();
+    let mut records = output
+        .split(|byte| *byte == 0)
+        .filter(|record| !record.is_empty());
+    while let Some(record) = records.next() {
+        let letter = String::from_utf8_lossy(record);
+        let Some(code) = letter.chars().next() else {
+            continue;
+        };
+        let renamed = matches!(code, 'R' | 'C');
+        let Some(first) = records.next() else {
+            continue;
+        };
+        let first = String::from_utf8_lossy(first).to_string();
+        let (path, old_path) = if renamed {
+            match records.next() {
+                Some(new_path) => (String::from_utf8_lossy(new_path).to_string(), Some(first)),
+                None => continue,
+            }
+        } else {
+            (first, None)
+        };
+        entries.push(GitNameStatusEntry {
+            kind: git_status_name(code).to_string(),
+            path,
+            old_path,
+        });
+    }
+    entries
+}
+
 pub fn index_numstat(entries: Vec<GitNumstatEntry>) -> HashMap<String, GitNumstatEntry> {
     entries
         .into_iter()
@@ -364,6 +570,162 @@ pub fn parse_deleted_branch_sha(stdout: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Bytes as `git log -z --format='%x01%h%x1f%s%x1f%P' --numstat` writes them: the header record
+    /// carries the mark, and Git's newline after it opens the following record rather than closing
+    /// the header.
+    fn log_bytes(parts: &[&str]) -> Vec<u8> {
+        parts.join("\x00").into_bytes()
+    }
+
+    #[test]
+    fn reads_a_commit_and_sums_its_numstat() {
+        let commits = parse_git_log_numstat(&log_bytes(&[
+            "\x01dbd4834\x1fHandle null Codex provider header maps\x1f49501cd",
+            "\n53\t3\tcrates/giskard-harness-codex/src/lib.rs",
+            "\n12\t0\tREADME.md",
+            "",
+        ]));
+        assert_eq!(commits.len(), 1);
+        let commit = &commits[0];
+        assert_eq!(commit.sha, "dbd4834");
+        assert_eq!(commit.title, "Handle null Codex provider header maps");
+        assert!(!commit.is_merge);
+        assert_eq!(commit.files_changed, 2);
+        assert_eq!(commit.added, 65);
+        assert_eq!(commit.deleted, 3);
+    }
+
+    /// Every record is NUL-terminated, so a numstat path is shaped exactly like a commit header.
+    /// Only the mark tells them apart — which is what keeps a commit whose subject looks like a
+    /// diffstat from being read as one.
+    #[test]
+    fn attributes_each_numstat_line_to_the_commit_above_it() {
+        let commits = parse_git_log_numstat(&log_bytes(&[
+            "\x01aaa1111\x1fSecond\x1fbbb2222",
+            "\n1\t1\tsecond.rs",
+            "\x01bbb2222\x1f9\t9\tnot a diffstat\x1fccc3333",
+            "\n4\t2\tfirst.rs",
+            "\n0\t7\tgone.rs",
+            "",
+        ]));
+        assert_eq!(commits.len(), 2);
+        assert_eq!(commits[0].files_changed, 1);
+        assert_eq!((commits[0].added, commits[0].deleted), (1, 1));
+        assert_eq!(commits[1].title, "9\t9\tnot a diffstat");
+        assert_eq!(commits[1].files_changed, 2);
+        assert_eq!((commits[1].added, commits[1].deleted), (4, 9));
+    }
+
+    /// A merge gets a header and no numstat: `git log` prints no diff for one, because there is no
+    /// single parent to print it against. Its row reports no figures rather than a misleading zero
+    /// pair passed off as a measurement.
+    #[test]
+    fn marks_a_merge_and_leaves_its_counts_empty() {
+        let commits = parse_git_log_numstat(&log_bytes(&[
+            "\x01921bd7c\x1fMerge branch 'side'\x1fbcbda19 7195461",
+            "\x011160b2c\x1fbase\x1f",
+            "\n1\t0\tf",
+            "",
+        ]));
+        assert_eq!(commits.len(), 2);
+        assert!(commits[0].is_merge);
+        assert_eq!(commits[0].files_changed, 0);
+        assert_eq!((commits[0].added, commits[0].deleted), (0, 0));
+        // A root commit has no parents at all, which is an empty field rather than a missing one.
+        assert!(!commits[1].is_merge);
+        assert_eq!(commits[1].files_changed, 1);
+    }
+
+    /// A rename emits its counts with an empty path, then the old and new paths as their own
+    /// records. Both have to be consumed, or the next commit's figures pick them up as numstat.
+    #[test]
+    fn consumes_both_paths_of_a_rename() {
+        let commits = parse_git_log_numstat(&log_bytes(&[
+            "\x0101fe17c\x1fRename f to renamed\x1f921bd7c",
+            "\n0\t0\t",
+            "f",
+            "renamed",
+            "\x01921bd7c\x1fEarlier\x1fbcbda19",
+            "\n5\t1\tkept.rs",
+            "",
+        ]));
+        assert_eq!(commits.len(), 2);
+        assert_eq!(commits[0].files_changed, 1);
+        assert_eq!((commits[0].added, commits[0].deleted), (0, 0));
+        assert_eq!(commits[1].files_changed, 1);
+        assert_eq!((commits[1].added, commits[1].deleted), (5, 1));
+    }
+
+    /// A binary file changed but has no lines to count, so it counts as a file and contributes
+    /// nothing to the totals — the same treatment the working tree's own diffstat gives it.
+    #[test]
+    fn counts_a_binary_file_without_counting_lines() {
+        let commits = parse_git_log_numstat(&log_bytes(&[
+            "\x011870c3d\x1fOpen untracked files from the Git status list\x1f49501cd",
+            "\n-\t-\tdocs/screenshots/ide-desktop.png",
+            "\n39\t7\tcrates/giskard-server/static/app.js",
+            "",
+        ]));
+        assert_eq!(commits[0].files_changed, 2);
+        assert_eq!((commits[0].added, commits[0].deleted), (39, 7));
+    }
+
+    /// An empty range is the common case on the default branch, and says so by parsing to nothing
+    /// rather than by failing.
+    #[test]
+    fn reads_an_empty_range_as_no_commits() {
+        assert!(parse_git_log_numstat(b"").is_empty());
+        assert!(parse_git_log_numstat(b"\x00\n\x00").is_empty());
+    }
+
+    #[test]
+    fn reads_a_ref_listing_and_its_symref_target() {
+        let listing = parse_git_ref_listing(b"main\x00\norigin\x00origin/main\norigin/main\x00\n");
+        assert_eq!(listing.names, vec!["main", "origin/main"]);
+        // `refs/remotes/origin/HEAD` lists as the bare remote and is a pointer, not a candidate.
+        assert_eq!(listing.symref_target.as_deref(), Some("origin/main"));
+    }
+
+    /// Git permits a pipe, a space and a quote inside a ref name — `main|evil` is a legal branch —
+    /// so a printable separator would let a ref name forge a field boundary and turn itself into a
+    /// symref target. NUL is the one byte a ref cannot contain.
+    #[test]
+    fn a_ref_name_cannot_forge_a_field_boundary() {
+        let listing = parse_git_ref_listing(b"main|evil\x00\nrelease 1.0\x00\n");
+        assert_eq!(listing.names, vec!["main|evil", "release 1.0"]);
+        assert_eq!(listing.symref_target, None);
+    }
+
+    #[test]
+    fn reads_an_empty_ref_listing() {
+        assert_eq!(parse_git_ref_listing(b""), GitRefListing::default());
+        assert_eq!(parse_git_ref_listing(b"\n\n"), GitRefListing::default());
+    }
+
+    #[test]
+    fn reads_name_status_entries_including_renames() {
+        let entries = parse_git_name_status(
+            b"M\x00renamed\x00R100\x00f\x00moved\x00A\x00new.rs\x00D\x00gone.rs\x00",
+        );
+        assert_eq!(entries.len(), 4);
+        assert_eq!(entries[0].kind, "modified");
+        assert_eq!(entries[0].path, "renamed");
+        assert_eq!(entries[0].old_path, None);
+        // The similarity score rides on the letter, and the old path comes first.
+        assert_eq!(entries[1].kind, "renamed");
+        assert_eq!(entries[1].path, "moved");
+        assert_eq!(entries[1].old_path.as_deref(), Some("f"));
+        assert_eq!(entries[2].kind, "added");
+        assert_eq!(entries[3].kind, "deleted");
+    }
+
+    /// A status record with no path behind it is truncated output, not an entry.
+    #[test]
+    fn drops_a_name_status_record_with_no_path() {
+        assert!(parse_git_name_status(b"M\x00").is_empty());
+        assert!(parse_git_name_status(b"R100\x00only-one-path\x00").is_empty());
+    }
 
     // Fixtures are bytes captured from real `git` output; see the crate docs for the two formats.
     /// With `--untracked-files=normal` an untracked directory arrives as a single entry with a

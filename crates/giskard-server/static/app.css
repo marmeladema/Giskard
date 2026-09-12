@@ -2,6 +2,8 @@
     --bg:#0e1116; --panel:#161b22; --panel2:#1c2230; --border:#2b3240;
     --fg:#e6edf3; --muted:#8b949e; --accent:#4f8cff; --mono:ui-monospace,SFMono-Regular,Menlo,monospace;
     --scroll-track:#111720; --scroll-thumb:#344154; --scroll-thumb-hover:#5b8def;
+    /* The commits scope: one hue for the count, the node and each commit's sha. */
+    --commit:#a371f7; --commit-dim:#6f4fb0; --commit-bright:#c4a2fb; --commit-wash:#1a1430;
   }
   * { box-sizing:border-box; }
   /* --app-height and --app-top are driven by window.visualViewport in app.js (syncAppHeight), so
@@ -588,6 +590,19 @@
      put its digits where the button's would sit. */
   .git-count-static { align-self:center; padding:0 7px; font-size:11.5px; }
   .git-count-static[hidden] { display:none; }
+  /* The commits scope takes a hue of its own and spends it nowhere else: this count, the node that
+     marks it, and the sha at the head of each commit row. The working tree's rows keep their
+     existing add/modify/delete colours, so the two scopes never have to be told apart by position.
+     The commit hue is GitHub's, which is where a Giskard user has seen it mean "commit" before. */
+  .git-review-commits { gap:5px; color:var(--commit); font-family:var(--mono); }
+  .git-review-commits:hover, .git-review-commits:focus-visible {
+    border-color:var(--commit-dim); background:var(--commit-wash); color:var(--commit-bright);
+  }
+  /* A dot, not a glyph with detail: at 6px any interior would be mud, and the row repeats it a
+     dozen times in the list below where it has to read as one mark rather than a picture. */
+  .git-commit-node {
+    width:6px; height:6px; flex:none; border-radius:50%; background:currentColor;
+  }
   /* The draft's checkout choice, sized to sit among this row's actions rather than to look like a
      form field: the row is 27px tall and every other control on it is a small muted chip. */
   .git-strategy {
@@ -614,6 +629,13 @@
     color:var(--muted); font-size:10px; font-weight:600; letter-spacing:.07em; text-transform:uppercase;
   }
   .git-section-title:first-child { margin-top:7px; }
+  /* A ref name is not a label: the section title is uppercased small-caps chrome, and putting
+     `origin/main` through that renders a branch nobody has. It keeps its own case, and its own
+     monospace, because it is a name the reader may have to type. */
+  .git-section-base {
+    text-transform:none; letter-spacing:0; font-weight:400;
+    font-family:var(--mono); color:var(--muted);
+  }
   .git-section-title .git-section-rule { flex:1; height:1px; background:var(--border); }
   .git-file {
     display:grid; grid-template-columns:12px minmax(0,1fr) auto; gap:8px; align-items:center;
@@ -640,6 +662,32 @@
   .git-file-name { color:var(--fg); }
   .git-file-stat { flex:none; display:inline-flex; gap:5px; color:var(--muted); font-family:var(--mono); font-size:10.5px; font-variant-numeric:tabular-nums; }
   .git-empty { padding:8px 6px; color:var(--muted); font-size:12px; }
+
+  /* One commit in the list. The row is `.git-line-head` in miniature, and deliberately so: what a
+     thing *is* sits in a toggle that expands it, what a thing *changed* sits in a button that opens
+     that diff. Two levels, one rule — and, as on the line above, the two cannot nest, so the
+     figures are a sibling of the toggle rather than a child. */
+  .git-commit-head { display:flex; align-items:stretch; gap:4px; }
+  .git-commit-toggle {
+    display:grid; grid-template-columns:9px 6px auto minmax(0,1fr); gap:8px; align-items:center;
+    flex:1; min-width:0; padding:3px 6px; border:0; border-radius:6px; background:transparent;
+    color:var(--fg); font:inherit; font-size:11.5px; text-align:left; cursor:pointer;
+  }
+  .git-commit-toggle:hover:not(:disabled), .git-commit-toggle:focus-visible { background:var(--panel2); }
+  .git-commit-toggle:disabled { cursor:default; }
+  .git-commit .git-commit-node { color:var(--commit); }
+  .git-commit.expanded .git-caret { transform:rotate(90deg); }
+  .git-commit-sha { font-family:var(--mono); font-size:11px; color:var(--commit); }
+  .git-commit-title { min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .git-commit-files { color:var(--muted); font-family:var(--mono); font-size:10.5px; font-variant-numeric:tabular-nums; }
+  /* A merge has no honest diffstat against any one parent, so it has no figures and therefore no
+     button — the same "no diff, no control" rule the clean working tree follows. */
+  .git-commit-static { align-self:center; padding:0 7px; color:var(--muted); font-family:var(--mono); font-size:10.5px; }
+  /* A commit's files are one step in, under the title they belong to, with the node's hue carried
+     down as the thread that holds them together. */
+  .git-commit-body { margin:1px 0 5px 15px; padding-left:10px; border-left:1px solid var(--commit-dim); }
+  .git-commit-body[hidden] { display:none; }
+  .git-commit-loading { padding:4px 6px; color:var(--muted); font-size:11px; }
 
   /* align-items:flex-end keeps the fixed-height ＋/send/stop buttons level with the *bottom* edge
      of the textarea as it grows, so the send control stays where the eye and thumb expect it
@@ -964,6 +1012,8 @@
     --bg:#0e1116; --panel:#161b22; --panel2:#1c2230; --border:#2b3240;
     --fg:#e6edf3; --muted:#8b949e; --accent:#5b8def;
     --scroll-track:#111720; --scroll-thumb:#344154; --scroll-thumb-hover:#5b8def;
+    /* The commits scope: one hue for the count, the node and each commit's sha. */
+    --commit:#a371f7; --commit-dim:#6f4fb0; --commit-bright:#c4a2fb; --commit-wash:#1a1430;
   }
   :root[data-appearance="terminal"] {
     --bg:#0a0d0b; --panel:#0d110e; --panel2:#131813; --border:#212a20;

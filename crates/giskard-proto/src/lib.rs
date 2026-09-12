@@ -419,6 +419,63 @@ pub struct GitFileStatus {
     pub unstaged_deleted: Option<u32>,
 }
 
+/// Serde skips for the Git status additions, so a workspace that is not a repository — or one with
+/// nothing on top of its base — serializes exactly the fields it did before commits were listed.
+fn is_zero(value: &usize) -> bool {
+    *value == 0
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
+/// One commit on the current branch, above the branch it was cut from.
+///
+/// Summary only: the row shows a sha, a subject and how much changed, and the file list behind it
+/// is read separately when the row is opened (`GET .../git/commit`). Listing 25 commits' files on
+/// an endpoint the browser polls would send far more than the collapsed row ever displays.
+#[derive(Debug, Clone, Serialize)]
+pub struct GitCommitSummary {
+    /// Abbreviated, as Git chose to abbreviate it — long enough to be unambiguous in this
+    /// repository, which is what the row shows and what the diff endpoint accepts back.
+    pub sha: String,
+    pub title: String,
+    /// A merge has no honest diffstat against any single parent, so its counts are all zero and the
+    /// row prints no figures rather than a measurement it cannot make.
+    pub is_merge: bool,
+    pub files_changed: usize,
+    pub added: u32,
+    pub deleted: u32,
+}
+
+/// The files one commit touched, read when its row is opened.
+#[derive(Debug, Clone, Serialize)]
+pub struct GitCommitFile {
+    pub path: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub old_path: Option<String>,
+    /// The same status vocabulary `GitFileStatus` uses, so both lists colour their rows from one
+    /// set of names.
+    pub status: String,
+    /// Absent when there is nothing to count *or* nothing was counted — a binary file, or a numstat
+    /// read that failed. `binary` is what tells those apart; absent counts alone do not.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub added: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deleted: Option<u32>,
+    /// The file changed but has no lines to count, which `--numstat` reports as `-`. Stated rather
+    /// than inferred from absent counts: a numstat read that failed leaves every file with no
+    /// counts, and calling those binary would mark a whole commit's files unopenable.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub binary: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct GitCommitFilesResponse {
+    pub sha: String,
+    pub files: Vec<GitCommitFile>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct GitStatusResponse {
     pub is_repository: bool,
@@ -438,6 +495,21 @@ pub struct GitStatusResponse {
     pub added_total: u32,
     pub deleted_total: u32,
     pub files: Vec<GitFileStatus>,
+    /// The ref the commits below are counted against — the branch this one was cut from, resolved
+    /// fresh on every read. It is named rather than assumed because it is detected (see
+    /// `git_base_ref`), and a detection the user cannot see is one they cannot correct.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base: Option<String>,
+    /// How many commits `base..HEAD` holds — the true total, which `commits` may not reach.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub commit_count: usize,
+    /// The most recent of them, newest first, capped so a long-running branch cannot make one
+    /// status read expensive.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub commits: Vec<GitCommitSummary>,
+    /// Whether the cap was reached, so the list can offer the rest rather than silently ending.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub commits_truncated: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }

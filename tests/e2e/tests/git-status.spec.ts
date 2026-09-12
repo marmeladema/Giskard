@@ -126,6 +126,76 @@ test.describe("git status line", () => {
     await expect(page.locator("#codePath")).toHaveText("Diff: Working tree");
   });
 
+  // The commits the branch holds that its base does not — the seeded workspace has two, on top of
+  // an `origin/main` two behind it. They are a scope of their own: the row carries both counts, and
+  // the commit count is a node and a number with the words in its accessible name.
+  test("counts the branch's commits beside the working tree's", async ({ page }) => {
+    const commits = page.locator("#gitReviewCommits");
+    await expect(commits).toBeVisible();
+    await expect(page.locator("#gitCommitCount")).toHaveText("2");
+    await expect(commits).toHaveAttribute(
+      "aria-label",
+      "Review 2 commits on top of origin/main",
+    );
+    // The working tree's own count is untouched by it.
+    await expect(page.locator("#gitCount")).toHaveText("3");
+
+    await commits.click();
+    await expect(page.locator("#codeOverlay")).toHaveClass(/\bopen\b/);
+    // Three dots, not two: the title names the range so it cannot be mistaken for the working tree.
+    await expect(page.locator("#codePath")).toHaveText("Diff: origin/main…HEAD (2 commits)");
+  });
+
+  // Each commit is a row that opens into its own files, and each of those opens the diff of that
+  // file *in that commit* — which is what the sha in the overlay title is for. Without it a
+  // commit's diff of a path and the working tree's diff of the same path are indistinguishable.
+  test("lists a commit's files and opens each at that commit", async ({ page }) => {
+    await page.locator("#gitLineToggle").click();
+    await expect(page.locator("#gitLineBody")).toBeVisible();
+
+    // Commits sit after the working tree, and the section names the base it counted against.
+    const heading = page.locator(".git-section-title", { hasText: "Commits" });
+    await expect(heading).toContainText("2");
+    await expect(heading.locator(".git-section-base")).toHaveText("on top of origin/main");
+
+    const rows = page.locator(".git-commit");
+    await expect(rows).toHaveCount(2);
+    // Newest first, and the sha is the one the diff endpoint will accept back.
+    const newest = rows.first();
+    await expect(newest.locator(".git-commit-title")).toHaveText("Document how to run the demo");
+    const sha = await newest.locator(".git-commit-sha").innerText();
+    expect(sha).toMatch(/^[0-9a-f]{7,}$/);
+
+    // The row is a disclosure, not a diff: opening it lists the files, it does not open an overlay.
+    await newest.locator(".git-commit-toggle").click();
+    await expect(newest.locator(".git-commit-toggle")).toHaveAttribute("aria-expanded", "true");
+    await expect(page.locator("#codeOverlay")).not.toHaveClass(/\bopen\b/);
+    const file = newest.locator(".git-commit-body .git-file");
+    await expect(file).toHaveCount(1);
+    await expect(file.locator(".git-file-name")).toHaveText("README.md");
+    await expect(file.locator(".git-file-status")).toHaveText("M");
+
+    await file.click();
+    await expect(page.locator("#codeOverlay")).toHaveClass(/\bopen\b/);
+    await expect(page.locator("#codePath")).toHaveText(`Diff: README.md at ${sha}`);
+  });
+
+  // The figures on a commit row follow the same rule as the figures on the line: they are the
+  // button, and they open the scope they count — here, the whole commit.
+  test("reviews a whole commit from its figures", async ({ page }) => {
+    await page.locator("#gitLineToggle").click();
+    const row = page.locator(".git-commit").first();
+    const sha = await row.locator(".git-commit-sha").innerText();
+    const figures = row.locator(".git-review");
+    await expect(figures.locator(".git-commit-files")).toHaveText("1 file");
+
+    await figures.click();
+    await expect(page.locator("#codeOverlay")).toHaveClass(/\bopen\b/);
+    await expect(page.locator("#codePath")).toHaveText(
+      `Diff: ${sha} Document how to run the demo`,
+    );
+  });
+
   // Untracked entries are listed too, and the two kinds are not the same row: a file can be opened,
   // a collapsed directory has no single file to open.
   test("lists untracked entries and opens only the files among them", async ({ page }) => {

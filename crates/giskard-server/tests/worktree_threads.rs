@@ -633,6 +633,162 @@ fn paths_in(status: &serde_json::Value) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// The commits the Git line lists are resolved against a *ref*, on every read, and this is the
+/// reason why. The obvious alternative is the commit a thread branched from, which the worktree
+/// record already stores — and a rebase onto a newer base leaves it behind. Because it stays an
+/// ancestor of the rewritten HEAD the range does not fail, it silently grows: measured here, the
+/// stored-commit range reports five commits for a branch that wrote two, and lists the three the
+/// base gained as the branch's own work.
+///
+/// Driven against a real repository through the route, because the failure is entirely in what Git
+/// reports for a rewritten history; a mock would only assert the assumption back.
+#[tokio::test]
+async fn branch_commits_survive_a_rebase_onto_a_newer_base() {
+    let server = start(true).await;
+    let repo = server.project.dir.path();
+
+    // A base with a remote-tracking ref, as a cloned repository would have. `git init` writes no
+    // such ref, so without it the branch below would be its own base.
+    git::run(repo, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
+    let branched_from = stdout_of(&git::run(repo, &["rev-parse", "HEAD"]));
+
+    git::run(repo, &["checkout", "-q", "-b", "feature"]);
+    for name in ["one", "two"] {
+        std::fs::write(repo.join(format!("feature-{name}.txt")), "work\n").unwrap();
+        git::run(repo, &["add", "."]);
+        git::run(repo, &["commit", "-qm", &format!("Feature work {name}")]);
+    }
+
+    let before = server.git_status(None).await;
+    assert_eq!(before["base"].as_str(), Some("origin/main"));
+    assert_eq!(before["commit_count"].as_u64(), Some(2));
+
+    // The base moves on, the way `main` does while a branch is open, and the branch is rebased onto
+    // it — which rewrites both of its commits.
+    git::run(repo, &["checkout", "-q", "main"]);
+    for step in ["one", "two", "three"] {
+        std::fs::write(repo.join(format!("base-{step}.txt")), "base\n").unwrap();
+        git::run(repo, &["add", "."]);
+        git::run(repo, &["commit", "-qm", &format!("Base work {step}")]);
+    }
+    git::run(repo, &["update-ref", "refs/remotes/origin/main", "main"]);
+    git::run(repo, &["checkout", "-q", "feature"]);
+    git::run(repo, &["rebase", "-q", "origin/main"]);
+
+    // What the stored branch point would now claim, and why it is not used.
+    let stale = stdout_of(&git::run(
+        repo,
+        &["rev-list", "--count", &format!("{branched_from}..HEAD")],
+    ));
+    assert_eq!(
+        stale, "5",
+        "the branch point should have gone stale, or this test proves nothing"
+    );
+
+    let after = server.git_status(None).await;
+    assert_eq!(after["base"].as_str(), Some("origin/main"));
+    assert_eq!(
+        after["commit_count"].as_u64(),
+        Some(2),
+        "the branch wrote two commits; the base's three are not its work"
+    );
+    let titles: Vec<&str> = after["commits"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|commit| commit["title"].as_str().unwrap())
+        .collect();
+    assert_eq!(titles, vec!["Feature work two", "Feature work one"]);
+}
+
+/// The fork-distance ranking decides between the remote and local forms of *one* name, never
+/// between different names. Ranking across names lets a long-diverged `develop` beat `main` on a
+/// repository that has both, and report the branch as hundreds of commits deep on a base it never
+/// sat on.
+#[tokio::test]
+async fn a_diverged_branch_of_another_name_does_not_become_the_base() {
+    let server = start(true).await;
+    let repo = server.project.dir.path();
+    git::run(repo, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
+
+    // `develop` leaves early and goes its own way, so it forks further from HEAD than `main` does.
+    git::run(repo, &["branch", "develop"]);
+    git::run(repo, &["checkout", "-q", "develop"]);
+    std::fs::write(repo.join("develop-only.txt"), "elsewhere\n").unwrap();
+    git::run(repo, &["add", "."]);
+    git::run(repo, &["commit", "-qm", "Work only on develop"]);
+    git::run(repo, &["checkout", "-q", "main"]);
+
+    std::fs::write(repo.join("feature.txt"), "work\n").unwrap();
+    git::run(repo, &["add", "."]);
+    git::run(repo, &["commit", "-qm", "Work on main"]);
+
+    let status = server.git_status(None).await;
+    assert_eq!(
+        status["base"].as_str(),
+        Some("origin/main"),
+        "a diverged branch of another name must not win the ranking: {status}"
+    );
+    assert_eq!(status["commit_count"].as_u64(), Some(1));
+}
+
+/// A repository whose default branch is not one of the conventional names still gets a base. The
+/// candidate patterns cannot ask for a name nobody knows yet, so the remote's own default — which
+/// `refs/remotes/origin/HEAD` names — has to be admitted after the fact. Without that the whole
+/// section is silently absent on such a repository, which is the worst shape a failure can take.
+#[tokio::test]
+async fn the_remotes_own_default_is_honoured_whatever_it_is_called() {
+    let server = start(true).await;
+    let repo = server.project.dir.path();
+
+    // `dev` is the default here, and it is deliberately none of main/master/develop/trunk.
+    git::run(repo, &["branch", "-m", "dev"]);
+    git::run(repo, &["update-ref", "refs/remotes/origin/dev", "HEAD"]);
+    git::run(
+        repo,
+        &[
+            "symbolic-ref",
+            "refs/remotes/origin/HEAD",
+            "refs/remotes/origin/dev",
+        ],
+    );
+
+    git::run(repo, &["checkout", "-q", "-b", "feature"]);
+    std::fs::write(repo.join("feature.txt"), "work\n").unwrap();
+    git::run(repo, &["add", "."]);
+    git::run(repo, &["commit", "-qm", "Feature work"]);
+
+    let status = server.git_status(None).await;
+    assert_eq!(
+        status["base"].as_str(),
+        Some("origin/dev"),
+        "the remote's own default was not honoured: {status}"
+    );
+    assert_eq!(status["commit_count"].as_u64(), Some(1));
+}
+
+/// On the base branch itself there is nothing on top of the base, so the section is absent rather
+/// than empty — and the rest of the status is unaffected.
+#[tokio::test]
+async fn a_branch_with_nothing_above_its_base_lists_no_commits() {
+    let server = start(true).await;
+    let repo = server.project.dir.path();
+    git::run(repo, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
+
+    let status = server.git_status(None).await;
+    assert!(status["is_repository"].as_bool().unwrap());
+    assert!(
+        status.get("commits").is_none(),
+        "commits should be absent, not empty: {status}"
+    );
+    assert!(status.get("commit_count").is_none());
+    assert!(status.get("base").is_none());
+}
+
+fn stdout_of(output: &std::process::Output) -> String {
+    String::from_utf8_lossy(&output.stdout).trim().to_string()
+}
+
 #[tokio::test]
 async fn a_thread_started_with_worktree_runs_in_it() {
     let server = start(/*git_repo*/ true).await;

@@ -183,6 +183,10 @@ let state = {
   gitStatus:null, gitLoading:false, gitError:null, gitRequestSeq:0,
   draftGitStrategy:"shared",
   gitExpanded:false, gitRepoByWorkspace:new Map(), gitResizeTimer:null, gitBodyHtml:null, gitDiffPending:false, gitRefreshTimer:null,
+  // Which commit rows are open, and the files behind the ones that have been read. Both live in
+  // state rather than in the DOM because the body is re-rendered from a string on every refresh:
+  // markup alone would lose an open row on the next poll.
+  gitCommitOpen:new Set(), gitCommitFiles:new Map(), gitCommitPending:new Set(), gitCommitFailed:new Set(),
   mcpServers:[], mcpCapabilities:{ status:false, reload:false, oauth_login:false }, mcpLoading:false, mcpError:null, expandedMcps:new Set(),
   threadReadOnly:false, readOnlyProvider:null, readOnlyMessage:null,
   pickerTypeahead:"", pickerTypeaheadTimer:null, pickerSelectedRow:null,
@@ -6196,6 +6200,10 @@ function resetGitState() {
   state.gitLoading = false;
   state.gitError = null;
   state.gitExpanded = false;
+  state.gitCommitOpen.clear();
+  state.gitCommitFiles.clear();
+  state.gitCommitPending.clear();
+  state.gitCommitFailed.clear();
   state.gitRequestSeq += 1;
   renderGitLine();
 }
@@ -6281,7 +6289,11 @@ function renderGitLine() {
 
   line.className = `git-line state-${stateName}${state.gitExpanded ? " expanded" : ""}`;
   const loadingFirst = stateName === "loading";
-  const expandable = stateName === "dirty" || stateName === "conflicted";
+  const commitCount = gitCommitCount(status);
+  // A branch whose work is committed has a clean tree and still has something to list, so the line
+  // opens on commits too. Without this the section would disappear the moment the last edit was
+  // committed — the state it exists to describe.
+  const expandable = stateName === "dirty" || stateName === "conflicted" || commitCount > 0;
   const dirty = gitDirtyCount(status);
 
   $("gitIcon").firstElementChild.setAttribute("href", status && status.detached ? "#gi-detached" : "#gi-branch");
@@ -6349,6 +6361,17 @@ function renderGitLine() {
     reviewTree.setAttribute("aria-label", label);
   }
 
+  // The commits scope is independent of the working tree's: a branch with both shows both counts,
+  // and a clean branch with commits shows only this one.
+  const reviewCommits = $("gitReviewCommits");
+  reviewCommits.hidden = loadingFirst || !commitCount;
+  if (!reviewCommits.hidden) {
+    $("gitCommitCount").textContent = String(commitCount);
+    const label = gitReviewCommitsLabel(status, commitCount);
+    reviewCommits.title = label;
+    reviewCommits.setAttribute("aria-label", label);
+  }
+
   const toggle = $("gitLineToggle");
   toggle.disabled = !expandable;
   toggle.setAttribute("aria-expanded", state.gitExpanded && expandable ? "true" : "false");
@@ -6383,6 +6406,20 @@ function gitHasWorkingDiff(status) {
   return ((status.staged_count || 0) + (status.unstaged_count || 0) + (status.conflicted_count || 0)) > 0;
 }
 
+/* How many commits this branch holds that its base does not. The server's own total, never the
+   length of the listed commits: the list is capped, and the row reports the truth. */
+function gitCommitCount(status) {
+  return status && status.commit_count ? status.commit_count : 0;
+}
+
+/* The commits count is a node and a number, so its name carries the words — including the base it
+   is counted against, which is detected rather than configured and so is worth stating wherever
+   there is room for it. */
+function gitReviewCommitsLabel(status, count) {
+  const base = status && status.base ? status.base : "the base branch";
+  return `Review ${count} commit${count === 1 ? "" : "s"} on top of ${base}`;
+}
+
 /* What the figures open, spelled out for the tooltip and the accessible name — the row has no width
    for it, and a number on its own does not say it can be clicked. The line counts are dropped when
    there are none to report (a binary-only or wholly untracked change) rather than printed as a pair
@@ -6399,8 +6436,18 @@ function gitLineTitle(status, stateName, dirty) {
   if (stateName === "loading") return "Loading Git status…";
   if (stateName === "error") return "Git status unavailable: " + (state.gitError || "");
   if (stateName === "conflicted") return `${status.conflicted_count} conflicted file${status.conflicted_count === 1 ? "" : "s"} — click to list the changes`;
-  if (!status || !status.dirty) return "Working tree clean";
-  return `${dirty} changed file${dirty === 1 ? "" : "s"} — click to list them`;
+  const commits = gitCommitCount(status);
+  // A clean tree with commits is still worth opening, so the tooltip has to say so rather than
+  // reporting "clean" on a row whose caret invites a click.
+  if (!status || !status.dirty) {
+    return commits
+      ? `Working tree clean — click to list ${commits} commit${commits === 1 ? "" : "s"}`
+      : "Working tree clean";
+  }
+  const changed = `${dirty} changed file${dirty === 1 ? "" : "s"}`;
+  return commits
+    ? `${changed} and ${commits} commit${commits === 1 ? "" : "s"} — click to list them`
+    : `${changed} — click to list them`;
 }
 
 function renderGitLineBody() {
@@ -6408,12 +6455,17 @@ function renderGitLineBody() {
   const status = state.gitStatus;
   if (!status || !status.is_repository) { body.innerHTML = ""; state.gitBodyHtml = null; return; }
   const sections = gitFileSections(status);
-  const html = (GIT_SECTIONS
+  const files = GIT_SECTIONS
     .filter(section => sections[section.key].length)
     .map(section => renderGitSection(section, sections[section.key]))
-    .join("")) || `<div class="git-empty">No changed files.</div>`;
+    .join("");
+  // Commits sit last: the working tree is what the next turn will touch, so it keeps the top of the
+  // list, and settled work reads as history below it.
+  const commits = renderGitCommitSection(status);
+  const html = (files + commits) || `<div class="git-empty">No changed files.</div>`;
   // The collapsed line re-renders on refresh and on every viewport tier change, and rebuilding an
-  // unchanged list would throw away the reader's scroll position in it.
+  // unchanged list would throw away the reader's scroll position in it. Which commit rows are open
+  // is part of the markup this compares, so a refresh that changes nothing leaves them open.
   if (state.gitBodyHtml === html) return;
   state.gitBodyHtml = html;
   body.innerHTML = html;
@@ -6425,6 +6477,153 @@ function renderGitLineBody() {
   body.querySelectorAll("[data-git-file]").forEach(row => {
     row.onclick = () => openCodeOverlay(row.dataset.gitFile, null);
   });
+  body.querySelectorAll("[data-git-commit]").forEach(row => {
+    row.onclick = () => toggleGitCommit(row.dataset.gitCommit);
+  });
+  body.querySelectorAll("[data-git-commit-all]").forEach(row => {
+    row.onclick = () => openGitCommitDiff(row.dataset.gitCommitAll, null);
+  });
+  body.querySelectorAll("[data-git-commit-file]").forEach(row => {
+    row.onclick = () => openGitCommitDiff(row.dataset.gitCommitFile, row.dataset.gitPath);
+  });
+}
+
+/* The commits on this branch that its base does not have, newest first. Absent entirely when there
+   are none — on the base branch itself, or on a branch whose work is all merged. */
+function renderGitCommitSection(status) {
+  const count = gitCommitCount(status);
+  if (!count) return "";
+  const commits = Array.isArray(status.commits) ? status.commits : [];
+  const base = status.base ? `<span class="git-section-base">on top of ${escapeHtml(status.base)}</span>` : "";
+  const rows = commits.map(commit => renderGitCommitRow(commit)).join("");
+  // The list is capped, so when it does not reach the count it says so rather than just ending.
+  const more = status.commits_truncated
+    ? `<div class="git-empty">${commits.length} of ${count} shown</div>`
+    : "";
+  return `<div class="git-section-title">Commits <span class="muted">${count}</span>${base}<span class="git-section-rule"></span></div>${rows}${more}`;
+}
+
+function renderGitCommitRow(commit) {
+  const sha = String(commit && commit.sha ? commit.sha : "");
+  if (!sha) return "";
+  const title = String(commit.title || "");
+  const open = state.gitCommitOpen.has(sha);
+  const files = state.gitCommitFiles.get(sha);
+  const failed = state.gitCommitFailed.has(sha);
+  // Two commits have nothing behind them, and neither gets a control: a merge, whose diffstat
+  // against any single parent would be a fiction, and an empty commit, which changed nothing at
+  // all. The same "no diff, no button" rule the clean working tree follows, and the row is a label
+  // rather than a disclosure in both cases.
+  const inert = commit.is_merge || !commit.files_changed;
+  const figures = inert
+    ? `<span class="git-commit-static">${commit.is_merge ? "merge" : "empty"}</span>`
+    : `<button type="button" class="git-review" data-git-commit-all="${escapeAttr(sha)}"
+        title="${escapeAttr(gitCommitReviewLabel(commit))}" aria-label="${escapeAttr(gitCommitReviewLabel(commit))}">
+        <span class="git-commit-files">${commit.files_changed} file${commit.files_changed === 1 ? "" : "s"}</span>
+        <span class="git-file-stat">${gitDiffstatHtml(commit.added || 0, commit.deleted || 0)}</span>
+      </button>`;
+  // A read that failed says so and stays retryable, rather than being remembered as a commit with
+  // no files — which would be indistinguishable from the truth and could never be corrected.
+  const body = open
+    ? `<div class="git-commit-body">${failed
+        ? `<div class="git-commit-loading">Could not list this commit's files — click the row to retry.</div>`
+        : files
+        ? (files.length ? files.map(file => renderGitCommitFileRow(sha, file)).join("") : `<div class="git-commit-loading">No files in this commit.</div>`)
+        : `<div class="git-commit-loading">Loading…</div>`}</div>`
+    : "";
+  return `<div class="git-commit${open ? " expanded" : ""}">
+    <div class="git-commit-head">
+      <button type="button" class="git-commit-toggle" data-git-commit="${escapeAttr(sha)}"
+              aria-expanded="${open ? "true" : "false"}"${inert ? " disabled" : ""}
+              title="${escapeAttr(gitCommitRowTitle(commit))}">
+        <span class="git-caret" aria-hidden="true">▸</span>
+        <span class="git-commit-node" aria-hidden="true"></span>
+        <span class="git-commit-sha">${escapeHtml(sha)}</span>
+        <span class="git-commit-title">${escapeHtml(title)}</span>
+      </button>
+      ${figures}
+    </div>
+    ${body}
+  </div>`;
+}
+
+/* A file as one commit changed it. Unlike a working-tree row this always opens: the diff is read
+   from history, so a path the commit deleted still has one, and no thread is needed to read a file
+   that is not on disk. Binary files are the exception — there is nothing to render. */
+function renderGitCommitFileRow(sha, file) {
+  const path = String(file.path || "");
+  const name = file.old_path ? `${file.old_path} → ${path}` : path;
+  // Only a file the server marked binary is inert. Absent counts are not the same thing: a numstat
+  // read that failed leaves every file without them, and treating that as binary would make a whole
+  // commit's files unopenable rather than merely unmeasured.
+  const action = file.binary
+    ? ` disabled title="${escapeAttr(name)} — binary file"`
+    : ` data-git-commit-file="${escapeAttr(sha)}" data-git-path="${escapeAttr(path)}" title="${escapeAttr(name)}"`;
+  const counted = typeof file.added === "number" || typeof file.deleted === "number";
+  const stat = file.binary ? `<span class="muted">bin</span>`
+    : counted ? gitDiffstatHtml(file.added || 0, file.deleted || 0)
+    : "";
+  return `<button type="button" class="git-file"${action}>
+    <span class="git-file-status status-${escapeAttr(file.status || "modified")}">${escapeHtml(gitStatusCode(file.status))}</span>
+    <span class="git-file-path">${renderGitPath(path)}</span>
+    <span class="git-file-stat">${stat}</span>
+  </button>`;
+}
+
+function gitCommitReviewLabel(commit) {
+  const files = `${commit.files_changed} file${commit.files_changed === 1 ? "" : "s"}`;
+  return `Review ${commit.sha} — ${files}, ${commit.added || 0} line${commit.added === 1 ? "" : "s"} added, ${commit.deleted || 0} removed`;
+}
+
+function gitCommitRowTitle(commit) {
+  const name = `${commit.sha} ${commit.title}`;
+  if (commit.is_merge) return `${name} — a merge, so it has no diffstat of its own`;
+  if (!commit.files_changed) return `${name} — an empty commit, with no files to list`;
+  return `${name} — click to list its files`;
+}
+
+/* Open or close one commit's file list, reading it the first time. The files are cached per sha:
+   history does not change under a rebase of someone else's making, and the list re-renders on every
+   status poll, so a second read would be pure cost. */
+async function toggleGitCommit(sha) {
+  if (!sha) return;
+  if (state.gitCommitOpen.has(sha)) {
+    state.gitCommitOpen.delete(sha);
+    state.gitBodyHtml = null;
+    renderGitLineBody();
+    return;
+  }
+  state.gitCommitOpen.add(sha);
+  // Re-opening a row whose read failed is the retry: the failure is cleared here so the row shows
+  // "Loading…" again and the request below runs a second time.
+  state.gitCommitFailed.delete(sha);
+  state.gitBodyHtml = null;
+  renderGitLineBody();
+  if (state.gitCommitFiles.has(sha) || state.gitCommitPending.has(sha)) return;
+
+  // The whole view, not just the project: switching threads within one project keeps the project id,
+  // and a commit read is scoped to a thread's workspace, so a project-only guard would file one
+  // thread's commit under a sha the reader is now looking at in another.
+  const view = captureActiveViewIdentity();
+  state.gitCommitPending.add(sha);
+  try {
+    const scope = gitScopeQuery();
+    const res = await api("GET", `/api/projects/${view.projectId}/git/commit?sha=${encodeURIComponent(sha)}${scope ? `&${scope}` : ""}`);
+    if (!activeViewIdentityIsCurrent(view)) return;
+    state.gitCommitFiles.set(sha, Array.isArray(res && res.files) ? res.files : []);
+    state.gitBodyHtml = null;
+    renderGitLine();
+  } catch (e) {
+    if (!activeViewIdentityIsCurrent(view)) return;
+    // Recorded as a failure, never as an empty commit: caching `[]` here would be indistinguishable
+    // from a commit that really changed nothing, and the row could never be corrected.
+    state.gitCommitFailed.add(sha);
+    state.gitBodyHtml = null;
+    renderGitLine();
+    notice("Could not list that commit's files: " + apiFailureMessage(e), "error");
+  } finally {
+    state.gitCommitPending.delete(sha);
+  }
 }
 
 function renderGitSection(section, files) {
@@ -6616,6 +6815,69 @@ async function openGitDiff(path, side) {
   }
 }
 
+/* One commit's diff, whole or for a single file within it. History, not the working tree: the
+   overlay title carries the sha, which is the only thing separating this from the working-tree diff
+   of the same path. */
+async function openGitCommitDiff(sha, path) {
+  if (!state.projectId || !sha || state.gitDiffPending) return;
+  // Captured whole, because a diff is read through one thread's workspace: a project-only guard
+  // would let a response for the thread that was open when it was requested open over another.
+  const view = captureActiveViewIdentity();
+  const scope = gitScopeQuery();
+  const query = `commit=${encodeURIComponent(sha)}${path ? `&path=${encodeURIComponent(path)}` : ""}${scope ? `&${scope}` : ""}`;
+  state.gitDiffPending = true;
+  try {
+    const res = await api("GET", `/api/projects/${view.projectId}/git/diff?${query}`);
+    if (!activeViewIdentityIsCurrent(view)) return;
+    if (!res || res.is_empty || !String(res.diff || "").trim()) {
+      notice(path ? `No diff for ${path} in ${sha}.` : `No diff in ${sha}.`, "warning");
+      return;
+    }
+    openDiffOverlay(path ? `${path} at ${sha}` : `${sha} ${gitCommitTitle(sha)}`.trim(), res.diff);
+  } catch (e) {
+    if (!activeViewIdentityIsCurrent(view)) return;
+    notice("Could not load git diff: " + apiFailureMessage(e), "error");
+  } finally {
+    state.gitDiffPending = false;
+  }
+}
+
+/* Everything this branch added on top of its base, as one diff. The range is resolved on the
+   server — the browser asks for "branch", not for a revision — so this cannot name a revision the
+   server did not choose. */
+async function openGitBranchDiff() {
+  if (!state.projectId || state.gitDiffPending) return;
+  const view = captureActiveViewIdentity();
+  const status = state.gitStatus;
+  const count = gitCommitCount(status);
+  state.gitDiffPending = true;
+  try {
+    const scope = gitScopeQuery();
+    const res = await api("GET", `/api/projects/${view.projectId}/git/diff?range=branch${scope ? `&${scope}` : ""}`);
+    if (!activeViewIdentityIsCurrent(view)) return;
+    if (!res || res.is_empty || !String(res.diff || "").trim()) {
+      notice("No commits to review on this branch.", "warning");
+      return;
+    }
+    const base = status && status.base ? status.base : "base";
+    openDiffOverlay(`${base}…HEAD (${count} commit${count === 1 ? "" : "s"})`, res.diff);
+  } catch (e) {
+    if (!activeViewIdentityIsCurrent(view)) return;
+    notice("Could not load git diff: " + apiFailureMessage(e), "error");
+  } finally {
+    state.gitDiffPending = false;
+  }
+}
+
+/* The subject of a listed commit, for an overlay title. Absent when the commit is past the list's
+   cap, in which case the sha alone names it. */
+function gitCommitTitle(sha) {
+  const status = state.gitStatus;
+  const commits = status && Array.isArray(status.commits) ? status.commits : [];
+  const found = commits.find(commit => commit && commit.sha === sha);
+  return found ? found.title : "";
+}
+
 async function openGitWorkingDiff() {
   const pid = state.projectId;
   if (!pid || state.gitDiffPending) return;
@@ -6640,6 +6902,7 @@ async function openGitWorkingDiff() {
 $("gitLineToggle").onclick = () => setGitExpanded(!state.gitExpanded);
 $("gitRefresh").onclick = () => loadGitStatus(state.projectId);
 $("gitReviewTree").onclick = () => openGitWorkingDiff();
+$("gitReviewCommits").onclick = () => openGitBranchDiff();
 /* The branch's character budget is width-tiered, so re-render the collapsed line when the viewport
    crosses a tier. Debounced because this also fires continuously while dragging a window edge. */
 window.addEventListener("resize", () => {
