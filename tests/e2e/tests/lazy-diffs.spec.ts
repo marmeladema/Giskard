@@ -2,6 +2,9 @@ import { test, expect, type Page } from "@playwright/test";
 import {
   SCRIPTED_DIFF_PATH,
   SCRIPTED_DIFF_TRIGGER,
+  SCRIPTED_WHOLE_FILE_RAW_PATH,
+  SCRIPTED_WHOLE_FILE_TRANSLATED_PATH,
+  SCRIPTED_WHOLE_FILE_TRIGGER,
   login,
   recordedNotices,
   recordNotices,
@@ -139,6 +142,69 @@ test.describe("lazy agent diffs", () => {
     expect(fallbacks.deleted).toContain("@@ -1,1 +0,0 @@\n-old");
     expect(fallbacks.frontMatter).toContain("+++ b/config.md");
     expect(fallbacks.frontMatter).toContain("+--- title: Example");
+  });
+
+  /* A created file is not a patch. Codex sends its raw content, and content whose own lines open
+     with `+` or `-` — a changelog, a Markdown list — must never be coloured as additions and
+     deletions that never happened. The mapper now translates that content into a real diff; turns
+     captured before it did still hold the raw content, and the overlay shows those as files. */
+  test.describe("whole-file changes", () => {
+    async function startWholeFileTurn(page: Page) {
+      await page.locator("#input").fill(SCRIPTED_WHOLE_FILE_TRIGGER);
+      await page.locator("#sendBtn").click();
+      const group = page.locator("#transcript .msg.file", {
+        hasText: SCRIPTED_WHOLE_FILE_TRANSLATED_PATH,
+      });
+      await expect(group).toBeVisible();
+      return group;
+    }
+
+    function entry(group: ReturnType<Page["locator"]>, path: string) {
+      return group.locator(".file-change-entry", { hasText: path });
+    }
+
+    test("shows a translated created-file body as an all-additions diff", async ({ page }) => {
+      const group = await startWholeFileTurn(page);
+      await entry(group, SCRIPTED_WHOLE_FILE_TRANSLATED_PATH).locator(".diff-open").click();
+
+      await expect(page.locator("#codePath")).toHaveText(
+        `Diff: ${SCRIPTED_WHOLE_FILE_TRANSLATED_PATH}`,
+      );
+      await expect(page.locator("#codeView .diff-add")).toHaveCount(3);
+      // The `- removed a flag` and `+ added a flag` lines are content, not changes.
+      await expect(page.locator("#codeView .diff-del")).toHaveCount(0);
+      await expect(page.locator("#codeMeta")).toContainText("+3 −0");
+      await expect(page.locator("#codeCopyDiff")).toHaveText("Copy diff");
+    });
+
+    test("shows a raw created-file body as a file listing, not a diff", async ({ page }) => {
+      const group = await startWholeFileTurn(page);
+      await entry(group, SCRIPTED_WHOLE_FILE_RAW_PATH).locator(".diff-open").click();
+
+      await expect(page.locator("#codePath")).toHaveText(
+        `Created: ${SCRIPTED_WHOLE_FILE_RAW_PATH}`,
+      );
+      await expect(page.locator("#codeMeta")).toHaveText("3 lines");
+      await expect(page.locator("#codeView .diff-add")).toHaveCount(3);
+      await expect(page.locator("#codeView .diff-del")).toHaveCount(0);
+      // Line numbers are the file's own, and the content keeps its leading characters.
+      await expect(page.locator("#codeView .diff-add").nth(1)).toHaveText("- removed a flag");
+      await expect(page.locator("#codeCopyDiff")).toHaveText("Copy file");
+    });
+
+    test("detects which captured bodies are patches", async ({ page }) => {
+      const verdicts = await page.evaluate(() => ({
+        hunk: looksLikeUnifiedDiff("@@ -1 +1 @@\n-old\n+new\n"),
+        headers: looksLikeUnifiedDiff("--- a/f\n+++ b/f\n"),
+        combined: looksLikeUnifiedDiff("@@@ -1,2 -1,2 +1,2 @@@\n"),
+        markdown: looksLikeUnifiedDiff("# Notes\n- removed\n+ added\n"),
+        prose: looksLikeUnifiedDiff("@@ prose that merely opens with the markers\n"),
+        rule: looksLikeUnifiedDiff("--- a horizontal rule\n\nsome prose\n"),
+      }));
+      expect(verdicts).toEqual({
+        hunk: true, headers: true, combined: true, markdown: false, prose: false, rule: false,
+      });
+    });
   });
 
   test("ignores a conflict after its rendered diff is replaced", async ({ page }) => {
@@ -329,6 +395,7 @@ declare function api(method: string, path: string): Promise<any>;
 declare function openCapturedDiff(descriptor: unknown, turnId: string): Promise<void>;
 declare function openCodeOverlay(path: string, line?: number): Promise<void>;
 declare function structuredCapturedDiffText(diff: unknown): string;
+declare function looksLikeUnifiedDiff(text: string): boolean;
 declare function renderFileChangeContribution(
   body: HTMLElement, payload: unknown, item: unknown, turnId: string,
 ): void;

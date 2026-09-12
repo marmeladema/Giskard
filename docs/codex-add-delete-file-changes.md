@@ -4,6 +4,11 @@ Plan for a defect in how Codex file-change items reach the diff overlay. Written
 `dbd4834` with `codex-codes` 0.153.4; every file and line reference below was checked against that
 tree. Re-check them if the branch has moved.
 
+**Status: implemented** — option A plus the client guard, as recommended below. Three things landed
+beyond the plan as written, each noted in place: `unified_stats` became hunk-aware, the whole-file
+listing relabels the copy button rather than hiding it, and the replay harness got its own trigger
+instead of extending the lazy-diff turn.
+
 ## The defect
 
 Codex reports a file-change item as a list of `FileUpdateChange { path, kind, diff }`
@@ -201,10 +206,17 @@ CRLF content; an `add` whose body is already a unified diff passes through uncha
 
 `crates/giskard-core/src/diff.rs`
 
-No behaviour change, but `capture_unified_diff` (`:47`) and `unified_stats` (`:183`) are now the
-load-bearing definition of "these counts are only meaningful over a unified diff". State that in a
-doc comment on both, naming the harness as the place that guarantees the input shape. This is the
-comment that stops the next harness from re-introducing the same defect.
+`capture_unified_diff` (`:47`) and `unified_stats` (`:183`) are now the load-bearing definition of
+"these counts are only meaningful over a unified diff". State that in a doc comment on both, naming
+the harness as the place that guarantees the input shape. This is the comment that stops the next
+harness from re-introducing the same defect.
+
+**Beyond the plan:** `unified_stats` also became hunk-aware. Its `!line.starts_with("+++")` guard
+ran over the whole body, so inside a hunk it dropped any changed line whose own text begins `++` or
+`--` — which a translated whole-file body produces the moment the file contains a line starting
+`+` or `-`, exactly the content this change is about. It now skips `---`/`+++` only before the
+first hunk, where they really are headers, and counts by the marker column inside one.
+`diffStats` in `app.js` was given the same rule so the overlay header agrees with the descriptor.
 
 ### 3. `giskard-server/static/app.js` — refuse to mis-render
 
@@ -221,23 +233,32 @@ comment that stops the next harness from re-introducing the same defect.
 - `renderDiffRows` (`:8823`) already takes rows with per-side line numbers, so the listing is a row
   builder, not a new renderer. `parseUnifiedDiff` itself is unchanged: its pre-hunk colouring is
   still right for the headerless-patch case it was written for.
-- Hide or relabel **Copy diff** for that path (`setCodeCopyDiff`, `:8882`) — copying raw content
-  under a "Copy diff" label is the same lie in miniature.
+- Relabel **Copy diff** to **Copy file** for that path (`setCodeCopyDiff`, `:8882`) — copying raw
+  content under a "Copy diff" label is the same lie in miniature, and the content is still worth
+  copying. The label is view state (`state.diffOverlayCopyLabel`) so the button restores its own
+  wording after the "Copied" flash rather than snapping back to "Copy diff".
 
 Add the new function names to the served-script assertions in
 `crates/giskard-server/tests/ui.rs` alongside the existing `parseUnifiedDiff` check (`:1213`).
 
 ### 4. End-to-end coverage
 
-`crates/giskard-server/src/bin/giskard-server-replay.rs` scripts the lazy-diff turn (`:579-650`) with
-two `FileChangeKind::Modified` entries. Add a created-file entry whose content contains lines
-starting with `+` and `-`, and assert in `tests/e2e/tests/lazy-diffs.spec.ts` that the overlay shows
-no `diff-del` row for it. Keep `SCRIPTED_DIFF_*` in `tests/e2e/tests/helpers.ts` in sync, per
-`AGENTS.md`. This is the test that would have caught the defect, so it is the one that must exist.
+Seed a created file whose content contains lines starting with `+` and `-`, and assert in
+`tests/e2e/tests/lazy-diffs.spec.ts` that the overlay shows no `diff-del` row for it. This is the
+test that would have caught the defect, so it is the one that must exist.
 
-The replay harness feeds `FileChangeEntry` directly and never goes through the Codex mapper, so it
-must be seeded with an already-synthesised diff — which is also the assertion that the two
-representations agree.
+**Beyond the plan:** rather than extending the existing lazy-diff turn, this is its own trigger
+(`SCRIPTED_WHOLE_FILE_TRIGGER`). Several existing tests address that turn's entries by `.first()`
+and `.last()`, and a second file-change item in the same turn merges into the same transcript row,
+so adding entries there would have moved the targets of assertions that have nothing to do with
+this change. The new turn carries both shapes at once — one entry with the translated body, one
+with the raw body a turn captured before the fix still holds — so the patch view and the listing
+are covered side by side. Keep `SCRIPTED_*` in `tests/e2e/tests/helpers.ts` in sync, per
+`AGENTS.md`.
+
+The replay harness feeds `FileChangeEntry` directly and never goes through the Codex mapper, so the
+translated body is seeded as a literal; the mapper's unit tests pin the same bytes, so a change to
+the translation fails both.
 
 ## Already-persisted history
 

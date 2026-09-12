@@ -637,15 +637,38 @@ flush before starting the next. If a request times out, diagnostics distinguish 
 was queued or written. Caller-visible timeout behavior and retry policy are unchanged. Adapter
 correlation remains available for retry only after a reported response-write failure.
 
+Codex reports a file change as `FileUpdateChange { path, kind, diff }`, and only
+`update` puts a unified diff in `diff`: for `add` and `delete` the field holds
+the file's **raw content**, the shape the legacy approval protocol names outright
+(`FileChange::Add { content }`). The adapter translates that content into a real
+unified diff against `/dev/null` before the entry leaves the crate, so every
+later layer — the captured content kind, the descriptor's added/removed counts,
+the browser's diff overlay, its copy button — can trust that a file-change body
+is a patch. Line endings are preserved and a body with no trailing newline gets
+the `\ No newline at end of file` marker. Without the translation, content whose
+own lines open with `+` or `-` (a Markdown list, a changelog) is painted with
+additions and deletions that never happened.
+
+The protocol schema types `diff` as a bare string and documents nothing about its
+shape, so the translation is guarded by the body's shape rather than by its
+change kind: an `add` or `delete` body that already looks like a patch — a hunk
+header, or a `---`/`+++` header pair — is passed through unwrapped and logged at
+`warn`, because that means upstream changed shape. `app.js` applies the same
+shape test to captured bodies on the way to the overlay, so a body stored before
+this translation existed is shown as a file listing rather than mis-coloured;
+change the two together.
+
 Current Codex file-change approval requests identify the associated item but do
 not carry its changed paths. With current Codex app-server ordering, the adapter
-retains the structured changes from the preceding `item/started` file-change
+retains the changed paths and kinds from the preceding `item/started` file-change
 item and refreshes them from any subsequent `item/fileChange/patchUpdated`
-notification. It then exposes those paths as approval metadata. If no item
-changes were supplied, Giskard logs the degraded request and the browser states
-that Codex did not provide the file list. An optional grant root remains
-separately labeled permission-scope metadata and is never presented as a changed
-target.
+notification. It then exposes those paths as approval metadata. Those retained
+previews are deliberately body-free: the approval card reads only the path and
+the change kind, so carrying the diffs would hold a second copy of every added
+file for the length of the turn. If no item changes were supplied, Giskard logs
+the degraded request and the browser states that Codex did not provide the file
+list. An optional grant root remains separately labeled permission-scope metadata
+and is never presented as a changed target.
 
 MCP elicitation approvals accept Codex's standard `form`, slash-form
 `openai/form`, camel-form `openaiForm`, and URL modes. All four retain `_meta`

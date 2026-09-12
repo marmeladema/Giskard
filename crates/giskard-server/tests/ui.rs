@@ -1219,6 +1219,16 @@ async fn index_page_is_served_and_public() {
         "UI opens file-change diffs in the diff overlay, rendered as source"
     );
     assert!(
+        body.contains("looksLikeUnifiedDiff")
+            && body.contains("openWholeFileOverlay(")
+            && body.contains("wholeFileRows(")
+            // Both signals are required, so a translated whole-file body keeps the patch view.
+            && body.contains("(change === \"created\" || change === \"deleted\") &&")
+            && body.contains("!looksLikeUnifiedDiff(text)")
+            && body.contains("Copy file"),
+        "UI shows a captured body that is not a patch as a whole-file listing, not as a diff"
+    );
+    assert!(
         body.contains("openCapturedDiff(")
             && body.contains("rowAdvertisesCapturedDiff(sourceRow, diffId)")
             && body.contains(

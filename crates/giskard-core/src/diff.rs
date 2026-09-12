@@ -44,6 +44,12 @@ pub struct CapturedDiffRecord {
     pub content: CapturedDiffContent,
 }
 
+/// Capture a unified-diff body behind its content identity.
+///
+/// The body must actually be a unified diff: the content kind recorded here tells every later
+/// layer — the descriptor's line counts, persistence, the lazy-diff endpoint, the overlay — that it
+/// may be parsed as a patch. A harness that receives whole-file content instead (Codex does, for
+/// `add` and `delete` file changes) translates it at its own boundary, before this point.
 pub fn capture_unified_diff(
     path: PathBuf,
     change: FileChangeKind,
@@ -180,16 +186,36 @@ fn serialized_bytes(value: &impl Serialize) -> Vec<u8> {
     serde_json::to_vec(value).expect("captured diff domain types always serialize as JSON")
 }
 
+/// Count the added and removed lines of a unified diff.
+///
+/// Hunk-aware: inside a hunk the first column is the marker and nothing else, so a body line that
+/// happens to read `+++` or `---` is counted rather than mistaken for a file header. Outside a
+/// hunk only `---`/`+++` header pairs are skipped, which keeps the headerless patches an agent can
+/// hand over counting the way they render (see `parseUnifiedDiff` in `app.js`, which colours the
+/// same lines by the same rule).
+///
+/// The counts are meaningful only over a unified diff. A harness whose file-change bodies are not
+/// patches must translate them before capture — `giskard-harness-codex` does this for Codex's
+/// whole-file `add`/`delete` content — or these numbers describe nothing.
 fn unified_stats(text: &str) -> (u64, u64) {
-    text.lines().fold((0, 0), |(additions, deletions), line| {
-        if line.starts_with('+') && !line.starts_with("+++") {
-            (additions + 1, deletions)
-        } else if line.starts_with('-') && !line.starts_with("---") {
-            (additions, deletions + 1)
-        } else {
-            (additions, deletions)
+    let mut additions = 0;
+    let mut deletions = 0;
+    let mut in_hunk = false;
+    for line in text.lines() {
+        if line.starts_with("@@") {
+            in_hunk = true;
+            continue;
         }
-    })
+        if !in_hunk && (line.starts_with("+++") || line.starts_with("---")) {
+            continue;
+        }
+        if line.starts_with('+') {
+            additions += 1;
+        } else if line.starts_with('-') {
+            deletions += 1;
+        }
+    }
+    (additions, deletions)
 }
 
 /// A structured file diff for the side-by-side viewer (spec §11.1).
@@ -374,6 +400,49 @@ mod tests {
         let (projected, _) = capture_structured_diff(diff);
         let descriptor = projected.captured.as_ref().unwrap();
         assert_eq!((descriptor.additions, descriptor.deletions), (0, 0));
+    }
+
+    #[test]
+    fn unified_stats_count_body_lines_that_look_like_file_headers() {
+        // Inside a hunk the first column is the marker and the rest is content, so a whole-file
+        // capture of a patch file — every line prefixed with `+` — counts every line.
+        let diff = concat!(
+            "--- /dev/null\n",
+            "+++ b/fixture.patch\n",
+            "@@ -0,0 +1,4 @@\n",
+            "+--- a/src/main.rs\n",
+            "++++ b/src/main.rs\n",
+            "+@@ -1 +1 @@\n",
+            "+-old\n",
+        );
+        let (descriptor, _) = capture_unified_diff(
+            "/fixture.patch".into(),
+            FileChangeKind::Created,
+            None,
+            diff.into(),
+        );
+        assert_eq!((descriptor.additions, descriptor.deletions), (4, 0));
+    }
+
+    #[test]
+    fn unified_stats_skip_headers_and_count_headerless_patches() {
+        let cases = [
+            ("--- a/f\n+++ b/f\n@@ -1 +1 @@\n-old\n+new\n", (1, 1)),
+            // An agent can hand over a patch with no hunk header at all; the markers are still
+            // all there is to go on, and this is how the overlay colours it.
+            ("-old\n+new\n", (1, 1)),
+            ("\\ No newline at end of file\n", (0, 0)),
+            ("", (0, 0)),
+        ];
+        for (diff, expected) in cases {
+            let (descriptor, _) =
+                capture_unified_diff("/f".into(), FileChangeKind::Modified, None, diff.to_owned());
+            assert_eq!(
+                (descriptor.additions, descriptor.deletions),
+                expected,
+                "{diff:?}"
+            );
+        }
     }
 
     #[test]

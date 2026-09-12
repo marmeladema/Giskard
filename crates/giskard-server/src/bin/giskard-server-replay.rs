@@ -50,6 +50,23 @@ mod common;
 const SCRIPTED_REPLY: &str = "Hello from the scripted replay harness!";
 const SCRIPTED_DIFF_TRIGGER: &str = "Trigger two scripted lazy diffs.";
 const SCRIPTED_DIFF_PATH: &str = "src/lazy-diff.rs";
+/// Whole-file changes, in both the shape the Codex mapper now produces and the shape turns
+/// captured before it did still hold on disk. The content's own lines open with `+` and `-`, which
+/// is what makes reading it as a patch visibly wrong.
+const SCRIPTED_WHOLE_FILE_TRIGGER: &str = "Trigger scripted whole-file changes.";
+const SCRIPTED_WHOLE_FILE_TRANSLATED_PATH: &str = "src/created-translated.md";
+const SCRIPTED_WHOLE_FILE_RAW_PATH: &str = "src/created-raw.md";
+const SCRIPTED_WHOLE_FILE_CONTENT: &str = "# Release notes\n- removed a flag\n+ added a flag\n";
+/// Byte-for-byte what `unified_diff_for_whole_file` produces for that content; the Codex mapper's
+/// unit tests pin the same shape, so a change to one fails the other.
+const SCRIPTED_WHOLE_FILE_TRANSLATED_DIFF: &str = concat!(
+    "--- /dev/null\n",
+    "+++ b/src/created-translated.md\n",
+    "@@ -0,0 +1,3 @@\n",
+    "+# Release notes\n",
+    "+- removed a flag\n",
+    "++ added a flag\n",
+);
 const SCRIPTED_DIFF_REPLACEMENT_DELAY: std::time::Duration = std::time::Duration::from_millis(1200);
 const SCRIPTED_DIFF_COMPLETION_DELAY: std::time::Duration = std::time::Duration::from_millis(1000);
 const HTTP_GRACEFUL_SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
@@ -577,6 +594,7 @@ impl AgentHarness for ScriptedHarness {
         let raise_server_request =
             input_text == Some(SCRIPTED_SERVER_REQUEST_TRIGGER) || raise_server_request_then_error;
         let raise_lazy_diffs = input_text == Some(SCRIPTED_DIFF_TRIGGER);
+        let raise_whole_file_changes = input_text == Some(SCRIPTED_WHOLE_FILE_TRIGGER);
         let stream_reasoning = input_text == Some(SCRIPTED_REASONING_TRIGGER);
         let wait_for_steering = input_text == Some(SCRIPTED_STEERING_TRIGGER);
 
@@ -595,6 +613,51 @@ impl AgentHarness for ScriptedHarness {
                 let _ = sender.append(AgentEvent::TurnStarted {
                     thread: thread_id,
                     turn,
+                });
+                return;
+            }
+
+            if raise_whole_file_changes {
+                let _ = sender.append(AgentEvent::TurnStarted {
+                    thread: thread_id,
+                    turn,
+                });
+                tokio::task::yield_now().await;
+                let entry = |path: &str, diff: &str| FileChangeEntry {
+                    path: path.into(),
+                    change: FileChangeKind::Created,
+                    diff: Some(diff.into()),
+                    captured_diff: None,
+                };
+                let _ = sender.append(AgentEvent::ItemCompleted {
+                    thread: thread_id,
+                    turn,
+                    item: Item {
+                        id: ItemId::new(),
+                        harness_item_id: "scripted_whole_file".into(),
+                        payload: ItemPayload::FileChange {
+                            path: SCRIPTED_WHOLE_FILE_TRANSLATED_PATH.into(),
+                            change: FileChangeKind::Created,
+                            changes: vec![
+                                entry(
+                                    SCRIPTED_WHOLE_FILE_TRANSLATED_PATH,
+                                    SCRIPTED_WHOLE_FILE_TRANSLATED_DIFF,
+                                ),
+                                entry(SCRIPTED_WHOLE_FILE_RAW_PATH, SCRIPTED_WHOLE_FILE_CONTENT),
+                            ],
+                            status: Some("completed".into()),
+                        },
+                        created_at: chrono::Utc::now(),
+                    },
+                });
+                let _ = sender.append(AgentEvent::TurnCompleted {
+                    thread: thread_id,
+                    turn,
+                    usage: TokenUsage::new(12, 4),
+                    status: TurnStatus {
+                        kind: TurnStatusKind::Completed,
+                        message: None,
+                    },
                 });
                 return;
             }
