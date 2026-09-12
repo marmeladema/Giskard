@@ -189,6 +189,25 @@ created and therefore the branch it may remove. What the thread does afterwards 
 yours: if the agent branches off, switches, or renames, Giskard does not follow it and does not
 manage those refs.
 
+## What the Git line counts in a worktree
+
+The status line above the composer lists the commits the thread's branch holds that its base does
+not. That base is resolved fresh on every read, as a **ref** — `origin/main` and friends, whichever
+forks closest to the branch — and deliberately *not* from the branch point recorded in the thread's
+worktree record.
+
+The recorded branch point is the tempting answer and the wrong one, because rebasing is the normal
+thing to do in a long-lived worktree. Rebase onto a newer `main` and that commit is left behind: it
+stays an ancestor of the rewritten HEAD, so the range does not fail, it silently grows. A thread
+that wrote two commits, rebased onto a base that had gained three, would report five — and list the
+base's three as the thread's own work. Resolving the ref each time reports two, with nothing to
+invalidate.
+
+A worktree shares its refs with the project's checkout, so this needs no worktree-specific
+handling: `origin/main` resolves inside the thread's checkout exactly as it does in the project's.
+A freshly created worktree has written nothing, so its branch holds nothing above its base and the
+section is absent until the thread commits.
+
 ## What the agent may and may not do to Git
 
 **An isolated thread's permissions are exactly an ordinary thread's.** Isolation decides *where* a

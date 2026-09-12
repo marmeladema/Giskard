@@ -1260,6 +1260,34 @@ fn seed_git_workspace(workspace: &Path) -> Result<(), String> {
     run_git_seed(workspace, ["add", "README.md", "src/main.rs"])?;
     run_git_seed(workspace, ["commit", "-m", "Seed demo workspace"])?;
 
+    // Two commits on top of a base, so the Git line has a branch history to list and not just a
+    // working tree. They touch files the working-tree changes below do not, so the modified-file
+    // rows and their diffs stay exactly what the rest of the suite asserts.
+    std::fs::write(
+        workspace.join("src/cli.rs"),
+        "pub fn parse() -> Vec<String> {\n    std::env::args().skip(1).collect()\n}\n",
+    )
+    .map_err(|e| format!("cannot write demo cli source: {e}"))?;
+    run_git_seed(workspace, ["add", "src/cli.rs"])?;
+    run_git_seed(workspace, ["commit", "-m", "Add a CLI entry point"])?;
+    std::fs::write(
+        workspace.join("README.md"),
+        "# Demo workspace\n\nSeeded for Giskard screenshots.\n\nRun it with `cargo run`.\n",
+    )
+    .map_err(|e| format!("cannot extend demo README: {e}"))?;
+    run_git_seed(workspace, ["add", "README.md"])?;
+    run_git_seed(workspace, ["commit", "-m", "Document how to run the demo"])?;
+
+    // The base those two sit on. A real checkout gets this ref from `git clone`; `git init` does
+    // not write one, so without it the workspace has no base to compare against and the Git line
+    // has no commits to list — the branch would be its own base. Pointed at the seed commit rather
+    // than at HEAD so there is a range, and left as a remote-tracking ref because that is what the
+    // base resolution prefers and what a cloned repository would actually have.
+    run_git_seed(
+        workspace,
+        ["update-ref", "refs/remotes/origin/main", "HEAD~2"],
+    )?;
+
     std::fs::write(
         workspace.join("src/main.rs"),
         "fn main() {\n    println!(\"hello from demo\");\n    println!(\"edited for status\");\n}\n",

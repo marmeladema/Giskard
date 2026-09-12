@@ -181,6 +181,17 @@
             <!-- The same figures with nothing to open. Kept as a separate node rather than a
                  `disabled` button so a clean line carries no control at all. -->
             <span class="git-count git-count-static mono" id="gitCountStatic" hidden></span>
+            <!-- How many commits this branch holds that its base does not, and the control that
+                 reviews all of them as one diff. Same rule as the working tree's figures beside it:
+                 the count is the button. It carries no unit word — the row has no width for one, and
+                 the node is the same mark that heads every commit row in the list below, so opening
+                 the section once explains the glyph. The words ride on the accessible name.
+                 A separate scope from the working tree, and never a substitute for it: on a branch
+                 with both, the row offers both. -->
+            <button type="button" class="git-review git-review-commits" id="gitReviewCommits" hidden>
+              <span class="git-commit-node" aria-hidden="true"></span>
+              <span class="mono" id="gitCommitCount"></span>
+            </button>
             <!-- Only a draft can choose this: a thread's workspace is fixed once it exists, so the
                  control is absent for open threads rather than shown disabled. It sits on this row
                  because this row describes the very tree the choice is about — the branch a worktree

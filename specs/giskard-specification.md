@@ -3421,15 +3421,27 @@ alongside raw token counts. Off by default; raw token counts are the primary met
 - Shows the set of files changed in the current turn, selectable; each file shows old vs new
   with additions/deletions highlighted. Large diffs are virtualized (§11.3).
 - The active project surface may expose a compact read-only Git status line above the composer:
-  current branch or detached head, ahead/behind, conflicted and changed counts, and the working
-  tree's diffstat. It expands in place into the changed files, grouped by conflicted/staged/
-  unstaged/untracked, plus the combined working-tree diff. A tracked row opens its own diff; an
-  untracked file has nothing to diff against, so its row opens the file itself in the code overlay
-  of §11.2 instead. An untracked directory is listed as one entry rather than expanded file by
-  file, and — having no single file to open — its row stays inert. The line refreshes as the
-  working tree changes — when a turn completes, and as file changes stream during one — so it
-  describes the tree now rather than when the thread was opened. Staging, committing, branch
-  creation/switching, and hunk mutation stay out of scope.
+  current branch or detached head, ahead/behind, conflicted and changed counts, the working tree's
+  diffstat, and how many commits the branch holds that its base does not. It expands in place into
+  the changed files, grouped by conflicted/staged/unstaged/untracked, and then those commits,
+  newest first. A tracked row opens its own diff; an untracked file has nothing to diff against, so
+  its row opens the file itself in the code overlay of §11.2 instead. An untracked directory is
+  listed as one entry rather than expanded file by file, and — having no single file to open — its
+  row stays inert.
+- The row's counts are its review controls rather than labels beside one: the working tree's
+  figures open the combined working-tree diff, and the commit count opens everything the branch
+  added on top of its base. A count with no diff behind it — a clean tree, an untracked-only tree,
+  a merge — is printed without being a control. Each commit is itself a disclosure: its row expands
+  into the files it touched, each of which opens that file's diff *at that commit*, and its own
+  figures open the whole commit. The commit list is capped and says so when it does not reach the
+  count.
+- The base the commits are counted against is detected per read, as a ref, and named in the
+  expanded list so a wrong detection is visible rather than silent. A branch is never its own base,
+  and a branch that holds nothing above its base has no commit count and no commits section at all.
+- The line refreshes as the working tree changes — when a turn completes, and as file changes
+  stream during one — so it describes the tree now rather than when the thread was opened. Reading
+  history does not make this a history editor: staging, committing, branch creation/switching, and
+  hunk mutation stay out of scope.
 
 ### 11.2 Code overlay for referenced paths
 
