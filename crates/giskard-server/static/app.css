@@ -551,35 +551,47 @@
   .git-line.state-conflicted .git-count { color:#ffb4ae; }
   .git-line.state-conflicted .git-branch, .git-line.state-conflicted .git-icon { color:#ffb4ae; }
   .git-line.state-error .git-icon { color:#ffb4ae; }
-  .git-line-actions { display:flex; align-items:center; gap:4px; flex:none; }
+  /* The row is divided into clickable sections rather than being a strip with buttons resting on
+     it, so every control fills the row's full height and its hover, focus and pressed box is the
+     section itself. Left to their own content they came out three different heights — an icon
+     button sizes to a 12px glyph, a text chip to its line box, a select to its own intrinsic
+     metrics — which read as mismatched lozenges floating at different sizes. Stretch, not a fixed
+     height, so the sections follow the row wherever it is taller (phones, below). */
+  .git-line-actions { display:flex; align-self:stretch; align-items:stretch; gap:4px; flex:none; }
+  .git-act, .git-review, .git-strategy { align-self:stretch; }
   .git-act {
-    padding:2px 7px; border:1px solid transparent; border-radius:5px; background:transparent;
-    color:var(--muted); font-size:11px; line-height:1.5;
+    display:inline-flex; align-items:center; padding:0 7px;
+    border:1px solid transparent; border-radius:5px; background:transparent;
+    color:var(--muted); font-size:11px; line-height:1;
   }
   .git-act:hover { border-color:var(--border); background:var(--panel2); color:var(--fg); }
   .git-act[hidden] { display:none; }
-  .git-act-icon { display:inline-flex; align-items:center; padding:3px 5px; }
+  .git-act-icon { padding:0 5px; }
   /* The working tree's own figures, as the control that reviews it. Transparent until hovered, so
      a row at rest still reads as a status line rather than as a toolbar — the figures are what the
      eye comes here for, and the hover edge is what says they can be opened. Sized to sit among this
-     row's chips: same border radius and type size as `.git-act` beside it. */
+     row's chips: same height, border radius and type size as `.git-act` beside it. `line-height:1`
+     because the box is sized by `--git-chip-h`, and a 1.5 line box would then be taller than the
+     content area it sits in. */
   .git-review {
     flex:none; display:inline-flex; align-items:center; gap:6px;
-    padding:2px 6px; border:1px solid transparent; border-radius:5px;
+    padding:0 6px; border:1px solid transparent; border-radius:5px;
     background:transparent; color:var(--muted);
-    font:inherit; font-size:11.5px; line-height:1.5; cursor:pointer;
+    font:inherit; font-size:11.5px; line-height:1; cursor:pointer;
   }
   .git-review:hover, .git-review:focus-visible { border-color:var(--border); background:var(--panel2); }
   .git-review[hidden] { display:none; }
   /* The same figures with no diff behind them — a clean tree, or a tree Git could not read. It is a
      span rather than a disabled button so the row carries no control at all in that state, and it
      keeps `.git-count`'s own class so the state colours still reach it. */
-  .git-count-static { padding:2px 6px; font-size:11.5px; }
+  /* 7px, not 6: it carries no border, so it needs the button's padding plus the border width to
+     put its digits where the button's would sit. */
+  .git-count-static { align-self:center; padding:0 7px; font-size:11.5px; }
   .git-count-static[hidden] { display:none; }
   /* The draft's checkout choice, sized to sit among this row's actions rather than to look like a
      form field: the row is 27px tall and every other control on it is a small muted chip. */
   .git-strategy {
-    flex:none; max-width:9.5em; padding:1px 4px; border-radius:5px;
+    flex:none; max-width:9.5em; padding:0 4px; border-radius:5px;
     border:1px solid var(--border); background:var(--panel2); color:var(--muted);
     font:inherit; font-size:11px; line-height:1.5;
   }
@@ -1054,11 +1066,12 @@
        `#gitReviewTree` rather than the diffstat alone: shedding the diffstat must not shed the
        button with it. */
     .git-line .git-diffstat { display:none; }
-    /* With the diffstat gone the chip is one digit wide, which is not a thumb-sized target, so on
-       phones it trades its tight padding for a comfortable one. The row is `min-height`, not a
-       fixed height, so it accommodates the taller chip instead of clipping it. */
-    .git-line .git-review { padding:5px 12px; min-width:40px; justify-content:center; }
-    .git-line-head { padding-left:10px; }
+    /* With the diffstat gone the count is one digit wide, so the section that holds it needs a
+       minimum of its own to stay thumb-sized. Its height needs nothing: the sections stretch, so
+       raising the row raises every one of them together — the refresh icon included, which on a
+       phone is the hardest target in the row. */
+    .git-line .git-review { padding:0 12px; min-width:44px; justify-content:center; }
+    .git-line-head { padding-left:10px; min-height:34px; }
     .git-line-body { padding-left:10px; padding-right:10px; }
 
     /* Header menus anchor to their button (right-aligned). Tasks/MCP sit near the left edge, so on
