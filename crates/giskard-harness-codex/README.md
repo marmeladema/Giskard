@@ -348,8 +348,8 @@ heuristic.
 Giskard receives browser attachments as transient `UserAttachment` values on
 `UserInput::Text`. The adapter maps them before `turn/start`:
 
-- image attachments are sent as Codex `UserInput::Image` values with
-  `data:<mime>;base64,<bytes>` URLs;
+- image attachments are sent as Codex `UserInput::Image` values with an inline
+  `UserInputImageReference` containing a `data:<mime>;base64,<bytes>` URL;
 - other files, including PDFs, are uploaded to the Codex app-server host with
   `fs/createDirectory` and `fs/writeFile`, then the harness-host path is appended
   to the text prompt.
@@ -539,6 +539,15 @@ configured `codex_path`, and reports through the `log` crate, which Giskard does
 `tracing`. Drift is not fatal — protocol additions the bindings do not model arrive as unknown
 notifications and requests — but it is the first thing to check when Codex behavior looks
 truncated.
+
+The adapter is pinned to `codex-codes` 0.155.1, tested against Codex CLI 0.155.1. Giskard uses the
+new explicit inline image-reference shape but does not yet expose the release's thread-attachment,
+plugin-selection, MCP App UI, MCP capability, model access-program, or plugin-onboarding metadata.
+The crate's cancellation-safe `AsyncClient` framing does not replace Giskard's transport, whose
+retained inbox, frame limit, continuous reader, request correlation, and shutdown behavior are
+part of the adapter's ownership contract. Effective `[model_providers]` also remains a narrow local
+projection because the new typed provider fields describe managed `ConfigRequirements`, not the
+effective `Config` table returned by `config/read`.
 
 ## Resume model verification
 

@@ -9,7 +9,13 @@
 
 **Document status:** Implementation-ready specification.
 **Audience:** An AI coding agent (and its human reviewer) implementing the system.
-**Version:** 1.91
+**Version:** 1.92
+
+> **Amendment — refresh Codex protocol SDK (1.92).** The Codex harness builds against
+> `codex-codes` 0.155.1, tested against Codex CLI 0.155.1. Existing image attachments use the
+> bindings' explicit inline image-reference type while preserving their data-URL wire shape. New
+> thread-attachment, plugin-selection, MCP UI/capability, model access-program, onboarding, and
+> managed-policy protocol surfaces remain available for later features and are not exposed here.
 
 > **Amendment — active-turn steering (1.91).** Once a normal user turn has an acknowledged turn
 > ID, the composer may append text to that exact turn through a distinct `SteerInput` action and
@@ -175,6 +181,13 @@
 > the intended frontend for the foreseeable future; treat every Dioxus/WASM/`giskard-ui` reference
 > below as historical design context, not a current requirement. The wire contract (`giskard-proto`)
 > and all backend design remain authoritative.
+
+**Changelog (1.91 → 1.92), refresh Codex protocol SDK:**
+- **CP3:** Update `codex-codes` from 0.153.4 to 0.155.1 and adapt image input construction to
+  `UserInputImageReference::Inline` without changing the serialized request or Giskard behavior.
+- **CP4:** Keep Giskard's owned stdio transport and effective-provider projection: the SDK's new
+  cancellation-safe client and managed `ConfigRequirements` fields do not replace their respective
+  lifecycle and `config/read` responsibilities.
 
 **Changelog (1.90 → 1.91), active-turn steering:**
 - **TS1:** `SteerInput { thread_id, turn_id, text }` appends text only to the exact acknowledged
@@ -3823,7 +3836,8 @@ held while awaiting harness, persistence, runtime publication, or owner shutdown
 > starting a turn; an image's declared MIME type must match its PNG, JPEG, GIF, or WebP signature.
 > Raw bytes are omitted from Giskard history and its parsed in-memory history cache. For the Codex
 > harness,
-> image attachments become `UserInput::Image { url: "data:<mime>;base64,<bytes>" }`; other files
+> image attachments become `UserInput::Image` with an inline image reference containing
+> `url: "data:<mime>;base64,<bytes>"`; other files
 > are transferred with Codex `fs/writeFile` to a randomized, per-turn harness-host temp directory,
 > and that path is appended to the text prompt. The Codex adapter removes the directory with
 > `fs/remove` after the turn, an upload/start failure, stream loss, command/control channel closure,
