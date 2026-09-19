@@ -50,10 +50,7 @@ async fn run() -> Result<(), String> {
             let password =
                 rpassword::prompt_password("Enter password: ").map_err(|e| e.to_string())?;
             let hash = argon2::Argon2::default()
-                .hash_password(
-                    password.as_bytes(),
-                    &argon2::password_hash::SaltString::generate(&mut rand::rngs::OsRng),
-                )
+                .hash_password(password.as_bytes())
                 .map_err(|e| format!("hashing failed: {e}"))?
                 .to_string();
             println!("{hash}");
@@ -406,12 +403,14 @@ async fn all_threads(
 /// e.g. after losing a logged-in device. The running server keeps the old key in memory, so it
 /// must be restarted to pick up the new one.
 fn revoke_sessions(data_dir: &std::path::Path) -> Result<(), String> {
-    use rand::RngCore;
+    use rand::TryRng;
     use std::os::unix::fs::PermissionsExt;
 
     let key_path = data_dir.join("session.key");
     let mut key = [0u8; 32];
-    rand::rngs::OsRng.fill_bytes(&mut key);
+    rand::rngs::SysRng
+        .try_fill_bytes(&mut key)
+        .map_err(|e| format!("cannot generate session signing key: {e}"))?;
     std::fs::create_dir_all(data_dir)
         .map_err(|e| format!("cannot create data dir {}: {e}", data_dir.display()))?;
     std::fs::write(&key_path, key)

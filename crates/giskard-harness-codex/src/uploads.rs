@@ -148,9 +148,8 @@ pub(crate) async fn cleanup_codex_upload_dir(
 }
 
 fn codex_upload_dir(thread: &ThreadHandle) -> PathBuf {
-    let mut rng = rand::thread_rng();
-    let nonce_high = rng.next_u64();
-    let nonce_low = rng.next_u64();
+    let nonce_high = rand::random::<u64>();
+    let nonce_low = rand::random::<u64>();
     std::env::temp_dir()
         .join(CODEX_UPLOAD_DIR_NAME)
         .join(format!(
@@ -161,7 +160,7 @@ fn codex_upload_dir(thread: &ThreadHandle) -> PathBuf {
 
 fn codex_upload_path(dir: &std::path::Path, index: usize, attachment: &UserAttachment) -> PathBuf {
     let mut nonce = [0_u8; 8];
-    rand::thread_rng().fill_bytes(&mut nonce);
+    rand::fill(&mut nonce);
     dir.join(format!(
         "{index:02}-{}-{}",
         u64::from_le_bytes(nonce),

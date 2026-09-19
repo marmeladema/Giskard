@@ -79,17 +79,17 @@ impl fmt::Display for ServerRequestId {
 
 impl ProjectId {
     pub fn new() -> Self {
-        Self(ulid::Ulid::new())
+        Self(ulid::Ulid::generate())
     }
 }
 impl ThreadId {
     pub fn new() -> Self {
-        Self(ulid::Ulid::new())
+        Self(ulid::Ulid::generate())
     }
 }
 impl TurnId {
     pub fn new() -> Self {
-        Self(ulid::Ulid::new())
+        Self(ulid::Ulid::generate())
     }
 }
 
@@ -114,13 +114,13 @@ impl FromStr for TurnId {
 impl ItemId {
     /// Mint a fresh Giskard-owned item id.
     pub fn new() -> Self {
-        Self(ulid::Ulid::new())
+        Self(ulid::Ulid::generate())
     }
 }
 impl DiffId {
     /// Mint a fresh identity for newly captured content.
     pub fn new() -> Self {
-        Self(ulid::Ulid::new().to_string())
+        Self(ulid::Ulid::generate().to_string())
     }
 
     /// Build a deterministic identity, used when projecting legacy inline content.

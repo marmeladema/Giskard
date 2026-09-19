@@ -3685,7 +3685,7 @@ mod layout_tests {
 
     fn item(text: &str) -> Item {
         Item {
-            id: giskard_core::ids::ItemId(ulid::Ulid::new()),
+            id: giskard_core::ids::ItemId(ulid::Ulid::generate()),
             harness_item_id: format!("native-{text}"),
             payload: ItemPayload::AgentMessage { text: text.into() },
             created_at: Utc::now(),

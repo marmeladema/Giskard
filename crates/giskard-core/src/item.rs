@@ -258,7 +258,7 @@ pub fn serialize_tool_output(
     digest.update(&bytes);
     let descriptor = ToolOutputDescriptor {
         serialized_bytes: bytes.len() as u64,
-        version: format!("\"sha256_{:x}\"", digest.finalize()),
+        version: format!("\"sha256_{}\"", hex::encode(digest.finalize())),
     };
     Ok((bytes, descriptor))
 }

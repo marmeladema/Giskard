@@ -322,5 +322,8 @@ pub fn prepare_item_output(event: &AgentEvent) -> Option<PreparedItemOutput> {
 }
 
 pub fn command_output_version(output: &str) -> String {
-    format!("\"sha256_{:x}\"", Sha256::digest(output.as_bytes()))
+    format!(
+        "\"sha256_{}\"",
+        hex::encode(Sha256::digest(output.as_bytes()))
+    )
 }

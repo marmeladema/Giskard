@@ -1,12 +1,10 @@
-use argon2::password_hash::{SaltString, rand_core::OsRng};
 use argon2::{Argon2, PasswordHasher};
 
 pub const PASSWORD: &str = "testpass";
 
 pub fn password_hash(password: &str) -> String {
-    let salt = SaltString::generate(&mut OsRng);
     Argon2::default()
-        .hash_password(password.as_bytes(), &salt)
+        .hash_password(password.as_bytes())
         .unwrap()
         .to_string()
 }
@@ -42,7 +40,7 @@ pub async fn login_with(client: &reqwest::Client, base: &str, password: &str) ->
 #[cfg(test)]
 mod tests {
     use argon2::Argon2;
-    use argon2::password_hash::{PasswordHash, PasswordVerifier};
+    use argon2::password_hash::{PasswordVerifier, phc::PasswordHash};
 
     #[test]
     fn generated_hash_verifies_only_the_password() {

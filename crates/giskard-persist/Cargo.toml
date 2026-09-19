@@ -20,11 +20,10 @@ fastrand = "2"
 ulid = { workspace = true }
 
 [dependencies.argon2]
-version = "0.5"
-features = ["std"]
+version = "0.6"
 
 [dependencies.rand]
-version = "0.8"
+version = "0.10"
 
 [dependencies.rpassword]
 version = "7"
