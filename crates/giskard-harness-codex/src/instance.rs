@@ -5,9 +5,9 @@ use crate::uploads::{cleanup_active_turn_upload, cleanup_all_active_turn_uploads
 /// One task-owned runtime for one Codex app-server process.
 ///
 /// Exactly one instance is created for each spawned transport and moved into exactly one Tokio
-/// task. Its mapper, active turns, pending steering requests, pending compactions, and pending
-/// context restores never leave that task; helper futures may borrow this state only through
-/// `&mut self`. No independent worker may mutate protocol state.
+/// task. Its mapper, active turns, pending steering requests, and pending context restores never
+/// leave that task; helper futures may borrow this state only through `&mut self`. No independent
+/// worker may mutate protocol state.
 ///
 /// This runtime serves every native thread on the process and is unrelated to a primary-thread or
 /// sub-agent hierarchy.
@@ -22,7 +22,6 @@ pub(super) struct CodexInstance<C> {
     mapper: CodexMapper,
     active_turns: ActiveTurns,
     pending_steers: Vec<PendingSteer>,
-    pending_compactions: HashMap<ThreadId, PendingCompaction>,
     pending_context_restores: HashMap<NativeThreadId, PendingContextRestore>,
 }
 
@@ -50,7 +49,6 @@ impl<C> CodexInstance<C> {
             mapper,
             active_turns: HashMap::new(),
             pending_steers: Vec::new(),
-            pending_compactions: HashMap::new(),
             pending_context_restores: HashMap::new(),
         };
         for binding in bootstrap.known_threads {
@@ -126,17 +124,7 @@ where
                     match msg {
                         Ok(Some(msg)) => {
                             observe_pending_context_restore(&mut self.pending_context_restores, &msg);
-                            match self.handle_server_message(msg).await {
-                                MessageOutcome::Handled => {}
-                                MessageOutcome::CompactionCompleted { thread, elapsed_ms } => {
-                                    info!(
-                                        %thread,
-                                        elapsed_ms,
-                                        pending_compactions = self.pending_compactions.len(),
-                                        "Codex context compaction completion observed"
-                                    );
-                                }
-                            }
+                            self.handle_server_message(msg).await;
                         }
                         Ok(None) => {
                             cleanup_all_active_turn_uploads(&mut self.client, &mut self.active_turns).await;
@@ -147,15 +135,6 @@ where
                                 "Codex stream ended before turn completion",
                             )
                             .await;
-                            if !self.pending_compactions.is_empty() {
-                                warn!(
-                                    action = "read_codex_stream",
-                                    workspace_root = %self.workspace_root.display(),
-                                    pending_compactions = self.pending_compactions.len(),
-                                    pending_compaction_states = ?pending_compaction_states(&self.pending_compactions),
-                                    "Codex message stream ended with pending context compactions"
-                                );
-                            }
                             break;
                         }
                         Err(CodexStreamError::NonJsonStdout {
@@ -165,8 +144,6 @@ where
                         }) => {
                             warn!(
                                 active_turns = self.active_turns.len(),
-                                pending_compactions = self.pending_compactions.len(),
-                                pending_compaction_states = ?pending_compaction_states(&self.pending_compactions),
                                 workspace_root = %self.workspace_root.display(),
                                 error = %parse_error,
                                 raw_bytes,
@@ -180,8 +157,6 @@ where
                                 warn!(
                                     action = "read_codex_stream",
                                     error = %message,
-                                    pending_compactions = self.pending_compactions.len(),
-                                    pending_compaction_states = ?pending_compaction_states(&self.pending_compactions),
                                     workspace_root = %self.workspace_root.display(),
                                     "Codex idle stream failed while background work was running"
                                 );
@@ -191,8 +166,6 @@ where
                                     error = %message,
                                     active_turns = self.active_turns.len(),
                                     active_turn_states = ?active_turn_states(&self.active_turns),
-                                    pending_compactions = self.pending_compactions.len(),
-                                    pending_compaction_states = ?pending_compaction_states(&self.pending_compactions),
                                     workspace_root = %self.workspace_root.display(),
                                     "Codex stream failed before all active turns completed"
                                 );
@@ -458,10 +431,7 @@ where
         }
     }
 
-    async fn handle_server_message(
-        &mut self,
-        message: codex_codes::ServerMessage,
-    ) -> MessageOutcome {
+    async fn handle_server_message(&mut self, message: codex_codes::ServerMessage) {
         let fallback_thread = fallback_thread(&self.mapper, &self.active_turns);
         match message {
             codex_codes::ServerMessage::Notification(notif) => {
@@ -481,8 +451,6 @@ where
                             active.active_turn = Some(*turn);
                         }
                     }
-                    let completed_compaction =
-                        observe_pending_compaction(&mut self.pending_compactions, thread, &event);
                     let completed_active_turn =
                         completed_current_active_turn(&self.active_turns, &event)
                             .map(|(_, turn)| turn);
@@ -534,9 +502,6 @@ where
                         self.active_turns.remove(&thread);
                         self.mapper.clear_active_turn(thread);
                     }
-                    if let Some(elapsed_ms) = completed_compaction {
-                        return MessageOutcome::CompactionCompleted { thread, elapsed_ms };
-                    }
                 } else if let Some(message) = mapping::fatal_turn_error(&notif) {
                     let (harness_thread_id, native_turn_id) = match &notif {
                         codex_codes::messages::Notification::Error(error) => {
@@ -554,7 +519,6 @@ where
                         "dropping fatal Codex error notification that could not be mapped to a known thread"
                     );
                 }
-                MessageOutcome::Handled
             }
             codex_codes::ServerMessage::Request { id, request } => {
                 let Some(event) = self
@@ -565,14 +529,13 @@ where
                     .flatten()
                 else {
                     respond_unroutable_server_request(&mut self.client, &id, &request).await;
-                    return MessageOutcome::Handled;
+                    return;
                 };
                 let thread = event.thread_id();
                 if let Some(active) = self.active_turns.get_mut(&thread) {
                     active.mark_server_message();
                 }
                 let _ = broadcast_event(&self.senders, thread, || event).await;
-                MessageOutcome::Handled
             }
         }
     }
@@ -812,19 +775,15 @@ where
                 info!(
                     thread = %thread.thread,
                     harness_thread_id = %thread.harness_thread_id,
-                    pending_compactions = self.pending_compactions.len(),
                     "requesting Codex context compaction"
                 );
                 let result = handle_compact_thread(&mut self.client, &thread).await;
                 match &result {
                     Ok(()) => {
-                        self.pending_compactions
-                            .insert(thread.thread, PendingCompaction::new(started));
                         info!(
                             thread = %thread.thread,
                             harness_thread_id = %thread.harness_thread_id,
                             ack_elapsed_ms = started.elapsed().as_millis(),
-                            pending_compactions = self.pending_compactions.len(),
                             "Codex accepted context compaction request"
                         );
                     }

@@ -1395,105 +1395,6 @@ async fn timeout_codex_control<T>(
     result
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum MessageOutcome {
-    Handled,
-    CompactionCompleted { thread: ThreadId, elapsed_ms: u128 },
-}
-
-#[derive(Debug)]
-struct PendingCompaction {
-    started_at: Instant,
-    saw_turn_started: bool,
-}
-
-impl PendingCompaction {
-    fn new(started_at: Instant) -> Self {
-        Self {
-            started_at,
-            saw_turn_started: false,
-        }
-    }
-
-    fn observe(&mut self, event: &AgentEvent) -> bool {
-        match event {
-            AgentEvent::TurnStarted { .. } => {
-                self.saw_turn_started = true;
-                false
-            }
-            AgentEvent::ItemCompleted { item, .. }
-                if is_context_compaction_activity(item) && !self.saw_turn_started =>
-            {
-                true
-            }
-            AgentEvent::TurnCompleted { .. } => true,
-            _ => false,
-        }
-    }
-}
-
-fn observe_pending_compaction(
-    pending_compactions: &mut HashMap<ThreadId, PendingCompaction>,
-    thread: ThreadId,
-    event: &AgentEvent,
-) -> Option<u128> {
-    let event_name = compaction_event_name(event)?;
-    let event_turn = event.turn();
-    let pending = pending_compactions.get_mut(&thread)?;
-    let saw_turn_started_before = pending.saw_turn_started;
-    let elapsed_ms = pending.started_at.elapsed().as_millis();
-    let completed = pending.observe(event);
-    info!(
-        %thread,
-        event_turn = display_opt(event_turn),
-        event = event_name,
-        saw_turn_started_before,
-        saw_turn_started_after = pending.saw_turn_started,
-        completed,
-        elapsed_ms,
-        "observed Codex context compaction event"
-    );
-    if !completed {
-        return None;
-    }
-    pending_compactions
-        .remove(&thread)
-        .map(|pending| pending.started_at.elapsed().as_millis())
-}
-
-fn compaction_event_name(event: &AgentEvent) -> Option<&'static str> {
-    match event {
-        AgentEvent::TurnStarted { .. } => Some("turn_started"),
-        AgentEvent::ItemCompleted { item, .. } if is_context_compaction_activity(item) => {
-            Some("context_compacted_item")
-        }
-        AgentEvent::TurnCompleted { .. } => Some("turn_completed"),
-        _ => None,
-    }
-}
-
-fn pending_compaction_states(
-    pending_compactions: &HashMap<ThreadId, PendingCompaction>,
-) -> Vec<String> {
-    pending_compactions
-        .iter()
-        .map(|(thread, pending)| {
-            format!(
-                "{thread}:saw_turn_started={},elapsed_ms={}",
-                pending.saw_turn_started,
-                pending.started_at.elapsed().as_millis()
-            )
-        })
-        .collect()
-}
-
-fn is_context_compaction_activity(item: &giskard_core::item::Item) -> bool {
-    matches!(
-        &item.payload,
-        giskard_core::item::ItemPayload::Activity { title, .. } if title == "Context compacted"
-    )
-}
-
 fn observe_pending_context_restore(
     pending: &mut HashMap<NativeThreadId, PendingContextRestore>,
     message: &codex_codes::ServerMessage,
@@ -2767,9 +2668,7 @@ async fn handle_interrupt_turn(
 mod tests {
     use super::*;
     use crate::uploads::{cleanup_active_turn_upload, cleanup_all_active_turn_uploads};
-    use chrono::Utc;
-    use giskard_core::ids::ItemId;
-    use giskard_core::item::{Item, ItemPayload};
+    use giskard_core::item::ItemPayload;
     use giskard_core::model::{Effort, ModelRef};
     use giskard_core::turn::{Mode, PermissionPreset};
     use serde_json::{Value, json};
@@ -3592,24 +3491,6 @@ mod tests {
         .unwrap_or_else(|_| panic!("timed out waiting for {label}"))
     }
 
-    fn context_compacted_event(thread: ThreadId, turn: TurnId) -> AgentEvent {
-        AgentEvent::ItemCompleted {
-            thread,
-            turn,
-            item: Item {
-                id: ItemId::new(),
-                harness_item_id: format!("context_compacted:{turn}"),
-                payload: ItemPayload::Activity {
-                    title: "Context compacted".into(),
-                    detail: None,
-                    metadata: None,
-                    subagent: None,
-                },
-                created_at: Utc::now(),
-            },
-        }
-    }
-
     fn completed_event(thread: ThreadId, turn: TurnId) -> AgentEvent {
         AgentEvent::TurnCompleted {
             thread,
@@ -4087,7 +3968,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fatal_stream_error_closes_worker_with_only_pending_compaction() {
+    async fn fatal_stream_error_closes_worker_during_compaction() {
         let (harness, controller) = spawn_fake_harness();
         let thread = harness
             .open_thread(open_opts(ThreadId::new(), None))
@@ -5700,48 +5581,6 @@ mod tests {
             .unwrap();
         assert_eq!(adopted.thread, accepted_thread);
         assert!(sender_for_thread(&harness.senders, rejected_thread).is_none());
-    }
-
-    #[test]
-    fn pending_compaction_marker_only_completes_without_turn_started() {
-        let thread = ThreadId::new();
-        let turn = TurnId::new();
-        let mut pending = HashMap::new();
-        pending.insert(thread, PendingCompaction::new(Instant::now()));
-
-        let elapsed_ms = observe_pending_compaction(
-            &mut pending,
-            thread,
-            &context_compacted_event(thread, turn),
-        );
-
-        assert!(elapsed_ms.is_some());
-        assert!(!pending.contains_key(&thread));
-    }
-
-    #[test]
-    fn pending_compaction_marker_after_turn_started_waits_for_turn_completed() {
-        let thread = ThreadId::new();
-        let turn = TurnId::new();
-        let mut pending = HashMap::new();
-        pending.insert(thread, PendingCompaction::new(Instant::now()));
-
-        let started = AgentEvent::TurnStarted { thread, turn };
-        assert!(observe_pending_compaction(&mut pending, thread, &started).is_none());
-        assert!(pending.get(&thread).unwrap().saw_turn_started);
-
-        let marker = observe_pending_compaction(
-            &mut pending,
-            thread,
-            &context_compacted_event(thread, turn),
-        );
-        assert!(marker.is_none());
-        assert!(pending.contains_key(&thread));
-
-        let completed =
-            observe_pending_compaction(&mut pending, thread, &completed_event(thread, turn));
-        assert!(completed.is_some());
-        assert!(!pending.contains_key(&thread));
     }
 
     #[tokio::test]
