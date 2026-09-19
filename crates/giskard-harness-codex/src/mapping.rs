@@ -1681,10 +1681,12 @@ pub fn map_user_input(input: &giskard_core::user_input::UserInput) -> Vec<codex_
                 }
                 Some(codex_codes::UserInput::Image {
                     detail: None,
-                    url: format!(
-                        "data:{};base64,{}",
-                        attachment.mime_type, attachment.data_base64
-                    ),
+                    image: codex_codes::UserInputImageReference::Inline {
+                        url: format!(
+                            "data:{};base64,{}",
+                            attachment.mime_type, attachment.data_base64
+                        ),
+                    },
                 })
             }));
             input
@@ -3580,8 +3582,13 @@ mod tests {
 
         assert_eq!(mapped.len(), 1);
         match &mapped[0] {
-            codex_codes::UserInput::Image { url, detail } => {
-                assert_eq!(url, "data:image/png;base64,aW1hZ2U=");
+            codex_codes::UserInput::Image { image, detail } => {
+                assert_eq!(
+                    image,
+                    &codex_codes::UserInputImageReference::Inline {
+                        url: "data:image/png;base64,aW1hZ2U=".into(),
+                    }
+                );
                 assert!(detail.is_none());
             }
             other => panic!("expected one image input, got {other:?}"),
