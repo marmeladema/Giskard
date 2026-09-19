@@ -9,7 +9,13 @@
 
 **Document status:** Implementation-ready specification.
 **Audience:** An AI coding agent (and its human reviewer) implementing the system.
-**Version:** 1.92
+**Version:** 1.93
+
+> **Amendment — manual compaction is an ordinary turn (1.93).** `thread/compact/start` is answered
+> by a normal Codex task: `turn/started`, a `contextCompaction` item, then `turn/completed` or an
+> abort. The `Context compacted` activity carries no lifecycle meaning; the turn gate, the
+> persisted `/compact` turn, and the browser's pending state all settle on `turn/completed` exactly
+> as for a user turn, and new activity rows carry no metadata.
 
 > **Amendment — refresh Codex protocol SDK (1.92).** The Codex harness builds against
 > `codex-codes` 0.155.1, tested against Codex CLI 0.155.1. Existing image attachments use the
@@ -181,6 +187,15 @@
 > the intended frontend for the foreseeable future; treat every Dioxus/WASM/`giskard-ui` reference
 > below as historical design context, not a current requirement. The wire contract (`giskard-proto`)
 > and all backend design remain authoritative.
+
+**Changelog (1.92 → 1.93), manual compaction is an ordinary turn:**
+- **CC6:** Codex runs a manual compaction as a normal task: `thread/compact/start` is followed by
+  `turn/started`, a `contextCompaction` item, and `turn/completed` (or an abort). Giskard no
+  longer recognises a `Context compacted` activity as a lifecycle signal; the turn gate, the
+  persisted `/compact` turn, and the browser's pending state all settle on `turn/completed`
+  exactly as for a user turn.
+- **CC7:** The `Context compacted` activity is an ordinary activity item. New rows carry no
+  metadata; the UI hides the raw protocol metadata only on rows persisted before this version.
 
 **Changelog (1.91 → 1.92), refresh Codex protocol SDK:**
 - **CP3:** Update `codex-codes` from 0.153.4 to 0.155.1 and adapt image input construction to
@@ -1012,16 +1027,16 @@ authoritative replacement runtime overview.
   `model_efforts` map.
 
 **Changelog (1.30 → 1.31), manual compaction completion hardening:**
-- **CC4:** After `thread/compact/start` succeeds, the Codex harness keeps draining app-server
-  notifications even when no command is running, so context-compaction notifications/items reach
-  the browser and registry. A `Context compacted` marker is terminal only for marker-only
-  compactions; once Codex emits `TurnStarted`, Giskard keeps draining until the matching
-  `TurnCompleted` event.
-- **CC5:** Manual compaction completion is robust to Codex versions that emit only a
-  context-compaction item/notification and no normal `turn/completed`. If no `TurnStarted` was
-  observed for the manual compaction, the first `Context compacted` activity item is treated as a
-  terminal successful compaction turn, persisted as `/compact`, broadcast to the browser, and used
-  to release the per-thread turn gate.
+- **CC4 (superseded by 1.93/CC6):** After `thread/compact/start` succeeds, the Codex harness
+  keeps draining app-server notifications even when no command is running, so context-compaction
+  notifications/items reach the browser and registry. A `Context compacted` marker is terminal
+  only for marker-only compactions; once Codex emits `TurnStarted`, Giskard keeps draining until
+  the matching `TurnCompleted` event.
+- **CC5 (superseded by 1.93/CC6):** Manual compaction completion is robust to Codex versions
+  that emit only a context-compaction item/notification and no normal `turn/completed`. If no
+  `TurnStarted` was observed for the manual compaction, the first `Context compacted` activity
+  item is treated as a terminal successful compaction turn, persisted as `/compact`, broadcast to
+  the browser, and used to release the per-thread turn gate.
 
 **Changelog (1.29 → 1.30), collapsible project sidebar groups:**
 - **PC1:** Project groups in the left sidebar / mobile Projects drawer are collapsible so a user can

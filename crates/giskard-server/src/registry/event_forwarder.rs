@@ -1,12 +1,5 @@
 use super::*;
 
-fn is_context_compaction_item(item: &Item) -> bool {
-    matches!(
-        &item.payload,
-        ItemPayload::Activity { title, .. } if title == "Context compacted"
-    )
-}
-
 /// Read half of the duplicate-notice gate: whether this notice was already recorded.
 fn is_duplicate_notice(
     seen_notices: &HashSet<(Option<TurnId>, String)>,
@@ -318,10 +311,6 @@ impl CurrentTurnItems {
         self.items.len()
     }
 
-    fn iter(&self) -> impl Iterator<Item = &Item> {
-        self.items.iter()
-    }
-
     fn rebuild_indexes(&mut self) {
         self.indexes.clear();
         for (idx, item) in self.items.iter().enumerate() {
@@ -623,7 +612,6 @@ struct ForwardedTurnState {
     diffs: Vec<giskard_core::FileDiff>,
     seen_notices: HashSet<(Option<TurnId>, String)>,
     item_ids_by_harness: HashMap<HarnessItemKey, ItemId>,
-    saw_context_compaction_marker: bool,
     live_usage: Option<giskard_core::token::TokenUsage>,
     // Reserved for the documented additive `Turn.context_window` persistence extension.
     live_context_window: Option<u32>,
@@ -642,7 +630,6 @@ impl ForwardedTurnState {
             diffs: Vec::new(),
             seen_notices: HashSet::new(),
             item_ids_by_harness: HashMap::new(),
-            saw_context_compaction_marker: false,
             live_usage: None,
             live_context_window: None,
             persisted_context_window: None,
@@ -659,7 +646,6 @@ impl ForwardedTurnState {
         self.diffs.clear();
         self.seen_notices.clear();
         self.item_ids_by_harness.clear();
-        self.saw_context_compaction_marker = false;
         self.live_usage = None;
         self.live_context_window = None;
         self.persisted_context_window = None;
@@ -1195,7 +1181,6 @@ impl ThreadEventForwarder {
                 stream_error = display_opt(self.stream_error.as_deref()),
                 items_buffered = self.turn.items.len(),
                 diffs_buffered = self.turn.diffs.len(),
-                saw_context_compaction_marker = self.turn.saw_context_compaction_marker,
                 elapsed_ms = self.forwarder_started.elapsed().as_millis(),
                 "event forwarder exited without turn completion; releasing active-turn ownership"
             );
@@ -1236,7 +1221,6 @@ impl ThreadEventForwarder {
                 ?e,
                 owned_turn = display_opt(self.turn.owned_turn),
                 turn_id = display_opt(self.turn.observed_turn),
-                saw_context_compaction_marker = self.turn.saw_context_compaction_marker,
                 items_buffered = self.turn.items.len(),
                 live_buffer_active,
                 turn_gate_held = self.turn.lease.is_some(),
@@ -1824,21 +1808,6 @@ impl ThreadEventForwarder {
                     item_id = %item.id, %error,
                     "failed to send linked native identity to the project event driver");
                 }
-                if self.turn.context.kind == TurnContextKind::ManualCompaction
-                    && is_context_compaction_item(item)
-                {
-                    self.turn.saw_context_compaction_marker = true;
-                    info!(
-                        %project_id,
-                        %thread_id,
-                        %turn,
-                        turn_started_seen = self.turn.observed_turn.is_some(),
-                        will_synthesize_completion = self.turn.observed_turn.is_none(),
-                        items_buffered_after = self.turn.items.len() + 1,
-                        elapsed_ms = self.forwarder_started.elapsed().as_millis(),
-                        "context compaction marker received"
-                    );
-                }
                 if self.turn.items.upsert(item) {
                     error!(
                         %project_id,
@@ -1937,7 +1906,6 @@ impl ThreadEventForwarder {
                 turn = %completed_turn,
                 status = ?status.kind,
                 items_buffered = self.turn.items.len(),
-                saw_context_compaction_marker = self.turn.saw_context_compaction_marker,
                 elapsed_ms = self.forwarder_started.elapsed().as_millis(),
                 "context compaction turn completed"
             );
@@ -2060,7 +2028,6 @@ impl ThreadEventForwarder {
         let tid = turn_id.unwrap_or(completed_turn);
         let item_count = self.turn.items.len();
         let diff_count = self.turn.diffs.len();
-        let has_context_compaction_marker = self.turn.items.iter().any(is_context_compaction_item);
         if ctx.kind == TurnContextKind::ManualCompaction {
             info!(
                 %project_id,
@@ -2069,7 +2036,6 @@ impl ThreadEventForwarder {
                 completed_turn = %completed_turn,
                 started_turn = display_opt(turn_id),
                 item_count,
-                has_context_compaction_marker,
                 status = ?status.kind,
                 "persisting context compaction turn"
             );
@@ -2105,7 +2071,6 @@ impl ThreadEventForwarder {
                 %thread_id,
                 turn = %tid,
                 item_count,
-                has_context_compaction_marker,
                 history_appended = persist_outcome.history_appended,
                 metadata_updated = persist_outcome.metadata_updated,
                 "context compaction persistence path finished"

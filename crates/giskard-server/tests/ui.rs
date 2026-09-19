@@ -472,8 +472,7 @@ async fn index_page_is_served_and_public() {
             && body.contains("function compactContext")
             && body.contains("type:\"compact_context\", thread_id: state.threadId")
             && body.contains("state.compactPending ? \"Compacting")
-            && body.contains("msg.action===\"compact_context\"")
-            && body.contains("isContextCompactionItem"),
+            && body.contains("msg.action===\"compact_context\""),
         "context menu exposes a manual context compaction action with pending/error recovery"
     );
     assert!(

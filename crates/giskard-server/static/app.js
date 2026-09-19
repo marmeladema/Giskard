@@ -4359,7 +4359,6 @@ function handleEvent(ev) {
       break;
     case "item_completed":
       if (!finalizeStreamedItem(ev.item, ev.turn)) addItem(ev.item, ev.turn);
-      if (isContextCompactionItem(ev.item)) finishCompactPending();
       // Only the live path: replaying history must not poll git for changes long since made.
       if (ev.item && ((ev.item.payload || ev.item).kind) === "file_change") scheduleGitRefresh();
       break;
@@ -8668,6 +8667,8 @@ function visibleActivityMetadata(p) {
   if (isContextCompactionPayload(p)) return null;
   return p.metadata;
 }
+// Presentation choice owned by the UI: rows persisted before S11 carry the raw Codex payload as
+// activity metadata and this hides it; rows written since then carry no metadata at all.
 function isContextCompactionPayload(p) {
   if (!p || p.kind !== "activity") return false;
   const metadata = p.metadata || {};
@@ -8675,10 +8676,6 @@ function isContextCompactionPayload(p) {
   if (metadata.threadId && metadata.turnId && String(p.title || "").toLowerCase().includes("context compact")) return true;
   const title = String(p.title || "").toLowerCase();
   return title.includes("context compaction") || title.includes("context compacted");
-}
-function isContextCompactionItem(item) {
-  const payload = item && (item.payload || item);
-  return isContextCompactionPayload(payload);
 }
 function finishCompactPending() {
   if (!state.compactPending) return;

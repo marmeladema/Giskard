@@ -13,13 +13,20 @@ identifiers.
 
 `CodexHarness` is the cloneable public API handle. Each project app-server process has exactly one
 non-cloneable `CodexInstance`, owned by exactly one Tokio task, that owns its transport, mapper,
-active turns, pending steering requests, pending compactions and context restores, workspace
-configuration, command/control receivers, and worker lifecycle. It serves every native thread on
-that process and is unrelated to the Primary/sub-agent hierarchy. Helper futures borrow its
-protocol state through `&mut self`; no independent worker mutates that state.
+active turns, pending steering requests, context restores, workspace configuration, command/control
+receivers, and worker lifecycle. It serves every native thread on that process and is unrelated to
+the Primary/sub-agent hierarchy. Helper futures borrow its protocol state through `&mut self`; no
+independent worker mutates that state.
 
 The transport may own internal reader and writer tasks for stdio and request correlation; they
-never access mapper, route, turn, compaction, or context-restore state.
+never access mapper, route, turn, or context-restore state.
+
+## Manual compaction
+
+`compact_thread` sends `thread/compact/start` and returns once Codex acknowledges it. Codex
+then runs the compaction as an ordinary turn (`turn/started`, a `contextCompaction` item,
+`turn/completed`), which the instance forwards like any other turn. The adapter keeps no
+per-compaction state.
 
 ## Transport
 

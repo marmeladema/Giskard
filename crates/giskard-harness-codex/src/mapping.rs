@@ -738,30 +738,6 @@ impl CodexMapper {
                 })
             }
 
-            Notification::ContextCompacted(n) => {
-                let thread = self.resolve_thread(&n.thread_id, fallback_thread)?;
-                let turn = self.resolve_turn(thread, &n.turn_id);
-                Some(AgentEvent::ItemCompleted {
-                    thread,
-                    turn,
-                    item: Item {
-                        id: self.resolve_item(
-                            thread,
-                            turn,
-                            &format!("context_compacted:{}", n.turn_id),
-                        ),
-                        harness_item_id: format!("context_compacted:{}", n.turn_id),
-                        payload: ItemPayload::Activity {
-                            title: "Context compacted".into(),
-                            detail: None,
-                            metadata: serde_json::to_value(n).ok(),
-                            subagent: None,
-                        },
-                        created_at: Utc::now(),
-                    },
-                })
-            }
-
             // Codex advisories are non-fatal — surface them as notices (warnings), not hard errors,
             // so they don't fail the turn or the pending message.
             Notification::Warning(n) => {
@@ -2943,7 +2919,7 @@ fn map_thread_item_complete(
         codex_codes::ThreadItem::ContextCompaction { .. } => ItemPayload::Activity {
             title: "Context compacted".into(),
             detail: None,
-            metadata: json_value(item),
+            metadata: None,
             subagent: None,
         },
         codex_codes::ThreadItem::FunctionCallOutput {
@@ -6500,40 +6476,7 @@ mod tests {
                 } => {
                     assert_eq!(title, "Context compacted");
                     assert_eq!(detail, None);
-                    let metadata = metadata.expect("raw Codex item metadata is preserved");
-                    assert_eq!(metadata["type"], "contextCompaction");
-                    assert_eq!(metadata["id"], "compact1");
-                }
-                other => panic!("expected activity, got {other:?}"),
-            },
-            other => panic!("expected item completion, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn context_compacted_notification_maps_to_clean_activity() {
-        let mut mapper = CodexMapper::new(PathBuf::from("/tmp"));
-        let notif = Notification::ContextCompacted(
-            serde_json::from_value(serde_json::json!({
-                "threadId": "th1",
-                "turnId": "t1"
-            }))
-            .unwrap(),
-        );
-
-        match mapper.map_notification(&notif, ThreadId::new()).unwrap() {
-            AgentEvent::ItemCompleted { item, .. } => match item.payload {
-                ItemPayload::Activity {
-                    title,
-                    detail,
-                    metadata,
-                    ..
-                } => {
-                    assert_eq!(title, "Context compacted");
-                    assert_eq!(detail, None);
-                    let metadata = metadata.expect("raw Codex notification metadata is preserved");
-                    assert_eq!(metadata["threadId"], "th1");
-                    assert_eq!(metadata["turnId"], "t1");
+                    assert_eq!(metadata, None);
                 }
                 other => panic!("expected activity, got {other:?}"),
             },
