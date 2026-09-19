@@ -162,7 +162,7 @@ fn captured_diff_id_from_content_bytes(
     digest.update(b",\"content\":");
     digest.update(content_bytes);
     digest.update(b"}");
-    DiffId::from_digest(format!("sha256_{:x}", digest.finalize()))
+    DiffId::from_digest(format!("sha256_{}", hex::encode(digest.finalize())))
 }
 
 fn canonical_content(content: &CapturedDiffContent) -> CapturedDiffContent {

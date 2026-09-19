@@ -131,9 +131,11 @@ fn load_or_create_session_key(data_dir: &std::path::Path) -> std::io::Result<Vec
             }
         }
     }
-    use rand::RngCore;
+    use rand::TryRng;
     let mut key = [0u8; 32];
-    rand::rngs::OsRng.fill_bytes(&mut key);
+    rand::rngs::SysRng
+        .try_fill_bytes(&mut key)
+        .map_err(std::io::Error::other)?;
     std::fs::create_dir_all(data_dir)?;
     std::fs::set_permissions(data_dir, std::fs::Permissions::from_mode(0o700))?;
     std::fs::write(&key_path, key)?;

@@ -1059,10 +1059,8 @@ fn env_path(var: &str) -> Option<PathBuf> {
 
 /// Argon2 hash of the given password, in the PHC string form the login path expects.
 fn hash_password(password: &str) -> Result<String, String> {
-    use argon2::password_hash::SaltString;
-    let salt = SaltString::generate(&mut rand::rngs::OsRng);
     argon2::Argon2::default()
-        .hash_password(password.as_bytes(), &salt)
+        .hash_password(password.as_bytes())
         .map(|h| h.to_string())
         .map_err(|e| format!("failed to hash replay password: {e}"))
 }
@@ -1196,8 +1194,10 @@ async fn run(
     // A fresh random session key each boot is fine: the replay server holds no durable sessions.
     let mut session_key = [0u8; 32];
     {
-        use rand::RngCore;
-        rand::rngs::OsRng.fill_bytes(&mut session_key);
+        use rand::TryRng;
+        rand::rngs::SysRng
+            .try_fill_bytes(&mut session_key)
+            .map_err(|e| format!("cannot generate replay session key: {e}"))?;
     }
 
     let factory = Arc::new(ScriptedFactory);
