@@ -163,6 +163,7 @@ deliberately unsettled — see M13.
 
 **Subscription generation.** A server-owned counter identifying one subscribe attempt, so messages
 belonging to a superseded attempt can be rejected rather than filtered by the browser afterwards.
+M9 introduces it on the server, where it cancels superseded bootstraps; M12 carries it on the wire.
 
 **Suffix (ordered suffix).** The events that arrived after a bootstrap's cut and must be applied on
 top of the baseline once it commits.
@@ -1164,11 +1165,11 @@ behind it; say so in the problem section rather than proceeding as though the ca
 lifecycle state that replaces its own guard, M4 for the active diff authority. M5 reuses M4's lazy
 content boundary and M2's apply boundary. M6 applies the same addressable-content pattern to
 completed tool output. M7 removes output from the task projection. M8 serves items by identity
-and derives its in-flight read from the live buffer. M9 and M10 are independent of each other and
-of M11.
+and derives its in-flight read from the live buffer. M10 takes its cut inside the bootstrap task M9
+introduces, so M9 lands first; both are independent of M11.
 M11's inventory is smaller if M8 has landed, because a previewable field no longer has to be
 accepted inline. M12 needs M10's cut and M11's classified inventory before journal byte accounting
-is meaningful, and needs M9's generations if it builds the transaction. M13 needs M11's outbox
+is meaningful, and puts M9's subscription generation on the wire if it builds the transaction. M13 needs M11's outbox
 measurements to choose its policy. M14 reuses M5/M6 normalization and needs M12's journal coverage
 token. Anything not listed here is ordering preference, not a constraint.
 
@@ -1375,7 +1376,7 @@ resolve through either authority but must return the same identified content. If
 has replaced the requested `diff_id`, return a conflict carrying the current descriptor; do not
 retain an unbounded version cache. The browser retries only while the same thread/turn remains
 selected and the current descriptor still advertises that identity. A per-request selection token
-rejects late responses; M9 later adds subscription-generation gating. The endpoint reads captured
+rejects late responses; M12 later adds subscription-generation gating on the wire. The endpoint reads captured
 agent output and must not recompute a workspace Git diff whose answer may already have changed.
 
 **Non-goals.** Retention policy for command, tool, text, or reasoning content. The journal,
@@ -1908,37 +1909,85 @@ therefore unverifiable; `captured_diff_records` is that read-back, on the same l
 
 ---
 
-### M9 — Cancellable, generation-owned subscribe
+### M9 — Cancellable subscribe
 
-**Problem.** `handle_client_msg` awaits the whole subscribe inline. A bootstrap in flight cannot be
-stopped, and the server has no identity for "which subscribe attempt is this", so a late message
-cannot be rejected at the boundary — only filtered by the browser after it arrives.
+Implementation plan: [`m9-cancellable-subscribe.md`](thread-state-and-bootstrap-reconciliation-plan/m9-cancellable-subscribe.md).
+
+**Problem.** `handle_client_msg` is awaited inline in the connection's receive loop
+(`ws.rs:394`), and its `Subscribe` arm (`ws.rs:443-603`) runs the whole bootstrap before
+returning: `ensure_thread_open` — a cold harness attach when the thread is not loaded
+(`ws.rs:1326`), which for Codex spawns an app-server — then `hub.subscribe`,
+`recompute_aggregates`, the history read, the live snapshot and the task snapshot, then the sends.
+While that runs the loop's `select!` (`ws.rs:341-359`) is not polled, so the connection can see
+neither a close frame nor its writer ending, and nothing in the chain asks whether anyone is still
+listening.
 
 Concretely: open a thread with several turns of cold history, then immediately click another
-thread. The first thread's `recompute_aggregates`, history read and live-snapshot read all still
-run, and its `ThreadState`, `HistoryDelta`, `LiveTurnSnapshot` and `RunningTasks` are all still
-sent. The browser discards them by thread id afterwards.
+thread. The browser does not send a superseding subscribe or an unsubscribe — it never sends
+`unsubscribe` at all — it closes the socket and opens a new one (`openThread` calls `connectWs`,
+`app.js:2671`, which closes the previous socket, `:2775-2780`). On the server the old connection's
+loop is parked inside the bootstrap, so `recompute_aggregates`, the history read and the live
+snapshot all run to completion, every `tx.send` goes into a channel whose writer has already
+ended, and only then does the loop observe the close and call `hub.disconnect` (`ws.rs:420`).
+Until that moment the dead client stays registered, and a live publish in the window is dropped
+at its closed channel (`hub.rs:150-158`) rather than never attempted.
 
-**Evidence.** The mechanism is verifiable in `routes.rs` — the reads are awaited inline and nothing
-cancels them — but no user-visible failure has been reported against it. What is certain is the
-waste: reads that cannot be used, and messages the browser exists to throw away. What is not
-established is that any user has seen a wrong transcript because of it. Treat this milestone as
-removing known-dead work, not as fixing a reported bug, and size it accordingly.
+**Evidence, corrected.** Earlier drafts placed the mechanism in `routes.rs` and read the concrete
+example as a superseding subscribe on the same socket. Both are wrong on `main`: S10 moved the
+handler to `ws.rs`, and one socket serves one thread view (the spec's "one WebSocket per browser
+client, multiplexing all threads", `specs/giskard-specification.md:3784-3785`, describes the
+protocol's capability, not what `app.js` does). Two consequences follow. There is no cross-thread head-of-line blocking to fix — an inline
+bootstrap of thread A cannot delay Stop or Send for thread B, because B has its own socket. And the
+only same-socket resubscribe for the same thread is the detail-conflict resync (`app.js:3791`).
+What is certain is the waste: reads whose results nobody can receive, a receive loop that cannot
+notice its peer is gone, and a client registration that outlives the socket by the length of a cold
+attach. No user has seen a wrong transcript because of it. Treat this milestone as removing known
+dead work and as putting the bootstrap into the shape M10 and M12 need — one unit of work with an
+identity and a cancel point — not as fixing a reported bug.
 
-**Proposed change.** Give each subscribe a server-owned, monotonic subscription generation. Run the
-bootstrap in a task the connection owns and keys by that generation, instead of inline in the
-receive loop. A superseding subscribe for the same thread, an unsubscribe, or a connection close
-cancels the in-flight task and drops its unsent output. Stamp bootstrap-phase messages with their
-generation so a stale one is rejected where it is received. The message set and its ordering are
-unchanged.
+**Proposed change.** Run each subscribe's bootstrap in a task the connection owns, keyed by the
+thread and a per-connection monotonic generation, so the receive loop keeps polling. The task keeps
+today's order exactly — attach, register with the hub before any read (the comment at
+`ws.rs:467-471` explains why that order is load-bearing), metadata, history, live snapshot, tasks,
+requests — and the message set and its ordering on the socket are unchanged.
 
-**Non-goals.** The transaction envelope and the journal (M12). The consistent cut (M10). Changing
-which messages a bootstrap sends. Removing the browser phase flags.
+*Cancellation is cooperative, never an abort.* A superseded, unsubscribed or closed bootstrap
+finishes the phase it is in, then stops and drops its unsent output. The first phase is a registry
+operation and the second publishes a metadata mutation; the driver's fences prove a dropped caller
+is safe for `start_turn` and compaction, not for `open_thread`, and this milestone's payoff does not
+justify adding that proof. "No further disk reads" therefore holds at phase granularity, which is
+the only granularity that is safe.
 
-**Expected outcome.** Switching threads mid-bootstrap produces no further messages for the
-abandoned thread, and a superseded subscribe performs no further disk reads. A message carrying a
-stale generation is rejected with a log rather than applied. `handle_client_msg` no longer awaits
-history and live-snapshot reads.
+*Triggers, in order of how often they happen:* the connection closing (the thread-switch case
+above), a `Subscribe` for a thread this connection is already bootstrapping (the detail-conflict
+resync), and `Unsubscribe` for that thread. Close is observed as soon as the loop is free to poll,
+so `hub.disconnect` runs at once.
+
+*The generation stays server-side in this milestone.* Stamping `ThreadState`, `HistoryDelta`,
+`LiveTurnSnapshot`, `RunningTasks` and `RequestState` with it would change five message types to
+reject frames that, on one FIFO, can only be the already-queued tail of a bootstrap the server has
+stopped sending; the browser already discards frames for another thread by id
+(`isCurrentThreadServerMessage`, `app.js:3182-3187`). M12's transaction envelope carries the
+generation on the wire (*Wire transaction*, `subscription_generation`); that is where the browser
+learns to reject by generation, and this milestone provides the counter it will carry.
+
+*The per-connection slots are session state, not an authority.* The map from thread to in-flight
+bootstrap lives in the connection handler's locals and dies with the socket. It records which
+subscribe attempt this connection is serving, not anything about the thread, so it is not the
+keyed authority map `AGENTS.md` forbids; the hub's subscriber lists are the same kind of state and
+already exist.
+
+**Non-goals.** Stamping the wire with the generation (M12). The transaction envelope and the journal
+(M12). The consistent cut (M10). Changing which messages a bootstrap sends, or their order. Removing
+the browser phase flags. Aborting a task mid-phase, or adding cancel-safety fences to the registry.
+Making the browser send `unsubscribe` or share a socket across thread views.
+
+**Expected outcome.** A connection that closes during a bootstrap is disconnected from the hub
+before the bootstrap's next phase, and that bootstrap performs no further reads and sends nothing
+more. A second subscribe for the same thread on one socket yields exactly one bootstrap's messages,
+the newer one's. `handle_client_msg` no longer awaits the attach, history or live-snapshot reads,
+and the receive loop is never parked longer than a message dispatch. Every existing subscribe test
+passes unchanged, the bootstrap messages are byte-identical, and no proto type changes.
 
 ---
 
@@ -2317,6 +2366,11 @@ integration, browser E2E, formatting, lint, and the full workspace suite.
 
 ### Bootstrap cut
 
+- M9: a socket closed while its subscribe is held inside a cold attach is disconnected from the
+  hub before the attach completes, and the abandoned bootstrap performs no read and sends nothing
+  after it; a second `Subscribe` for the same thread on one socket produces exactly one bootstrap's
+  messages; `Unsubscribe` during a bootstrap ends it; every existing subscribe and resync test
+  passes with byte-identical messages.
 - `ItemDelta` before the live cut appears exactly once.
 - `ItemDelta` after the cut appears exactly once and in order.
 - Completion before, during, and after history read produces neither a missing nor duplicate turn.
