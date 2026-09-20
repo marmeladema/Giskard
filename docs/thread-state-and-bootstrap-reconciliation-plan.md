@@ -18,8 +18,8 @@ into the same root cause — a turn's record was both its index entry and its un
 **M1 through M7 are complete**: history pagination over HTTP, the runtime registry, turn-less
 context restoration, lazy agent-produced diffs, lazy completed-command output, lazy completed
 tool output, and strict Tasks-menu ownership for `RunningTasks`. Each milestone
-below carries its own status line; this paragraph is a summary, not the record. A
-live item read, an item endpoint, a cancellable subscribe, a consistent bootstrap
+below carries its own status line; this paragraph is a summary, not the record. An
+item endpoint, a cancellable subscribe, a consistent bootstrap
 cut, the classified content inventory, the journal and its apply
 path, the class-aware outbox, and durable amendments remain to be built, as defined under
 *Implementation milestones*.
@@ -38,7 +38,7 @@ Every code reference below was re-checked after the event-pipeline and design-st
 landings. **Two other workstreams have their own milestone numbering, and neither is this one's.**
 
 - [`event-pipeline-architecture-review.md`](event-pipeline-architecture-review.md), with its
-  M0–M8 under [`event-pipeline-review/`](event-pipeline-review/). It works the seam between the
+  M0–M8 under [`event-pipeline-architecture-review/`](event-pipeline-architecture-review/). It works the seam between the
   Codex adapter and the server. (Its milestones document was folded into the review itself; there
   is no longer a separate `event-pipeline-milestones.md`.)
 - [`design-straightening-review.md`](design-straightening-review.md), with its S1–S11 under
@@ -46,7 +46,7 @@ landings. **Two other workstreams have their own milestone numbering, and neithe
   the M-series left: grouping state by owner, splitting the largest files, and deleting duplicated
   abstractions.
 
-This plan's M1–M16 are unrelated to both. It works the seam between the server and the browser, and
+This plan's M1–M15 are unrelated to both. It works the seam between the server and the browser, and
 both reviews say so: the event-pipeline review names the metadata service with revisions, the hub
 and the per-client delivery lanes as parts it does not touch, and the design-straightening review
 lists "revisioned projections on the wire … each have one authority and one clock" under *What is
@@ -88,7 +88,7 @@ reference rather than inline: the wire sends a *descriptor* and the body is fetc
 
 **Amendment.** A durable correction appended to a turn's payload file after that turn was already
 persisted — the mechanism a late command or tool completion needs so history stops claiming it is
-still running. M15.
+still running. M14.
 
 **Authority.** The one component allowed to decide a given piece of state. Every state class has
 exactly one, plus one clock; no other component may write it, and no clock orders a different
@@ -113,7 +113,7 @@ durably covered by — so a reconnecting client can tell whether history already
 
 **Cut.** A single instant at which several things are read together, so their answers describe the
 same moment. The **live cut** is the boundary between "already in the history baseline" and
-"arriving as ordered events"; a **consistent cut** is what M11 introduces for the bootstrap reads.
+"arriving as ordered events"; a **consistent cut** is what M10 introduces for the bootstrap reads.
 
 **Descriptor.** A small, fixed-size stand-in for a large payload — sizes, counts, a content
 identity, an availability flag — sent in place of the body. `CommandOutputDescriptor`,
@@ -159,7 +159,7 @@ on success, roll back on failure — each step publishing a new revision.
 
 **Resync / `NeedsResync`.** The proposed state for a subscription whose ordered stream lost a
 message, requiring a fresh baseline before further events mean anything. Its necessity is
-deliberately unsettled — see M14.
+deliberately unsettled — see M13.
 
 **Subscription generation.** A server-owned counter identifying one subscribe attempt, so messages
 belonging to a superseded attempt can be rejected rather than filtered by the browser afterwards.
@@ -224,7 +224,7 @@ The store now exposes `load_turn_records`, and ordinary format-2 pagination sele
 before fetching their payloads. Adding the consistent `load_history_snapshot` and
 `load_history_from` reads remains in scope for the milestone whose bootstrap consumes them — the
 storage plan deferred those transaction-facing reads until a consumer existed, and that consumer
-is M11.
+is M10.
 
 ### One of the two full-history reads per bootstrap is already gone
 
@@ -243,7 +243,7 @@ it belongs to no milestone here.
 
 `giskard-persist::preview::bounded_preview(text, max_bytes) -> (String, bool)` is UTF-8-safe and
 already has two callers (`prompt_preview`, `status.message`). M5 extends this primitive with
-retention direction for durable command head/tail and wire tail previews; M12 reuses it for the
+retention direction for durable command head/tail and wire tail previews; M11 reuses it for the
 remaining named policies. Neither milestone adds a second UTF-8 truncation algorithm.
 
 ### Amendments have a home in the format, and no home in the code yet
@@ -252,7 +252,7 @@ Payload records already carry an explicit `index`, payload files are tagged and 
 and the fold rules for collections and singletons are stated in `parse_turn_payload`. A late command
 or tool completion can therefore be appended to its turn's payload file without a format bump.
 
-Nothing implements this. It is M15, and it is a durable-format behaviour change that
+Nothing implements this. It is M14, and it is a durable-format behaviour change that
 deserves its own review: an amendment needs a durable clock the browser can compare against, a
 persistence-recovery path when the amendment write fails, and a reconnect rule. It must not be
 absorbed into an earlier milestone.
@@ -308,7 +308,7 @@ suffix must cause a thread resync, not silent divergence or a socket-wide bootst
 ### Runtime bootstrap still infers a transaction from message order
 
 *Still true. M1 moved older-page pagination to HTTP and removed `HistoryPage`, but the bootstrap
-sequence itself is unchanged; M10, M11 and M13 own the rest.*
+sequence itself is unchanged; M9, M10 and M12 own the rest.*
 
 Bootstrap behavior is spread across `ThreadState`, a bootstrap-only `HistoryDelta`, an optional
 `LiveTurnSnapshot`, and `RunningTasks`. The browser coordinates them with
@@ -401,8 +401,8 @@ touched.
 small: user text, approval and activity metadata, sub-agent prompts. This is an assumption about
 model behaviour, not a property of the data. It is named here rather than left implicit so that
 when one of them starts arriving large, the answer is to move it to *addressable* — not to begin
-truncating it. Reasoning text was on this list until M9 made it addressable in completed turns,
-which is the worked example of that rule. Agent text is still on it, and deliberately: M9 leaves it
+truncating it. Reasoning text was on this list until M8 made it addressable in completed turns,
+which is the worked example of that rule. Agent text is still on it, and deliberately: M8 leaves it
 inline because it is the content a reader came for, not because it is bounded.
 
 ### Rules that follow
@@ -810,7 +810,7 @@ bootstrap memory until commit or cancellation.
 
 Live request payloads, notices, metadata strings, and reconnect-only accumulations each need a
 documented classification: bounded, addressable, truncated with an explicit marker, or accepted
-inline with the measurement behind it. M12 records those and enforces them with a test.
+inline with the measurement behind it. M11 records those and enforces them with a test.
 
 **Superseded.** This plan previously specified a maximum ordered-event size, and a live event
 exceeding it marking its subscription `NeedsResync`. There is no such size: the socket already
@@ -1037,7 +1037,7 @@ Most of this list is done. Verified against `giskard-proto/src/lib.rs`:
 - ~~`ApprovalResolved`~~ — removed in M2; `RequestState` is the sole resolution authority;
 - ~~additive `ThreadActivityBootstrap` and authoritative use of `ThreadActivity`~~ — removed in M2
   in favour of the revisioned runtime overview;
-- top-level bootstrap-only `HistoryDelta` and `LiveTurnSnapshot` — **still present**, and M13
+- top-level bootstrap-only `HistoryDelta` and `LiveTurnSnapshot` — **still present**, and M12
   replaces them with the bootstrap transaction;
 - turn runtime state from live `ThreadState` — **still present**.
 
@@ -1103,7 +1103,7 @@ The audit found correctness issues which should not be hidden inside this alread
 change:
 
 - A command or tool may finish after its interrupted turn was appended. The late event has no
-  durable coverage, so reconnect after disconnection can show it as running. **This is now M15**:
+  durable coverage, so reconnect after disconnection can show it as running. **This is now M14**:
   the per-turn payload format admits the amendment without a format bump, and what remains is the
   durable clock, recovery path, and reconnect rule.
 - A turn whose payload is unreadable is dropped from the returned history with an `error!` log and
@@ -1135,12 +1135,13 @@ Most of that list now exists, built by other workstreams rather than by this pla
 component by component. `registry.rs` became one in the event-pipeline work
 (`registry/{admission,driver,event_forwarder,project,thread}.rs`). S10 split `ws.rs` out of
 `routes.rs`, which is the WebSocket half of the fourth line; `hub.rs` and `delivery.rs` hold the
-rest, and the class-aware outbox is still M14's. `thread_bootstrap.rs` is the one line with nothing
-behind it yet, and M11 and M13 are what would build it.
+rest, and the class-aware outbox is still M13's. `thread_bootstrap.rs` is the one line with nothing
+behind it yet, and M10 and M12 are what would build it.
 
 `registry.rs` remains harness/process orchestration. What remains for this plan is the last of the
 three independent applications of every agent event: the forwarder's item fold. M8 does not remove
-it — it adds a derived read so M9 needs no second fold — and collapsing the two is the named
+it — it adds a derived read so its endpoint needs no second fold — and collapsing the two is the
+named
 follow-up under that milestone. `AppState` should not expose raw live-buffer/task stores once
 routes can use narrow registry and bootstrap interfaces.
 
@@ -1162,12 +1163,13 @@ behind it; say so in the problem section rather than proceeding as though the ca
 **Dependencies.** M1 depends on nothing. M3 and M4 need M2's runtime registry — M3 for the
 lifecycle state that replaces its own guard, M4 for the active diff authority. M5 reuses M4's lazy
 content boundary and M2's apply boundary. M6 applies the same addressable-content pattern to
-completed tool output. M7 removes output from the task projection. M8 gives the in-flight turn a
-typed per-item read, and M9 consumes it. M10 and M11 are independent of each other and of M12.
-M12's inventory is smaller if M9 has landed, because a previewable field no longer has to be
-accepted inline. M13 needs M11's cut and M12's classified inventory before journal byte accounting
-is meaningful, and needs M10's generations if it builds the transaction. M14 needs M12's outbox
-measurements to choose its policy. M15 reuses M5/M6 normalization and needs M13's journal coverage
+completed tool output. M7 removes output from the task projection. M8 serves items by identity
+and derives its in-flight read from the live buffer. M9 and M10 are independent of each other and
+of M11.
+M11's inventory is smaller if M8 has landed, because a previewable field no longer has to be
+accepted inline. M12 needs M10's cut and M11's classified inventory before journal byte accounting
+is meaningful, and needs M9's generations if it builds the transaction. M13 needs M11's outbox
+measurements to choose its policy. M14 reuses M5/M6 normalization and needs M12's journal coverage
 token. Anything not listed here is ordering preference, not a constraint.
 
 **New behaviour lands after the primitive it depends on, never beside it.** M3 is the worked example:
@@ -1198,7 +1200,7 @@ requested page count; correlate or abort in-flight fetches when the active threa
 
 Pagination is a request/response with no ordering relationship to live state, so it does not belong
 in the ordered lane, where it competes for outbox capacity and would need a subscription generation.
-Moving it out also shrinks what M13 has to reason about.
+Moving it out also shrinks what M12 has to reason about.
 
 **Non-goals.** The bootstrap transaction. Bounded reads — `load_history` already serves whole turns
 and is sufficient here; the bounded reads land with the bootstrap that needs them.
@@ -1206,14 +1208,14 @@ and is sufficient here; the bounded reads land with the bootstrap that needs the
 **Expected outcome.** Two protocol variants are gone. Pagination cannot be confused with bootstrap
 history. Switching threads mid-fetch cannot apply the previous thread's page.
 
-**Transitional handoff to M11 and M13.** M1 moves only older-page pagination to HTTP. Until M13
+**Transitional handoff to M10 and M12.** M1 moves only older-page pagination to HTTP. Until M12
 replaces the
 implicit bootstrap state machine, fresh subscriptions and stale-cursor recovery continue to carry
 their bounded initial history as a bootstrap-only reset `HistoryDelta`; this is not a pagination
 response. The server still obtains that history and the live snapshot through sequential reads, so
 they do not form a transactional cut. M1 deliberately preserves that pre-existing limitation rather
-than introducing a second independent HTTP/WebSocket race. M11 makes those reads a consistent cut;
-M13 owns closing the rest with the journal watermark, ordered suffix, and exactly-once apply.
+than introducing a second independent HTTP/WebSocket race. M10 makes those reads a consistent cut;
+M12 owns closing the rest with the journal watermark, ordered suffix, and exactly-once apply.
 
 ---
 
@@ -1243,8 +1245,8 @@ and
 browser request map. Replace additive activity state with the replacement overview.
 
 **Non-goals.** Lazy diff delivery (M4). Lazy completed-command output (M5). Lazy completed tool
-output (M6). Task-projection ownership (M7). The content inventory (M12). The event journal and
-bootstrap transaction (M13). Durable amendments and amendment-write recovery (M15). Changes to
+output (M6). Task-projection ownership (M7). The content inventory (M11). The event journal and
+bootstrap transaction (M12). Durable amendments and amendment-write recovery (M14). Changes to
 `giskard-persist` — **this milestone must
 not touch that crate**; if it appears to need to, that is the signal to stop.
 
@@ -1275,7 +1277,7 @@ is untouched.
 
 Most of this milestone is harness-side and independent: `ThreadUpdateSink`, the Codex resume
 mapping, pending replay observation without a time-based deadline, and the mapper's active-turn
-gate that keeps replayed usage out of turn ledgers. Those live in crates M2 and M13 never touch.
+gate that keeps replayed usage out of turn ledgers. Those live in crates M2 and M12 never touch.
 
 The exception is the staleness guard. On the abandoned branch it was a bespoke generation/commit
 counter in `registry.rs`, hooked into `start_turn`, `compact_thread`, `forget_thread`,
@@ -1373,7 +1375,7 @@ resolve through either authority but must return the same identified content. If
 has replaced the requested `diff_id`, return a conflict carrying the current descriptor; do not
 retain an unbounded version cache. The browser retries only while the same thread/turn remains
 selected and the current descriptor still advertises that identity. A per-request selection token
-rejects late responses; M10 later adds subscription-generation gating. The endpoint reads captured
+rejects late responses; M9 later adds subscription-generation gating. The endpoint reads captured
 agent output and must not recompute a workspace Git diff whose answer may already have changed.
 
 **Non-goals.** Retention policy for command, tool, text, or reasoning content. The journal,
@@ -1391,7 +1393,7 @@ the explicit conflict above. Workspace Git diff continues to use its existing HT
 
 **Status:** complete. Completed command output is carried as an 8 KiB tail descriptor and fetched
 in full from its own endpoint; the durable limit is configurable, and the late-completion exception
-remains as documented until M15.
+remains as documented until M14.
 
 **Problem.** Completed command output was streamed incrementally and then sent again in full —
 embedded in `ItemCompleted`, in reconnect history, in ordinary history pages, and in every
@@ -1474,7 +1476,7 @@ Closing the overlay releases fetched content.
 A terminal completion received after its turn was already persisted is still normalized before
 wire publication, but M5 does not amend the payload or advertise lazy availability. A browser which
 observed the running stream may keep its local accumulation for that session; reconnect has only the
-bounded preview. Log the deferred durable update explicitly. M15 makes this case persisted and lazy.
+bounded preview. Log the deferred durable update explicitly. M14 makes this case persisted and lazy.
 
 **Non-goals.** Tool input/output/metadata. A generic item-content abstraction. Any change to agent,
 reasoning, user, approval, activity, or sub-agent content. Running-output retrieval. The journal,
@@ -1485,7 +1487,7 @@ limit and truncation is explicit; legacy output remains unmigrated but its wire 
 bounded. Running commands behave exactly as before. Every completed command projection carries only
 the 8 KiB tail-oriented descriptor. Normal completion has byte-identical runtime and persisted
 endpoint reads; the documented post-persistence late-completion exception advertises no lazy body
-until M15. Old format-1 turns work without migration, and the browser retains completed output only
+until M14. Old format-1 turns work without migration, and the browser retains completed output only
 while its overlay is open or while preserving the late-completion exception's already-observed
 stream.
 
@@ -1566,12 +1568,12 @@ completion arrives and is never substituted for missing output.
 
 A terminal tool completion received after its turn was already persisted remains ignored in M6,
 as it is today: no descriptor or endpoint availability is advertised, and the drop is logged with
-thread, turn, and item identity. M15 extends durable late-item amendments to this case.
+thread, turn, and item identity. M14 extends durable late-item amendments to this case.
 
 Keep persisted JSON complete in M6. There is no durable tool-output limit, truncation marker,
 payload format bump, or migration in this milestone. Durable JSON retention is a distinct policy
 decision: byte-slicing would corrupt JSON, and replacing subtrees would invent a semantic projection
-format. M12 may record the output as already addressable when auditing remaining content bounds;
+format. M11 may record the output as already addressable when auditing remaining content bounds;
 it must not silently truncate it.
 
 **Deferred global thread-identity invariant.** Runtime entries and all of their primitives are keyed
@@ -1595,7 +1597,7 @@ output descriptor but not its JSON value. Every advertised output remains retrie
 active to persisted race and `PersistenceBlocked`; absent and running output is not advertised. The
 overlay fetches and releases valid JSON on demand, while live progress behavior and every non-output
 tool field remain unchanged. The documented post-persistence late-completion exception advertises
-nothing until M15.
+nothing until M14.
 
 ---
 
@@ -1630,7 +1632,7 @@ Live ordered events continue to supply all command output observed by an uninter
 `LiveTurnSnapshot` remains the active-turn reconnect authority and retains its existing bounded
 command-output projection. If a command outlives its persisted turn, output emitted after that turn
 was appended but before a browser reconnects is not recoverable: the row resumes from persisted
-content plus newly observed deltas and does not imply that the interval is complete. M15 closes
+content plus newly observed deltas and does not imply that the interval is complete. M14 closes
 this late-completion durability gap. Completed command output remains lazily retrievable through
 M5's endpoint. M7 changes neither durable content nor either output policy.
 
@@ -1646,115 +1648,9 @@ controls retain their existing routing and lifecycle behavior.
 
 ---
 
-### M8 — Live item read
+### M8 — Item endpoint
 
-**Problem.** M9 needs to answer "what is item X of the turn running right now." Today no component
-answers that, and the reason is narrower than earlier drafts of this milestone claimed — narrow
-enough that the fix is a read, not a refactor.
-
-*What already works, contrary to what this milestone used to say.* The runtime does receive the
-in-flight turn's item lifecycle. Every owned event is applied through the forwarder
-(`event_forwarder.rs:1607`) and appended to `LiveTurnState` through `append_with_outputs`
-(`thread_runtime/live.rs:133`, called at `thread_runtime.rs:805`), including `ItemStarted` and
-`ItemCompleted`. `LiveTurnState::item_events(thread, item_id)` (`thread_runtime/live.rs:245`)
-already returns one item's lifecycle events, `live_item_events` (`thread_runtime.rs:558`) already
-exposes it, and `registry.rs:1766` already uses it to resolve a sub-agent link by item id, folding
-the events newest-first at the call site. **An item is reachable.** Earlier text here asserted the
-opposite; that was wrong.
-
-*What is actually missing.* Two things, both small:
-
-- **A fold into one value.** `item_events` hands back a `Vec<AgentEvent>` and every caller folds it
-  itself. One caller exists today and it folds inline. A second caller — M9's endpoint — would
-  write the same fold again, with the same chance of getting the precedence wrong.
-- **A type that can say "started" without lying.** `AgentEvent::ItemStarted` carries `ItemStart`
-  (`item.rs:46`), not `Item`: an id, a harness id, a kind, and optionally `CommandExecutionStart`
-  or `ToolCallStart`. `Item` is the persisted shape, and its payloads have required fields that do
-  not exist at start — `CommandExecution.output`, `AgentMessage.text`, `Reasoning.text`,
-  `UserMessage.text`, `FileChange.path` (`item.rs:161`). Lifting a start into an `Item` means
-  fabricating those values or making them optional in the persisted shape. Both are the kind of
-  lie *Bounded, addressable, truncated* exists to forbid. A running item is a different thing from
-  a completed one and the type must say so.
-
-*What `ItemOutputState` is, since this milestone used to misdescribe it.* It is not a workaround
-for unreachable items and M9 does not retire it. It exists because the live buffer deliberately
-strips what it holds: a completed tool call's `output` is set to `None` and a completed command's
-output is replaced by an empty descriptor before the event is stored
-(`thread_runtime/live.rs:155-190`, inside `append_with_outputs`), because that content is hashed,
-versioned and served by its own routes. `ItemOutputState` is the authority for exactly that
-stripped content, off the wire and off the reactor. It survives M8 and M9 unchanged.
-
-**Proposed change.** One type and one read. No stored projection, no new component.
-
-```rust
-enum LiveItem { Started(ItemStart), Completed(Item) }
-```
-
-in `giskard-server` — not `giskard-core`. Nothing persisted and nothing on the wire changes.
-
-*The read.* `live_item(thread, turn, item_id) -> Option<LiveItem>` on `ThreadRuntimeSupport` and
-`ResolvedThreadRuntime`, computed on demand from `LiveTurnState::item_events`: the last
-`ItemCompleted` for that id wins, otherwise the `ItemStarted`, otherwise `None`. It is the fold
-`registry.rs:1766` writes by hand, named once and given a type. No component on
-`ThreadRuntimeEntry`, no new lifetime class, no cleanup site, no doc-comment change, no
-`ENTITY-AUTHORITY-*` annotation, nothing new to clear at settle.
-
-*What `Completed` carries, stated so no caller is surprised.* The `Item` as the live buffer holds
-it — tool `output` is `None` and command output is an empty descriptor, per the stripping above.
-That is what M9 wants: its response excludes output on representation grounds and carries
-descriptors instead, which it reads from `ItemOutputState` and the turn's descriptor maps. A caller
-wanting a body follows the route that already serves it.
-
-*Deltas stay out.* `ItemDelta::Text` and `ItemDelta::CommandOutput` (`item.rs:368`) are stream
-state, not item state. They live in the live buffer for replay — command output compacted head and
-tail past 16 KiB (`compact_command_output_deltas`, `thread_runtime/live.rs:469`) — and are folded
-only by the browser (`app.js:6038`, `:7402`, `:7443`). No server component accumulates a running
-item's output, and at completion the harness sends the whole item anyway. `LiveItem::Started`
-carries exactly what the start carried. If a later caller genuinely needs "what has streamed so
-far" by id, it is derivable from the same scan and can be added to this read without a stored
-accumulator. Not in M8, and not in M9.
-
-*Dispositions are already correct, and the plan should say so.* Only owned events reach the live
-buffer: `apply_late` (`event_forwarder.rs:1396`) applies an already-persisted turn's event with
-`append_live: false` (`:1413`) and then removes the command output it applied (`:1421`). Turnless
-events do not enter either. So the read needs no disposition rules of its own — it sees the owned
-turn and nothing else. This is a property worth stating because a *stored* projection fed from
-`apply_prepared_event` would not have it: it would take the same late insert with no cleanup.
-
-*Cost.* One scan of the turn's event buffer per lookup. The reconnect snapshot
-(`thread_runtime/live.rs:260`) already clones that entire buffer for every reconnecting client, so
-a filtered scan per item lookup is not the expensive thing in this file. Roughly forty lines plus
-tests.
-
-**Non-goals.** A stored fold on `ThreadRuntimeEntry` — see the follow-up below. Moving or changing
-`ForwardedTurnState.items`: the forwarder keeps folding for persistence exactly as it does today.
-Changing `LiveTurnState.events`, the reconnect snapshot, `ItemOutputState`, or the forwarder's
-persistence path. Making `Item` fields optional, or lifting `ItemStart` into `Item` by any route.
-Folding deltas into `LiveItem`. Any HTTP endpoint, any wire change, any change to
-`giskard-persist`.
-
-**Expected outcome.** **Nothing a user can see changes.** No wire message, no rendered row, no new
-fetchable content: that is the criterion, not a caveat, and anything visible means the milestone
-over-reached into M9. `live_item` answers for any item of the in-flight turn from the moment its
-`ItemStarted` was applied — `Started` while it runs, `Completed` once it completed — and the
-sub-agent link resolution in `registry.rs` can be expressed through the same fold rather than its
-own. Persisted turns are byte-identical. No new component on `ThreadRuntimeEntry`, no new lifetime
-class, no new cleanup site. `CurrentTurnItems` is untouched.
-
-*Named follow-up, deliberately not scheduled: the stored fold.* If profiling ever shows item
-lookups matter, or a second reader of the in-flight item list appears, move `CurrentTurnItems`
-from `ForwardedTurnState` into `ThreadRuntimeEntry` as a component, fold it on `ItemStarted` and
-`ItemCompleted` in `apply_event_locked`, have `complete_forwarded_turn` take its items from the
-runtime as it already takes captured diffs (`captured_diff_records`, `event_forwarder.rs:2055`),
-clear it in `settle_completed_turn`, and make `live_item` an index lookup. Same type, same
-signature, same callers — the derived read is what that change would build on. Note what this
-retires: an earlier draft of this milestone argued that a persistence read-back would be "a
-behavioural change to the persistence path" and therefore unverifiable. `captured_diff_records` is
-that read-back, on the same lock, today. The argument was wrong and the precedent is the reason.
-
----
-
-### M9 — Item endpoint
+Implementation plan: [`m8-item-endpoint.md`](thread-state-and-bootstrap-reconciliation-plan/m8-item-endpoint.md).
 
 **Problem.** Every wire message must carry an item's fields whole, because there is nowhere else a
 client can get one. Three lazy routes already hang off an item, and a fourth off its turn:
@@ -1775,7 +1671,7 @@ nothing to expand to.
 
 One field is already paying for it. `AgentMessage.text` and `Reasoning.text` both cross the wire
 whole in every history page and every bootstrap baseline, and no milestone bounds either — M4 and
-M5 listed reasoning text as a non-goal, and M12 classifies both *accepted inline* on the strength
+M5 listed reasoning text as a non-goal, and M11 classifies both *accepted inline* on the strength
 of being small in practice, which a reasoning trace breaks by construction.
 
 **Proposed change.** Serve
@@ -1784,8 +1680,8 @@ of being small in practice, which a reasoning trace breaks by construction.
 has no frame limit and does not compete for outbox capacity, so returning references here would
 turn one round trip into several for content the caller already asked for.
 
-*The body is tagged, because a running item is not a completed one.* M8's `LiveItem` has two
-states and the response carries the distinction rather than flattening it:
+*The body is tagged, because a running item is not a completed one.* The `LiveItem` read below
+has two states and the response carries the distinction rather than flattening it:
 
 ```text
 {"state": "started",   "item": <ItemStart>}
@@ -1795,7 +1691,8 @@ states and the response carries the distinction rather than flattening it:
 A client asking for a running item receives exactly the object it already received on the wire at
 `ItemStarted`. Say so in `docs/api-endpoints.md`, so no client expects `output`, `exit_code` or
 `duration_ms` on a started one: those fields do not exist yet, and inventing them — or making them
-optional on the persisted `Item` so one type could serve both — is the fabrication M8 refuses.
+optional on the persisted `Item` so one type could serve both — is the fabrication this
+milestone refuses.
 
 *What is excluded, and why it is not about size.* Command output has its own representation
 (`text/plain; charset=utf-8` with the `X-Giskard-Output-*` headers), tool output is exactly
@@ -1805,11 +1702,82 @@ their **descriptors** — `diff_id`, the command and tool output descriptors —
 body follows to the route that already serves it.
 
 *Resolution mirrors M5 and M6 exactly.* Validate project/thread/turn/item containment before
-lookup. Resolve an active turn from the runtime through M8's `live_item`, then fall back to a
+lookup. Resolve an active turn from the runtime through `live_item` (below), then fall back to a
 targeted read of that item in the selected immutable turn payload; never scan turns. Return the
-same 404 for an unknown item, a cross-container identity, or an item not yet available. M8 stores
-nothing for this: `live_item` derives its answer from the live buffer's own lifecycle events, so
+same 404 for an unknown item, a cross-container identity, or an item not yet available. Nothing
+is stored for this: `live_item` derives its answer from the live buffer's own lifecycle events, so
 this endpoint depends on a read, not on a projection anyone has to keep in step.
+
+*Resolving an in-flight item: the `LiveItem` read.* The runtime already receives the in-flight
+turn's item lifecycle. Every owned event is applied through the forwarder
+(`event_forwarder.rs:1607`) and appended to `LiveTurnState` through `append_with_outputs`
+(`thread_runtime/live.rs:133`, called at `thread_runtime.rs:805`), including `ItemStarted` and
+`ItemCompleted`. `LiveTurnState::item_events(thread, item_id)` (`thread_runtime/live.rs:245`)
+already returns one item's lifecycle events, `live_item_events` (`thread_runtime.rs:558`) already
+exposes it, and `registry.rs:1766` already uses it to resolve a sub-agent link by item id. An item
+is reachable; earlier drafts of this plan asserted the opposite, and that was wrong. What is
+missing is small: a fold into one value, and a type that can say "started" without lying.
+`AgentEvent::ItemStarted` carries `ItemStart` (`item.rs:46`), not `Item` — an id, a harness id, a
+kind, and optionally `CommandExecutionStart` or `ToolCallStart` — and `Item`'s payloads have
+required fields that do not exist at start (`CommandExecution.output`, `AgentMessage.text`,
+`Reasoning.text`, `UserMessage.text`, `FileChange.path`; `item.rs:161`). Lifting a start into an
+`Item` means fabricating those values or making them optional in the persisted shape, which is the
+kind of lie *Bounded, addressable, truncated* exists to forbid. So the read is one type, in
+`giskard-server` and not in `giskard-core`, with no stored projection and no new component:
+
+```rust
+enum LiveItem {
+    Started(ItemStart),
+    Completed {
+        item: Item,
+        command_output: Option<CommandOutputDescriptor>,
+        tool_output: Option<WireToolOutput>,
+    },
+}
+```
+
+`live_item(thread, turn, item_id) -> Option<LiveItem>` on `ThreadRuntimeSupport` and
+`ResolvedThreadRuntime` is computed on demand from the live buffer: the last `ItemCompleted` for
+that id wins, otherwise the `ItemStarted`, otherwise `None`; a turn id other than the live turn's is
+`None`. `Completed` carries the `Item` as the buffer holds it — tool `output` is `None` and command
+output is replaced by the descriptor preview, because that content is hashed, versioned and served
+by its own routes (`thread_runtime/live.rs:155-190`) — together with the two descriptors from the
+live turn's own maps (`command_output_descriptors`, `tool_output_descriptors`). Those three fields
+are exactly the arguments of `WireItem::from_item_with_outputs` (`wire.rs:494`), the conversion
+the reconnect snapshot already uses, so the endpoint's completed branch is one call and never
+re-derives a descriptor. No component on `ThreadRuntimeEntry`, no new lifetime class, no cleanup
+site, no doc-comment change, no `ENTITY-AUTHORITY-*` annotation, nothing new to clear at settle.
+
+*What `ItemOutputState` is, since earlier drafts misdescribed it.* It is not a workaround for
+unreachable items and this milestone does not retire it. It exists because the live buffer
+deliberately strips what it holds, and it is the authority for exactly that stripped content, off
+the wire and off the reactor. It survives this milestone unchanged.
+
+*Deltas stay out.* `ItemDelta::Text` and `ItemDelta::CommandOutput` (`item.rs:368`) are stream
+state, not item state. They live in the live buffer for replay — command output compacted head and
+tail past 16 KiB (`compact_command_output_deltas`, `thread_runtime/live.rs:469`) — and are folded
+only by the browser (`app.js:6038`, `:7402`, `:7443`). No server component accumulates a running
+item's output, and at completion the harness sends the whole item anyway. `LiveItem::Started`
+carries exactly what the start carried. If a later caller genuinely needs "what has streamed so
+far" by id, it is derivable from the same scan and can be added to the read without a stored
+accumulator. Not here.
+
+*Dispositions are already correct.* Only owned events reach the live buffer: `apply_late`
+(`event_forwarder.rs:1396`) applies an already-persisted turn's event with `append_live: false`
+(`:1413`) and then removes the command output it applied (`:1421`); turnless events do not enter
+either. The read therefore sees the owned turn and nothing else, and needs no disposition rules of
+its own. A *stored* projection fed from `apply_prepared_event` would not have this property.
+
+*The sub-agent link fold stays where it is.* `registry.rs:1766` walks the same events newest-first
+but stops at the newest event that carries sub-agent information, which `ItemCompleted` may lack
+while `ItemStarted` has it. That is a different precedence from "last lifecycle event wins", so
+it is not a consumer of `live_item` and is not touched.
+
+*Cost.* One reverse walk of the turn's event buffer per lookup, stopping at the first event for the
+id, and one clone of that event. The reconnect snapshot (`thread_runtime/live.rs:262`) already
+clones and converts the entire buffer for every reconnecting client, so a filtered walk per item
+lookup is not the expensive thing in this file, and the lookup is user-driven: one per expand or
+open, never polled.
 
 *Serve an item from the moment it starts, not from when it completes.* Restricting this to
 completed items would defeat the milestone: `CommandExecutionStart.command` and `ToolCallStart`'s
@@ -1857,7 +1825,7 @@ cases separate on what the reader does with each. An agent message is the transc
 content: it is rendered expanded, it is what someone scrolled back to read, and a preview would
 put an expand button on the thing they came for while saving bytes they were about to fetch
 anyway. A reasoning note is collapsed by default and mostly never opened, so its bytes are paid on
-every page and read on almost none. Agent text stays *accepted inline*, and M12's measurements —
+every page and read on almost none. Agent text stays *accepted inline*, and M11's measurements —
 not this milestone — decide whether that holds.
 
 Four constraints the implementation must respect:
@@ -1885,19 +1853,24 @@ Four constraints the implementation must respect:
 default-collapsed behaviour and its remembered per-row choice — the presentation half is done and
 this milestone must not redo it. What it does not do is fetch: collapsing hides the body while
 leaving the full text in the DOM, so expanding costs no round trip today. The transport half is
-therefore the whole of M9's work here — expanding a row whose body is a prefix fetches the item
+therefore the whole of M8's work here — expanding a row whose body is a prefix fetches the item
 from this endpoint, renders the full note, and thereafter behaves exactly like a row that never
 was truncated, including its copy button. A row that already holds the full text must not fetch.
 
 *What else it unlocks, deliberately not built here.* The same shape makes previewing
-`ToolCall.input`, `.metadata` and `CommandExecution.command` viable, and lets M12's inventory carry
-fewer accepted-inline assumptions. Those wait for M12's measurements to say whether they are worth
+`ToolCall.input`, `.metadata` and `CommandExecution.command` viable, and lets M11's inventory carry
+fewer accepted-inline assumptions. Those wait for M11's measurements to say whether they are worth
 it.
 
-**Non-goals.** A generic field-addressing framework — this is one resource with one URL, and M6's
+**Non-goals.** A stored item projection on `ThreadRuntimeEntry` — see the named follow-up at the
+end of this milestone. Moving or changing `ForwardedTurnState.items`: the forwarder keeps folding
+for persistence exactly as it does today. Changing `LiveTurnState.events`, the reconnect snapshot,
+`ItemOutputState`, or the forwarder's persistence path. Making `Item` fields optional, or lifting
+`ItemStart` into `Item` by any route. Folding deltas into `LiveItem`. A generic field-addressing
+framework — this is one resource with one URL, and M6's
 non-goal against a generic item-content abstraction still stands. Previewing any field other than
 reasoning text: `AgentMessage.text`, `ToolCall.input`, `.metadata` and `CommandExecution.command`
-all wait for M12's measurements. Re-doing the collapsed reasoning row: its toggle, summary line,
+all wait for M11's measurements. Re-doing the collapsed reasoning row: its toggle, summary line,
 default state and remembered choice landed in `6c1fd2f` and are not in scope. Any change to live
 delta streaming. Caching, `ETag`, or conditional requests. Running command output or tool progress
 — those stay on their own routes and the live stream. Durable truncation: the persisted text is
@@ -1910,7 +1883,11 @@ carries exactly what its `ItemStart` carried — no fabricated `output`, `exit_c
 duplicates bytes already reachable at the output or diff URLs, and carries the descriptors needed
 to reach them. Containment and 404 behaviour match the two existing item routes exactly. An item
 with no `ItemStarted` is never synthesized, which `LiveItem` makes structural rather than a rule to
-remember. `docs/api-endpoints.md` documents both states.
+remember. `docs/api-endpoints.md` documents both states. Underneath, `live_item` answers for any
+item of the in-flight turn from the moment its `ItemStarted` was applied — `Started` while it
+runs, `Completed` once it completed — with no new component on `ThreadRuntimeEntry`, no new
+lifetime class and no new cleanup site; `CurrentTurnItems` is untouched and persisted turns are
+byte-identical.
 
 A completed turn carries a 1 KiB reasoning prefix that always includes the note's first non-blank
 line, plus byte and line counts; no collapsed row in history reads `"Thinking"` that did not read
@@ -1919,9 +1896,19 @@ button never yields a prefix without saying so. Agent text still crosses whole. 
 watched the turn live never sees its text shrink when the same turn returns from history. Persisted
 text is unchanged, and live delta streaming is unchanged.
 
+*Named follow-up, deliberately not scheduled: the stored fold.* If profiling ever shows item
+lookups matter, or a second reader of the in-flight item list appears, move `CurrentTurnItems`
+from `ForwardedTurnState` into `ThreadRuntimeEntry` as a component, fold it on `ItemStarted` and
+`ItemCompleted` in `apply_event_locked`, have `complete_forwarded_turn` take its items from the
+runtime as it already takes captured diffs (`captured_diff_records`, `event_forwarder.rs:2058`),
+clear it in `settle_completed_turn`, and make `live_item` an index lookup. Same type, same
+signature, same callers — the derived read is what that change would build on. An earlier draft
+argued that a persistence read-back would be "a behavioural change to the persistence path" and
+therefore unverifiable; `captured_diff_records` is that read-back, on the same lock, today.
+
 ---
 
-### M10 — Cancellable, generation-owned subscribe
+### M9 — Cancellable, generation-owned subscribe
 
 **Problem.** `handle_client_msg` awaits the whole subscribe inline. A bootstrap in flight cannot be
 stopped, and the server has no identity for "which subscribe attempt is this", so a late message
@@ -1945,7 +1932,7 @@ cancels the in-flight task and drops its unsent output. Stamp bootstrap-phase me
 generation so a stale one is rejected where it is received. The message set and its ordering are
 unchanged.
 
-**Non-goals.** The transaction envelope and the journal (M13). The consistent cut (M11). Changing
+**Non-goals.** The transaction envelope and the journal (M12). The consistent cut (M10). Changing
 which messages a bootstrap sends. Removing the browser phase flags.
 
 **Expected outcome.** Switching threads mid-bootstrap produces no further messages for the
@@ -1955,7 +1942,7 @@ history and live-snapshot reads.
 
 ---
 
-### M11 — Consistent bootstrap cut
+### M10 — Consistent bootstrap cut
 
 **Problem.** Subscribe reads three times at three different instants: `recompute_aggregates` for
 metadata, `load_turns_after` or `load_history` for history, and `live_snapshot` for the in-flight
@@ -1990,19 +1977,19 @@ pair is a cut rather than two reads. Record the cut's watermark so a later miles
 changes.
 
 **Non-goals.** The transaction envelope, exactly-once delivery, and removing the browser phase
-flags (all M13). The browser journal. The outbox. Changing which events `LiveTurnState` coalesces,
+flags (all M12). The browser journal. The outbox. Changing which events `LiveTurnState` coalesces,
 or adding a new coalescing rule — the cut must accommodate the existing ones, not extend them.
 
 **Expected outcome.** The history baseline and live snapshot from one subscribe describe the same
 instant. A turn completing during bootstrap lands in the history baseline or as an ordered event
 after the cut, never in an indeterminate mixture of both. The watermark states what the snapshot
 represents, and stays correct for events the live buffer coalesces rather than replays. The store
-exposes the consistent reads M13 consumes. Browser dedupe is unchanged and still present — M13 is
+exposes the consistent reads M12 consumes. Browser dedupe is unchanged and still present — M12 is
 what removes it.
 
 ---
 
-### M12 — Content inventory and outbox instrumentation
+### M11 — Content inventory and outbox instrumentation
 
 **Problem.** This milestone previously proposed defining "maximum encoded-event admission" — a
 ceiling on how large a single event may be. That was the wrong instrument, for three reasons.
@@ -2058,8 +2045,8 @@ is introduced.
 bounded, addressable, truncated, or accepted inline per *Bounded, addressable, truncated*. Record
 the measurement behind each accepted-inline entry against the current corpus — the byte
 distribution actually observed, not an assertion. Reasoning text is no longer a candidate for that
-list: M9 previews it in completed turns, so it is *addressable*. Agent text still is one, and it
-is the entry whose measurement matters most — M9 left it inline on a reader-behaviour argument,
+list: M8 previews it in completed turns, so it is *addressable*. Agent text still is one, and it
+is the entry whose measurement matters most — M8 left it inline on a reader-behaviour argument,
 and this is where that argument is either confirmed by the corpus or overturned. The same question
 stands for `ToolCall.input`, `.metadata` and `CommandExecution.command`. Land the table with a
 test that fails when a wire field is added without a classification, so drift is caught where it
@@ -2068,14 +2055,14 @@ is introduced rather than by a constant nobody maintains.
 *Outbox instrumentation.* Give the outbox a total byte and entry budget, and log the sequence range
 and byte counts whenever it *would* have overflowed. Instrumentation only: no eviction, rejection
 or resync behaviour changes here. This is queue capacity, which is a different question from
-message size, and it is what lets M14 choose a policy from observation instead of assumption.
+message size, and it is what lets M13 choose a policy from observation instead of assumption.
 
 **Non-goals.** Any per-message size ceiling — the socket already has one and this milestone
 deliberately does not add a second. Command and tool output, owned by M5 and M6. Making
 `ToolCall.input`, `ToolCall.metadata` or `CommandExecution.command` addressable: they render
 inline, and the inventory records why. Capping `FileChange.changes`: a file list whose completeness
 is its meaning is never truncated, and with no frame ceiling there is no "does not fit" case to
-answer. A second UTF-8 truncation algorithm. Any eviction, resync or connection policy — M14
+answer. A second UTF-8 truncation algorithm. Any eviction, resync or connection policy — M13
 decides those from this milestone's data.
 
 **Expected outcome.** Every wire field is classified, each accepted-inline entry cites the
@@ -2085,7 +2072,7 @@ real would-have-overflowed count from real use. No new size constant exists.
 
 ---
 
-### M13 — Journal and exactly-once bootstrap transaction
+### M12 — Journal and exactly-once bootstrap transaction
 
 **The largest remaining milestone. Watch it — and check it is still needed.**
 
@@ -2101,7 +2088,7 @@ rendered-id sets exist only to absorb the resulting duplication.
 **Re-scope before starting.** The original case for this milestone was byte-chunking: a single turn
 record could be arbitrarily large, so the bootstrap base64-chunked it. M4, M5, M6 and M7 removed
 that entirely — diffs, command output and tool output are addressable, task output is gone, and M1
-moved pagination off the socket. M10 and M11 remove two of the three remaining justifications.
+moved pagination off the socket. M9 and M10 remove two of the three remaining justifications.
 
 So the first deliverable is a measurement, not a formality: with a cancellable generation-owned
 subscribe and a consistent cut in place, determine whether the phase flags can be deleted without a
@@ -2123,17 +2110,17 @@ element large enough to be worth deferring uses a bounded descriptor and lazy re
 no generic byte-fragment fallback. Bound both individual encoded messages and total staged
 bytes/items, and fail the transaction explicitly rather than partially applying or hiding items.
 
-**Non-goals.** The class-aware outbox (M14). Amendments (M15). Generic base64 or byte-sliced
+**Non-goals.** The class-aware outbox (M13). Amendments (M14). Generic base64 or byte-sliced
 application messages. Any protocol work not justified by the measurement above.
 
 **Expected outcome.** An `ItemDelta` before or after the live cut appears exactly once. A cancelled
 or failed bootstrap applies nothing. The four browser phase flags are gone and one apply path
 remains. If the envelope was not built, the same flag count is reached without it and this outcome
-is met by M10, M11 and the journal alone.
+is met by M9, M10 and the journal alone.
 
 ---
 
-### M14 — Class-aware outbox
+### M13 — Class-aware outbox
 
 **Problem.** Producers and socket capacity are not separated by an explicit policy. Persistence,
 harness and forwarder producers must never await a slow client, and the outbox must be finite, but
@@ -2148,7 +2135,7 @@ nothing downstream can detect.
 **Proposed change.** The connection-owned delivery pump with per-class admission, coalescing
 replacement state, and a control reserve. Producers never await socket capacity.
 
-Decide the ordered-lane overflow policy from M12's measurements, not in advance. If the
+Decide the ordered-lane overflow policy from M11's measurements, not in advance. If the
 would-have-overflowed log never fired in real use, the answer is to close the connection and let
 the existing reconnect path rebuild — one line of policy, and for one user rebuilding one
 connection's view costs almost nothing. Only if it fired, and the cause was a genuine stall rather
@@ -2157,7 +2144,7 @@ deltas it replaces, so it cannot help a client that is simply too slow, and ship
 premise would add a state machine for a failure mode nobody observed.
 
 **Non-goals.** Anything inside the bootstrap transaction beyond the resync entry point, if one is
-built at all. The content inventory and its one retention policy (M12).
+built at all. The content inventory and its one retention policy (M11).
 
 **Expected outcome.** Replacement state coalesces to the newest revision under pressure and no
 producer awaits socket capacity. The ordered-lane overflow policy is documented with the evidence
@@ -2166,7 +2153,7 @@ on the same socket while other traffic continues.
 
 ---
 
-### M15 — Late item completion (durable amendments)
+### M14 — Late item completion (durable amendments)
 
 **Problem.** A command or tool can finish after its interrupted turn was already appended. The late
 event has no durable coverage, so the persisted turn is wrong from the moment it is written until
@@ -2198,7 +2185,7 @@ every point in time, not merely after the amendment.
 
 ---
 
-### M16 — Cleanup and budget
+### M15 — Cleanup and budget
 
 **Problem.** A sequence of replacements leaves residue: superseded stores, protocol variants,
 browser flags, tests and documentation that no longer describe the system. Left in place they are
@@ -2206,7 +2193,7 @@ indistinguishable from live code to the next reader, and the complexity budget t
 itself cannot be honestly measured while they remain.
 
 **Proposed change.** Remove the obsolete stores, protocol variants, browser flags, tests and
-documentation left by M2–M15. Re-measure and report the complexity budget after cleanup. Run unit,
+documentation left by M2–M14. Re-measure and report the complexity budget after cleanup. Run unit,
 integration, browser E2E, formatting, lint, and the full workspace suite.
 
 **Expected outcome.** The measured protocol and browser counts meet the budget below.
@@ -2295,7 +2282,7 @@ integration, browser E2E, formatting, lint, and the full workspace suite.
   matches the current descriptor.
 - MCP progress `ItemDelta::Text` continues to render while running, does not advertise output
   availability, and is never treated as a fragment of the completed JSON result.
-- A post-persistence late tool completion is logged and advertises nothing in M6; M13 coverage
+- A post-persistence late tool completion is logged and advertises nothing in M6; M12 coverage
   proves that both late command and late tool completion eventually amend and republish durably.
 - Opening a completed tool fetches output lazily; abort on selection change or close, retry, reopen,
   close-time release, structured rendering, combined input/output copy and download, wrong content
@@ -2312,7 +2299,7 @@ integration, browser E2E, formatting, lint, and the full workspace suite.
   descriptors come from `ItemOutputState`. A late event applied with `append_live: false` and a
   turnless event both leave the read unchanged. Nothing is stored, so persisted turns are
   byte-identical and `settle_completed_turn` clears nothing new.
-- M9's item route resolves running and completed items alike, tagging the body `started` or
+- M8's item route resolves running and completed items alike, tagging the body `started` or
   `completed`, matches the two existing item routes' containment and 404 behavior, never scans
   turns, and returns descriptors — not bodies — for command output, tool output, and diffs. A
   started item carries only what its `ItemStart` carried, including the bare id/harness-id/kind
@@ -2324,7 +2311,7 @@ integration, browser E2E, formatting, lint, and the full workspace suite.
   fetches nothing; and the row copy button never yields a prefix silently. A browser that watched
   the turn live keeps the longer text when the turn returns from history. Live `ItemDelta::Text`,
   `AgentMessage.text`, and the persisted reasoning text are all unchanged.
-- M12's inventory classifies every wire field and a new one cannot reach the wire unclassified.
+- M11's inventory classifies every wire field and a new one cannot reach the wire unclassified.
   Accepted-inline fields cite the measurement behind them, and remain named assumptions rather than
   falsely asserted limits.
 
@@ -2432,8 +2419,8 @@ instruction below only bites if someone is looking, and a milestone that reports
 the trajectory visible while it is still cheap to change course.
 
 If a count moves away from its target and the milestone that lands next does not bring it back,
-stop and review the design rather than replacing the criterion with a qualitative claim. M13
-measures against the target when the unified bootstrap path lands; M16 re-measures the final state
+stop and review the design rather than replacing the criterion with a qualitative claim. M12
+measures against the target when the unified bootstrap path lands; M15 re-measures the final state
 after cleanup.
 
 ## Exit criteria
@@ -2445,7 +2432,7 @@ The work is complete only when:
 - bootstrap contains one explicit transaction and no arbitrary message FIFO;
 - every client-visible state class has a named authority, clock, and overflow behavior;
 - no slow client can block a turn forwarder;
-- the ordered-lane overflow policy is chosen from M12's measurements and documented with the
+- the ordered-lane overflow policy is chosen from M11's measurements and documented with the
   evidence that chose it, so no queue-full branch silently creates permanent client divergence;
 - one agent event is not independently reconciled by several overlapping client projections — met
   by M2 and M7 for tasks and activity; the forwarder's persistence fold and the live buffer remain
