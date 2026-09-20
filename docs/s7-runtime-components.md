@@ -426,15 +426,16 @@ mod tasks;
 pub(crate) use diffs::RuntimeDiffLookup;
 pub(crate) use gate::TurnReservation;
 pub(crate) use outputs::{
-    RuntimeCommandOutput, RuntimeCommandOutputLookup, RuntimeToolOutput, RuntimeToolOutputLookup,
-    command_output_version,
+    RuntimeCommandOutputLookup, RuntimeToolOutputLookup, command_output_version,
 };
 pub(crate) use requests::{RequestResolution, RuntimeRequestId};
 ```
 
 (Plus private `use` lines for what only `thread_runtime.rs` needs: `RequestLedger`,
 `RequestPayload`, `ClaimRejection`, `CommitRejection`, `CapturedDiffState`, `ItemOutputState`,
-`PreparedItemOutput`, `prepare_item_output`, `TurnGate`, `ActiveTurnOwner`.) Every import listed
+`PreparedItemOutput`, `prepare_item_output`, `TurnGate`, `ActiveTurnOwner`. `RuntimeCommandOutput`
+and `RuntimeToolOutput` are named nowhere outside the runtime, so they are not re-exported: an
+unused `pub(crate) use` fails `-D warnings`.) Every import listed
 under "Crate-facing names" in the ground truth then resolves unchanged; `routes.rs`,
 `event_forwarder.rs`, `services.rs`, `registry/thread.rs`, `tests/e2e_smoke.rs` are not edited
 except `event_forwarder.rs:4874`. Delete any `use` in `thread_runtime.rs` that only the moved
@@ -468,7 +469,7 @@ noted:
 | `:2344-2346` | locks the entry and asserts `entry.captured_diffs[&turn].contents.len() == 1` | `assert_eq!(runtime.captured_diff_records(&authority, turn).len(), 1);` — the existing public query; the two lock lines go |
 | `:2349-2470` | two pure diff tests | moved verbatim to `thread_runtime/diffs.rs` `mod tests` (they need `super::*`, `giskard_core`, `ThreadId`, `TurnId`, `ItemId`) |
 | `:2607-2612` | `state.current_by_slot.len() == 2`, `state.contents.len() == 2`, `drop(entry)` | `assert_eq!(lock_unpoison(&entry, ..).diffs.slot_count(turn), 2);` and `assert_eq!(runtime.captured_diff_records(&authority, turn).len(), 2);` |
-| `:3549-3560` | `entry.active_turn...persistence_blocked...0 == turn` | `assert_eq!(entry.gate.blocked_turn(), Some(turn));` |
+| `:3549-3560` | `entry.active_turn...persistence_blocked...0 == turn` | `assert_eq!(entry.gate.blocked_turn(), Some(turn.id));` (`turn` there is a `Turn`; the first cut of this row wrote `Some(turn)`) |
 | `:3657, :3663, :3693, :3699` | `.item_outputs.contains_key(&(turn, id))` | `.outputs.contains(turn, id)` |
 | `event_forwarder.rs:4874` | `Outbound::Request(responding.request_state)` | `Outbound::RuntimeEffects(responding.into())` |
 

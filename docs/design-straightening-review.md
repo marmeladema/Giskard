@@ -252,7 +252,8 @@ and method order instead; **B** no thread-close hook for per-thread-process adap
 the adapter already hears `delete_thread`, `set_thread_archived` and `shutdown`, and `retire_thread`
 is an idle question spec §4.7 already assigns to the adapter; **C** the `"Context compacted"` title
 convention becomes a typed marker in follow-up S11, not here, because it changes a persisted item
-shape; **D** the request-id uniqueness rule is written down, on the trait, on `respond_approval` and
+shape (S11 later found that no consumer needs the marker at all; see step 11 below); **D** the
+request-id uniqueness rule is written down, on the trait, on `respond_approval` and
 `respond_server_request`, and in the spec's `ApprovalId` sketch. The trait doc also states the two
 other contracts a multi-process adapter must meet: `subscribe` must answer for any handle the
 instance issued before the session has produced anything, and a stream ends per thread.
@@ -334,7 +335,19 @@ Each step is one PR that stands alone on `main`, mechanical first:
 | 8 | C2 `classify` / `apply` in the forwarder — **landed in S8** | structural, no behaviour change | ±250 |
 | 9 | C4 option 1, then option 2 if C6 wants it — **landed in S9** | API | −200 |
 | 10 | D file splits (`ws.rs`, codex modules; `app.js` deferred) — **landed in S10** | mechanical | 0 |
-| 11 | Typed notices and activities, the compaction marker first — **plan pending** | core + adapters | ±150 |
+| 11 | Retire the marker-only compaction machinery; the compaction activity becomes an ordinary activity — **landed in S11** ([`s11-compaction-marker.md`](s11-compaction-marker.md)) | deletion: Codex adapter, forwarder, `app.js`, spec | −200 |
+
+**Step 11 changed shape.** The typed-marker idea assumed the `"Context compacted"` activity is a
+lifecycle signal. Reading the code showed that every string match on that title (Codex adapter,
+forwarder, `app.js`) exists for spec CC4/CC5, the "marker-only" compaction shape of old Codex
+versions, and that the forwarder code which acted on it was removed in commit `9392310`; what is
+left only logs. `openai/codex` at the pinned tag `rust-v0.155.1` (and `main`) runs a manual
+compaction as an ordinary task: `turn/started`, a `contextCompaction` item, `turn/completed`; the
+deprecated `thread/compacted` notification is no longer sent. So S11 is a deletion, not a typing
+change; the broader question of typed notices and activities is a separate discussion that this
+case no longer motivates. Landed as planned in [`s11-compaction-marker.md`](s11-compaction-marker.md);
+implementation also removed the forwarder's `CurrentTurnItems::iter`, whose only caller was the
+deleted marker check.
 
 Steps 1–4 can be given to an agent today; each has a crisp exit (grep returns nothing, counter
 fields gone, one fake). Steps 7 and 8 need a plan document in the M-series style because they
