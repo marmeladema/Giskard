@@ -34,7 +34,20 @@ now inside `run_subscribe_bootstrap`.
   the "deferred durable command-output update" warning (`:1420-1428`), publishes the runtime
   effects and the transcript event to the hub (`:1440-1442`, `:1461-1470`), and for a tool item
   removes the tool output and warns "ignoring completed tool output for an already-persisted turn"
-  (`:1474-1489`). Connected clients therefore see the completion live; nothing durable changes.
+  (`:1474-1489`). Connected clients therefore see a late *command* completion live; nothing durable
+  changes. A late *tool* completion gets neither the runtime apply nor the transcript publish:
+  both are gated on `is_terminal_command_completion` (`:1409`, `:1449`), so the tool branch only
+  drops its output. Connected clients learn of a settled late tool only by reloading, which this
+  milestone does not change (see *Follow-ups*).
+- **What a persisted turn holds.** Only items delivered by `ItemCompleted` reach the payload:
+  `CurrentTurnItems` (`:299-348`) is fed by the `upsert` in the `ItemCompleted` arm (`:1811`) and
+  drained into the `Turn` at persistence (`:2043-2053`, `items: self.turn.items.take()`). An
+  item that has only had `ItemStarted` when the turn ends is therefore absent from the payload; a
+  command whose `ItemCompleted` carried a running status (`is_terminal_command_completion`,
+  `:245-256`, treats that as non-terminal) is present with that status. In the browser
+  `detachRunningCommands` (`app.js:6057-6064`) keeps a running command row on screen after its
+  turn completes, so a connected client still shows it; a reloading client renders the persisted
+  turn, in which the row is either absent or shows the frozen running state.
 - **Which turn a late completion belongs to.** The Codex mapper keys running commands by process
   id and resolves a completion to its turn through `native_turn_for_process`
   (`harness-codex/src/mapping.rs:245`, `:817`), so a completion arriving after `turn/completed`
@@ -112,17 +125,24 @@ now inside `run_subscribe_bootstrap`.
   a `\n` so the torn tail becomes its own line and the amendment its own; the torn tail is never
   truncated or repaired. No fsync, matching the index append. The payload is never rewritten, so
   the write costs the amendment's size whatever the turn holds.
-- **D2. The amendment record carries no index.** It is written as `{"kind":"item","item":…}` so
-  the reader keeps the slot the first record established (`history.rs:146-155`). `PayloadLine::Item`
-  gains `index: Option<usize>` with `skip_serializing_if` so existing lines are byte-identical.
+- **D2. The amendment record carries no index.** It is written as `{"kind":"item","item":…}`.
+  For an item already in the payload (a command persisted with a running status, or a
+  re-amendment) the reader keeps the slot the first record established (`history.rs:146-155`).
+  For an item absent from the payload, the common case since only `ItemCompleted` items are
+  persisted, the reader assigns `items.len()`, the end of the turn, which is where something that
+  settled last belongs. `PayloadLine::Item` gains `index: Option<usize>` with
+  `skip_serializing_if` so existing lines are byte-identical.
 - **D3. Index folds last-wins.** `parse_history_index` keeps the last record for a turn id and
   records the line position of that winning record. The retry case still works: an identical
   re-appended record wins with identical content. A downgraded build keeps the first record, which
   only leaves `item_count` stale; the `TurnRecord` doc already forbids validating against it.
 - **D4. The winning line is the clock.** `load_turns_after(cursor)` returns, in turn order, every
   turn whose first record is after the cursor's first record, plus every turn whose winning record
-  is after the cursor's first record. A client can receive an amended turn twice; it cannot miss
-  one that landed after it last saw the cursor turn.
+  is after the cursor's first record. The cursor turn itself is included when it was amended after
+  the client took the cursor, which is the common reconnect: a client resumes at the newest turn it
+  saw, the one whose command was still running. It is never returned merely for being the cursor.
+  A client can receive an amended turn twice; it cannot miss one that landed after it last saw the
+  cursor turn.
 - **D5. Runtime copy outlives the write.** `apply_late` removes the runtime output only after the
   amendment is durable. On a write error it logs at `error!` with project, thread, turn, item,
   action `amend_turn_item` and the error, keeps the runtime copy, and continues; no retry.
@@ -214,8 +234,9 @@ Order is the order that keeps the tree compiling and each step testable.
    shape; `load_turn_item` (M8) is unaffected beyond that.
 4. Tests: `amend_turn_item` then `load_turn_item` returns the settled item with its original
    slot; `load_all_turns` shows the item settled and the count right; `load_turns_after` with a
-   cursor older than the amendment returns the amended turn, with a cursor newer than it does not,
-   and never returns the cursor turn itself; `amend_turn_item` on a flat-layout thread returns
+   cursor older than the amendment returns the amended turn, with a cursor newer than it does not;
+   the cursor turn is returned when it is the amended one and not otherwise; `amend_turn_item` on
+   a flat-layout thread returns
    `Unsupported` and writes nothing; a superseding record survives a torn final line on the next
    append (existing index tolerance); `amend_turn_item` on a payload whose last line is torn
    inserts the newline first and the turn then loads with the settled item and
@@ -240,9 +261,11 @@ an item settling changes no aggregate the catalog shows.
 
 ### E. `crates/giskard-server/src/thread_runtime.rs` (+15)
 
-`pub(crate) fn forget_persisted_command_output_version(&self, authority, turn, item)` removing the
-`(turn, item)` key from `persisted_command_output_versions`, with a `ResolvedThreadRuntime`
-wrapper beside `persisted_command_output_version_permit` (`:297`).
+`pub(crate) fn forget_persisted_command_output_version(&self, authority, turn, item)` on the
+support-level API beside `remove_command_output` (`:454`), removing the `(turn, item)` key from
+`persisted_command_output_versions`. No `ResolvedThreadRuntime` wrapper: the forwarder calls the
+support API directly, as it does for `remove_command_output` (`event_forwarder.rs:1424`), and an
+uncalled wrapper fails clippy's dead-code gate (exit check J).
 
 ### F. `crates/giskard-server/src/registry/event_forwarder.rs` (net about +40)
 
@@ -286,8 +309,9 @@ completion.
    late `ItemCompleted` on the socket; then `load_turn_item` shows the settled item, and the
    command-output route serves the late output with a fresh `ETag`.
 2. **Reconnect.** Same, but drop the socket before releasing the gate; release; reconnect with
-   `Subscribe { since: <that turn> }`; the delta contains the amended turn with the settled item and
-   nothing else; a second reconnect with the same cursor returns it again.
+   `Subscribe { since: <that turn> }`; the delta contains the amended turn, which is the cursor
+   turn itself, with the settled item and nothing else; a second reconnect with the same cursor
+   returns it again.
 3. **Reload.** History page after the amendment shows the item settled.
 4. **Tool result.** Same flow with a `ToolCallStart` and a late tool completion carrying JSON
    output: the tool-output route serves it from persistence after the runtime copy is gone.
@@ -341,10 +365,10 @@ completion.
 | # | Check | Expected |
 | --- | --- | --- |
 | A | `rg -n "fn amend_turn_item" crates` | store, metadata service |
-| B | `rg -n "skipping duplicate turn id" crates/giskard-persist/src` | nothing (replaced by the superseding log) |
+| B | `rg -n "skipping duplicate turn id" crates/giskard-persist/src/history.rs` | nothing (replaced by the superseding log); the two hits in `store.rs` (`:367` flat reader, `:886` parsed-history cache) are format 1 and stay |
 | C | `rg -n "deferred durable command-output update\|ignoring completed tool output" crates/giskard-server/src` | only inside the `Unsupported` arms |
 | D | `rg -n "index: Option<usize>" crates/giskard-persist/src/history.rs` | the write-side `PayloadLine::Item` and the read-side `PayloadItem` |
-| E | `rg -n "forget_persisted_command_output_version" crates/giskard-server/src` | runtime definition, wrapper, one forwarder call |
+| E | `rg -n "forget_persisted_command_output_version" crates/giskard-server/src` | runtime definition and one forwarder call |
 | F | `rg -n "HISTORY_FORMAT: u32 = 3\|TURN_PAYLOAD_FORMAT: u32 = 1" crates/giskard-persist/src/layout.rs` | both unchanged |
 | G | `rg -c "ServerMessage" crates/giskard-proto/src/lib.rs` and the variant count | 11 variants, unchanged |
 | H | `git diff --stat main -- crates/giskard-harness crates/giskard-harness-codex crates/giskard-harness-replay crates/giskard-testenv crates/giskard-server/src/ws.rs crates/giskard-server/src/routes.rs crates/giskard-server/src/thread_runtime/live.rs crates/giskard-persist/src/atomic.rs tests/e2e` | empty |
@@ -373,6 +397,13 @@ completion.
 - `load_turns_after` returning the cursor turn itself, or returning amended turns out of order,
   which would regress `newestPersistedTurnId`.
 - The exception sentences in the spec and API docs left standing.
+
+## Follow-ups (not this milestone)
+
+- A late tool completion is persisted by this milestone but still not published to connected
+  clients (`apply_late` gates both the runtime apply and the transcript publish on a command
+  completion). A tool call that outlives its turn has no known producer today, so the live
+  publish waits for one.
 
 ## Size
 

@@ -2009,12 +2009,16 @@ never learns it. The forwarder classifies such an event `LateForPersistedTurn` a
 and connected clients receive the completion live — then throws the durable part away: it removes
 the command output it just normalized with the warning "deferred durable command-output update for
 already-persisted turn" (`:1420-1428`), and ignores a late tool result with "ignoring completed
-tool output for an already-persisted turn" (`:1478-1488`). The persisted item keeps the running
-status and the frozen output it had when the turn was appended.
+tool output for an already-persisted turn" (`:1478-1488`). Only items delivered by `ItemCompleted`
+are persisted (`CurrentTurnItems`, `:299-348`), so the persisted turn either lacks the item
+entirely, when it had only started, or keeps the running status and frozen output its
+`ItemCompleted` carried when the turn was appended.
 
 Concretely: a background build outlives its turn, the turn is appended, the browser reloads. The
-row now says running with output frozen at append time; the command-output route serves the stale
-persisted bytes because the fresh runtime copy was removed; nothing ever corrects it. Codex
+row is gone, or says running with output frozen at append time; the command-output route serves
+the stale persisted bytes because the fresh runtime copy was removed; nothing ever corrects it. A
+client that stays connected sees the completion because the browser keeps running command rows
+after their turn ends; a late tool completion is not even published to it. Codex
 background terminals make this ordinary use, not only the aftermath of a Stop. M5 and M6 both
 carved this case out as an explicit exception, the spec still says "post-persistence late
 completion remains ignored until the durable amendment milestone" (`specs/giskard-specification.md:170`,
@@ -2043,8 +2047,9 @@ warning row under a turn that lost records; a newer payload format or a missing 
 still fails that turn alone. The index folds turn records last-wins from now
 on, and the position of a turn's winning record in the index is the amendment clock: `Subscribe
 { since }` returns every turn appended after the cursor turn's first record *and* every turn whose
-winning record is later than that line, ordered by turn order. No protocol field is added; a
-client can only receive an amendment twice, never miss one. The runtime keeps its copy of the
+winning record is later than that line, ordered by turn order, which includes the cursor turn
+itself when it is the one amended. A client can only receive an amendment twice, never miss
+one. The runtime keeps its copy of the
 output until the amendment is durable, so the lazy routes never serve stale bytes, and forgets
 it, and the cached persisted-output version, only after. A failed amendment write is logged with
 the thread, turn and item and leaves the runtime copy in place; there is no retry loop.
