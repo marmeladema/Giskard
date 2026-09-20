@@ -1456,13 +1456,12 @@ async fn index_page_is_served_and_public() {
         "task snapshots never merge output into the event-owned running command"
     );
     assert!(
-        body.contains("renderMarkdown(body, p.text"),
+        body.contains("renderMarkdown(body, p.kind===\"reasoning\" ? msg.dataset.copyText"),
         "UI renders completed agent/reasoning text as Markdown through the server"
     );
     assert!(
-        body.contains(
-            "p.kind===\"agent_message\" || p.kind===\"reasoning\" || p.kind===\"user_message\""
-        ) && !body.contains("if (p.kind===\"user_message\") body.textContent"),
+        body.contains("p.kind===\"agent_message\" || p.kind===\"user_message\"")
+            && !body.contains("if (p.kind===\"user_message\") body.textContent"),
         "user messages render as Markdown like agent text, not as plain text"
     );
     assert!(
@@ -2858,6 +2857,26 @@ fn browser_loads_completed_tool_json_only_in_the_overlay() {
     assert!(body.contains("retryable:!!(overlay && overlay.error)"));
     assert!(body.contains("loadToolOutputOverlay(state.outputOverlay)"));
     assert!(body.contains("model.kind === \"tool\" ? loadToolOutputOverlay(ov)"));
+}
+
+#[test]
+fn browser_fetches_complete_reasoning_before_expand_or_copy() {
+    let body = app_js();
+    for expected in [
+        "function turnItemUrl",
+        "/items/${encodeURIComponent(itemId)}`",
+        "async function fetchReasoningNote",
+        "dataset.reasoningTruncated",
+        "body.state !== \"completed\"",
+        "await fetchReasoningNote(el)",
+        "prev.length > incoming.length",
+        "p.kind===\"agent_message\" || p.kind===\"user_message\") {\n    msg.dataset.copyText = p.text || \"\";\n    delete msg.dataset.reasoningTruncated;",
+    ] {
+        assert!(
+            body.contains(expected),
+            "reasoning fetch is missing `{expected}`"
+        );
+    }
 }
 
 #[test]

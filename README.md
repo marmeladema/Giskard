@@ -139,7 +139,9 @@ Then open **http://127.0.0.1:8787**, log in, and:
    identity, without uploading that potentially large output from the browser. Reasoning notes are
    collapsible: a note stays open while it is the newest row — so the live turn's thinking is
    readable — and folds to a one-line summary as soon as the next row arrives. The summary line
-   reopens it, and a note you opened yourself stays open. When the project's workspace is a
+   reopens it, and a note you opened yourself stays open. Long completed notes initially arrive as
+   a line-bounded first kilobyte; opening one fetches the rest, and copying always yields the whole
+   note. When the project's workspace is a
    Git repository, a one-line **Git status** sits just above the composer — branch, ahead/behind,
    changed-file count and total diffstat — and expands in place into the changed files, each
    opening its diff. It refreshes as the agent changes the tree, so it stays current during a turn.

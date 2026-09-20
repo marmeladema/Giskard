@@ -13,7 +13,7 @@ pub mod wire;
 pub use wire::{
     WireAgentEvent, WireApprovalKind, WireApprovalMetadata, WireApprovalRequest,
     WireCapturedDiffDescriptor, WireCommandOutput, WireFileDiff, WireHarnessError, WireItem,
-    WireItemPayload, WireToolOutput, WireTurn,
+    WireItemPayload, WireItemStart, WireTextPreview, WireToolOutput, WireTurn, WireTurnItem,
 };
 
 // C1/§3.5: `giskard-proto` is the single wire vocabulary. Path-free `giskard-core` domain types

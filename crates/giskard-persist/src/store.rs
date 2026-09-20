@@ -10,7 +10,7 @@ use std::sync::{Arc, Weak};
 use tokio::sync::{Mutex, RwLock};
 
 use giskard_core::ids::{ItemId, ProjectId, ThreadId, TurnId};
-use giskard_core::item::ItemPayload;
+use giskard_core::item::{Item, ItemPayload};
 use giskard_core::model::{Effort, ModelRef};
 use giskard_core::thread::ThreadKind;
 use giskard_core::token::{DailyTokenLedger, TokenLedger};
@@ -1536,14 +1536,14 @@ impl PersistStore {
         Ok(payload.diff_contents.get(diff_id).cloned())
     }
 
-    /// Load one terminal command's retained output from an indexed immutable turn payload.
-    pub async fn load_command_output(
+    /// Load one item from an indexed immutable turn payload.
+    pub async fn load_turn_item(
         &self,
         project: ProjectId,
         thread: ThreadId,
         turn: TurnId,
         item_id: ItemId,
-    ) -> Result<Option<StoredCommandOutput>, PersistError> {
+    ) -> Result<Option<Item>, PersistError> {
         self.ensure_migrated(project, thread).await;
         let records = self.load_turn_records_unlocked(project, thread).await?;
         if !records.iter().any(|record| record.turn_id == turn) {
@@ -1567,9 +1567,18 @@ impl PersistStore {
                 .await?
                 .map(|payload| payload.items)
         };
-        let Some(item) =
-            loaded_items.and_then(|items| items.into_iter().find(|item| item.id == item_id))
-        else {
+        Ok(loaded_items.and_then(|items| items.into_iter().find(|item| item.id == item_id)))
+    }
+
+    /// Load one terminal command's retained output from an indexed immutable turn payload.
+    pub async fn load_command_output(
+        &self,
+        project: ProjectId,
+        thread: ThreadId,
+        turn: TurnId,
+        item_id: ItemId,
+    ) -> Result<Option<StoredCommandOutput>, PersistError> {
+        let Some(item) = self.load_turn_item(project, thread, turn, item_id).await? else {
             return Ok(None);
         };
         let ItemPayload::CommandExecution {
@@ -1617,32 +1626,7 @@ impl PersistStore {
         turn: TurnId,
         item_id: ItemId,
     ) -> Result<Option<StoredToolOutput>, PersistError> {
-        self.ensure_migrated(project, thread).await;
-        let records = self.load_turn_records_unlocked(project, thread).await?;
-        if !records.iter().any(|record| record.turn_id == turn) {
-            return Ok(None);
-        }
-        let paths = self.thread_paths(project, thread).await;
-        let loaded_items = if paths.layout() == ThreadLayout::Flat {
-            let path = paths.history();
-            let data = match tokio::fs::read_to_string(&path).await {
-                Ok(data) => data,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-                Err(error) => return Err(PersistError::Io(error.to_string())),
-            };
-            parse_turn_history(&path, &data)?
-                .into_iter()
-                .find(|candidate| candidate.id == turn)
-                .map(|turn| turn.items)
-        } else {
-            let payload_path = paths.turn_payload(turn);
-            history::read_turn_payload(&payload_path)
-                .await?
-                .map(|payload| payload.items)
-        };
-        let Some(item) =
-            loaded_items.and_then(|items| items.into_iter().find(|item| item.id == item_id))
-        else {
+        let Some(item) = self.load_turn_item(project, thread, turn, item_id).await? else {
             return Ok(None);
         };
         let ItemPayload::ToolCall { output, status, .. } = item.payload else {
@@ -2424,6 +2408,67 @@ mod tests {
                 .unwrap()
                 .revision,
             1
+        );
+    }
+
+    #[tokio::test]
+    async fn load_turn_item_is_scoped_to_the_indexed_turn_and_item() {
+        let (_tmp, store) = make_store();
+        let project_id = ProjectId::new();
+        let thread_id = ThreadId::new();
+        store
+            .create_thread(project_id, test_thread(project_id, thread_id))
+            .await
+            .unwrap();
+        let now = Utc::now();
+        let item = Item {
+            id: ItemId::new(),
+            harness_item_id: "native-item".into(),
+            payload: ItemPayload::AgentMessage {
+                text: "persisted".into(),
+            },
+            created_at: now,
+        };
+        let turn = Turn {
+            id: TurnId::new(),
+            user_input: giskard_core::user_input::UserInput::text("prompt"),
+            items: vec![item.clone()],
+            model: TurnModel::Known(test_model()),
+            mode: TurnMode::Known(Mode::Build),
+            status: giskard_core::turn::TurnStatus {
+                kind: giskard_core::turn::TurnStatusKind::Completed,
+                message: None,
+            },
+            usage: giskard_core::token::TokenUsage::default(),
+            diffs: Vec::new(),
+            started_at: now,
+            completed_at: Some(now),
+        };
+        store
+            .append_turn(project_id, thread_id, &turn)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            store
+                .load_turn_item(project_id, thread_id, turn.id, item.id)
+                .await
+                .unwrap(),
+            Some(item)
+        );
+        assert!(
+            store
+                .load_turn_item(project_id, thread_id, turn.id, ItemId::new())
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .load_turn_item(project_id, thread_id, TurnId::new(), turn.items[0].id)
+                .await
+                .unwrap()
+                .is_none()
         );
     }
 
@@ -4841,6 +4886,14 @@ mod layout_tests {
         );
         assert!(persisted_change.captured_diff.is_none());
         assert_eq!(persisted_turn.diffs, vec![structured_body.clone()]);
+        assert_eq!(
+            store
+                .load_turn_item(pid, tid, turn.id, item_id)
+                .await
+                .unwrap()
+                .map(|item| item.id),
+            Some(item_id)
+        );
 
         assert_eq!(
             store

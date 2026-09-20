@@ -13,6 +13,7 @@ WebSocket. Highlights: `POST /api/login`, `POST /api/logout`, `GET /api/ws-ticke
 `GET /api/projects/{id}/threads/{thread_id}/turns/{turn_id}/items/{item_id}/command-output`,
 `GET /api/projects/{id}/threads/{thread_id}/turns/{turn_id}/items/{item_id}/command-output-links`,
 `GET /api/projects/{id}/threads/{thread_id}/turns/{turn_id}/items/{item_id}/tool-output`,
+`GET /api/projects/{id}/threads/{thread_id}/turns/{turn_id}/items/{item_id}`,
 `GET /api/projects/{id}/threads/{thread_id}/deletion-impact`,
 `GET /api/projects/{id}/models`,
 `GET /api/tokens`, `GET /api/projects/{id}/tokens`,
@@ -128,6 +129,13 @@ The browser fetches only while the matching tool overlay is open and accepts the
 `ETag` still matches the selected descriptor. Post-persistence late tool completion is not
 advertised or retrievable until durable late-item amendments are implemented.
 
+`GET /api/projects/{id}/threads/{thread_id}/turns/{turn_id}/items/{item_id}` returns an item as
+state-tagged JSON. A `started` response carries the same browser-safe `WireItemStart` as the live
+event. A `completed` response carries the item with command or tool output descriptors only, never
+the output or diff body. Lookup checks the active runtime first, then the immutable turn payload,
+then runtime again across the persistence race. Missing threads, turns, items, cross-container
+identities, mismatched live turn ids, and items that have not started all return 404.
+
 Process-local thread state is published separately: `ThreadRuntimeOverview { revision, threads }`
 is a global replacement snapshot (including an empty `threads` list), `RequestState` carries a
 per-request revision and the authoritative pending/responding/resolved status for each approval or
@@ -155,7 +163,8 @@ are disabled while a turn is active because steering is text-only.
 without it the endpoint returns the newest page. `limit` is optional and is clamped to 1–100 turns;
 the configured `[history] initial` default applies to the newest page and `page` to older pages.
 History pagination is authenticated HTTP, not a WebSocket message, and a thread outside the named
-project returns 404.
+project returns 404. Completed reasoning text is delivered as a line-bounded 1 KiB prefix while
+keeping its first non-blank line whole; the item endpoint serves the full note.
 
 If you open a thread whose agent can no longer be started — most often because its
 **provider was removed from config** (e.g. you swapped one proxy provider id for another) — the

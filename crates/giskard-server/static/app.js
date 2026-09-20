@@ -5271,6 +5271,10 @@ function attachRowCopy(el) {
   let resetTimer = 0;
   btn.onclick = async (e) => {
     e.stopPropagation();
+    if (el.dataset.reasoningTruncated) {
+      const loaded = await fetchReasoningNote(el);
+      if (!loaded) return;
+    }
     const raw = el.dataset.copyText != null
       ? el.dataset.copyText
       : (el.querySelector(".body") ? el.querySelector(".body").textContent : "");
@@ -5798,6 +5802,7 @@ function setReasoningExpanded(msg, expanded, opts) {
     const caret = toggle.querySelector(".reasoning-caret");
     if (caret) caret.textContent = expanded ? "▾" : "▸";
   }
+  if (expanded && msg.dataset.reasoningTruncated) fetchReasoningNote(msg);
   if (!manual) return;
   const key = reasoningRowKey(msg);
   if (key) state.reasoningChoicesByRowKey.set(key, expanded);
@@ -7809,10 +7814,19 @@ function renderItemBody(body, p) {
   clearRowToggle(msg);
   // Markdown messages keep their raw source so the row copy button yields Markdown, not rendered
   // text; other rows fall back to the rendered text.
-  if (p.kind==="agent_message" || p.kind==="reasoning" || p.kind==="user_message") {
+  if (p.kind==="reasoning") {
+    const prev = msg.dataset.copyText || "";
+    const incoming = p.text || "";
+    const text = (p.preview && prev.length > incoming.length) ? prev : incoming;
+    msg.dataset.copyText = text;
+    if (p.preview && text === incoming) msg.dataset.reasoningTruncated = "1";
+    else delete msg.dataset.reasoningTruncated;
+  } else if (p.kind==="agent_message" || p.kind==="user_message") {
     msg.dataset.copyText = p.text || "";
+    delete msg.dataset.reasoningTruncated;
   } else {
     delete msg.dataset.copyText;
+    delete msg.dataset.reasoningTruncated;
   }
   body.replaceChildren();
   if (p.kind==="command_execution") {
@@ -7856,7 +7870,7 @@ function renderItemBody(body, p) {
   } else if (p.kind==="agent_message" || p.kind==="reasoning" || p.kind==="user_message") {
     // User messages get the same server-rendered, sanitized Markdown as agent text, so pasted code
     // fences, lists and emphasis format the same on both sides of the conversation.
-    renderMarkdown(body, p.text || "");
+    renderMarkdown(body, p.kind==="reasoning" ? msg.dataset.copyText : (p.text || ""));
   } else if (p.kind==="file_change") {
     renderFileChange(body, p);
   } else if (p.kind==="tool_call") {
@@ -7870,7 +7884,7 @@ function renderItemBody(body, p) {
   }
   // A reasoning note keeps whatever state its row already has; a fresh one opens if it is the
   // newest row. Completion is not what folds it — the next appended row is.
-  if (p.kind==="reasoning") applyReasoningRow(msg, p.text || "");
+  if (p.kind==="reasoning") applyReasoningRow(msg, msg.dataset.copyText || "");
   else removeReasoningToggle(msg);
   const taskItemId = msg.dataset.commandItemId || msg.dataset.toolItemId || "";
   if (taskItemId) {
@@ -9356,6 +9370,50 @@ function commandOutputUrl(projectId, threadId, turnId, itemId) {
 }
 function toolOutputUrl(projectId, threadId, turnId, itemId) {
   return `/api/projects/${encodeURIComponent(projectId)}/threads/${encodeURIComponent(threadId)}/turns/${encodeURIComponent(turnId)}/items/${encodeURIComponent(itemId)}/tool-output`;
+}
+function turnItemUrl(projectId, threadId, turnId, itemId) {
+  return `/api/projects/${encodeURIComponent(projectId)}/threads/${encodeURIComponent(threadId)}/turns/${encodeURIComponent(turnId)}/items/${encodeURIComponent(itemId)}`;
+}
+async function fetchReasoningNote(msg) {
+  if (msg._reasoningFetch) return msg._reasoningFetch;
+  const turnId = msg.dataset.turn || "";
+  const itemId = identityTokens(msg.dataset.item)[0] || "";
+  const projectId = state.projectId;
+  const threadId = state.threadId;
+  const generation = state.activeViewGeneration;
+  if (!turnId || !itemId || !projectId || !threadId) return false;
+  const request = (async () => {
+    try {
+      const response = await fetch(turnItemUrl(projectId, threadId, turnId, itemId));
+      if (!response.ok) throw new Error(await response.text() || `HTTP ${response.status}`);
+      if ((response.headers.get("content-type") || "") !== "application/json") {
+        throw new Error("Reasoning item response had an invalid Content-Type.");
+      }
+      const body = await response.json();
+      if (body.state !== "completed" || !body.item || !body.item.payload ||
+          body.item.payload.kind !== "reasoning") {
+        throw new Error("Reasoning item response had an invalid body.");
+      }
+      if (!msg.isConnected || state.activeViewGeneration !== generation ||
+          state.projectId !== projectId || state.threadId !== threadId ||
+          msg.dataset.turn !== turnId || identityTokens(msg.dataset.item)[0] !== itemId) return false;
+      const full = body.item.payload.text || "";
+      const noteBody = msg.querySelector(":scope > .body");
+      if (!noteBody) return false;
+      msg.dataset.copyText = full;
+      delete msg.dataset.reasoningTruncated;
+      renderMarkdown(noteBody, full);
+      applyReasoningRow(msg, full);
+      return true;
+    } catch (e) {
+      notice("Could not load reasoning note: " + apiFailureMessage(e), "error");
+      return false;
+    } finally {
+      delete msg._reasoningFetch;
+    }
+  })();
+  msg._reasoningFetch = request;
+  return request;
 }
 function commandOutputLinksUrl(projectId, threadId, turnId, itemId) {
   return commandOutputUrl(projectId, threadId, turnId, itemId) + "-links";

@@ -352,6 +352,40 @@ pub fn command_output_tail_preview(
     }
 }
 
+/// Bytes of reasoning text a completed turn carries eagerly on the wire (M8, spec RP1).
+pub const REASONING_PREVIEW_MAX_BYTES: usize = 1024;
+
+/// Head prefix of a reasoning note. Whole when it fits; otherwise cut at the last newline at or
+/// below `max_bytes`, never before the end of the first non-blank line, which is always kept
+/// whole. Returns the prefix and whether anything was dropped.
+pub fn reasoning_head_preview(text: &str, max_bytes: usize) -> (String, bool) {
+    if text.len() <= max_bytes {
+        return (text.to_owned(), false);
+    }
+
+    let first_non_blank_end = text
+        .split_inclusive('\n')
+        .scan(0, |offset, line| {
+            *offset += line.len();
+            Some((*offset, line))
+        })
+        .find_map(|(end, line)| (!line.trim().is_empty()).then_some(end));
+
+    let Some(first_non_blank_end) = first_non_blank_end else {
+        return (text.to_owned(), false);
+    };
+    let budget = max_bytes.max(first_non_blank_end);
+    let cut = text
+        .match_indices('\n')
+        .map(|(index, _)| index + 1)
+        .take_while(|end| *end <= budget)
+        .last();
+    let Some(cut) = cut.filter(|cut| *cut < text.len()) else {
+        return (text.to_owned(), false);
+    };
+    (text[..cut].to_owned(), true)
+}
+
 /// The complete result of normalizing provider command output at the ingestion boundary.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NormalizedCommandOutput {
@@ -388,6 +422,32 @@ impl ItemKind {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reasoning_preview_obeys_line_and_first_summary_boundaries() {
+        assert_eq!(reasoning_head_preview("short", 10), ("short".into(), false));
+        assert_eq!(
+            reasoning_head_preview("first\nsecond line\nthird\n", 18),
+            ("first\nsecond line\n".into(), true)
+        );
+        let long_first = format!("{}\nrest\n", "x".repeat(20));
+        assert_eq!(
+            reasoning_head_preview(&long_first, 10),
+            (format!("{}\n", "x".repeat(20)), true)
+        );
+        assert_eq!(
+            reasoning_head_preview("a single long line", 3),
+            ("a single long line".into(), false)
+        );
+        assert_eq!(
+            reasoning_head_preview("\n  \nsummary\nrest\n", 2),
+            ("\n  \nsummary\n".into(), true)
+        );
+        assert_eq!(
+            reasoning_head_preview("éé\ntail\n", 3),
+            ("éé\n".into(), true)
+        );
+    }
 
     #[test]
     fn item_payload_serde_roundtrip() {

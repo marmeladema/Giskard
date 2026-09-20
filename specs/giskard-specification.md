@@ -9,7 +9,12 @@
 
 **Document status:** Implementation-ready specification.
 **Audience:** An AI coding agent (and its human reviewer) implementing the system.
-**Version:** 1.93
+**Version:** 1.94
+
+> **Amendment — item endpoint and reasoning previews (1.94).** Individual turn items are readable
+> through a runtime-first, persistence-backed endpoint. Completed history and bootstrap turns carry
+> bounded reasoning prefixes while live delivery, reconnect state, persistence, and item reads keep
+> the full note; expanding or copying a preview fetches that full item.
 
 > **Amendment — manual compaction is an ordinary turn (1.93).** `thread/compact/start` is answered
 > by a normal Codex task: `turn/started`, a `contextCompaction` item, then `turn/completed` or an
@@ -188,6 +193,23 @@
 > below as historical design context, not a current requirement. The wire contract (`giskard-proto`)
 > and all backend design remain authoritative.
 
+**Changelog (1.93 → 1.94), item endpoint and reasoning previews:**
+- **IE1:** `GET /api/projects/{id}/threads/{thread_id}/turns/{turn_id}/items/{item_id}` returns a
+  state-tagged body. `started` carries the browser-safe item start exactly as its live event did;
+  `completed` carries the item and its output descriptors, never command, tool, or diff bodies.
+- **IE2:** Resolution checks the live runtime, then the immutable payload, then runtime again across
+  the persistence race. Unknown, cross-container, mismatched, and not-yet-started items share 404;
+  an item without `ItemStarted` is never synthesized.
+- **IE3:** The live lookup is derived from buffered lifecycle events. It adds no stored projection,
+  runtime-entry component, or persisted-format change.
+- **RP1:** Completed turns in history and bootstrap deltas carry reasoning text as a 1 KiB head
+  prefix with `preview { prefix_bytes, total_bytes, total_lines }` when cut. Cuts occur on line
+  boundaries and keep the first non-blank line whole. Live events, reconnect snapshots, item reads,
+  and persistence retain full text.
+- **RP2:** Expanding a previewed reasoning row fetches its item; copying yields the complete note or
+  nothing. A browser that watched the turn live keeps its longer text when history arrives.
+- **RP3:** Agent text is not previewed.
+
 **Changelog (1.92 → 1.93), manual compaction is an ordinary turn:**
 - **CC6:** Codex runs a manual compaction as a normal task: `thread/compact/start` is followed by
   `turn/started`, a `contextCompaction` item, and `turn/completed` (or an abort). Giskard no
@@ -279,7 +301,7 @@
   does not map.
 
 **Changelog (1.74 → 1.75), collapsible reasoning rows:**
-- **RN1:** A reasoning note is a collapsible transcript row: a one-line summary — the note's first
+- **RN1 (amended by 1.94/RP2):** A reasoning note is a collapsible transcript row: a one-line summary — the note's first
   line with its Markdown markers stripped — sits above the rendered note, and collapsing hides the
   note body only. The row's text is never discarded, so the row copy button still yields the whole
   note and expanding costs no re-render or fetch. This is browser-side presentation: the wire
