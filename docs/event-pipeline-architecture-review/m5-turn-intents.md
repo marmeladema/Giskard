@@ -1,6 +1,6 @@
 # M5 — Intents replace prepared operations
 
-Implementation plan for milestone M5 of [`event-pipeline-milestones.md`](event-pipeline-milestones.md).
+Implementation plan for milestone M5 of [`event-pipeline-architecture-review.md`](../event-pipeline-architecture-review.md).
 Written against `main` at `eec099e` (M4 merged). Every file and line reference below was checked
 against that tree; re-check them if the branch has moved.
 
@@ -447,7 +447,7 @@ adapter; the e2e suite.
 
 ## Documentation
 
-- `docs/event-pipeline-milestones.md`: M5 status, the amended design (intents go to the thread's
+- `docs/event-pipeline-architecture-review.md`: M5 status, the amended design (intents go to the thread's
   forwarder through the coordinator's owner phase; interrupt stays direct), the narrowed exit
   criterion, and a plan pointer.
 - `docs/subagents.md:94-98`: "clears only the matching coordinator token" → the owner attaches the

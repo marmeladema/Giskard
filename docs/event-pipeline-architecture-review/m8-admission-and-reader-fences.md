@@ -1,6 +1,6 @@
 # M8 — Admission and reader fences
 
-Implementation plan for milestone M8 of [`event-pipeline-milestones.md`](event-pipeline-milestones.md).
+Implementation plan for milestone M8 of [`event-pipeline-architecture-review.md`](../event-pipeline-architecture-review.md).
 Written against `main` at `3c804dd` (M7 and the live-usage change merged, spec 1.85; the
 server-request claim fix in PR #235 is at 1.86). Every file and line reference below was checked
 against that tree; re-check them if the branch has moved.
@@ -174,7 +174,7 @@ reader was dropped without reporting, is reported to the next reader created."
 | `driver.rs:643-665` | `start_deferred().await` at the end of `owner_exited` |
 | `crates/giskard-server/src/registry/admission.rs:20-23` | `Admission::native_thread_id` |
 | `crates/giskard-harness/src/event_log.rs:8, 249-256` | D3 and module doc |
-| `specs/giskard-specification.md`, `docs/event-pipeline-milestones.md`, `AGENTS.md` | See Documentation |
+| `specs/giskard-specification.md`, `docs/event-pipeline-architecture-review.md`, `AGENTS.md` | See Documentation |
 
 No file outside these compiles against the changed items.
 
@@ -264,7 +264,7 @@ No file outside these compiles against the changed items.
   installed after the deletion snapshot."
 - Leave the 1.84 and 1.78 amendment blocks as history.
 
-`docs/event-pipeline-milestones.md`: M8 section for this milestone (done in this commit), the
+`docs/event-pipeline-architecture-review.md`: M8 section for this milestone (done in this commit), the
 cursor-committed persistence milestone renumbered to M9, and the ordering diagram updated.
 
 `AGENTS.md:132-135`: append to the admission bullet: "A quiesced driver refuses attachment and

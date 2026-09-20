@@ -1,6 +1,6 @@
 # M7 — Lifecycle fences and reader contracts
 
-Implementation plan for milestone M7 of [`event-pipeline-milestones.md`](event-pipeline-milestones.md).
+Implementation plan for milestone M7 of [`event-pipeline-architecture-review.md`](../event-pipeline-architecture-review.md).
 Written against `main` at `b71aaf1` (M6 merged). Every file and line reference below was checked
 against that tree; re-check them if the branch has moved.
 
@@ -275,7 +275,7 @@ M0 scenario tests.
 
 ## Documentation
 
-- `docs/event-pipeline-milestones.md`: M7 section as landed; M9 keeps the cursor-committed
+- `docs/event-pipeline-architecture-review.md`: M7 section as landed; M9 keeps the cursor-committed
   persistence text; ordering diagram updated.
 - `docs/subagents.md` deletion paragraph: "project deletion quiesces the driver, then takes the
   authoritative owner set".
