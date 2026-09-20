@@ -83,6 +83,11 @@ impl Hub {
         replacements
     }
 
+    /// Registered client count, for tests and future metrics.
+    pub async fn client_count(&self) -> usize {
+        self.clients.lock().await.len()
+    }
+
     pub async fn subscribe(&self, thread_id: ThreadId, client_id: ClientId) -> bool {
         let Some(delivery) = self.clients.lock().await.get(&client_id).cloned() else {
             warn!(

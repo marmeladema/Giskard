@@ -9,7 +9,13 @@
 
 **Document status:** Implementation-ready specification.
 **Audience:** An AI coding agent (and its human reviewer) implementing the system.
-**Version:** 1.94
+**Version:** 1.95
+
+> **Amendment — cancellable subscribe (1.95).** A subscribe bootstrap runs in a
+> connection-owned task identified by a server-side generation, so slow attach and read phases do
+> not hold the WebSocket receive loop. A close, same-thread resubscribe, or unsubscribe cancels
+> superseded work cooperatively at phase boundaries without aborting an in-flight registry or store
+> operation; bootstrap messages and their order remain unchanged.
 
 > **Amendment — item endpoint and reasoning previews (1.94).** Individual turn items are readable
 > through a runtime-first, persistence-backed endpoint. Completed history and bootstrap turns carry
@@ -192,6 +198,16 @@
 > the intended frontend for the foreseeable future; treat every Dioxus/WASM/`giskard-ui` reference
 > below as historical design context, not a current requirement. The wire contract (`giskard-proto`)
 > and all backend design remain authoritative.
+
+**Changelog (1.94 → 1.95), cancellable subscribe:**
+- **CS1:** A subscribe bootstrap runs in a connection-owned task with a server-side generation;
+  attach or read work never holds the receive loop, and its message set and order are unchanged.
+- **CS2:** A close, same-thread resubscribe on the same socket, or unsubscribe cancels an in-flight
+  bootstrap cooperatively at its next phase boundary. Nothing is aborted mid-await, and the
+  cancelled generation performs no further reads or sends.
+- **CS3:** The generation is not carried on the wire in this version. The browser continues to
+  discard frames by thread id; wire-level generation rejection arrives with the bootstrap
+  transaction envelope.
 
 **Changelog (1.93 → 1.94), item endpoint and reasoning previews:**
 - **IE1:** `GET /api/projects/{id}/threads/{thread_id}/turns/{turn_id}/items/{item_id}` returns a
