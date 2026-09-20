@@ -1,6 +1,6 @@
 # S6 — `Services`: the forwarder takes what it uses, not the registry
 
-Implementation plan for step 6 of [`design-straightening-review.md`](design-straightening-review.md)
+Implementation plan for step 6 of [`design-straightening-review.md`](../design-straightening-review.md)
 (finding B3). Written against `main` at `b2ae422` (S5 merged); every file and line reference below
 was checked against that tree. Re-check them if the branch has moved.
 

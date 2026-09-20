@@ -1,6 +1,6 @@
 # S7 — The thread runtime as components behind one lock
 
-Implementation plan for step 7 of [`design-straightening-review.md`](design-straightening-review.md)
+Implementation plan for step 7 of [`design-straightening-review.md`](../design-straightening-review.md)
 (finding C5) plus the first reduction recorded under "Follow-on" in
 [`s5-hub-publish.md`](s5-hub-publish.md) (`Outbound::Request` goes). Written against `main` at
 `7822b02` (S6 merged); every file and line reference below was checked against that tree.

@@ -1,6 +1,6 @@
 # S4a — A `giskard-testenv` crate for the server integration tests
 
-Implementation plan for step 4 of [`design-straightening-review.md`](design-straightening-review.md)
+Implementation plan for step 4 of [`design-straightening-review.md`](../design-straightening-review.md)
 (finding C6). Written against `main` at `020a2ad` (S3b merged); every file and line reference
 below was checked against that tree. Re-check them if the branch has moved.
 

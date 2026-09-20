@@ -1,6 +1,6 @@
 # S1 — `AgentEvent` identity accessors
 
-Implementation plan for step 1 of [`design-straightening-review.md`](design-straightening-review.md)
+Implementation plan for step 1 of [`design-straightening-review.md`](../design-straightening-review.md)
 (finding C1). Named S1 because M1 is the retained event log that already landed. Written against
 `main` at `37fb77e` plus PR #239; every file and line reference below was checked against that
 tree. Re-check them if the branch has moved.

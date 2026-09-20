@@ -129,7 +129,7 @@ forwarder becoming testable without a registry fixture (see D).
 **Status: landed in S6.** `Services` owns the five handles and `publish_runtime_overview`;
 `RegistryShared` keeps its five registry fields plus one `Arc<Services>`. The driver and the
 admission code still hold a `RegistryShared` and reach services through `shared.services`; see
-[`s6-services.md`](s6-services.md).
+[`s6-services.md`](design-straightening-review/s6-services.md).
 
 **B4. `ForwarderExitReason`, `OwnerPhase`, and the teardown predicate** are already well placed.
 Leave them.
@@ -180,7 +180,7 @@ effects. The current per-kind `match` in the middle (link items to the driver, d
 compaction markers) becomes a third small function. The 58 log statements in the file mostly
 belong to `classify`'s drop reasons and collapse into one `log_drop(reason, &event)`.
 
-**Status: landed in S8** ([`s8-classify-apply.md`](s8-classify-apply.md)), with five corrections to
+**Status: landed in S8** ([`s8-classify-apply.md`](design-straightening-review/s8-classify-apply.md)), with five corrections to
 the sketch above. (1) Two of the gates keep registries — the duplicate-notice gate inserts into
 `seen_notices` and the item-identity gate inserts a first-seen id into `item_ids_by_harness` — so
 each gate split into a read used by the pure `classify` and a write, `ForwardedTurnState::remember`,
@@ -215,7 +215,7 @@ forwarder and registry stop knowing about `WireAgentEvent`.
 
 **Status: landed in S5.** `Outbound` carries one more variant than sketched here —
 `RunningTasks`, the lane `routes.rs` computes directly — and the overview keeps
-its own method; see [`s5-hub-publish.md`](s5-hub-publish.md).
+its own method; see [`s5-hub-publish.md`](design-straightening-review/s5-hub-publish.md).
 
 **C4. `AgentHarness` is three interfaces.** Its 21 methods split cleanly by receiver:
 
@@ -236,7 +236,7 @@ its own method; see [`s5-hub-publish.md`](s5-hub-publish.md).
    `AgentHarness: HarnessProcess + HarnessThreads + HarnessTurns`. Fakes then implement only what
    they use, which directly attacks the 21 fake implementations below.
 
-**Status: landed in S9** ([`s9-harness-scopes.md`](s9-harness-scopes.md)), as option 1 only, with
+**Status: landed in S9** ([`s9-harness-scopes.md`](design-straightening-review/s9-harness-scopes.md)), as option 1 only, with
 five corrections to the paragraph above. (1) Option 2's trigger is gone: after S4b there are nine
 `impl AgentHarness for` blocks, not 21, and trait defaults already let each implement what it uses,
 so a split would not reduce what any adapter or fake writes. (2) A split has a cost the review did
@@ -275,7 +275,7 @@ clocks, two existing types, and a cache S2 left alone), "outputs" is two types w
 (`CapturedDiffState` keyed by `TurnId` and `ItemOutputState` keyed by `(TurnId, ItemId)`), and
 `RequestTransition` stays as the ledger's typed result while `Outbound::Request` goes at the
 publish edge through `impl From<RequestTransition> for AppliedRuntimeEvent`; see
-[`s7-runtime-components.md`](s7-runtime-components.md).
+[`s7-runtime-components.md`](design-straightening-review/s7-runtime-components.md).
 
 **C6. A test-support crate — landed in S4a (scaffolding) and S4b (the shared fake).** Twenty-one `impl AgentHarness for` fakes, twelve copies of
 `generate_password_hash`, six of `ws_text`, three of `spawn_test_app`, and `e2e_smoke.rs` at
@@ -305,7 +305,7 @@ the Codex production-line and watchdog sizes and the `routes.rs` layout and log 
 corrected; `ws.rs` is a sibling module whose eleven shared `routes.rs` items and two struct fields
 make the HTTP-to-WebSocket coupling explicit; and the Codex crate keeps its flat module layout.
 The `app.js` split is deferred because it is not a mechanical move and provides no asserted module
-boundaries without a JavaScript unit-test toolchain; see [`s10-file-splits.md`](s10-file-splits.md).
+boundaries without a JavaScript unit-test toolchain; see [`s10-file-splits.md`](design-straightening-review/s10-file-splits.md).
 Implementation also verified the visibility and sequencing corrections recorded in that plan's
 implementation-corrections section.
 
@@ -335,7 +335,7 @@ Each step is one PR that stands alone on `main`, mechanical first:
 | 8 | C2 `classify` / `apply` in the forwarder — **landed in S8** | structural, no behaviour change | ±250 |
 | 9 | C4 option 1, then option 2 if C6 wants it — **landed in S9** | API | −200 |
 | 10 | D file splits (`ws.rs`, codex modules; `app.js` deferred) — **landed in S10** | mechanical | 0 |
-| 11 | Retire the marker-only compaction machinery; the compaction activity becomes an ordinary activity — **landed in S11** ([`s11-compaction-marker.md`](s11-compaction-marker.md)) | deletion: Codex adapter, forwarder, `app.js`, spec | −200 |
+| 11 | Retire the marker-only compaction machinery; the compaction activity becomes an ordinary activity — **landed in S11** ([`s11-compaction-marker.md`](design-straightening-review/s11-compaction-marker.md)) | deletion: Codex adapter, forwarder, `app.js`, spec | −200 |
 
 **Step 11 changed shape.** The typed-marker idea assumed the `"Context compacted"` activity is a
 lifecycle signal. Reading the code showed that every string match on that title (Codex adapter,
@@ -345,7 +345,7 @@ left only logs. `openai/codex` at the pinned tag `rust-v0.155.1` (and `main`) ru
 compaction as an ordinary task: `turn/started`, a `contextCompaction` item, `turn/completed`; the
 deprecated `thread/compacted` notification is no longer sent. So S11 is a deletion, not a typing
 change; the broader question of typed notices and activities is a separate discussion that this
-case no longer motivates. Landed as planned in [`s11-compaction-marker.md`](s11-compaction-marker.md);
+case no longer motivates. Landed as planned in [`s11-compaction-marker.md`](design-straightening-review/s11-compaction-marker.md);
 implementation also removed the forwarder's `CurrentTurnItems::iter`, whose only caller was the
 deleted marker check.
 
