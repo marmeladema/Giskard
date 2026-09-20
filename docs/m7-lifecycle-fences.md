@@ -29,7 +29,7 @@ all of them and the tests land together.
 - No byte accounting inside `EventLog<T>`. The caps stay counts; the frame bound is enforced where
   bytes enter the process.
 - No change to the admission algorithm in `admission.rs` beyond what a retry needs.
-- Cursor-committed persistence stays M8.
+- Cursor-committed persistence stays M9.
 
 ## Ground truth
 
@@ -197,7 +197,7 @@ existing `NonJson` path after a lossy conversion, as before.
 
 Documentation states plainly that `EVENT_LOG_RETAIN_LIMIT` and `CODEX_INBOX_RETAIN_LIMIT` count
 entries, that per-entry size is bounded by the frame limit, and that the byte-bounded journal with
-spill in the architecture review is the M8 design, not the landed one.
+spill in the architecture review is the M9 design, not the landed one.
 
 ## Every site that changes
 
@@ -275,7 +275,7 @@ M0 scenario tests.
 
 ## Documentation
 
-- `docs/event-pipeline-milestones.md`: M7 section as landed; M8 keeps the cursor-committed
+- `docs/event-pipeline-milestones.md`: M7 section as landed; M9 keeps the cursor-committed
   persistence text; ordering diagram updated.
 - `docs/subagents.md` deletion paragraph: "project deletion quiesces the driver, then takes the
   authoritative owner set".
@@ -288,7 +288,7 @@ M0 scenario tests.
 - `docs/m3-single-stdout-reader.md` and `docs/m1-retained-event-log.md`: one sentence each that
   the caps count entries and the frame bound is `CODEX_MAX_FRAME_BYTES`.
 - `docs/event-pipeline-architecture-review.md` §6.4: a note that the landed logs are count-bounded
-  with a per-frame byte limit; the byte-bounded spill journal is M8.
+  with a per-frame byte limit; the byte-bounded spill journal is M9.
 - `AGENTS.md`: extend the driver rule with "deletion and shutdown quiesce the driver before the
   owner set is taken or the harness is shut down".
 
