@@ -2,10 +2,11 @@
 
 Implementation plan for milestone M10 of
 [`thread-state-and-bootstrap-reconciliation-plan.md`](../thread-state-and-bootstrap-reconciliation-plan.md).
-Written against `main` at `15d16cf` (M8 landed, spec 1.94). Every file and line reference below
+Written against `main` at `3deab1d` (M9 landed, spec 1.95). Every file and line reference below
 was checked against that tree; re-check them if the branch has moved. The milestone text is the
 authority on scope and non-goals; this document says how to land it and how to prove it landed.
-It assumes M9 has landed only for spec numbering; nothing here depends on M9's code.
+Nothing here depends on M9's code: the resync read it changes is still called from the bootstrap,
+now inside `run_subscribe_bootstrap`.
 
 ## What lands
 
@@ -68,10 +69,12 @@ It assumes M9 has landed only for spec numbering; nothing here depends on M9's c
   turn with `renderPersistedTurn` into a new container and inserts it (`:4053-4095`), then advances
   `newestPersistedTurnId` to the last turn in the delta (`:4095`); nothing checks whether a turn in
   the delta is already on screen.
-- **Docs that reserve this case.** `specs/giskard-specification.md:170` ("post-persistence late
-  completion remains ignored until the durable amendment milestone") and `:2318` (tool output);
-  `docs/api-endpoints.md:129-131`; version line `:12` (1.94 on `main`; 1.95 if M9 lands first).
-  Tag series `LA*` is unused.
+- **Docs that reserve this case.** `specs/giskard-specification.md:176` ("post-persistence late
+  completion remains ignored until the durable amendment milestone") and `:2334` (tool output);
+  `docs/api-endpoints.md:129-131`; version line `:12` (1.95 on `main`, so this milestone is 1.96).
+  The newest amendment blockquote is the cancellable-subscribe one at `:14` and the newest
+  changelog block is 1.94 → 1.95 at `:202`; the new entries go above each. Tag series `LA*` is
+  unused.
 - **Tests.** `giskard-testenv`'s `FakeCore` exposes `append(thread, event)` and
   `complete_turn(thread, turn)` (`fake.rs:111`, `:115`), so a script can complete a turn and then
   append the command's `ItemCompleted`. `tests/e2e_smoke.rs:6208` shows a persisted-history
@@ -222,7 +225,7 @@ completion.
   after the client's cursor turn, ordered by turn order; a client may see an amendment twice, never
   miss one), **LA3** (runtime output survives until the amendment is durable; a failed write is
   logged and the runtime copy is kept), **LA4** (flat layout unsupported, logged). Retire the
-  reservations at `:170` and `:2318` with "(superseded by LA1)" prefixes in the C-series
+  reservations at `:176` and `:2334` with "(superseded by LA1)" prefixes in the C-series
   convention.
 - `docs/api-endpoints.md:129-131`: replace the sentence with the new behaviour for both routes,
   and add to the history description that resync deltas may contain previously delivered turns
