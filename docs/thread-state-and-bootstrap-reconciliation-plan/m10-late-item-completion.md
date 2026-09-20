@@ -10,15 +10,20 @@ now inside `run_subscribe_bootstrap`.
 
 ## What lands
 
-1. `PersistStore::amend_turn_item`: a settled item appended to its turn's payload file and a
-   superseding turn record appended to the index, payload first, index last, with no format bump.
-2. The index folds turn records last-wins, and the position of a turn's winning record becomes the
+1. `PersistStore::amend_turn_item`: a settled item appended to its turn's payload file with one
+   write to the file opened for append (preceded by a newline when the file's last line is torn),
+   and a superseding turn record appended to the index, payload first, index last, with no format
+   bump. The payload is never rewritten.
+2. Best-effort payload reads: a payload record that cannot be parsed, torn or not, is skipped with
+   a warning and counted; the turn still loads. The count travels on the turn as
+   `skipped_records`, and the transcript shows a warning row under such a turn.
+3. The index folds turn records last-wins, and the position of a turn's winning record becomes the
    amendment clock that `load_turns_after` uses, so a resync delta carries amended turns.
-3. `apply_late` persists the normalized item before forgetting the runtime copy of its output,
+4. `apply_late` persists the normalized item before forgetting the runtime copy of its output,
    for commands and tools alike, and keeps the runtime copy when the write fails.
-4. The browser refreshes a turn it already rendered when a resync delta names it again.
-5. Spec, `docs/api-endpoints.md`, README, and tests for the persisted, lazy-route, reconnect and
-   failure paths.
+5. The browser refreshes a turn it already rendered when a resync delta names it again.
+6. Spec, `docs/api-endpoints.md`, README, and tests for the persisted, lazy-route, reconnect,
+   damaged-record and failure paths.
 
 ## Facts the plan rests on
 
@@ -39,16 +44,22 @@ now inside `run_subscribe_bootstrap`.
   explicit display `index` because "a command that settles late is necessarily appended at the end
   of the file" (`:115-120`), and the reader folds items by id: a later record for a known id
   replaces the item in its slot and keeps the slot's index when the record carries none
-  (`:146-155`, `:596-603`). Unknown record kinds are skipped with a warning (`:632`). The file is
-  written whole with temp-file, fsync and rename so it is "complete or absent" (`:283`); the reader
-  has no torn-final-line tolerance for payloads (only the index has it, `:411-418`).
+  (`:146-155`, `:596-603`). Unknown record kinds are skipped with a warning (`:627-634`). The file
+  is written whole at commit with temp-file, fsync and rename (`:283`), and nothing appends to it
+  afterwards today. The reader fails the whole turn on the first line that is not JSON
+  (`:541-548`) or whose record does not deserialize (the `from_value` calls at `:551-608`), and
+  `read_turn_payload` (`:753-778`) then quarantines the file to `<path>.corrupt-<ts>` and fails
+  that one turn; a newer format header is `Invalid` and is not quarantined (`:756-766`). A missing
+  `user_input` record is also `Corrupt` today. The store skips a turn whose payload failed and
+  keeps the rest of the thread (`store.rs:455-480`).
 - **The index format.** `history.jsonl` is a header then one `turn_v3` record per turn
   (`:106-112`, written at `:238`). `TurnRecord` (`:65-104`) carries `item_count` "as of this
   record" and its doc says "a superseding turn record carries the current count" (`:79-89`).
   `parse_history_index` currently skips a duplicate turn id with a warning, first-wins
   (`:466-475`); `append_turn_unlocked` relies on that for its retry case, where a second attempt
-  re-appends an identical record (`store.rs:1286-1300`). The index is appended with `O_APPEND` and
-  tolerates one torn final line (`:411-418`).
+  re-appends an identical record (`store.rs:1286-1300`). The index is appended with one
+  `write_all` to a file opened with `append(true)` (`store.rs:1331-1338`) and tolerates one torn
+  final line (`:411-418`).
 - **The resync read.** `load_turns_after` (`store.rs:1776-1826`) finds the cursor's position in the
   deduplicated record list and returns the records after it, then loads their payloads through
   `load_selected_turn_records` (`:1674`). It is position-based, so with last-wins folding the
@@ -68,10 +79,21 @@ now inside `run_subscribe_bootstrap`.
   and `addItem` upserts a repeated item id (`:7531-7560`). A non-reset `HistoryDelta` renders each
   turn with `renderPersistedTurn` into a new container and inserts it (`:4053-4095`), then advances
   `newestPersistedTurnId` to the last turn in the delta (`:4095`); nothing checks whether a turn in
-  the delta is already on screen.
+  the delta is already on screen. `renderPersistedTurn` (`:4275-4304`) renders the items then an
+  `errorBubble` row for a failed or interrupted status (`:4298-4301`); `noticeBubble` (`:4446-4449`)
+  is the existing transcript-anchored warning row, styled as `.msg.notice` in every appearance
+  (`app.css:836-837`, `:1051`). `tests/ui.rs:915` asserts the opening lines of
+  `renderPersistedTurn`, which the change below does not alter.
+- **The turn types.** `Turn` (`core/src/turn.rs:160-180`) and `WireTurn`
+  (`proto/src/wire.rs:831-864`) carry no integrity information; `WireTurn` is built by
+  `From<Turn>`, which both the history page and `HistoryDelta` use. `Turn` struct literals exist in
+  12 files (`rg -l "\bTurn \{" crates`), most of them tests.
 - **Docs that reserve this case.** `specs/giskard-specification.md:176` ("post-persistence late
   completion remains ignored until the durable amendment milestone") and `:2334` (tool output);
   `docs/api-endpoints.md:129-131`; version line `:12` (1.95 on `main`, so this milestone is 1.96).
+  The "complete or absent" wording lives at spec `:413-415`, `:2628-2629` ("written once when the
+  turn commits"), `README.md:428-430` and the `history.rs:283` doc comment; the history route is
+  described at `docs/api-endpoints.md:161-166`.
   The newest amendment blockquote is the cancellable-subscribe one at `:14` and the newest
   changelog block is 1.94 → 1.95 at `:202`; the new entries go above each. Tag series `LA*` is
   unused.
@@ -84,9 +106,12 @@ now inside `run_subscribe_bootstrap`.
 
 ## Decisions
 
-- **D1. Append to the payload by atomic rewrite.** Read the payload bytes, append one `item` line,
-  `atomic_write` the result. The payload reader tolerates no torn line, and a late completion is
-  rare, so the cost of rewriting one turn's payload is accepted over adding torn-line recovery.
+- **D1. Append to the payload in place.** Open the payload with `append(true)` (never create: a
+  persisted turn must have one), and write the `item` line with one `write_all`, exactly as the
+  index is appended. If the file is non-empty and its last byte is not `\n`, the buffer starts with
+  a `\n` so the torn tail becomes its own line and the amendment its own; the torn tail is never
+  truncated or repaired. No fsync, matching the index append. The payload is never rewritten, so
+  the write costs the amendment's size whatever the turn holds.
 - **D2. The amendment record carries no index.** It is written as `{"kind":"item","item":…}` so
   the reader keeps the slot the first record established (`history.rs:146-155`). `PayloadLine::Item`
   gains `index: Option<usize>` with `skip_serializing_if` so existing lines are byte-identical.
@@ -115,16 +140,40 @@ now inside `run_subscribe_bootstrap`.
   for each of its items, which is the existing upsert, and is excluded from the container that is
   inserted; `newestPersistedTurnId` advances only to the newest turn id in the delta by turn order,
   which the server guarantees is last.
+- **D11. Best-effort payload reads.** `parse_turn_payload` no longer fails a turn on a bad line. A
+  line that is not JSON, or a known record kind that does not deserialize, is logged at `warn!`
+  with path, line and error, counted, and skipped; a torn final line is just the last such line.
+  The turn loads from what remains. Two failures stay fatal because nothing can be shown without
+  them: a `turn_header` newer than this build (`Invalid`, file left alone) and a missing
+  `user_input` record (`Corrupt`, quarantined as today). Neither can be produced by an amendment:
+  a commit writes both atomically before any amendment line exists.
+- **D12. The skipped count reaches the browser on the turn.** `TurnPayload` gains
+  `skipped_records: u32`; `Turn` and `WireTurn` gain the same field, `#[serde(default)]` and
+  omitted when zero, so healthy turns are byte-identical on the wire and in the flat legacy
+  format. The browser renders a `noticeBubble` row under a turn whose count is non-zero. A count,
+  not the reasons: the reasons are in the log, and the wire field stays bounded.
 
 ## Changes
 
 Order is the order that keeps the tree compiling and each step testable.
 
-### A. `crates/giskard-persist/src/history.rs` (+60, tests +60)
+### A. `crates/giskard-persist/src/history.rs` (+90, tests +90)
 
 1. `PayloadLine::Item { index: Option<usize>, item }` (`:126`); update the writer at `:307` to
    pass `Some(index)`; add `pub fn payload_item_line(item: &Item) -> Result<String, PersistError>`
    that serializes `PayloadLine::Item { index: None, item }` through `line_of` (`:274`).
+1b. `parse_turn_payload` (`:516`): add `skipped_records: u32` to `TurnPayload` (`:167-178`).
+   Replace the `?` on the line parse (`:541-548`) and on each record's `from_value` (`:551-608`)
+   with a `warn!` (`path`, `line`, `kind` when known, `error`, `"skipping unreadable record in
+   turn payload"`), `skipped_records += 1`, `continue`. The newer-format `Invalid` (`:565-571`)
+   and the missing `user_input` `Corrupt` stay. `read_turn_payload` (`:753-778`) is unchanged:
+   with D11 its quarantine arm is reached only for a payload with no usable `user_input`. Update
+   the `:283` doc comment: a payload is written whole at commit and afterwards only extended by
+   appended amendment records; a record that does not parse is skipped and counted. Rewrite the
+   doc comment on `parse_turn_payload` (`:500-515`) to state the skip rule beside the fold rules.
+1c. `TurnRecord::into_turn` (`:245-270`) copies `payload.skipped_records` onto the `Turn`, and its
+   `item_count` warning (`:246-257`) is suppressed when `skipped_records > 0`, since a skipped
+   item record explains the difference.
 2. `parse_history_index` (`:400-490`): replace the `seen` set with a `HashMap<TurnId, usize>` from
    turn id to the record's position in `records`; on a duplicate, overwrite `records[pos]` and log
    at `debug!` ("superseding turn record") instead of `warn!`. Return, beside the records, the line
@@ -134,19 +183,30 @@ Order is the order that keeps the tree compiling and each step testable.
    (`rg -n "parse_history_index\(" crates/giskard-persist/src`).
 3. Tests: a payload with an appended `item` record without `index` folds into the original slot;
    an index with a superseding record folds last-wins and reports its winning line; the existing
-   duplicate-id test flips from "skipped" to "superseded"; a downgraded reader is not tested here
-   (documented behaviour only).
+   duplicate-id test flips from "skipped" to "superseded"; a payload whose last line is torn
+   loads with `skipped_records == 1` and every earlier record; a bad interior line (not JSON, and
+   separately a well-formed `item` object missing a field) is skipped and counted while the
+   records after it load; a torn last line followed by an appended amendment (as the amend path
+   writes it, `\n` first) yields the amended item and `skipped_records == 1`; a missing
+   `user_input` is still `Corrupt`. `store.rs:3938`
+   (`a_damaged_payload_fails_that_turn_alone_and_is_quarantined`) keeps passing unchanged: its
+   damaged file has no `user_input`. A downgraded reader is not tested here (documented behaviour
+   only).
 
 ### B. `crates/giskard-persist/src/store.rs` (+120, tests +100)
 
 1. `pub async fn amend_turn_item(&self, project, thread, turn, item: &Item) ->
    Result<AmendOutcome, PersistError>` with `enum AmendOutcome { Amended, Unsupported }`. Under the
-   thread lock: `ensure_migrated`; `Unsupported` for `ThreadLayout::Flat`; read
-   `paths.turn_payload(turn)` (absent → an error naming the missing payload, since a persisted
-   turn must have one); append `payload_item_line(item)`; `atomic_write`; then build the superseding
-   `TurnRecord` from the winning record with the folded `item_count` and append it to the index
-   through the same `O_APPEND` write `append_turn_unlocked` uses (`:1335`), including its parent
-   fsync. Log at `debug!` with project, thread, turn, item, payload bytes before and after.
+   thread lock: `ensure_migrated`; `Unsupported` for `ThreadLayout::Flat`; in one
+   `spawn_blocking`: open `paths.turn_payload(turn)` with `OpenOptions::new().append(true)` and
+   no `create` (absent → an `Io` error naming the missing payload, since a persisted turn must
+   have one); read the file's length and, when non-zero, its last byte; build the buffer as
+   `payload_item_line(item)` prefixed with `\n` if that byte is not `\n`; one `write_all`. Then
+   read the payload back through `read_turn_payload` (the tolerant reader, on this rare path
+   only) for the folded item count, build the superseding `TurnRecord` from the winning record
+   with that `item_count`, and append it to the index through the same `append(true)` write
+   `append_turn_unlocked` uses (`:1331-1338`). Log at `debug!` with project, thread, turn, item,
+   bytes appended and whether a newline was inserted.
 2. `load_turns_after` (`:1776`): use the positions from A2. `cursor_first` is the cursor's first
    line; select records with `first_line > cursor_first || winning_line > cursor_first`, keep
    them in record order, and load as today. Update the `debug!` line with `amended_records`.
@@ -157,21 +217,34 @@ Order is the order that keeps the tree compiling and each step testable.
    cursor older than the amendment returns the amended turn, with a cursor newer than it does not,
    and never returns the cursor turn itself; `amend_turn_item` on a flat-layout thread returns
    `Unsupported` and writes nothing; a superseding record survives a torn final line on the next
-   append (existing index tolerance).
+   append (existing index tolerance); `amend_turn_item` on a payload whose last line is torn
+   inserts the newline first and the turn then loads with the settled item and
+   `skipped_records == 1`; `amend_turn_item` twice for two items appends two lines and both fold.
 
-### C. `crates/giskard-server/src/thread_metadata.rs` (+15)
+### C. `crates/giskard-core/src/turn.rs` (+8) and `crates/giskard-proto/src/wire.rs` (+6)
+
+1. `Turn` (`turn.rs:160-180`): add `#[serde(default, skip_serializing_if = "is_zero")] pub
+   skipped_records: u32` with a doc comment: records of the turn's payload file that could not be
+   read and were skipped when the turn was reassembled; zero for a live turn and a healthy file; a
+   bounded count, the reasons are in the server log. Add `fn is_zero(n: &u32) -> bool` beside it.
+   Every `Turn` literal in the workspace gains `skipped_records: 0`
+   (`rg -n "\bTurn \{" crates --type rust`; 12 files).
+2. `WireTurn` (`wire.rs:831-843`): the same field and attribute; `From<Turn>` (`:845-864`)
+   copies it. No other wire type changes and no `ServerMessage` variant is added.
+
+### D. `crates/giskard-server/src/thread_metadata.rs` (+15)
 
 `pub(crate) async fn amend_turn_item(&self, project_id, thread_id, turn, item) ->
 Result<AmendOutcome, PersistError>` delegating to the store. No metadata mutation is published:
 an item settling changes no aggregate the catalog shows.
 
-### D. `crates/giskard-server/src/thread_runtime.rs` (+15)
+### E. `crates/giskard-server/src/thread_runtime.rs` (+15)
 
 `pub(crate) fn forget_persisted_command_output_version(&self, authority, turn, item)` removing the
 `(turn, item)` key from `persisted_command_output_versions`, with a `ResolvedThreadRuntime`
 wrapper beside `persisted_command_output_version_permit` (`:297`).
 
-### E. `crates/giskard-server/src/registry/event_forwarder.rs` (net about +40)
+### F. `crates/giskard-server/src/registry/event_forwarder.rs` (net about +40)
 
 In `apply_late` (`:1396-1495`):
 
@@ -185,7 +258,7 @@ In `apply_late` (`:1396-1495`):
 3. The `hub.publish` calls stay where they are; the transcript event still goes out.
 4. Non-terminal late events (`log_ignored_seen_turn_running_task_start`) are unchanged.
 
-### F. `crates/giskard-server/static/app.js` (+25) and `tests/ui.rs` (+10)
+### G. `crates/giskard-server/static/app.js` (+40) and `tests/ui.rs` (+15)
 
 `renderHistoryDelta` non-reset branch (`:4053-4095`): before rendering, partition `turns` into
 those with an existing row (`document.querySelector('.msg[data-turn="<id>"]')`, the selector shape
@@ -194,7 +267,15 @@ per item and skip `renderPersistedTurn`. Advance `newestPersistedTurnId` to the 
 delta as today; the server orders the delta by turn order. `tests/ui.rs` gains assertions for the
 partition and the upsert call.
 
-### G. Tests: `crates/giskard-server/tests/late_item_completion.rs` (new, about 300 lines)
+`renderPersistedTurn` (`:4275-4304`): after the status row (`:4298-4301`), if
+`turn.skipped_records > 0` call `noticeBubble` with "N record(s) of this turn could not be read
+and were skipped; the turn may be incomplete." The row is stamped with the turn id like every
+other row rendered inside the function. On the upsert path above, add the row only if the turn
+has none yet (`.msg.notice[data-turn="<id>"]`), so a repeated delta does not stack warnings.
+`tests/ui.rs` asserts the `noticeBubble` call inside `renderPersistedTurn`; the existing
+assertion on the function's opening lines (`:915`) still holds.
+
+### H. Tests: `crates/giskard-server/tests/late_item_completion.rs` (new, about 350 lines)
 
 A script whose `start_turn` appends `TurnStarted`, an `ItemStarted` with a `CommandExecutionStart`,
 then completes the turn (`core.complete_turn`) with the command still running; a `Gate` the test
@@ -215,8 +296,15 @@ completion.
    command-output route still serves the fresh output from the runtime, and the log carries
    `action = "amend_turn_item"` at `error!`.
 6. **Flat layout.** A thread on `ThreadLayout::Flat` logs `Unsupported` and behaves as today.
+7. **Damaged record surfaced.** Persist a turn, truncate its payload's last line on disk, then
+   fetch the history page and separately subscribe with a reset bootstrap: the turn is present
+   with its readable items and `skipped_records: 1` in both `WireTurn`s, and the item endpoint
+   still serves the readable items. A healthy turn's JSON carries no `skipped_records` key.
+8. **Amendment after a torn tail.** Truncate the payload's last line, release the gate so the
+   late completion is amended: the turn loads with the settled item and `skipped_records: 1`, and
+   the log shows the newline insertion at `debug!` and the skipped record at `warn!`.
 
-### H. Documentation
+### I. Documentation
 
 - `specs/giskard-specification.md`: bump the version; amendment blockquote; changelog block
   `late item completion` with **LA1** (a terminal item completing after its turn persisted is
@@ -224,20 +312,29 @@ completion.
   bump), **LA2** (the index folds turn records last-wins; a resync delta includes turns amended
   after the client's cursor turn, ordered by turn order; a client may see an amendment twice, never
   miss one), **LA3** (runtime output survives until the amendment is durable; a failed write is
-  logged and the runtime copy is kept), **LA4** (flat layout unsupported, logged). Retire the
+  logged and the runtime copy is kept), **LA4** (flat layout unsupported, logged), **LA5** (a
+  payload is written whole at commit and afterwards only extended by appended records, one write
+  each; a payload record that does not parse is skipped with a warning and counted, the turn still
+  loads, and the count is delivered on the turn as `skipped_records` and shown as a warning row; a
+  newer payload format or a missing `user_input` still fails that turn alone). Retire the
   reservations at `:176` and `:2334` with "(superseded by LA1)" prefixes in the C-series
-  convention.
+  convention, and reword "complete or absent" at `:413-415` and "written once when the turn
+  commits" at `:2628-2629` to the LA5 rule.
 - `docs/api-endpoints.md:129-131`: replace the sentence with the new behaviour for both routes,
-  and add to the history description that resync deltas may contain previously delivered turns
-  whose items settled late.
+  and add to the history description (`:161-166`) that resync deltas may contain previously
+  delivered turns whose items settled late, and that a turn carries `skipped_records` when part of
+  its payload could not be read.
 - `README.md`: one sentence beside the command-row description (`:137-139`): a command that
-  finishes after its turn ended is recorded and shown settled after a reload.
+  finishes after its turn ended is recorded and shown settled after a reload. Reword the storage
+  paragraph (`:428-430`): the payload is written atomically at commit and only ever extended by
+  appended amendment lines; a line that cannot be read is skipped and the transcript says so.
 
 ### Not touched
 
-`giskard-proto`, `giskard-core`, `giskard-harness*`, `giskard-testenv`, the live buffer, the
-bootstrap sequence in `ws.rs`, `ItemOutputState`'s shape, `routes.rs` handlers, the history and
-payload format numbers, and `tests/e2e/`.
+`giskard-harness*`, `giskard-testenv`, the live buffer, the bootstrap sequence in `ws.rs`,
+`ItemOutputState`'s shape, `routes.rs` handlers, the history and payload format numbers,
+`atomic.rs`, the quarantine path in `read_turn_payload`, and `tests/e2e/`. In `giskard-core` and
+`giskard-proto` only the `skipped_records` field and its zero-skip helper.
 
 ## Exit checks
 
@@ -250,15 +347,24 @@ payload format numbers, and `tests/e2e/`.
 | E | `rg -n "forget_persisted_command_output_version" crates/giskard-server/src` | runtime definition, wrapper, one forwarder call |
 | F | `rg -n "HISTORY_FORMAT: u32 = 3\|TURN_PAYLOAD_FORMAT: u32 = 1" crates/giskard-persist/src/layout.rs` | both unchanged |
 | G | `rg -c "ServerMessage" crates/giskard-proto/src/lib.rs` and the variant count | 11 variants, unchanged |
-| H | `git diff --stat main -- crates/giskard-proto crates/giskard-core crates/giskard-harness crates/giskard-harness-codex crates/giskard-harness-replay crates/giskard-testenv crates/giskard-server/src/ws.rs crates/giskard-server/src/routes.rs crates/giskard-server/src/thread_runtime/live.rs tests/e2e` | empty |
-| I | `rg -n "\*\*LA[1-4]:\*\*\|superseded by LA1" specs/giskard-specification.md` | 6 lines |
+| H | `git diff --stat main -- crates/giskard-harness crates/giskard-harness-codex crates/giskard-harness-replay crates/giskard-testenv crates/giskard-server/src/ws.rs crates/giskard-server/src/routes.rs crates/giskard-server/src/thread_runtime/live.rs crates/giskard-persist/src/atomic.rs tests/e2e` | empty |
+| H2 | `git diff main -- crates/giskard-core crates/giskard-proto \| rg "^[+-] " \| rg -v "skipped_records\|is_zero\|^[+-]\s*(//|///)"` | nothing but the field, its attribute and the helper |
+| H3 | `rg -n "atomic_write\|\.create(true)" crates/giskard-persist/src/store.rs` around `amend_turn_item` | not used by the amend path |
+| H4 | `rg -n "skipped_records" crates static` | core, proto, history.rs (`TurnPayload`, parser, `into_turn`), app.js, tests |
+| H5 | `rg -c "quarantining" crates/giskard-persist/src/history.rs` | 1, unchanged |
+| I | `rg -n "\*\*LA[1-5]:\*\*\|superseded by LA1" specs/giskard-specification.md` | 7 lines |
 | J | `cargo fmt --all --check`; `cargo clippy --workspace --all-targets --locked -- -D warnings` | clean |
 | K | `cargo test --workspace --locked` | green, including `late_item_completion`, `history_sync`, `code_overlay`, `e2e_smoke::replayed_persisted_turn_events_are_not_duplicated` |
-| L | Test G2 run against `main` before the change | fails: the delta is empty and the item still reads running |
+| L | Test H2 run against `main` before the change | fails: the delta is empty and the item still reads running |
+| M | Test H7 run against `main` before the change | fails: the turn is missing from the page and its payload is quarantined |
 
 ## Signs the step has gone wrong
 
-- A payload written with `OpenOptions::append`: the payload reader cannot recover a torn line.
+- The payload read back and rewritten whole by the amend path, or a torn tail truncated or
+  "repaired" before appending: the amend path only ever appends.
+- A payload reader that still fails a turn, or quarantines a file, over one unreadable record;
+  or one that silently drops a record without the `warn!` and the count.
+- `skipped_records` carrying anything but a count, or appearing in the JSON of a healthy turn.
 - A history or payload format bump, or a new `TurnRecord` field used as the clock: the line
   position is the clock and the format admits the amendment as it is.
 - The runtime output removed before the amendment is durable, or a retry loop around the write.
@@ -270,5 +376,6 @@ payload format numbers, and `tests/e2e/`.
 
 ## Size
 
-About +250 production lines (persist 180, server 55, browser 25) and about +500 test lines, plus
-docs. If `ws.rs`, `live.rs` or `giskard-proto` appear in the diff, M13 has crept in.
+About +300 production lines (persist 210, core and proto 15, server 55, browser 40) and about
++600 test lines, plus docs. If `ws.rs` or `live.rs` appear in the diff, or `giskard-proto`
+changes anything beyond the `skipped_records` field, M13 has crept in.

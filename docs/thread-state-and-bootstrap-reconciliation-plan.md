@@ -2033,9 +2033,14 @@ first-wins today, `:466-475`), the clock a reconnecting client is compared again
 browser's handling of a turn it has already rendered arriving again in a resync delta.
 
 **Proposed change.** Persist the settled item as an amendment and let the existing resync deliver
-it. Append the normalized item as a payload `item` record (the payload is rewritten atomically so
-it stays "complete or absent", `:283`), then append a superseding turn record to the index, in the
-same payload-first, index-last order as a commit. The index folds turn records last-wins from now
+it. Append the normalized item as a payload `item` record with one write to the payload opened
+for append, preceded by a newline when the file's last line is torn, then append a superseding
+turn record to the index, in the same payload-first, index-last order as a commit. The payload is
+never rewritten. Reads become best-effort to match: a payload
+record that does not parse, torn or otherwise, is skipped with a warning and counted rather than
+failing the turn, and the count travels on the turn (`skipped_records`) so the transcript shows a
+warning row under a turn that lost records; a newer payload format or a missing `user_input`
+still fails that turn alone. The index folds turn records last-wins from now
 on, and the position of a turn's winning record in the index is the amendment clock: `Subscribe
 { since }` returns every turn appended after the cursor turn's first record *and* every turn whose
 winning record is later than that line, ordered by turn order. No protocol field is added; a
@@ -2053,13 +2058,15 @@ that turn's items instead of rendering it again.
 **Non-goals.** Any change to the runtime registry, the live buffer, the bootstrap sequence, or
 delivery. The flat legacy layout: an amendment for a thread still on it is logged and skipped, as
 its append path is already degraded. A payload-format or history-format bump. New `ServerMessage`
-variants. Amending anything other than an item that reached a terminal state.
+variants (one bounded count on the turn is added, not a message). Repairing or truncating damaged
+payload lines. Amending anything other than an item that reached a terminal state.
 
 **Expected outcome.** A command or tool completing after its turn was persisted is durable across
 a server restart, is served by the command-output and tool-output routes from persistence with a
 fresh version, and appears settled to a client that reloads or reconnects. A client that already
 rendered the turn is updated, not duplicated. An amendment write failure is visible in the log and
-does not lose the output while the process lives. The persisted turn is accurate at every point in
+does not lose the output while the process lives. A damaged payload record costs that record, not
+the turn, and the user is told in the transcript. The persisted turn is accurate at every point in
 time after the amendment, and the spec and API notes that reserve this case are retired.
 
 ---
