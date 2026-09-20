@@ -15,12 +15,12 @@ of the original plan; it was inserted because the bootstrap and retention work b
 into the same root cause — a turn's record was both its index entry and its unbounded payload. See
 *What the storage layout change unlocks* for the parts of this plan it simplifies or retires.
 
-**M1 through M8 are complete**: history pagination over HTTP, the runtime registry, turn-less
+**M1 through M9 are complete**: history pagination over HTTP, the runtime registry, turn-less
 context restoration, lazy agent-produced diffs, lazy completed-command output, lazy completed
-tool output, strict Tasks-menu ownership for `RunningTasks`, and the item endpoint with reasoning
-previews. Each milestone below carries its own status line; this paragraph is a summary, not the
-record. A cancellable subscribe, durable late-item amendments, the ordered-lane overflow policy,
-the content inventory, the bootstrap measurement, and cleanup remain, as defined under
+tool output, strict Tasks-menu ownership for `RunningTasks`, the item endpoint with reasoning
+previews, and the cancellable subscribe. Each milestone below carries its own status line; this
+paragraph is a summary, not the record. Durable late-item amendments, the ordered-lane overflow
+policy, the content inventory, the bootstrap measurement, and cleanup remain, as defined under
 *Implementation milestones*.
 
 This plan began with Codex restoring a context window outside a turn. The codebase audit showed
@@ -1915,6 +1915,11 @@ therefore unverifiable; `captured_diff_records` is that read-back, on the same l
 ### M9 — Cancellable subscribe
 
 Implementation plan: [`m9-cancellable-subscribe.md`](thread-state-and-bootstrap-reconciliation-plan/m9-cancellable-subscribe.md).
+
+**Status:** complete (`3deab1d`). The subscribe bootstrap runs in a connection-owned task keyed by
+thread and a per-connection generation, cancelled cooperatively at phase boundaries on close,
+same-thread resubscribe and unsubscribe; the message set and order are unchanged, the generation
+stays server-side, and `tests/subscribe_cancellation.rs` covers the three triggers; spec 1.95.
 
 **Problem.** `handle_client_msg` is awaited inline in the connection's receive loop
 (`ws.rs:394`), and its `Subscribe` arm (`ws.rs:443-603`) runs the whole bootstrap before
