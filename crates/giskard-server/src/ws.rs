@@ -1,4 +1,7 @@
+use std::collections::HashMap;
 use std::fmt;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use axum::{
@@ -11,7 +14,7 @@ use axum::{
 use chrono::Utc;
 use futures::{SinkExt, StreamExt};
 use giskard_core::error::{HarnessError, PersistError};
-use giskard_core::ids::{ProjectId, ThreadId};
+use giskard_core::ids::{ProjectId, ThreadId, TurnId};
 use giskard_core::model::ModelRef;
 use giskard_core::thread::ThreadKind;
 use giskard_core::turn::{TurnMode, TurnModel, TurnOverrides};
@@ -337,6 +340,7 @@ async fn handle_ws(socket: WebSocket, state: AppState) {
     let hub = state.hub.clone();
     let receiver_shutdown = state.shutdown.clone();
     let mut shutting_down = false;
+    let mut slots = SubscriptionSlots::default();
 
     loop {
         let incoming = tokio::select! {
@@ -393,7 +397,8 @@ async fn handle_ws(socket: WebSocket, state: AppState) {
                     }
                     _ => None,
                 };
-                if let Err(mut e) = handle_client_msg(&state, client_id, &tx, msg).await {
+                if let Err(mut e) = handle_client_msg(&state, client_id, &tx, &mut slots, msg).await
+                {
                     e.info.request_id = metadata_request_id;
                     error!(
                         %client_id,
@@ -423,6 +428,7 @@ async fn handle_ws(socket: WebSocket, state: AppState) {
         }
     }
 
+    slots.cancel_all();
     hub.disconnect(client_id).await;
     if shutting_down {
         let writer_wait = SHUTDOWN_CLOSE_TIMEOUT + SHUTDOWN_WRITER_GRACE;
@@ -437,172 +443,60 @@ async fn handle_client_msg(
     state: &AppState,
     client_id: usize,
     tx: &mpsc::Sender<ServerMessage>,
+    slots: &mut SubscriptionSlots,
     msg: ClientMessage,
 ) -> Result<(), WsError> {
     match msg {
         ClientMessage::Subscribe { thread_id, since } => {
-            // Attaching the harness is best-effort. If it fails — most often because the thread's
-            // provider was removed from config — degrade to a read-only view: the persisted
-            // history is still served and the attach failure is surfaced as a non-fatal warning,
-            // so an orphaned thread stays viewable even though it can never run a new turn. Only a
-            // genuinely missing thread remains a hard error.
-            let (project_id, notice) = match ensure_thread_open(state, thread_id, "subscribe").await
-            {
-                Ok(access) => (access.project_id, access.warning),
-                Err(attach_error) => {
-                    let project_id = project_for_readonly(state, thread_id, "subscribe").await?;
-                    warn!(
-                        %thread_id,
-                        code = %attach_error.info.code,
-                        detail = display_opt(attach_error.info.detail.as_deref()),
-                        "thread harness attach failed; serving read-only history"
-                    );
-                    (
-                        project_id,
-                        Some(read_only_warning(state, project_id, &attach_error, thread_id).await),
-                    )
-                }
-            };
-            // Registering before the snapshot below is built is what makes the snapshot's
-            // `active_turn` safe to act on: a turn that ends after this line broadcasts its
-            // `TurnCompleted` to this client, and one that ended before it is already out of the
-            // turn gate. Build the snapshot first and a turn ending in between would be reported
-            // live by a client that then never hears it finish.
-            if !state.hub.subscribe(thread_id, client_id).await {
-                return Err(WsError::new(
-                    "ws_client_not_registered",
-                    ErrorSeverity::Error,
-                    "WebSocket client registration was lost; reconnect to continue.",
+            let (generation, cancelled) = slots.begin(thread_id);
+            debug!(
+                %client_id,
+                %thread_id,
+                generation,
+                action = "subscribe",
+                "spawning subscribe bootstrap"
+            );
+            let state = state.clone();
+            let tx = tx.clone();
+            tokio::spawn(async move {
+                if let Err(e) = run_subscribe_bootstrap(
+                    &state, client_id, &tx, thread_id, since, generation, &cancelled,
                 )
-                .thread(thread_id)
-                .action("subscribe"));
-            }
-
-            if let Some(warning) = notice {
-                let _ = tx.send(ServerMessage::Error { error: warning }).await;
-            }
-
-            let tf = state
-                .thread_metadata
-                .recompute_aggregates(project_id, thread_id)
                 .await
-                .map_err(|e| WsError::from_persist(e, "subscribe_history", Some(thread_id)))?
-                .into_current()
-                .ok_or_else(|| {
-                    WsError::new(
-                        "thread_not_found",
-                        ErrorSeverity::Error,
-                        "Thread not found.",
-                    )
-                    .thread(thread_id)
-                    .action("subscribe")
-                })?;
-            let _ = tx
-                .send(ServerMessage::ThreadState(
-                    crate::thread_metadata::ThreadMetadataService::thread_state(
-                        &tf,
-                        Some(state.registry.thread_has_active_turn(thread_id).await),
-                    ),
-                ))
-                .await;
-
-            // Initial/reconnect history remains a temporary bootstrap-only delta. Only older-page
-            // pagination is fetched over HTTP and kept out of the ordered socket lane.
-            //
-            // * Resync (`since` present): history-first ordering. Send the persisted history — a
-            //   `HistoryDelta` of the turns after the cursor when we can resolve it, or a bounded
-            //   reset delta when we can't (stale cursor) — *before* the live turn and tasks. The
-            //   client reconciles or rebuilds the transcript while it still owns it, then the live
-            //   turn appends on top. The browser may keep a stale live DOM block visible until the
-            //   replacement snapshot arrives, so delta rows still need to be inserted before that
-            //   retained live block on the UI side.
-            let history_started_at = Instant::now();
-            let resync_delta = match since {
-                Some(cursor) => state
-                    .store
-                    .load_turns_after(project_id, thread_id, cursor)
-                    .await
-                    .map_err(|e| WsError::from_persist(e, "subscribe_resync", Some(thread_id)))?,
-                None => None,
-            };
-
-            let history_message = if let Some(turns) = resync_delta {
-                Some(ServerMessage::HistoryDelta {
-                    thread_id,
-                    turns: turns.into_iter().map(Into::into).collect(),
-                    reset: false,
-                    has_more: None,
-                })
-            } else {
-                let limit = history_limit_or_default(
-                    state,
-                    thread_id,
-                    "subscribe_history",
-                    |config| config.history.initial,
-                    5,
-                )
-                .await;
-                let (turns, has_more) = state
-                    .store
-                    .load_history(project_id, thread_id, None, limit)
-                    .await
-                    .map_err(|e| WsError::from_persist(e, "subscribe_history", Some(thread_id)))?;
-                Some(ServerMessage::HistoryDelta {
-                    thread_id,
-                    turns: turns.into_iter().map(Into::into).collect(),
-                    reset: true,
-                    has_more: Some(has_more),
-                })
-            };
-
-            // The live turn (H5) isn't in the JSONL yet — reconstruct it from the live buffer — and
-            // its running tasks. Bootstrap history goes first so a reset rebuilds completed rows
-            // before the live snapshot appends its in-flight rows.
-            debug!(
-                %project_id,
-                %thread_id,
-                action = "subscribe_history",
-                incremental = since.is_some(),
-                elapsed_ms = history_started_at.elapsed().as_millis(),
-                "loaded subscription history"
-            );
-
-            let live_snapshot_started_at = Instant::now();
-            let runtime = state.registry.thread_runtime(thread_id).await;
-            let live_snapshot = runtime.as_ref().and_then(|runtime| runtime.live_snapshot());
-            debug!(
-                %project_id,
-                %thread_id,
-                action = "build_live_snapshot",
-                accumulated_events = live_snapshot
-                    .as_ref()
-                    .map_or(0, |snapshot| snapshot.accumulated.len()),
-                elapsed_ms = live_snapshot_started_at.elapsed().as_millis(),
-                "built subscription live snapshot"
-            );
-            let (revision, tasks) = runtime
-                .as_ref()
-                .map_or((0, Vec::new()), |runtime| runtime.tasks_snapshot());
-            let running_tasks = ServerMessage::RunningTasks {
-                thread_id,
-                revision,
-                tasks,
-            };
-            if let Some(history_message) = history_message {
-                let _ = tx.send(history_message).await;
-            }
-            if let Some(snap) = live_snapshot {
-                let _ = tx.send(ServerMessage::LiveTurnSnapshot(snap)).await;
-            }
-            let _ = tx.send(running_tasks).await;
-            for request in runtime
-                .as_ref()
-                .map_or_else(Vec::new, |runtime| runtime.request_states())
-            {
-                let _ = tx.send(ServerMessage::RequestState(request)).await;
-            }
+                {
+                    // A superseded bootstrap must not surface its failure to the client: the
+                    // error belongs to a subscription the connection has already replaced or
+                    // dropped. Log it anyway so a bootstrap that fails while being cancelled
+                    // stays diagnosable instead of disappearing.
+                    if cancelled.load(Ordering::Acquire) {
+                        debug!(
+                            %client_id,
+                            %thread_id,
+                            generation,
+                            code = %e.info.code,
+                            detail = display_opt(e.info.detail.as_deref()),
+                            action = "subscribe",
+                            "cancelled subscribe bootstrap failed; dropping error"
+                        );
+                        return;
+                    }
+                    error!(
+                        %client_id,
+                        code = %e.info.code,
+                        severity = ?e.info.severity,
+                        thread_id = display_opt(e.info.thread_id),
+                        request_id = display_opt(e.info.request_id.as_deref()),
+                        action = display_opt(e.info.action.as_deref()),
+                        detail = display_opt(e.info.detail.as_deref()),
+                        "WS handler error: {}",
+                        e.info.message
+                    );
+                    let _ = tx.send(e.into_server_message()).await;
+                }
+            });
         }
         ClientMessage::Unsubscribe { thread_id } => {
+            slots.cancel(thread_id);
             state.hub.unsubscribe(thread_id, client_id).await;
         }
         ClientMessage::SendInput {
@@ -1314,6 +1208,296 @@ async fn handle_client_msg(
         ClientMessage::Ping => {
             let _ = tx.send(ServerMessage::Pong).await;
         }
+    }
+    Ok(())
+}
+
+struct BootstrapSlot {
+    generation: u64,
+    cancelled: Arc<AtomicBool>,
+}
+
+/// Per-connection record of the in-flight subscribe bootstrap for each thread.
+///
+/// Lifetime: connection-scoped. A slot is created by `begin` on `Subscribe`, replaced (cancelling
+/// the previous generation) by a later `Subscribe` for the same thread, removed by `cancel` on
+/// `Unsubscribe`, and the whole map is drained by `cancel_all` when the receive loop exits — the
+/// single cleanup site, so no slot outlives `handle_ws`. A bootstrap that runs to completion
+/// leaves its slot in place by design: nothing but the loop touches the map, so the entry is just
+/// a spent generation marker until it is replaced or drained.
+#[derive(Default)]
+struct SubscriptionSlots {
+    next_generation: u64,
+    by_thread: HashMap<ThreadId, BootstrapSlot>,
+}
+
+impl SubscriptionSlots {
+    fn begin(&mut self, thread_id: ThreadId) -> (u64, Arc<AtomicBool>) {
+        self.cancel(thread_id);
+        self.next_generation = self.next_generation.saturating_add(1);
+        let generation = self.next_generation;
+        let cancelled = Arc::new(AtomicBool::new(false));
+        self.by_thread.insert(
+            thread_id,
+            BootstrapSlot {
+                generation,
+                cancelled: cancelled.clone(),
+            },
+        );
+        (generation, cancelled)
+    }
+
+    fn cancel(&mut self, thread_id: ThreadId) {
+        if let Some(slot) = self.by_thread.remove(&thread_id) {
+            cancel_slot(thread_id, &slot);
+        }
+    }
+
+    fn cancel_all(&mut self) {
+        for (thread_id, slot) in self.by_thread.drain() {
+            cancel_slot(thread_id, &slot);
+        }
+    }
+}
+
+fn cancel_slot(thread_id: ThreadId, slot: &BootstrapSlot) {
+    // Slots for finished bootstraps stay in the map, so cancelling one is routinely a no-op —
+    // most of all at loop exit, where every thread the connection ever subscribed is drained. The
+    // task holds the only other handle on the flag, so a strong count of one means it is already
+    // gone and there is nothing worth logging.
+    if Arc::strong_count(&slot.cancelled) > 1 {
+        debug!(
+            %thread_id,
+            generation = slot.generation,
+            action = "cancel_subscribe_bootstrap",
+            "cancelling subscribe bootstrap"
+        );
+    }
+    slot.cancelled.store(true, Ordering::Release);
+}
+
+fn subscribe_bootstrap_cancelled(
+    cancelled: &AtomicBool,
+    client_id: usize,
+    thread_id: ThreadId,
+    generation: u64,
+    phase: &'static str,
+    started_at: Instant,
+) -> bool {
+    if !cancelled.load(Ordering::Acquire) {
+        return false;
+    }
+    debug!(
+        %client_id,
+        %thread_id,
+        generation,
+        phase,
+        elapsed_ms = started_at.elapsed().as_millis(),
+        action = "subscribe",
+        "cancelled subscribe bootstrap"
+    );
+    true
+}
+
+async fn run_subscribe_bootstrap(
+    state: &AppState,
+    client_id: usize,
+    tx: &mpsc::Sender<ServerMessage>,
+    thread_id: ThreadId,
+    since: Option<TurnId>,
+    generation: u64,
+    cancelled: &AtomicBool,
+) -> Result<(), WsError> {
+    let started_at = Instant::now();
+    macro_rules! bail_if_cancelled {
+        ($phase:literal) => {
+            if subscribe_bootstrap_cancelled(
+                cancelled, client_id, thread_id, generation, $phase, started_at,
+            ) {
+                return Ok(());
+            }
+        };
+    }
+
+    // Attaching the harness is best-effort. If it fails — most often because the thread's
+    // provider was removed from config — degrade to a read-only view: the persisted history is
+    // still served and the attach failure is surfaced as a non-fatal warning, so an orphaned
+    // thread stays viewable even though it can never run a new turn. Only a genuinely missing
+    // thread remains a hard error.
+    let (project_id, notice) = match ensure_thread_open(state, thread_id, "subscribe").await {
+        Ok(access) => (access.project_id, access.warning),
+        Err(attach_error) => {
+            let project_id = project_for_readonly(state, thread_id, "subscribe").await?;
+            warn!(
+                %thread_id,
+                code = %attach_error.info.code,
+                detail = display_opt(attach_error.info.detail.as_deref()),
+                "thread harness attach failed; serving read-only history"
+            );
+            (
+                project_id,
+                Some(read_only_warning(state, project_id, &attach_error, thread_id).await),
+            )
+        }
+    };
+    bail_if_cancelled!("ensure_thread_open");
+
+    // Registering before the snapshot below is built is what makes the snapshot's `active_turn`
+    // safe to act on: a turn that ends after this line broadcasts its `TurnCompleted` to this
+    // client, and one that ended before it is already out of the turn gate. Build the snapshot
+    // first and a turn ending in between would be reported live by a client that then never hears
+    // it finish.
+    //
+    // Because this runs off the receive loop there is a small window where an `Unsubscribe`
+    // handled just before this line hits the hub first and leaves this registration standing, so
+    // the client keeps receiving live events for a thread it unsubscribed from. That is accepted:
+    // the window is tiny and the browser never sends `unsubscribe`. Do not "fix" it by
+    // unsubscribing from the hub on cancel — cancellation is per generation, and a superseded
+    // generation would then tear down the registration a newer one has already made. The same
+    // window on disconnect only costs the hub's existing "unregistered client" warning.
+    if !state.hub.subscribe(thread_id, client_id).await {
+        return Err(WsError::new(
+            "ws_client_not_registered",
+            ErrorSeverity::Error,
+            "WebSocket client registration was lost; reconnect to continue.",
+        )
+        .thread(thread_id)
+        .action("subscribe"));
+    }
+    bail_if_cancelled!("hub_subscribe");
+
+    if let Some(warning) = notice {
+        bail_if_cancelled!("send_attach_warning");
+        let _ = tx.send(ServerMessage::Error { error: warning }).await;
+    }
+    bail_if_cancelled!("before_recompute_aggregates");
+
+    let tf = state
+        .thread_metadata
+        .recompute_aggregates(project_id, thread_id)
+        .await
+        .map_err(|e| WsError::from_persist(e, "subscribe_history", Some(thread_id)))?
+        .into_current()
+        .ok_or_else(|| {
+            WsError::new(
+                "thread_not_found",
+                ErrorSeverity::Error,
+                "Thread not found.",
+            )
+            .thread(thread_id)
+            .action("subscribe")
+        })?;
+    bail_if_cancelled!("recompute_aggregates");
+    let active_turn = state.registry.thread_has_active_turn(thread_id).await;
+    let thread_state =
+        crate::thread_metadata::ThreadMetadataService::thread_state(&tf, Some(active_turn));
+    bail_if_cancelled!("send_thread_state");
+    let _ = tx.send(ServerMessage::ThreadState(thread_state)).await;
+    bail_if_cancelled!("before_load_history");
+
+    // Initial/reconnect history remains a temporary bootstrap-only delta. Only older-page
+    // pagination is fetched over HTTP and kept out of the ordered socket lane.
+    //
+    // * Resync (`since` present): history-first ordering. Send the persisted history — a
+    //   `HistoryDelta` of the turns after the cursor when we can resolve it, or a bounded reset
+    //   delta when we can't (stale cursor) — *before* the live turn and tasks. The client
+    //   reconciles or rebuilds the transcript while it still owns it, then the live turn appends
+    //   on top. The browser may keep a stale live DOM block visible until the replacement snapshot
+    //   arrives, so delta rows still need to be inserted before that retained live block on the UI
+    //   side.
+    let history_started_at = Instant::now();
+    let resync_delta = match since {
+        Some(cursor) => state
+            .store
+            .load_turns_after(project_id, thread_id, cursor)
+            .await
+            .map_err(|e| WsError::from_persist(e, "subscribe_resync", Some(thread_id)))?,
+        None => None,
+    };
+
+    let history_message = if let Some(turns) = resync_delta {
+        Some(ServerMessage::HistoryDelta {
+            thread_id,
+            turns: turns.into_iter().map(Into::into).collect(),
+            reset: false,
+            has_more: None,
+        })
+    } else {
+        let limit = history_limit_or_default(
+            state,
+            thread_id,
+            "subscribe_history",
+            |config| config.history.initial,
+            5,
+        )
+        .await;
+        let (turns, has_more) = state
+            .store
+            .load_history(project_id, thread_id, None, limit)
+            .await
+            .map_err(|e| WsError::from_persist(e, "subscribe_history", Some(thread_id)))?;
+        Some(ServerMessage::HistoryDelta {
+            thread_id,
+            turns: turns.into_iter().map(Into::into).collect(),
+            reset: true,
+            has_more: Some(has_more),
+        })
+    };
+    bail_if_cancelled!("load_history");
+
+    // The live turn (H5) isn't in the JSONL yet — reconstruct it from the live buffer — and its
+    // running tasks. Bootstrap history goes first so a reset rebuilds completed rows before the
+    // live snapshot appends its in-flight rows.
+    debug!(
+        %project_id,
+        %thread_id,
+        generation,
+        action = "subscribe_history",
+        incremental = since.is_some(),
+        elapsed_ms = history_started_at.elapsed().as_millis(),
+        "loaded subscription history"
+    );
+
+    let live_snapshot_started_at = Instant::now();
+    let runtime = state.registry.thread_runtime(thread_id).await;
+    let live_snapshot = runtime.as_ref().and_then(|runtime| runtime.live_snapshot());
+    debug!(
+        %project_id,
+        %thread_id,
+        generation,
+        action = "build_live_snapshot",
+        accumulated_events = live_snapshot
+            .as_ref()
+            .map_or(0, |snapshot| snapshot.accumulated.len()),
+        elapsed_ms = live_snapshot_started_at.elapsed().as_millis(),
+        "built subscription live snapshot"
+    );
+    bail_if_cancelled!("build_live_snapshot");
+    let (revision, tasks) = runtime
+        .as_ref()
+        .map_or((0, Vec::new()), |runtime| runtime.tasks_snapshot());
+    let running_tasks = ServerMessage::RunningTasks {
+        thread_id,
+        revision,
+        tasks,
+    };
+    if let Some(history_message) = history_message {
+        bail_if_cancelled!("send_history");
+        let _ = tx.send(history_message).await;
+    }
+    if let Some(snap) = live_snapshot {
+        bail_if_cancelled!("send_live_snapshot");
+        let _ = tx.send(ServerMessage::LiveTurnSnapshot(snap)).await;
+    }
+    bail_if_cancelled!("send_running_tasks");
+    let _ = tx.send(running_tasks).await;
+    bail_if_cancelled!("before_request_states");
+    for request in runtime
+        .as_ref()
+        .map_or_else(Vec::new, |runtime| runtime.request_states())
+    {
+        bail_if_cancelled!("send_request_state");
+        let _ = tx.send(ServerMessage::RequestState(request)).await;
     }
     Ok(())
 }
