@@ -7,7 +7,7 @@ use giskard_core::approval::ApprovalDecision;
 use giskard_core::approval::ApprovalRequest;
 use giskard_core::event::AgentEvent;
 use giskard_core::ids::{ApprovalId, ItemId, ServerRequestId, ThreadId, TurnId};
-use giskard_core::item::{CommandOutputDescriptor, ItemDelta, ItemPayload};
+use giskard_core::item::{CommandOutputDescriptor, Item, ItemDelta, ItemPayload, ItemStart};
 #[cfg(test)]
 use giskard_core::server_request::ServerRequest;
 use giskard_core::user_input::UserInput;
@@ -37,6 +37,15 @@ struct LiveTurn {
     /// would replay it as actionable and re-answering routes a stale id to the harness. The answer
     /// is recorded here the moment it is routed, which closes that window.
     resolved_server_requests: HashSet<ServerRequestId>,
+}
+
+pub(crate) enum LiveItem {
+    Started(ItemStart),
+    Completed {
+        item: Item,
+        command_output: Option<CommandOutputDescriptor>,
+        tool_output: Option<WireToolOutput>,
+    },
 }
 
 #[derive(Default)]
@@ -255,6 +264,31 @@ impl LiveTurnState {
             })
             .cloned()
             .collect()
+    }
+
+    pub fn live_item(
+        &self,
+        thread_id: ThreadId,
+        turn_id: TurnId,
+        item_id: ItemId,
+    ) -> Option<LiveItem> {
+        if self.thread_id != Some(thread_id) {
+            return None;
+        }
+        let turn = self.turn.as_ref().filter(|turn| turn.turn_id == turn_id)?;
+        turn.events.iter().rev().find_map(|event| match event {
+            AgentEvent::ItemStarted { item, .. } if item.id == item_id => {
+                Some(LiveItem::Started(item.clone()))
+            }
+            AgentEvent::ItemCompleted { item, .. } if item.id == item_id => {
+                Some(LiveItem::Completed {
+                    item: item.clone(),
+                    command_output: turn.command_output_descriptors.get(&item_id).cloned(),
+                    tool_output: turn.tool_output_descriptors.get(&item_id).cloned(),
+                })
+            }
+            _ => None,
+        })
     }
 
     pub fn snapshot(&self, thread_id: ThreadId) -> Option<LiveTurnSnapshot> {
@@ -622,6 +656,112 @@ mod tests {
             }),
             tool: None,
         }
+    }
+
+    #[test]
+    fn live_item_tracks_the_latest_lifecycle_event_and_exact_turn() {
+        let mut store = LiveTurnState::new();
+        let thread = ThreadId::new();
+        let turn = TurnId::new();
+        let item_id = ItemId::new();
+        store.replace_turn_with_user_input(thread, turn, None);
+        store.append(
+            thread,
+            AgentEvent::ItemStarted {
+                thread,
+                turn,
+                item: command_start(item_id),
+            },
+        );
+        assert!(matches!(
+            store.live_item(thread, turn, item_id),
+            Some(LiveItem::Started(item)) if item.id == item_id
+        ));
+        assert!(store.live_item(thread, TurnId::new(), item_id).is_none());
+        assert!(store.live_item(thread, turn, ItemId::new()).is_none());
+
+        let descriptor = CommandOutputDescriptor::from_durable("done", false, 4, 1, true);
+        store.append_with_command_output(
+            thread,
+            AgentEvent::ItemCompleted {
+                thread,
+                turn,
+                item: Item {
+                    id: item_id,
+                    harness_item_id: "cmd_1".into(),
+                    payload: ItemPayload::CommandExecution {
+                        command: "yes".into(),
+                        cwd: "/tmp/project".into(),
+                        output: "done".into(),
+                        output_truncated: false,
+                        output_original_bytes: None,
+                        output_original_lines: None,
+                        exit_code: Some(0),
+                        status: Some("completed".into()),
+                        process_id: None,
+                        duration_ms: None,
+                    },
+                    created_at: Utc::now(),
+                },
+            },
+            Some(descriptor.clone()),
+        );
+        assert!(matches!(
+            store.live_item(thread, turn, item_id),
+            Some(LiveItem::Completed { command_output: Some(found), .. }) if found == descriptor
+        ));
+        store.clear_turn(thread);
+        assert!(store.live_item(thread, turn, item_id).is_none());
+    }
+
+    #[test]
+    fn live_tool_item_carries_descriptor_and_no_inline_output() {
+        let mut store = LiveTurnState::new();
+        let thread = ThreadId::new();
+        let turn = TurnId::new();
+        let item_id = ItemId::new();
+        let descriptor = WireToolOutput {
+            serialized_bytes: 4,
+            version: "\"sha256_test\"".into(),
+        };
+        store.replace_turn_with_user_input(thread, turn, None);
+        store.append_with_outputs(
+            thread,
+            AgentEvent::ItemCompleted {
+                thread,
+                turn,
+                item: Item {
+                    id: item_id,
+                    harness_item_id: "tool_1".into(),
+                    payload: ItemPayload::ToolCall {
+                        name: "lookup".into(),
+                        input: serde_json::Value::Null,
+                        output: Some(serde_json::json!({"secret": true})),
+                        server: None,
+                        status: Some("completed".into()),
+                        metadata: None,
+                        subagent: None,
+                        error: None,
+                    },
+                    created_at: Utc::now(),
+                },
+            },
+            None,
+            Some(descriptor.clone()),
+        );
+        let Some(LiveItem::Completed {
+            item,
+            tool_output: Some(found),
+            ..
+        }) = store.live_item(thread, turn, item_id)
+        else {
+            panic!("completed tool item");
+        };
+        assert_eq!(found, descriptor);
+        assert!(matches!(
+            item.payload,
+            ItemPayload::ToolCall { output: None, .. }
+        ));
     }
 
     #[tokio::test]

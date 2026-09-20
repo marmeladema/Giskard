@@ -43,6 +43,7 @@ pub(crate) use requests::{RequestResolution, RuntimeRequestId};
 
 use diffs::CapturedDiffState;
 use gate::TurnGate;
+pub(crate) use live::LiveItem;
 use live::LiveTurnState;
 use outputs::{ItemOutputState, prepare_item_output};
 use requests::{ClaimRejection, CommitRejection, RequestLedger, RequestPayload};
@@ -286,6 +287,10 @@ impl ResolvedThreadRuntime {
     /// Resolves tool output from the current runtime entry.
     pub(crate) fn tool_output(&self, turn_id: TurnId, item_id: ItemId) -> RuntimeToolOutputLookup {
         self.support.tool_output(&self.authority, turn_id, item_id)
+    }
+
+    pub(crate) fn live_item(&self, turn_id: TurnId, item_id: ItemId) -> Option<LiveItem> {
+        self.support.live_item(&self.authority, turn_id, item_id)
     }
 
     /// Captures an exact-entry permit for caching a persisted output version.
@@ -566,6 +571,18 @@ impl ThreadRuntimeSupport {
         };
         let entry = lock_unpoison(&entry, "thread runtime entry");
         entry.live.item_events(thread_id, item_id)
+    }
+
+    pub(crate) fn live_item(
+        &self,
+        authority: &Arc<ThreadAuthority>,
+        turn_id: TurnId,
+        item_id: ItemId,
+    ) -> Option<LiveItem> {
+        let thread_id = authority.thread_id();
+        let entry = self.existing_entry(authority)?;
+        let entry = lock_unpoison(&entry, "thread runtime entry");
+        entry.live.live_item(thread_id, turn_id, item_id)
     }
 
     pub(crate) fn ensure_live_turn(

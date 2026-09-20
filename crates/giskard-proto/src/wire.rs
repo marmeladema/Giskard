@@ -19,8 +19,8 @@ use giskard_core::event::AgentEvent;
 use giskard_core::ids::{ApprovalId, ItemId, ServerRequestId, ThreadId, TurnId};
 use giskard_core::item::{
     CommandExecutionStart, CommandOutputDescriptor, FileChangeEntry, FileChangeKind, Item,
-    ItemDelta, ItemKind, ItemPayload, ItemStart, SubagentAction, SubagentLink, SubagentStatus,
-    ToolCallStart, ToolOutputDescriptor,
+    ItemDelta, ItemKind, ItemPayload, ItemStart, REASONING_PREVIEW_MAX_BYTES, SubagentAction,
+    SubagentLink, SubagentStatus, ToolCallStart, ToolOutputDescriptor,
 };
 use giskard_core::server_request::ServerRequest;
 use giskard_core::token::TokenUsage;
@@ -127,6 +127,20 @@ pub struct WireItem {
     pub created_at: DateTime<Utc>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum WireTurnItem {
+    Started { item: WireItemStart },
+    Completed { item: WireItem },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WireTextPreview {
+    pub prefix_bytes: u64,
+    pub total_bytes: u64,
+    pub total_lines: u64,
+}
+
 /// Bounded completed-command output projection.
 pub type WireCommandOutput = CommandOutputDescriptor;
 
@@ -188,6 +202,8 @@ pub enum WireItemPayload {
     },
     Reasoning {
         text: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        preview: Option<WireTextPreview>,
     },
     CommandExecution {
         command: String,
@@ -476,6 +492,26 @@ impl From<Item> for WireItem {
 }
 
 impl WireItem {
+    pub fn from_persisted_item(item: Item) -> Self {
+        let mut wire: Self = item.into();
+        if let WireItemPayload::Reasoning { text, preview } = &mut wire.payload {
+            let full = std::mem::take(text);
+            let (prefix, truncated) =
+                giskard_core::item::reasoning_head_preview(&full, REASONING_PREVIEW_MAX_BYTES);
+            if truncated {
+                *preview = Some(WireTextPreview {
+                    prefix_bytes: prefix.len() as u64,
+                    total_bytes: full.len() as u64,
+                    total_lines: giskard_core::item::command_output_logical_lines(&full),
+                });
+                *text = prefix;
+            } else {
+                *text = full;
+            }
+        }
+        wire
+    }
+
     /// Convert an item with the descriptor produced at the command normalization boundary.
     pub fn from_item_with_command_output(
         item: Item,
@@ -584,7 +620,10 @@ impl From<ItemPayload> for WireItemPayload {
         match p {
             ItemPayload::UserMessage { text } => Self::UserMessage { text },
             ItemPayload::AgentMessage { text } => Self::AgentMessage { text },
-            ItemPayload::Reasoning { text } => Self::Reasoning { text },
+            ItemPayload::Reasoning { text } => Self::Reasoning {
+                text,
+                preview: None,
+            },
             ItemPayload::CommandExecution {
                 command,
                 cwd,
@@ -808,7 +847,11 @@ impl From<Turn> for WireTurn {
         Self {
             id: t.id,
             user_input: t.user_input,
-            items: t.items.into_iter().map(Into::into).collect(),
+            items: t
+                .items
+                .into_iter()
+                .map(WireItem::from_persisted_item)
+                .collect(),
             model: t.model,
             mode: t.mode,
             status: t.status,
@@ -826,6 +869,74 @@ mod tests {
     use giskard_core::approval::{ApprovalKind, ApprovalMetadata};
     use giskard_core::model::ModelRef;
     use std::path::PathBuf;
+
+    #[test]
+    fn persisted_reasoning_is_previewed_but_direct_items_are_full() {
+        let text = format!("summary\n{}\ntail\n", "x".repeat(2048));
+        let item = Item {
+            id: ItemId::new(),
+            harness_item_id: "reasoning".into(),
+            payload: ItemPayload::Reasoning { text: text.clone() },
+            created_at: Utc::now(),
+        };
+        let persisted = WireItem::from_persisted_item(item.clone());
+        let WireItemPayload::Reasoning {
+            text: prefix,
+            preview,
+        } = persisted.payload
+        else {
+            panic!("expected reasoning payload");
+        };
+        let preview = preview.expect("long persisted reasoning has preview metadata");
+        assert!(prefix.len() <= REASONING_PREVIEW_MAX_BYTES);
+        assert!(prefix.ends_with('\n'));
+        assert_eq!(preview.prefix_bytes, prefix.len() as u64);
+        assert_eq!(preview.total_bytes, text.len() as u64);
+        assert_eq!(preview.total_lines, 3);
+
+        let direct = WireItem::from(item);
+        let WireItemPayload::Reasoning {
+            text: direct_text,
+            preview,
+        } = direct.payload
+        else {
+            panic!("expected reasoning payload");
+        };
+        assert_eq!(direct_text, text);
+        assert!(preview.is_none());
+    }
+
+    #[test]
+    fn turn_item_states_round_trip_and_absent_preview_is_omitted() {
+        let item = WireItem {
+            id: ItemId::new(),
+            harness_item_id: "reasoning".into(),
+            payload: WireItemPayload::Reasoning {
+                text: "short".into(),
+                preview: None,
+            },
+            created_at: Utc::now(),
+        };
+        let completed = WireTurnItem::Completed { item };
+        let json = serde_json::to_value(&completed).unwrap();
+        assert_eq!(json["state"], "completed");
+        assert!(json["item"]["payload"].get("preview").is_none());
+        let _: WireTurnItem = serde_json::from_value(json).unwrap();
+
+        let started = WireTurnItem::Started {
+            item: ItemStart {
+                id: ItemId::new(),
+                harness_item_id: "command".into(),
+                kind: ItemKind::CommandExecution,
+                command: None,
+                tool: None,
+            }
+            .into(),
+        };
+        let json = serde_json::to_value(&started).unwrap();
+        assert_eq!(json["state"], "started");
+        let _: WireTurnItem = serde_json::from_value(json).unwrap();
+    }
 
     #[test]
     fn approval_kind_path_becomes_string() {

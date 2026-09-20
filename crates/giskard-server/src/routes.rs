@@ -132,6 +132,10 @@ pub fn protected_routes(state: AppState) -> Router<AppState> {
             "/api/projects/{id}/threads/{thread_id}/turns/{turn_id}/items/{item_id}/tool-output",
             get(tool_output),
         )
+        .route(
+            "/api/projects/{id}/threads/{thread_id}/turns/{turn_id}/items/{item_id}",
+            get(turn_item),
+        )
         // File reads name their thread in the path rather than leaving it implicit. The workspace a
         // read is answered from is the thread's, so the thread has to be part of the request; a
         // caller that could omit it would be answered from somewhere it never asked about.
@@ -4711,6 +4715,62 @@ fn tool_output_response(
         .header(axum::http::header::ETAG, version)
         .body(axum::body::Body::from(bytes))
         .map_err(|error| ApiError::Internal(error.to_string()))
+}
+
+async fn turn_item(
+    State(state): State<AppState>,
+    AxumPath((project_id, thread_id, turn_id, item_id)): AxumPath<(
+        ProjectId,
+        ThreadId,
+        giskard_core::TurnId,
+        giskard_core::ItemId,
+    )>,
+) -> Result<Json<WireTurnItem>, ApiError> {
+    if state
+        .store
+        .load_thread(project_id, thread_id)
+        .await
+        .map_err(|error| ApiError::Internal(error.to_string()))?
+        .is_none()
+    {
+        return Err(ApiError::NotFound);
+    }
+    let runtime = state.registry.thread_runtime(thread_id).await;
+    let live = || {
+        runtime
+            .as_ref()
+            .and_then(|runtime| runtime.live_item(turn_id, item_id))
+    };
+    if let Some(item) = live() {
+        return Ok(Json(wire_turn_item(item)));
+    }
+    let persisted = state
+        .store
+        .load_turn_item(project_id, thread_id, turn_id, item_id)
+        .await
+        .map_err(|error| ApiError::Internal(error.to_string()))?;
+    if let Some(item) = live() {
+        return Ok(Json(wire_turn_item(item)));
+    }
+    let item = persisted.ok_or(ApiError::NotFound)?;
+    Ok(Json(WireTurnItem::Completed {
+        item: WireItem::from(item),
+    }))
+}
+
+fn wire_turn_item(item: crate::thread_runtime::LiveItem) -> WireTurnItem {
+    match item {
+        crate::thread_runtime::LiveItem::Started(item) => {
+            WireTurnItem::Started { item: item.into() }
+        }
+        crate::thread_runtime::LiveItem::Completed {
+            item,
+            command_output,
+            tool_output,
+        } => WireTurnItem::Completed {
+            item: WireItem::from_item_with_outputs(item, command_output, tool_output),
+        },
+    }
 }
 
 /// Completed transcript pagination is an ordinary authenticated request/response. It deliberately
