@@ -1,6 +1,6 @@
 # M4 — One event driver per project
 
-Implementation plan for milestone M4 of [`event-pipeline-milestones.md`](event-pipeline-milestones.md).
+Implementation plan for milestone M4 of [`event-pipeline-architecture-review.md`](../event-pipeline-architecture-review.md).
 Written against `main` at `81dd02e` (M3 merged). Every file and line reference below was checked
 against that tree; re-check them if the branch has moved.
 
@@ -279,7 +279,7 @@ integration test under `crates/giskard-server/tests`; the adapter suite; the six
 - `specs/giskard-specification.md`: bump to 1.81 with an amendment paragraph; update §4.3's "the
   registry installs exactly one consuming event owner per loaded native thread" (`:1756-1758`) to
   say the project driver does.
-- `docs/event-pipeline-milestones.md`: M4 status line.
+- `docs/event-pipeline-architecture-review.md`: M4 status line.
 
 ## Order of work
 

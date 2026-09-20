@@ -1,6 +1,6 @@
 # M6 — Materialization off the event path
 
-Implementation plan for milestone M6 of [`event-pipeline-milestones.md`](event-pipeline-milestones.md).
+Implementation plan for milestone M6 of [`event-pipeline-architecture-review.md`](../event-pipeline-architecture-review.md).
 Written against `main` at `fce61f7` (M5 merged). Every file and line reference below was checked
 against that tree; re-check them if the branch has moved.
 
@@ -393,7 +393,7 @@ Every sub-agent test in `e2e_smoke.rs` listed in the ground truth must pass unch
 
 ## Documentation
 
-- `docs/event-pipeline-milestones.md`: M6 status, the design as landed, exit line, plan pointer.
+- `docs/event-pipeline-architecture-review.md`: M6 status, the design as landed, exit line, plan pointer.
 - `docs/subagents.md` "Link-open API" paragraph (`:179-186`): replace "share one per-project
   lifecycle lock, while linked evidence from one parent is processed through a FIFO" with: all
   native identity admissions (discovery, sub-agent link, explicit open) are processed one at a time

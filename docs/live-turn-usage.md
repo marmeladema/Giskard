@@ -427,7 +427,7 @@ removal of the warning, and that an invalid window suppresses only the window.
 `README.md:147-151`: say the header value updates during the turn from the latest reported input
 tokens, not only at turn end.
 
-`docs/event-pipeline-milestones.md`: no change; this is not a pipeline milestone.
+`docs/event-pipeline-architecture-review.md`: no change; this is not a pipeline milestone.
 
 ## Order of work
 

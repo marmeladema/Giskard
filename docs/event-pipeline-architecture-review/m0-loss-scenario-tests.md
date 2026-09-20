@@ -1,6 +1,6 @@
 # M0 — Loss scenario tests
 
-Implementation plan for milestone M0 of [`event-pipeline-milestones.md`](event-pipeline-milestones.md).
+Implementation plan for milestone M0 of [`event-pipeline-architecture-review.md`](../event-pipeline-architecture-review.md).
 Written against `main` at `b6fdf22`. Every file and line reference below was checked against that
 tree; re-check them if the branch has moved.
 
@@ -342,7 +342,7 @@ together with the behavior it pins.
 
 ## Deliverable 3 — status line
 
-Add one line under M0 in `docs/event-pipeline-milestones.md`:
+Add one line under M0 in `docs/event-pipeline-architecture-review.md`:
 
 > **Status.** Landed in <PR>. Run `cargo test -p giskard-harness-codex --lib -- --ignored loss_scenarios`
 > and `cargo test -p giskard-server --lib -- --ignored replacement_forwarder` to see the current
@@ -360,7 +360,7 @@ No README, spec, `AGENTS.md` or endpoint documentation changes: nothing user-vis
    window: rework it until it fails for the stated reason.
 3. `git diff --stat main` shows changes only under `crates/giskard-harness-codex/src/lib.rs`
    (inside `mod tests`), `crates/giskard-server/src/registry/event_forwarder.rs` (inside
-   `mod tests`) and `docs/event-pipeline-milestones.md`.
+   `mod tests`) and `docs/event-pipeline-architecture-review.md`.
 
 ## Pitfalls
 
