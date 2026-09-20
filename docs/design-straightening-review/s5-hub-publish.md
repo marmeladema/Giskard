@@ -1,6 +1,6 @@
 # S5 — `Hub::publish(Outbound)`: one implementation of the outbound lanes
 
-Implementation plan for step 5 of [`design-straightening-review.md`](design-straightening-review.md)
+Implementation plan for step 5 of [`design-straightening-review.md`](../design-straightening-review.md)
 (finding C3). Written against `main` at `6f464b0` (S4b merged); every file and line reference below
 was checked against that tree. Re-check them if the branch has moved.
 

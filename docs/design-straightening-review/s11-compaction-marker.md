@@ -1,6 +1,6 @@
 # S11 — Retire the marker-only compaction machinery
 
-Step 11 of [`design-straightening-review.md`](design-straightening-review.md). It replaces the
+Step 11 of [`design-straightening-review.md`](../design-straightening-review.md). It replaces the
 earlier "typed compaction marker" idea from S9 decision C.
 
 ## What was found

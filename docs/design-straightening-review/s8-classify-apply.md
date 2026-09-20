@@ -1,6 +1,6 @@
 # S8 — `classify` / `apply` in the event forwarder
 
-Implementation plan for step 8 of [`design-straightening-review.md`](design-straightening-review.md)
+Implementation plan for step 8 of [`design-straightening-review.md`](../design-straightening-review.md)
 (finding C2). Written against `main` at `58a841b` (S7 merged); every file and line reference
 below was checked against that tree. Re-check them if the branch has moved.
 

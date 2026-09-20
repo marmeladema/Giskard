@@ -1,6 +1,6 @@
 # S3 — A `DriverEvent` seam in place of test counters
 
-Implementation plan for step 3 of [`design-straightening-review.md`](design-straightening-review.md)
+Implementation plan for step 3 of [`design-straightening-review.md`](../design-straightening-review.md)
 (finding A). Written against `main` at `967a00e` (S2 merged); every file and line reference below
 was checked against that tree. Re-check them if the branch has moved.
 

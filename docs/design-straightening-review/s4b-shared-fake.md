@@ -1,6 +1,6 @@
 # S4b — One `FakeHarness` for the server integration tests, and event waits
 
-Second half of finding C6 of [`design-straightening-review.md`](design-straightening-review.md),
+Second half of finding C6 of [`design-straightening-review.md`](../design-straightening-review.md),
 following [`s4a-testenv.md`](s4a-testenv.md). Written against `main` at `d474b91` (S4a merged);
 every file and line reference below was checked against that tree. Re-check them if the branch
 has moved.

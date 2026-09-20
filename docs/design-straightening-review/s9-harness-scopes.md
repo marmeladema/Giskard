@@ -1,6 +1,6 @@
 # S9 — `AgentHarness` by scope, and what a second harness needs from it
 
-Implementation plan for step 9 of [`design-straightening-review.md`](design-straightening-review.md)
+Implementation plan for step 9 of [`design-straightening-review.md`](../design-straightening-review.md)
 (finding C4). Written against `main` at `f830df8` (S8 merged); every file and line reference
 below was checked against that tree. Re-check them if the branch has moved.
 

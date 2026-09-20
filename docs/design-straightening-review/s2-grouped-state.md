@@ -1,6 +1,6 @@
 # S2 — Group per-turn and per-item state by lifetime
 
-Implementation plan for step 2 of [`design-straightening-review.md`](design-straightening-review.md)
+Implementation plan for step 2 of [`design-straightening-review.md`](../design-straightening-review.md)
 (findings B1 and B2). Written against `main` at `b07ea17` (S1 merged); every file and line
 reference below was checked against that tree. Re-check them if the branch has moved.
 

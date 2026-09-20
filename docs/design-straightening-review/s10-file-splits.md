@@ -1,6 +1,6 @@
 # S10 — Two mechanical file splits: `ws.rs` and the Codex adapter's modules
 
-Implementation plan for step 10 of [`design-straightening-review.md`](design-straightening-review.md)
+Implementation plan for step 10 of [`design-straightening-review.md`](../design-straightening-review.md)
 (finding D, first two bullets). Written against `main` at `5d7d234` (S9 merged); every file and
 line reference below was checked against that tree. Re-check them if the branch has moved.
 
