@@ -196,7 +196,10 @@ async fn verify_staged(
         .await
         .map_err(|e| PersistError::Io(e.to_string()))?;
     let records = parse_history_index(staged_index, &data)?;
-    let staged_ids: Vec<_> = records.iter().map(|record| record.turn_id).collect();
+    let staged_ids: Vec<_> = records
+        .iter()
+        .map(|indexed| indexed.record.turn_id)
+        .collect();
     let source_ids: Vec<_> = source_turns.iter().map(|turn| turn.id).collect();
     if staged_ids != source_ids {
         return Err(PersistError::Invalid(format!(
@@ -210,7 +213,8 @@ async fn verify_staged(
             source_ids.len()
         )));
     }
-    for record in &records {
+    for indexed in &records {
+        let record = &indexed.record;
         let payload_path = staging
             .join("turns")
             .join(format!("{}.jsonl", record.turn_id));

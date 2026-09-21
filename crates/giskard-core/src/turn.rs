@@ -177,6 +177,19 @@ pub struct Turn {
     /// `None` while the turn is still live.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub completed_at: Option<DateTime<Utc>>,
+    /// Records of this turn's payload file that could not be read and were skipped when the turn
+    /// was reassembled. Zero for a live turn and for a healthy file, and omitted from the JSON when
+    /// it is, so nothing that was ever written changes shape.
+    ///
+    /// A bounded count and nothing more: the reasons, with line numbers and parse errors, are in
+    /// the server log. What it buys a reader is the one thing the log cannot tell them — that the
+    /// turn they are looking at may be incomplete.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub skipped_records: u32,
+}
+
+fn is_zero(count: &u32) -> bool {
+    *count == 0
 }
 
 #[cfg(test)]

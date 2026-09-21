@@ -126,8 +126,16 @@ and item. Runtime authority remains available across the persistence race and wh
 thread, turn, and item containment is enforced before lookup. Unknown or cross-container items,
 non-tool items, absent or unavailable output, and still-running tools all return the same 404.
 The browser fetches only while the matching tool overlay is open and accepts the body only when its
-`ETag` still matches the selected descriptor. Post-persistence late tool completion is not
-advertised or retrievable until durable late-item amendments are implemented.
+`ETag` still matches the selected descriptor.
+
+A command or tool that settles after its turn was persisted is amended into that turn: one record
+for the settled item is appended to the turn's payload file, and a superseding turn record to the
+history index. Both routes then serve the late output — from the runtime while it is still held,
+and from the payload once the amendment is durable and the runtime copy has been dropped, under the
+version the amended output hashes to. A thread on the flat layout has no per-turn payload to amend,
+so a late completion there is still logged and not retained. An amendment that cannot be written
+keeps the runtime copy, so a connected client and these routes still serve the output until the
+process restarts.
 
 `GET /api/projects/{id}/threads/{thread_id}/turns/{turn_id}/items/{item_id}` returns an item as
 state-tagged JSON. A `started` response carries the same browser-safe `WireItemStart` as the live
@@ -163,7 +171,15 @@ are disabled while a turn is active because steering is text-only.
 without it the endpoint returns the newest page. `limit` is optional and is clamped to 1–100 turns;
 the configured `[history] initial` default applies to the newest page and `page` to older pages.
 History pagination is authenticated HTTP, not a WebSocket message, and a thread outside the named
-project returns 404. Completed reasoning text is delivered as a line-bounded 1 KiB prefix while
+project returns 404. A reconnect's `HistoryDelta` may contain turns the client was already
+delivered: a turn whose item settled after it was persisted is sent again with the item settled, so
+the browser refreshes the rows it already has rather than rendering the turn twice.
+
+A turn carries `skipped_records` when part of its payload file could not be read. Payload reads are
+best-effort — an unparseable record is logged, counted and skipped, and the turn is still delivered
+from what remains — so the count is how a client learns the turn may be incomplete. It is omitted
+when zero, which is every healthy turn, and it appears on `WireTurn` wherever one does: the history
+page, the bootstrap, and resync deltas. Completed reasoning text is delivered as a line-bounded 1 KiB prefix while
 keeping its first non-blank line whole; the item endpoint serves the full note.
 
 If you open a thread whose agent can no longer be started — most often because its

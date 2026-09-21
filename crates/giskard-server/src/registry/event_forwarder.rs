@@ -1419,17 +1419,68 @@ impl ThreadEventForwarder {
                 return ForwarderControl::Exit(ForwarderExitReason::RuntimeAuthorityReplaced);
             };
             if let AgentEvent::ItemCompleted { turn, item, .. } = &event {
-                self.services
-                    .runtime
-                    .remove_command_output(&self.authority, *turn, item.id);
-                warn!(
-                    %project_id,
-                    %thread_id,
-                    %turn,
-                    item_id = %item.id,
-                    harness_item_id = %item.harness_item_id,
-                    "deferred durable command-output update for already-persisted turn"
-                );
+                // The runtime copy is what every reader has until the amendment is durable, so it
+                // is dropped only once the write succeeded. A failed write keeps it: a live client
+                // and the lazy route still serve the settled output, and only a reload loses it.
+                match self
+                    .services
+                    .thread_metadata
+                    .amend_turn_item(project_id, thread_id, *turn, item)
+                    .await
+                {
+                    Ok(AmendOutcome::Amended) => {
+                        self.services.runtime.remove_command_output(
+                            &self.authority,
+                            *turn,
+                            item.id,
+                        );
+                        self.services
+                            .runtime
+                            .forget_persisted_command_output_version(
+                                &self.authority,
+                                *turn,
+                                item.id,
+                            );
+                        info!(
+                            %project_id,
+                            %thread_id,
+                            %turn,
+                            item_id = %item.id,
+                            harness_item_id = %item.harness_item_id,
+                            action = "amend_turn_item",
+                            kind = "command",
+                            "amended a persisted turn with a late command completion"
+                        );
+                    }
+                    Ok(AmendOutcome::Unsupported) => {
+                        self.services.runtime.remove_command_output(
+                            &self.authority,
+                            *turn,
+                            item.id,
+                        );
+                        warn!(
+                            %project_id,
+                            %thread_id,
+                            %turn,
+                            item_id = %item.id,
+                            harness_item_id = %item.harness_item_id,
+                            action = "amend_turn_item",
+                            "deferred durable command-output update for already-persisted turn"
+                        );
+                    }
+                    Err(error) => {
+                        error!(
+                            %project_id,
+                            %thread_id,
+                            %turn,
+                            item_id = %item.id,
+                            harness_item_id = %item.harness_item_id,
+                            action = "amend_turn_item",
+                            %error,
+                            "failed to amend a persisted turn with a late command completion"
+                        );
+                    }
+                }
             }
             log_command_completion_after_terminate(project_id, before.as_ref(), &event);
             debug!(
@@ -1473,20 +1524,61 @@ impl ThreadEventForwarder {
         if let AgentEvent::ItemCompleted { turn, item, .. } = &event
             && let ItemPayload::ToolCall { name, server, .. } = &item.payload
         {
-            self.services
-                .runtime
-                .remove_tool_output(&self.authority, *turn, item.id);
-            if completed_tool_has_terminal_output(item) {
-                warn!(
-                    %project_id,
-                    %thread_id,
-                    %turn,
-                    item_id = %item.id,
-                    harness_item_id = %item.harness_item_id,
-                    tool_name = %name,
-                    tool_server = server.as_deref(),
-                    "ignoring completed tool output for an already-persisted turn"
-                );
+            match self
+                .services
+                .thread_metadata
+                .amend_turn_item(project_id, thread_id, *turn, item)
+                .await
+            {
+                Ok(AmendOutcome::Amended) => {
+                    self.services
+                        .runtime
+                        .remove_tool_output(&self.authority, *turn, item.id);
+                    info!(
+                        %project_id,
+                        %thread_id,
+                        %turn,
+                        item_id = %item.id,
+                        harness_item_id = %item.harness_item_id,
+                        tool_name = %name,
+                        tool_server = server.as_deref(),
+                        action = "amend_turn_item",
+                        kind = "tool",
+                        "amended a persisted turn with a late tool completion"
+                    );
+                }
+                Ok(AmendOutcome::Unsupported) => {
+                    self.services
+                        .runtime
+                        .remove_tool_output(&self.authority, *turn, item.id);
+                    if completed_tool_has_terminal_output(item) {
+                        warn!(
+                            %project_id,
+                            %thread_id,
+                            %turn,
+                            item_id = %item.id,
+                            harness_item_id = %item.harness_item_id,
+                            tool_name = %name,
+                            tool_server = server.as_deref(),
+                            action = "amend_turn_item",
+                            "ignoring completed tool output for an already-persisted turn"
+                        );
+                    }
+                }
+                Err(error) => {
+                    error!(
+                        %project_id,
+                        %thread_id,
+                        %turn,
+                        item_id = %item.id,
+                        harness_item_id = %item.harness_item_id,
+                        tool_name = %name,
+                        tool_server = server.as_deref(),
+                        action = "amend_turn_item",
+                        %error,
+                        "failed to amend a persisted turn with a late tool completion"
+                    );
+                }
             }
         }
         ForwarderControl::Continue
@@ -2051,6 +2143,7 @@ impl ThreadEventForwarder {
             diffs: std::mem::take(&mut self.turn.diffs),
             started_at: self.turn.started_at,
             completed_at: Some(Utc::now()),
+            skipped_records: 0,
         };
         let captured_diffs = self
             .services
@@ -3623,6 +3716,7 @@ mod tests {
                     },
                     started_at: Utc::now(),
                     completed_at: Some(Utc::now()),
+                    skipped_records: 0,
                 },
             )
             .await
@@ -4453,6 +4547,7 @@ mod tests {
                     diffs: Vec::new(),
                     started_at: now,
                     completed_at: Some(now),
+                    skipped_records: 0,
                 },
             )
             .await
@@ -4580,6 +4675,7 @@ mod tests {
                     diffs: Vec::new(),
                     started_at: now,
                     completed_at: Some(now),
+                    skipped_records: 0,
                 },
             )
             .await
@@ -5926,6 +6022,7 @@ mod tests {
                     diffs: vec![],
                     started_at: now,
                     completed_at: Some(now),
+                    skipped_records: 0,
                 },
             )
             .await
@@ -6112,6 +6209,7 @@ mod tests {
                     diffs: vec![],
                     started_at: now,
                     completed_at: Some(now),
+                    skipped_records: 0,
                 },
             )
             .await

@@ -9,7 +9,8 @@ use giskard_core::thread::ThreadKind;
 use giskard_core::turn::{Turn, TurnMode, TurnModel};
 use giskard_persist::PersistError;
 use giskard_persist::store::{
-    PersistStore, ThreadFile, ThreadGitWorkspace, ThreadMutation, ThreadRecency, TurnCommitOutcome,
+    AmendOutcome, PersistStore, ThreadFile, ThreadGitWorkspace, ThreadMutation, ThreadRecency,
+    TurnCommitOutcome,
 };
 use giskard_proto::{ThreadMetadata, ThreadState};
 
@@ -102,6 +103,23 @@ impl ThreadMetadataService {
             self.publish(project_id, mutation).await;
         }
         Ok(outcome)
+    }
+
+    /// Record an item that settled after its turn was persisted.
+    ///
+    /// No mutation is published: an item settling changes no aggregate the catalog shows — not the
+    /// token ledger, not the turn's status, not the thread's recency — so there is nothing for a
+    /// thread-list projection to learn from it.
+    pub(crate) async fn amend_turn_item(
+        &self,
+        project_id: ProjectId,
+        thread_id: ThreadId,
+        turn: TurnId,
+        item: &giskard_core::item::Item,
+    ) -> Result<AmendOutcome, PersistError> {
+        self.store
+            .amend_turn_item(project_id, thread_id, turn, item)
+            .await
     }
 
     pub(crate) async fn create(
@@ -512,6 +530,7 @@ mod tests {
             diffs: vec![],
             started_at: Utc::now(),
             completed_at: Some(Utc::now()),
+            skipped_records: 0,
         };
         assert!(matches!(
             service

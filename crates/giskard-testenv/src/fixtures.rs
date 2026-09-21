@@ -140,6 +140,7 @@ pub fn completed_turn(text: &str, model: ModelRef) -> Turn {
         diffs: vec![],
         started_at: now,
         completed_at: Some(now),
+        skipped_records: 0,
     }
 }
 

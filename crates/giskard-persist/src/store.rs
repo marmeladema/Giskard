@@ -19,7 +19,7 @@ use giskard_core::turn::{PermissionPreset, Turn, TurnMode, TurnModel};
 use crate::PersistError;
 use crate::atomic::{atomic_write, atomic_write_json, read_json, read_json_or_quarantine};
 use crate::config::Config;
-use crate::history::{self, HistoryHeader, TurnRecord};
+use crate::history::{self, HistoryHeader, IndexedTurnRecord, TurnRecord};
 use crate::layout::{ThreadLayout, ThreadPaths};
 use crate::migrate::{self, MigrationOutcome};
 use giskard_core::diff::CapturedDiffRecord;
@@ -180,6 +180,16 @@ pub struct OrphanSweep {
     /// Why nothing was deleted. `None` means the sweep was willing to delete `payloads` — and did,
     /// unless this was a dry run.
     pub refusal: Option<String>,
+}
+
+/// Whether a late item completion could be recorded durably for this thread.
+///
+/// `Unsupported` is not a failure: it is a thread whose layout has no per-turn payload file to
+/// amend, and the caller keeps the behaviour it had before amendments existed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AmendOutcome {
+    Amended,
+    Unsupported,
 }
 
 /// Result after a turn was appended to authoritative history.
@@ -432,7 +442,10 @@ async fn assemble_turns(
     index_path: &Path,
     index_data: &str,
 ) -> Result<Vec<Turn>, PersistError> {
-    let records = history::parse_history_index(index_path, index_data)?;
+    let records = history::parse_history_index(index_path, index_data)?
+        .into_iter()
+        .map(|indexed| indexed.record)
+        .collect();
     Ok(assemble_turn_records(paths, records).await)
 }
 
@@ -1353,6 +1366,174 @@ impl PersistStore {
         Ok(())
     }
 
+    /// Record an item that settled after its turn was persisted.
+    ///
+    /// Payload first, index last, and no format bump: one `item` record carrying no display index
+    /// is appended to the turn's payload file, then a superseding `turn_v3` record is appended to
+    /// the index. A crash between the two leaves the index's `item_count` stale, which
+    /// [`TurnRecord::item_count`] already forbids anything from validating against — the payload
+    /// file wins.
+    ///
+    /// The payload is **appended to, never rewritten**. One `write_all` to a handle opened for
+    /// append costs the size of the amendment and nothing else, whatever the turn holds, and it
+    /// cannot lose the records already there the way a read-modify-write can. The price is a torn
+    /// final line if the process dies mid-write, which the payload reader pays for by skipping and
+    /// counting that record rather than failing the turn.
+    ///
+    /// If the file does not already end in a newline — the tail of an earlier torn append — the
+    /// buffer starts with one, so the damaged tail stays its own line and the amendment is its own.
+    /// The tail is never truncated or repaired: it is evidence, and the reader already survives it.
+    ///
+    /// # Why the index is touched at all
+    ///
+    /// The payload write alone makes the completion durable: a reload reads payload files, so the
+    /// history page, the lazy output routes and the item endpoint all show the settled item without
+    /// the index knowing anything happened. The superseding record buys exactly one behaviour, and
+    /// it is worth naming because nothing else in this function depends on it.
+    ///
+    /// A client resumes with the newest turn it rendered, which for a command that outlived its
+    /// turn is *that* turn. [`Self::load_turns_after`] answers "what changed since your cursor"
+    /// from the index and nothing else — that is the property the index/payload split exists to
+    /// create, and it is why a bounded read never opens the agent-driven half. An amendment
+    /// confined to the payload is therefore invisible to it: the delta comes back empty, and the
+    /// browser keeps showing a command as running for the life of the page, while the output route
+    /// behind that row — which consults no clock — already serves the finished output. Only a
+    /// reload reconciles the two.
+    ///
+    /// Appending the record gives the turn a later line position, and that position is the clock
+    /// `load_turns_after` compares against the cursor. So: one appended line is what makes a
+    /// *reconnect* heal the transcript instead of only a page reload. `item_count` riding along is
+    /// bookkeeping, not the reason — the count is a display hint nothing may validate against.
+    pub async fn amend_turn_item(
+        &self,
+        project: ProjectId,
+        thread: ThreadId,
+        turn: TurnId,
+        item: &Item,
+    ) -> Result<AmendOutcome, PersistError> {
+        self.ensure_migrated(project, thread).await;
+        let lock = self.thread_lock(thread).await;
+        let _guard = lock.lock().await;
+
+        let paths = self.thread_paths(project, thread).await;
+        // A flat thread keeps one line per turn with its items inline: there is no per-turn file to
+        // append to, and rewriting the shared append-only history to amend one turn is exactly what
+        // the directory layout exists to avoid.
+        if paths.layout() == ThreadLayout::Flat {
+            return Ok(AmendOutcome::Unsupported);
+        }
+
+        // Read the index before writing anything, so a turn this build cannot place in history
+        // fails without having touched its payload.
+        let index_path = paths.history();
+        let index_data = match tokio::fs::read_to_string(&index_path).await {
+            Ok(data) => data,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Err(PersistError::Io(format!(
+                    "{}: cannot amend a turn with no history index",
+                    index_path.display()
+                )));
+            }
+            Err(e) => return Err(PersistError::Io(e.to_string())),
+        };
+        let records = history::parse_history_index(&index_path, &index_data)?;
+        let Some(winning) = records
+            .iter()
+            .find(|indexed| indexed.record.turn_id == turn)
+        else {
+            return Err(PersistError::Invalid(format!(
+                "{}: cannot amend turn {turn}, which the history index does not carry",
+                index_path.display()
+            )));
+        };
+
+        let payload_path = paths.turn_payload(turn);
+        let line = history::payload_item_line(item)?;
+        let write_path = payload_path.clone();
+        let appended = tokio::task::spawn_blocking(move || -> std::io::Result<(usize, bool)> {
+            use std::io::{Read, Seek, SeekFrom, Write};
+            // No `create`: a persisted turn must already have a payload, and conjuring an empty
+            // one here would turn a lost file into a turn with no prompt.
+            let mut file = std::fs::OpenOptions::new()
+                .read(true)
+                .append(true)
+                .open(&write_path)?;
+            let len = file.metadata()?.len();
+            let mut needs_newline = false;
+            if len > 0 {
+                file.seek(SeekFrom::End(-1))?;
+                let mut last = [0u8; 1];
+                file.read_exact(&mut last)?;
+                needs_newline = last[0] != b'\n';
+            }
+            let mut buffer = Vec::with_capacity(line.len() + 1);
+            if needs_newline {
+                buffer.push(b'\n');
+            }
+            buffer.extend_from_slice(line.as_bytes());
+            // One write: the append is as close to atomic as this file gets, and a partial write
+            // is the torn line the reader already tolerates.
+            file.write_all(&buffer)?;
+            Ok((buffer.len(), needs_newline))
+        })
+        .await
+        .map_err(|e| PersistError::Io(e.to_string()))?;
+        let (appended_len, newline_inserted) = match appended {
+            Ok(appended) => appended,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Err(PersistError::Io(format!(
+                    "{}: cannot amend a turn whose payload is missing",
+                    payload_path.display()
+                )));
+            }
+            Err(e) => return Err(PersistError::Io(e.to_string())),
+        };
+
+        // Read the file back for the count the superseding record carries, so the index row never
+        // claims more or fewer items than the file it describes. A whole-file read on the rare
+        // amendment path is the price of never holding the payload in memory on the write path.
+        let Some(payload) = history::read_turn_payload(&payload_path).await? else {
+            return Err(PersistError::Io(format!(
+                "{}: turn payload vanished while it was being amended",
+                payload_path.display()
+            )));
+        };
+        let item_count = payload.items.len();
+
+        // Same fields, same `completed_at`: an item settling does not reopen the turn or change its
+        // outcome. `item_count` is the only thing an amendment moves.
+        let mut superseding = winning.record.clone();
+        superseding.item_count = item_count;
+        let record_line = superseding.line()?.into_bytes();
+        let index_write_path = index_path.clone();
+        tokio::task::spawn_blocking(move || {
+            use std::io::Write;
+            // No `create` on this path either: the index was read above, so it exists, and a
+            // thread whose index vanished under the lock must not get an empty one invented here.
+            let mut file = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&index_write_path)?;
+            file.write_all(&record_line)
+        })
+        .await
+        .map_err(|e| PersistError::Io(e.to_string()))?
+        .map_err(|e| PersistError::Io(e.to_string()))?;
+
+        tracing::debug!(
+            %project,
+            %thread,
+            turn_id = %turn,
+            item_id = %item.id,
+            action = "amend_turn_item",
+            appended_bytes = appended_len,
+            newline_inserted,
+            item_count,
+            skipped_records = payload.skipped_records,
+            "amended a persisted turn with a late item completion"
+        );
+        Ok(AmendOutcome::Amended)
+    }
+
     /// Append a completed turn and fold its usage into metadata under one per-thread lock.
     ///
     /// The JSONL append still happens first (H3). If the following atomic metadata write fails,
@@ -1459,6 +1640,25 @@ impl PersistStore {
         project: ProjectId,
         thread: ThreadId,
     ) -> Result<Vec<TurnRecord>, PersistError> {
+        Ok(self
+            .load_indexed_turn_records_unlocked(project, thread)
+            .await?
+            .into_iter()
+            .map(|indexed| indexed.record)
+            .collect())
+    }
+
+    /// The same bounded rows, each carrying the index line positions that place it.
+    ///
+    /// Only the resync delta needs them: they are what tells a turn that is new to a client from
+    /// one whose payload was amended after the client last read. A flat-layout thread has no index
+    /// lines of its own, so its records are placed at their position in the sequence, which leaves
+    /// every ordering comparison meaning exactly what it means today.
+    async fn load_indexed_turn_records_unlocked(
+        &self,
+        project: ProjectId,
+        thread: ThreadId,
+    ) -> Result<Vec<IndexedTurnRecord>, PersistError> {
         let started_at = std::time::Instant::now();
         let paths = self.thread_paths(project, thread).await;
         let path = paths.history();
@@ -1471,7 +1671,8 @@ impl PersistStore {
             ThreadLayout::Directory => history::parse_history_index(&path, &data),
             ThreadLayout::Flat => Ok(parse_turn_history(&path, &data)?
                 .iter()
-                .map(TurnRecord::from_turn)
+                .enumerate()
+                .map(|(line, turn)| IndexedTurnRecord::at(TurnRecord::from_turn(turn), line))
                 .collect()),
         }?;
         tracing::debug!(
@@ -1769,10 +1970,21 @@ impl PersistStore {
         Ok((all[start..end].to_vec(), start > 0))
     }
 
-    /// Load the turns persisted strictly after the `after` cursor (a `TurnId`), oldest-first — the
-    /// delta an incremental reconnect needs. Returns `None` when the cursor is not found in history
-    /// (the client's cursor is stale or from another thread), signalling the caller to fall back to
-    /// a full snapshot rather than guessing.
+    /// Load the turns a client at the `after` cursor has not seen settled, oldest-first — the delta
+    /// an incremental reconnect needs. Returns `None` when the cursor is not found in history (the
+    /// client's cursor is stale or from another thread), signalling the caller to fall back to a
+    /// full snapshot rather than guessing.
+    ///
+    /// "Has not seen settled" is two things: every turn that became durable after the cursor turn
+    /// did, and every turn whose payload was *amended* after that point — a command or tool that
+    /// settled late. The cursor's own index position is the clock for both, so an amendment needs
+    /// no field of its own on the wire or on disk.
+    ///
+    /// The cursor turn is not returned for being the cursor — the suffix starts strictly after it —
+    /// but it *is* returned when it is itself the amended one, which is the ordinary case: a client
+    /// resumes at the newest turn it saw, and that is the turn whose command was still running. A
+    /// client can therefore be handed the same amended turn twice; it can never miss one that
+    /// landed after it last read.
     pub async fn load_turns_after(
         &self,
         project: ProjectId,
@@ -1783,9 +1995,14 @@ impl PersistStore {
         let paths = self.thread_paths(project, thread).await;
         if paths.layout() == ThreadLayout::Directory {
             let started_at = std::time::Instant::now();
-            let records = self.load_turn_records_unlocked(project, thread).await?;
+            let records = self
+                .load_indexed_turn_records_unlocked(project, thread)
+                .await?;
             let total_records = records.len();
-            let Some(index) = records.iter().position(|record| record.turn_id == after) else {
+            let Some(cursor) = records
+                .iter()
+                .find(|indexed| indexed.record.turn_id == after)
+            else {
                 tracing::debug!(
                     %project,
                     %thread,
@@ -1797,7 +2014,22 @@ impl PersistStore {
                 );
                 return Ok(None);
             };
-            let selected = records[index + 1..].to_vec();
+            let cursor_first = cursor.first_line;
+            let mut amended_records = 0usize;
+            let selected: Vec<TurnRecord> = records
+                .iter()
+                .filter(|indexed| {
+                    if indexed.first_line > cursor_first {
+                        return true;
+                    }
+                    let amended = indexed.winning_line > cursor_first;
+                    if amended {
+                        amended_records += 1;
+                    }
+                    amended
+                })
+                .map(|indexed| indexed.record.clone())
+                .collect();
             let selected_records = selected.len();
             let turns = self
                 .load_selected_turn_records(project, thread, selected)
@@ -1809,6 +2041,7 @@ impl PersistStore {
                 action = "load_turns_after",
                 total_records,
                 selected_records,
+                amended_records,
                 returned_turns = turns.len(),
                 elapsed_ms = started_at.elapsed().as_millis(),
                 "loaded selected history suffix"
@@ -2226,7 +2459,7 @@ impl PersistStore {
         };
 
         let mut errors = vec![];
-        for record in records {
+        for IndexedTurnRecord { record, .. } in records {
             let payload_path = paths.turn_payload(record.turn_id);
             // Reported, not quarantined. Renaming the bad file aside here would make a *second*
             // `validate` run describe the same damage as a missing payload, losing the parse error
@@ -2443,6 +2676,7 @@ mod tests {
             diffs: Vec::new(),
             started_at: now,
             completed_at: Some(now),
+            skipped_records: 0,
         };
         store
             .append_turn(project_id, thread_id, &turn)
@@ -3085,6 +3319,7 @@ mod tests {
             diffs: vec![],
             started_at: Utc::now(),
             completed_at: Some(Utc::now()),
+            skipped_records: 0,
         }
     }
 
@@ -3584,8 +3819,11 @@ mod tests {
         assert!(store.history_cache_entry(pid, tid).await.is_none());
     }
 
+    /// A repeated turn id is an amendment, not a second turn: the index folds it last-wins, so the
+    /// bounded fields come from the newest record, while the payload file stays the durable one the
+    /// first append wrote.
     #[tokio::test]
-    async fn jsonl_history_skips_duplicate_turn_ids_on_read_and_recompute() {
+    async fn jsonl_history_supersedes_duplicate_turn_ids_on_read_and_recompute() {
         use giskard_core::token::TokenUsage;
         let (_tmp, store) = make_store();
         let pid = ProjectId::new();
@@ -3602,11 +3840,14 @@ mod tests {
         store.append_turn(pid, tid, &second).await.unwrap();
 
         let all = store.load_all_turns(pid, tid).await.unwrap();
-        assert_eq!(all.len(), 2);
+        assert_eq!(all.len(), 2, "a repeated id is one turn, not two");
         assert_eq!(all[0].id, original.id);
-        assert_eq!(all[0].user_input, original.user_input);
-        assert_eq!(all[0].usage, original.usage);
-        assert_eq!(all[1].id, second.id);
+        assert_eq!(
+            all[0].user_input, original.user_input,
+            "the payload file is not rewritten under an id already on disk"
+        );
+        assert_eq!(all[0].usage, duplicate.usage, "the last record wins");
+        assert_eq!(all[1].id, second.id, "and the turn keeps its place");
 
         store
             .save_thread(
@@ -3642,8 +3883,8 @@ mod tests {
             .unwrap()
             .into_current()
             .unwrap();
-        assert_eq!(tf.tokens.total.input, 300);
-        assert_eq!(tf.tokens.total.output, 30);
+        assert_eq!(tf.tokens.total.input, 1199);
+        assert_eq!(tf.tokens.total.output, 119);
     }
 
     #[tokio::test]
@@ -3833,10 +4074,11 @@ mod layout_tests {
         let data = tokio::fs::read_to_string(paths.history()).await.unwrap();
         let records = crate::history::parse_history_index(&paths.history(), &data).unwrap();
         assert_eq!(records.len(), 1);
-        assert!(records[0].prompt_truncated);
-        assert!(records[0].prompt_preview.len() <= crate::preview::PROMPT_PREVIEW_MAX_BYTES);
-        assert!(prompt.starts_with(&records[0].prompt_preview));
-        assert_eq!(records[0].item_count, 0);
+        let record = &records[0].record;
+        assert!(record.prompt_truncated);
+        assert!(record.prompt_preview.len() <= crate::preview::PROMPT_PREVIEW_MAX_BYTES);
+        assert!(prompt.starts_with(&record.prompt_preview));
+        assert_eq!(record.item_count, 0);
 
         // Reading the thread yields the full prompt, not the preview.
         let loaded = store.load_all_turns(pid, tid).await.unwrap();
@@ -4557,7 +4799,9 @@ mod layout_tests {
             store.append_turn(pid, tid, turn).await.unwrap();
         }
 
-        // Well-formed lines, one required record missing — not a truncation.
+        // Well-formed lines, one required record missing. Now that an unreadable record is skipped
+        // rather than failing the file, reaching this state means the prompt was lost — damage, not
+        // an incomplete-but-intact file — so the bytes are quarantined for inspection.
         let paths = store.current_thread_paths(pid, tid);
         let payload = paths.turn_payload(incomplete.id);
         let data = tokio::fs::read_to_string(&payload).await.unwrap();
@@ -4575,13 +4819,23 @@ mod layout_tests {
             "the incomplete turn fails alone rather than reassembling with an empty prompt"
         );
         assert!(
-            payload.exists(),
-            "the bytes parsed, so the file is reported rather than quarantined — its surviving \
-             records may still be recoverable"
+            !payload.exists(),
+            "a payload that lost its prompt is quarantined, not left in place"
+        );
+        let quarantined: Vec<_> = std::fs::read_dir(paths.turns_dir())
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.contains(".corrupt-"))
+            .collect();
+        assert_eq!(
+            quarantined.len(),
+            1,
+            "left on disk for inspection: {quarantined:?}"
         );
         let errors = store.history_validation_errors(pid, tid).await;
         assert_eq!(errors.len(), 1);
-        assert!(errors[0].1.contains("no user_input record"), "{errors:?}");
+        assert!(errors[0].0.ends_with(format!("{}.jsonl", incomplete.id)));
     }
 
     /// The payload file holds two classes of record, and each needs its own stated rule.
@@ -4674,8 +4928,9 @@ mod layout_tests {
 
         // The kind stays authoritative in the index, so aggregate repair still reads no payload.
         let records = crate::history::parse_history_index(&paths.history(), &index).unwrap();
-        assert_eq!(records[0].status.kind, TurnStatusKind::Failed);
-        assert!(records[0].status.message.as_deref().is_some_and(|message| {
+        let record = &records[0].record;
+        assert_eq!(record.status.kind, TurnStatusKind::Failed);
+        assert!(record.status.message.as_deref().is_some_and(|message| {
             message.len() <= crate::preview::STATUS_MESSAGE_MAX_BYTES && detail.starts_with(message)
         }));
 
@@ -4805,6 +5060,382 @@ mod layout_tests {
             MigrationOutcome::Migrated
         );
         assert_eq!(store.load_all_turns(pid, tid).await.unwrap().len(), 1);
+    }
+
+    // ---- Late item completion (durable amendments) ----
+
+    fn running_command_item(id: giskard_core::ItemId) -> Item {
+        Item {
+            id,
+            harness_item_id: format!("native-{id}"),
+            payload: ItemPayload::CommandExecution {
+                command: "cargo test".into(),
+                cwd: "/tmp/project".into(),
+                output: String::new(),
+                output_truncated: false,
+                output_original_bytes: None,
+                output_original_lines: None,
+                exit_code: None,
+                status: Some("running".into()),
+                process_id: Some("pid-1".into()),
+                duration_ms: None,
+            },
+            created_at: Utc::now(),
+        }
+    }
+
+    fn settled_command_item(id: giskard_core::ItemId) -> Item {
+        let mut item = running_command_item(id);
+        item.payload = ItemPayload::CommandExecution {
+            command: "cargo test".into(),
+            cwd: "/tmp/project".into(),
+            output: "all tests passed".into(),
+            output_truncated: false,
+            output_original_bytes: None,
+            output_original_lines: None,
+            exit_code: Some(0),
+            status: Some("completed".into()),
+            process_id: Some("pid-1".into()),
+            duration_ms: Some(4200),
+        };
+        item
+    }
+
+    fn command_status(item: &Item) -> (Option<&str>, Option<i32>, &str) {
+        match &item.payload {
+            ItemPayload::CommandExecution {
+                status,
+                exit_code,
+                output,
+                ..
+            } => (status.as_deref(), *exit_code, output.as_str()),
+            other => panic!("expected a command item, got {other:?}"),
+        }
+    }
+
+    /// The amended item is the one a lazy route reads, and it keeps the slot its first record
+    /// established rather than moving to the end of the turn.
+    #[tokio::test]
+    async fn an_amended_item_settles_in_place_for_lazy_reads_and_whole_turn_reads() {
+        let (_tmp, store) = make_store();
+        let pid = ProjectId::new();
+        let tid = ThreadId::new();
+
+        let command = giskard_core::ItemId::new();
+        let turn = turn_with_items(
+            "run the tests",
+            vec![
+                running_command_item(command),
+                item("and here is what I found"),
+            ],
+        );
+        store.append_turn(pid, tid, &turn).await.unwrap();
+
+        let paths = store.current_thread_paths(pid, tid);
+        let before = tokio::fs::read_to_string(paths.turn_payload(turn.id))
+            .await
+            .unwrap();
+        let outcome = store
+            .amend_turn_item(pid, tid, turn.id, &settled_command_item(command))
+            .await
+            .unwrap();
+        assert_eq!(outcome, AmendOutcome::Amended);
+        let after = tokio::fs::read_to_string(paths.turn_payload(turn.id))
+            .await
+            .unwrap();
+        assert!(
+            after.starts_with(&before) && after.len() > before.len(),
+            "the payload is appended to, never rewritten"
+        );
+
+        let loaded = store
+            .load_turn_item(pid, tid, turn.id, command)
+            .await
+            .unwrap()
+            .expect("the amended item");
+        assert_eq!(
+            command_status(&loaded),
+            (Some("completed"), Some(0), "all tests passed")
+        );
+
+        let all = store.load_all_turns(pid, tid).await.unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].items.len(), 2, "an amendment is not a new item");
+        assert_eq!(
+            all[0].items[0].id, command,
+            "the settled command keeps its slot, not the bottom of the turn"
+        );
+        assert_eq!(
+            command_status(&all[0].items[0]),
+            (Some("completed"), Some(0), "all tests passed")
+        );
+
+        // The superseding index record carries the count the amended payload folds to.
+        let records = store.load_turn_records(pid, tid).await.unwrap();
+        assert_eq!(records.len(), 1, "an amendment is not a new turn");
+        assert_eq!(records[0].item_count, 2);
+        assert_eq!(
+            records[0].completed_at, turn.completed_at,
+            "an item settling does not reopen the turn"
+        );
+        assert_eq!(records[0].status, turn.status);
+    }
+
+    /// A resync delta carries a turn amended after the client's cursor, and never the cursor turn
+    /// itself — which would walk the client's resume point backwards.
+    #[tokio::test]
+    async fn load_turns_after_carries_turns_amended_after_the_cursor() {
+        use giskard_core::token::TokenUsage;
+        let (_tmp, store) = make_store();
+        let pid = ProjectId::new();
+        let tid = ThreadId::new();
+
+        let command = giskard_core::ItemId::new();
+        let first = turn_with_items("run the tests", vec![running_command_item(command)]);
+        store.append_turn(pid, tid, &first).await.unwrap();
+        let second = make_turn(TokenUsage::new(200, 20));
+        store.append_turn(pid, tid, &second).await.unwrap();
+
+        // Before the amendment, a client resuming at the newest turn has nothing to catch up on,
+        // and a cursor that was not amended never comes back for being the cursor.
+        assert_eq!(
+            store.load_turns_after(pid, tid, second.id).await.unwrap(),
+            Some(vec![])
+        );
+        assert_eq!(
+            store
+                .load_turns_after(pid, tid, first.id)
+                .await
+                .unwrap()
+                .map(|turns| turns.iter().map(|t| t.id).collect::<Vec<_>>()),
+            Some(vec![second.id])
+        );
+
+        store
+            .amend_turn_item(pid, tid, first.id, &settled_command_item(command))
+            .await
+            .unwrap();
+
+        // A cursor older than the amendment sees it, with the item settled.
+        let delta = store
+            .load_turns_after(pid, tid, second.id)
+            .await
+            .unwrap()
+            .expect("a delta, not a fallback");
+        assert_eq!(
+            delta.iter().map(|t| t.id).collect::<Vec<_>>(),
+            vec![first.id]
+        );
+        assert_eq!(
+            command_status(&delta[0].items[0]),
+            (Some("completed"), Some(0), "all tests passed")
+        );
+
+        // Asking again with the same cursor returns it again: a client may see an amendment twice,
+        // it may never miss one.
+        let again = store.load_turns_after(pid, tid, second.id).await.unwrap();
+        assert_eq!(
+            again.map(|turns| turns.iter().map(|t| t.id).collect::<Vec<_>>()),
+            Some(vec![first.id])
+        );
+
+        // The cursor turn comes back when it is itself the amended one — the ordinary reconnect,
+        // where the client resumes at the turn whose command was still running.
+        let from_the_amended_turn = store
+            .load_turns_after(pid, tid, first.id)
+            .await
+            .unwrap()
+            .expect("a delta");
+        assert_eq!(
+            from_the_amended_turn
+                .iter()
+                .map(|t| t.id)
+                .collect::<Vec<_>>(),
+            vec![first.id, second.id]
+        );
+    }
+
+    /// A cursor set after the amendment landed has nothing to catch up on.
+    #[tokio::test]
+    async fn load_turns_after_skips_an_amendment_older_than_the_cursor() {
+        use giskard_core::token::TokenUsage;
+        let (_tmp, store) = make_store();
+        let pid = ProjectId::new();
+        let tid = ThreadId::new();
+
+        let command = giskard_core::ItemId::new();
+        let first = turn_with_items("run the tests", vec![running_command_item(command)]);
+        store.append_turn(pid, tid, &first).await.unwrap();
+        store
+            .amend_turn_item(pid, tid, first.id, &settled_command_item(command))
+            .await
+            .unwrap();
+        let second = make_turn(TokenUsage::new(200, 20));
+        store.append_turn(pid, tid, &second).await.unwrap();
+
+        assert_eq!(
+            store.load_turns_after(pid, tid, second.id).await.unwrap(),
+            Some(vec![]),
+            "an amendment the client already read is not re-delivered"
+        );
+    }
+
+    /// A superseding record is appended, so a crash that tears the next append leaves the previous
+    /// record standing and the turn readable.
+    #[tokio::test]
+    async fn a_torn_append_after_an_amendment_leaves_the_amended_turn_readable() {
+        let (_tmp, store) = make_store();
+        let pid = ProjectId::new();
+        let tid = ThreadId::new();
+
+        let command = giskard_core::ItemId::new();
+        let turn = turn_with_items("run the tests", vec![running_command_item(command)]);
+        store.append_turn(pid, tid, &turn).await.unwrap();
+        store
+            .amend_turn_item(pid, tid, turn.id, &settled_command_item(command))
+            .await
+            .unwrap();
+
+        let paths = store.current_thread_paths(pid, tid);
+        let index = tokio::fs::read_to_string(paths.history()).await.unwrap();
+        tokio::fs::write(
+            paths.history(),
+            format!("{index}{{\"kind\":\"turn_v3\",\"tur"),
+        )
+        .await
+        .unwrap();
+
+        let all = store.load_all_turns(pid, tid).await.unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!(
+            command_status(&all[0].items[0]),
+            (Some("completed"), Some(0), "all tests passed")
+        );
+    }
+
+    /// The amend path only ever appends. A payload whose last append was torn gets a newline first,
+    /// so the damaged tail stays its own line and the amendment is read.
+    #[tokio::test]
+    async fn amending_a_payload_with_a_torn_tail_inserts_a_newline_and_keeps_the_tail() {
+        let (_tmp, store) = make_store();
+        let pid = ProjectId::new();
+        let tid = ThreadId::new();
+
+        let command = giskard_core::ItemId::new();
+        let turn = turn_with_items(
+            "run the tests",
+            vec![running_command_item(command), item("a note")],
+        );
+        store.append_turn(pid, tid, &turn).await.unwrap();
+
+        let paths = store.current_thread_paths(pid, tid);
+        let payload_path = paths.turn_payload(turn.id);
+        let whole = tokio::fs::read_to_string(&payload_path).await.unwrap();
+        let torn = whole[..whole.len() - 20].to_string();
+        tokio::fs::write(&payload_path, &torn).await.unwrap();
+
+        store
+            .amend_turn_item(pid, tid, turn.id, &settled_command_item(command))
+            .await
+            .unwrap();
+
+        let on_disk = tokio::fs::read_to_string(&payload_path).await.unwrap();
+        assert!(
+            on_disk.starts_with(&torn),
+            "the torn tail is evidence, never truncated or repaired"
+        );
+        assert_eq!(
+            on_disk.lines().count(),
+            torn.lines().count() + 1,
+            "the amendment is its own line, not glued to the tail"
+        );
+
+        let all = store.load_all_turns(pid, tid).await.unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].skipped_records, 1, "the torn tail costs one record");
+        assert_eq!(
+            command_status(&all[0].items[0]),
+            (Some("completed"), Some(0), "all tests passed")
+        );
+    }
+
+    /// Two items settling late append two lines, and both fold.
+    #[tokio::test]
+    async fn two_amendments_append_two_lines_and_both_fold() {
+        let (_tmp, store) = make_store();
+        let pid = ProjectId::new();
+        let tid = ThreadId::new();
+
+        let first = giskard_core::ItemId::new();
+        let second = giskard_core::ItemId::new();
+        let turn = turn_with_items("run both", vec![]);
+        store.append_turn(pid, tid, &turn).await.unwrap();
+
+        let paths = store.current_thread_paths(pid, tid);
+        let before = tokio::fs::read_to_string(paths.turn_payload(turn.id))
+            .await
+            .unwrap();
+
+        for id in [first, second] {
+            store
+                .amend_turn_item(pid, tid, turn.id, &settled_command_item(id))
+                .await
+                .unwrap();
+        }
+
+        let after = tokio::fs::read_to_string(paths.turn_payload(turn.id))
+            .await
+            .unwrap();
+        assert!(after.starts_with(&before), "the payload is only extended");
+        assert_eq!(after.lines().count(), before.lines().count() + 2);
+
+        let all = store.load_all_turns(pid, tid).await.unwrap();
+        assert_eq!(
+            all[0].items.iter().map(|item| item.id).collect::<Vec<_>>(),
+            vec![first, second],
+            "each amendment lands at the end, in the order it settled"
+        );
+        assert_eq!(all[0].skipped_records, 0);
+
+        let records = store.load_turn_records(pid, tid).await.unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].item_count, 2);
+    }
+
+    /// A flat thread has no per-turn payload to amend. It is not an error: the caller keeps the
+    /// behaviour it had before amendments existed, and nothing on disk moves.
+    #[tokio::test]
+    async fn amending_a_flat_layout_thread_is_unsupported_and_writes_nothing() {
+        let (_tmp, store) = make_store();
+        let pid = ProjectId::new();
+        let tid = ThreadId::new();
+        write_format1_thread(&store, pid, &test_thread(pid, tid), &[]).await;
+        store.unmigratable.write().await.insert((pid, tid));
+
+        let command = giskard_core::ItemId::new();
+        let turn = turn_with_items("run the tests", vec![running_command_item(command)]);
+        store.append_turn(pid, tid, &turn).await.unwrap();
+        assert_eq!(store.thread_layout(pid, tid).await, ThreadLayout::Flat);
+
+        let flat_history = store.thread_paths(pid, tid).await.history();
+        let before = tokio::fs::read_to_string(&flat_history).await.unwrap();
+        let outcome = store
+            .amend_turn_item(pid, tid, turn.id, &settled_command_item(command))
+            .await
+            .unwrap();
+        assert_eq!(outcome, AmendOutcome::Unsupported);
+        assert_eq!(
+            tokio::fs::read_to_string(&flat_history).await.unwrap(),
+            before,
+            "an unsupported amendment writes nothing"
+        );
+
+        let loaded = store
+            .load_turn_item(pid, tid, turn.id, command)
+            .await
+            .unwrap()
+            .expect("the unamended item");
+        assert_eq!(command_status(&loaded), (Some("running"), None, ""));
     }
 
     /// A migration failure leaves a readable flat thread in service. Its writes and lazy reads

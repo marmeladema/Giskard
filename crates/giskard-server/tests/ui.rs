@@ -2227,6 +2227,85 @@ fn browser_scopes_async_http_results_to_an_active_view_generation() {
     assert!(delta_renderer.contains("resetTranscriptForAuthoritativeSnapshot();"));
 }
 
+/// A resync delta can name a turn the browser already rendered: an item of it settled after the
+/// turn was persisted. That turn is refreshed in place through the ordinary upsert, never rendered
+/// a second time, and it does not walk the resume cursor backwards.
+#[test]
+fn browser_refreshes_a_rendered_turn_a_delta_names_again() {
+    let body = app_js();
+    assert!(
+        body.contains("function renderedTurnRow(turnId) {"),
+        "the browser can tell whether a turn is already on screen"
+    );
+
+    let delta_renderer = between(
+        body,
+        "function renderHistoryDelta(msg) {",
+        "function reconcileInFlightTurn()",
+    );
+    assert!(
+        delta_renderer
+            .contains("const amendedTurns = turns.filter(turn => !!renderedTurnRow(turn.id));")
+            && delta_renderer
+                .contains("const newTurns = turns.filter(turn => !renderedTurnRow(turn.id));"),
+        "a non-reset delta partitions the turns it was sent by what is already rendered"
+    );
+    assert!(
+        delta_renderer.contains("for (const it of (turn.items || [])) addItem(it, turn.id, true);"),
+        "an already-rendered turn is refreshed through the ordinary item upsert"
+    );
+    assert!(
+        delta_renderer.contains("for (const turn of newTurns) renderPersistedTurn(turn);")
+            && !delta_renderer.contains("for (const turn of turns) renderPersistedTurn(turn);"),
+        "only turns that are not on screen are rendered into the inserted container"
+    );
+    assert!(
+        delta_renderer.contains("state.newestPersistedTurnId = turns[turns.length - 1].id;"),
+        "the resume cursor still advances to the last turn of the delta, which the server orders"
+    );
+    assert_order(
+        delta_renderer,
+        "for (const it of (turn.items || [])) addItem(it, turn.id, true);",
+        "for (const turn of newTurns) renderPersistedTurn(turn);",
+    );
+    assert!(
+        delta_renderer.contains(".msg.notice[data-turn=\"")
+            && delta_renderer.contains("noticeBubble(skippedRecordsNotice(turn.skipped_records))"),
+        "a repeated delta refreshes a damaged turn's rows without stacking warning rows"
+    );
+}
+
+/// A turn whose stored record could not be read in full says so in the transcript: the count is on
+/// the turn, the reasons are in the server log.
+#[test]
+fn browser_warns_under_a_turn_whose_payload_records_were_skipped() {
+    let body = app_js();
+    assert!(
+        body.contains("function skippedRecordsNotice(count) {"),
+        "one place composes the warning text"
+    );
+    let renderer = between(
+        body,
+        "function renderPersistedTurn(turn) {",
+        "function skippedRecordsNotice(count) {",
+    );
+    assert!(
+        renderer.contains(
+            "if (turn.skipped_records > 0) noticeBubble(skippedRecordsNotice(turn.skipped_records));"
+        ),
+        "the warning row is rendered inside the turn, with its rows"
+    );
+    assert_order(
+        renderer,
+        "errorBubble(st.message",
+        "noticeBubble(skippedRecordsNotice(turn.skipped_records))",
+    );
+    assert!(
+        body.contains("could not be read and were skipped; the turn may be incomplete."),
+        "the row says what it can: something is missing, not why"
+    );
+}
+
 #[test]
 fn browser_keeps_appended_transcript_rows_anchored_to_bottom() {
     let body = app_js();
@@ -2532,7 +2611,7 @@ fn browser_incremental_resync_reconciles_in_flight_turn() {
     assert_order(
         delta,
         "const completedPendingTurn =",
-        "for (const turn of turns) renderPersistedTurn(turn);",
+        "for (const turn of newTurns) renderPersistedTurn(turn);",
     );
     assert!(delta.contains("!liveId && !!state.pendingUserEl && turns.length > 0"));
     assert!(delta.contains("if (completedLiveTurn || completedPendingTurn)"));
