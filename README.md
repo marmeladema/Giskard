@@ -136,12 +136,13 @@ Then open **http://127.0.0.1:8787**, log in, and:
    commands/tools, **Sub-agents** monitor, **MCP** status menu, and **Context** usage button;
    scrolling the transcript to the top lazy-loads older history. Completed command rows carry only
    a bounded preview; opening one fetches its retained output and resolves path links by command
-   identity, without uploading that potentially large output from the browser. Reasoning notes are
-   collapsible: a note stays open while it is the newest row — so the live turn's thinking is
-   readable — and folds to a one-line summary as soon as the next row arrives. The summary line
-   reopens it, and a note you opened yourself stays open. Long completed notes initially arrive as
-   a line-bounded first kilobyte; opening one fetches the rest, and copying always yields the whole
-   note. When the project's workspace is a
+   identity, without uploading that potentially large output from the browser. A command that
+   finishes after its turn has ended is recorded with that turn, so it still reads as finished
+   after a reload. Reasoning notes are collapsible: a note stays open while it is the newest row —
+   so the live turn's thinking is readable — and folds to a one-line summary as soon as the next
+   row arrives. The summary line reopens it, and a note you opened yourself stays open. Long
+   completed notes initially arrive as a line-bounded first kilobyte; opening one fetches the rest,
+   and copying always yields the whole note. When the project's workspace is a
    Git repository, a one-line **Git status** sits just above the composer — branch, ahead/behind,
    changed-file count and total diffstat — and expands in place into the changed files, each
    opening its diff. It refreshes as the agent changes the tree, so it stays current during a turn.
@@ -426,10 +427,13 @@ Thread **history** is split by how the two halves grow. `history.jsonl` is the i
 turn, holding only bounded fields (ids, model, status, usage, timestamps, a capped prompt preview,
 attachment descriptors) — so it stays small no matter what the agent did, and it is appended to.
 `turns/<turn_id>.jsonl` holds the unbounded half — the full prompt, the full status message, the
-items, and the full captured diffs — and is
-written with an atomic temp-file+fsync+rename, so a payload is complete or absent rather than torn.
-A turn commits payload first, index last: a crash between them leaves a file no record references,
-which every read path simply cannot see. `thread.json` is small metadata + token aggregates that can
+items, and the full captured diffs — and is written at commit with an atomic
+temp-file+fsync+rename, so the file a commit produces is complete or absent rather than torn.
+Afterwards it is only ever extended: a command or tool that finishes after its turn ended appends
+one record for the settled item. Reading a payload is correspondingly best-effort — a record that
+cannot be read is skipped and counted rather than failing the whole turn, and the transcript says
+so under that turn. A turn commits payload first, index last: a crash between them leaves a file no
+record references, which every read path simply cannot see. `thread.json` is small metadata + token aggregates that can
 be rebuilt from the index alone.
 
 Native threads whose relationship has not arrived yet are retained as hidden, read-only `orphan`

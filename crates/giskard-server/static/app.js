@@ -4076,22 +4076,44 @@ function renderHistoryDelta(msg) {
     state.pendingLiveSnapshotReconcile = !!liveId || !!state.pendingUserEl;
   }
 
+  // A delta can name a turn that is already on screen: one of its items settled after the turn was
+  // persisted, so the server sent the amended turn again rather than inventing a message for it.
+  // Rendering that turn into a new container would show it twice, so its items go through the
+  // ordinary upsert, refreshing the rows in place exactly as a live item completion does.
+  const amendedTurns = turns.filter(turn => !!renderedTurnRow(turn.id));
+  const newTurns = turns.filter(turn => !renderedTurnRow(turn.id));
+  for (const turn of amendedTurns) {
+    const prevRenderTurnId = state.currentRenderTurnId;
+    state.currentRenderTurnId = turn.id;
+    for (const it of (turn.items || [])) addItem(it, turn.id, true);
+    // Only if the turn has no warning row yet: a repeated delta must not stack them.
+    if (turn.skipped_records > 0 && !$("transcript").querySelector('.msg.notice[data-turn="' + idKey(turn.id) + '"]')) {
+      noticeBubble(skippedRecordsNotice(turn.skipped_records));
+    }
+    state.currentRenderTurnId = prevRenderTurnId;
+  }
+
   // Append completed-since turns. If the old live turn is still visible, insert the persisted turns
   // immediately before that live block so transcript chronology stays correct until the snapshot
   // atomically replaces the live block.
-  if (turns.length) {
+  if (newTurns.length) {
     const container = document.createElement("div");
     const prev = state.renderTarget;
     const prevTaskGroup = state.activeTaskGroup;
     state.renderTarget = container;
     state.activeTaskGroup = null;
-    for (const turn of turns) renderPersistedTurn(turn);
+    for (const turn of newTurns) renderPersistedTurn(turn);
     state.renderTarget = prev;
     state.activeTaskGroup = prevTaskGroup;
     const t = $("transcript");
     const anchor = !completedLiveTurn ? firstLiveTurnRow(liveId) : null;
     while (container.firstChild) t.insertBefore(container.firstChild, anchor);
     collapseSupersededReasoningRows(t);
+  }
+  if (turns.length) {
+    // The server sends the delta in turn order, so its last turn is the newest one this client
+    // has now seen — including the case where the only turn in it is the cursor turn itself,
+    // re-sent because one of its items settled late, which leaves the cursor where it was.
     state.newestPersistedTurnId = turns[turns.length - 1].id;   // advance the resume cursor
     updateGaugeFromTurns(turns);   // a live snapshot, if any, overrides this next
   }
@@ -4217,6 +4239,19 @@ function rebuildRenderTrackingFromDom() {
   state.renderedApprovalStateKeys = approvalKeys;
   renderRunningCommands();
 }
+// Whether a turn already has rows in the transcript. Rows are stamped with their turn id while
+// they render, so the DOM is the only place that knows — a turn can be on screen from a history
+// page, an earlier delta, or a live turn that was reconciled into place.
+function renderedTurnRow(turnId) {
+  const t = $("transcript");
+  if (!t || turnId == null) return null;
+  const id = String(turnId);
+  for (const el of t.querySelectorAll(".msg")) {
+    if (el.dataset.turn === id) return el;
+  }
+  return null;
+}
+
 function removeTurnRows(turnId) {
   const t = $("transcript");
   if (!t) return;
@@ -4299,8 +4334,15 @@ function renderPersistedTurn(turn) {
   if (st && (st.kind==="failed" || st.kind==="interrupted")) {
     errorBubble(st.message || (st.kind==="interrupted" ? "Turn interrupted." : "Turn failed."));
   }
+  // Part of this turn's stored record could not be read. The server logged why; all the transcript
+  // can honestly say is that what you are looking at may be missing something.
+  if (turn.skipped_records > 0) noticeBubble(skippedRecordsNotice(turn.skipped_records));
   state.currentRenderTurnId = prevRenderTurnId;
   breakTaskGroup();
+}
+function skippedRecordsNotice(count) {
+  const records = count === 1 ? "1 record" : count + " records";
+  return records + " of this turn could not be read and were skipped; the turn may be incomplete.";
 }
 
 // Load older history when the user scrolls near the top (H4/H6 infinite scroll).

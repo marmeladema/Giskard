@@ -23,4 +23,4 @@ pub use preview::{
     bounded_head_tail, bounded_preview, bounded_tail_preview, bounded_tail_preview_for_original,
     logical_line_count,
 };
-pub use store::{OrphanSweep, PersistStore, ProjectEntry, ProjectIndex};
+pub use store::{AmendOutcome, OrphanSweep, PersistStore, ProjectEntry, ProjectIndex};

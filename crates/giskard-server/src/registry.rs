@@ -32,7 +32,9 @@ use giskard_harness::{
     ThreadHandle, ThreadUpdate, thread_update_channel,
 };
 use giskard_persist::PersistStore;
-use giskard_persist::store::{ProjectConfig, ThreadFile, ThreadMutation, TurnCommitOutcome};
+use giskard_persist::store::{
+    AmendOutcome, ProjectConfig, ThreadFile, ThreadMutation, TurnCommitOutcome,
+};
 use giskard_proto::{RunningTask, ThreadRuntimeOverview, WireCommandOutput};
 
 use crate::hub::{Hub, Outbound};

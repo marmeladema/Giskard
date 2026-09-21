@@ -9,7 +9,16 @@
 
 **Document status:** Implementation-ready specification.
 **Audience:** An AI coding agent (and its human reviewer) implementing the system.
-**Version:** 1.95
+**Version:** 1.96
+
+> **Amendment — late item completion (1.96).** A terminal command or tool that settles after its
+> turn was persisted is recorded durably: the settled item is appended to the turn's payload file
+> and a superseding turn record is appended to the index, payload first, index last, with no format
+> bump. A payload is written whole at commit and only ever extended afterwards, never rewritten, so
+> payload reads become best-effort: a record that does not parse is skipped, counted, and reported
+> on the turn as `skipped_records`. The index folds turn records last-wins, and a resync delta
+> carries turns amended after the client's cursor. Runtime output survives until the amendment is
+> durable. The flat layout has no per-turn payload to amend and keeps its previous behaviour.
 
 > **Amendment — cancellable subscribe (1.95).** A subscribe bootstrap runs in a
 > connection-owned task identified by a server-side generation, so slow attach and read phases do
@@ -173,8 +182,9 @@
 > Descriptor size, strong domain-separated SHA-256 version, HTTP `ETag`, and response body all
 > derive from the same compact JSON serialization. Explicit JSON `null` is present four-byte
 > output; a missing output remains absent. Runtime authority bridges completion and persistence,
-> including `PersistenceBlocked`, while post-persistence late completion remains ignored until the
-> durable amendment milestone. No payload-format bump, migration, preview, or truncation is added.
+> including `PersistenceBlocked`. (superseded by LA1) A post-persistence late completion is amended
+> into the turn's payload rather than ignored. No payload-format bump, migration, preview, or
+> truncation is added.
 
 > **Amendment — lazy captured diffs (1.72).** Agent-produced unified and structured diff bodies
 > are extracted before browser delivery into immutable, turn-owned content records. Live events,
@@ -198,6 +208,30 @@
 > the intended frontend for the foreseeable future; treat every Dioxus/WASM/`giskard-ui` reference
 > below as historical design context, not a current requirement. The wire contract (`giskard-proto`)
 > and all backend design remain authoritative.
+
+**Changelog (1.95 → 1.96), late item completion:**
+- **LA1:** A terminal item completing after its turn persisted is appended to the turn's payload
+  file as an `item` record carrying no display index, and a superseding turn record carrying the
+  folded item count is appended to the history index. Payload first, index last, no format bump. A
+  crash between the two leaves the index's `item_count` stale, which nothing may validate against;
+  the payload file wins.
+- **LA2:** The index folds turn records last-wins. A resync delta includes every turn that became
+  durable after the client's cursor turn plus every turn amended after it, ordered by turn order —
+  the cursor turn itself included when it is the amended one. A client may see an amendment twice;
+  it never misses one.
+- **LA3:** Runtime output survives until the amendment is durable. The runtime copy, and the cached
+  persisted-output version, are dropped only after the write succeeds; a failed write is logged at
+  `error` and the runtime copy is kept, with no retry.
+- **LA4:** A thread on the flat layout has no per-turn payload to amend. The amendment is reported
+  unsupported and logged, and that thread keeps its previous behaviour.
+- **LA5:** A turn payload is written whole and atomically at commit, and afterwards only
+  **extended** — one appended record per amendment, one `write_all` each, never rewritten; when the
+  file does not end in a newline the append inserts one first and leaves the torn tail in place.
+  Payload reads are best-effort to match: a record that does not parse is logged with its line and
+  error, counted, and skipped, and the turn loads from what remains. The count is delivered on the
+  turn as `skipped_records` (omitted when zero) and the transcript shows a warning row under such a
+  turn. A payload `format` newer than this build, and a payload that has lost its `user_input`
+  record, still fail that turn alone.
 
 **Changelog (1.94 → 1.95), cancellable subscribe:**
 - **CS1:** A subscribe bootstrap runs in a connection-owned task with a server-side generation;
@@ -412,7 +446,9 @@
 - **L1:** A thread is a directory. `<thread_id>/history.jsonl` is a bounded **index** (a header
   line, then one strictly bounded record per turn); `<thread_id>/turns/<turn_id>.jsonl` is that
   turn's **payload** — full `UserInput`, items, diffs — written with temp file + `fsync` + rename,
-  so it is complete or absent (§5.2, §5.4).
+  so the file a commit produces is complete or absent (§5.2, §5.4). (superseded in part by LA5) The
+  file is afterwards extended by appended amendment records, and a record that does not parse is
+  skipped and counted rather than failing the turn.
 - **L2:** A turn commits payload first, index last. A crash between them leaves a payload no turn
   record references, invisible to every read path because reads start from the index (§5.4).
 - **L3:** Three independent version markers: `thread.json` → `version` (metadata schema),
@@ -2330,9 +2366,9 @@ Compact `serde_json::to_vec` bytes are the single source for `serialized_bytes`,
 domain-separated SHA-256 `version`, endpoint body, and strong `ETag`. Consequently
 `Some(Value::Null)` is available output with body `null`, while `None` remains missing output.
 Runtime authority is published before the descriptor and retained until successful persistence,
-including while `PersistenceBlocked`; persisted lookup targets the selected turn and item. A
-post-persistence late tool completion remains ignored and is logged until durable late-item
-amendments are implemented.
+including while `PersistenceBlocked`; persisted lookup targets the selected turn and item.
+(superseded by LA1) A post-persistence late tool completion is amended into the turn's payload and
+is served from it once the runtime copy is gone.
 
 > `AgentEventStream` is a typed reader over a per-thread retained event log, supporting multiple
 > subscribers per thread without dropping events when a subscriber is installed or replaced.
@@ -2626,7 +2662,7 @@ there is one source of truth to correct if needed.
   `format` (the directory layout and index schema, written once — at thread creation, or by the
   first append for a thread the store never saw created — and never rewritten), and each
   `turns/<id>.jsonl` header → `format` (that turn's payload schema, written once when the turn
-  commits). The layout version lives in the history header rather than in `thread.json` because
+  commits and never rewritten by the amendment records appended after it). The layout version lives in the history header rather than in `thread.json` because
   `thread.json` is rewritten on every metadata mutation, and because a file that carries its own
   format claim has no cross-file consistency for a crash to break. Payload headers are per-file so a
   directory holding a mix of old and new payload files is legal, which is what makes lazy per-turn

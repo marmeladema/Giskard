@@ -164,6 +164,7 @@ async fn migrate_storage_converts_flat_threads_and_prune_legacy_removes_the_orig
         diffs: vec![],
         started_at: now,
         completed_at: Some(now),
+        skipped_records: 0,
     };
     let threads_dir = tmp
         .path()
@@ -576,6 +577,7 @@ async fn sweep_orphan_payloads_deletes_a_freshly_written_orphan() {
         diffs: vec![],
         started_at: now,
         completed_at: Some(now),
+        skipped_records: 0,
     };
     store
         .append_turn(project_id, thread_id, &committed)

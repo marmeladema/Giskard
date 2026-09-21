@@ -121,11 +121,28 @@ enum HistoryLine<'a> {
 #[derive(Debug, Clone, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 enum PayloadLine<'a> {
-    TurnHeader { format: u32, turn_id: TurnId },
-    UserInput { user_input: &'a UserInput },
-    Status { status: &'a TurnStatus },
-    Item { index: usize, item: &'a Item },
-    Diff { index: usize, diff: &'a FileDiff },
+    TurnHeader {
+        format: u32,
+        turn_id: TurnId,
+    },
+    UserInput {
+        user_input: &'a UserInput,
+    },
+    Status {
+        status: &'a TurnStatus,
+    },
+    Item {
+        /// Absent on an amendment line, so the reader keeps the slot the item's first record
+        /// established. `skip_serializing_if` keeps every line the whole-file writer produces
+        /// byte-identical to what it wrote before amendments existed.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        index: Option<usize>,
+        item: &'a Item,
+    },
+    Diff {
+        index: usize,
+        diff: &'a FileDiff,
+    },
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -175,6 +192,10 @@ pub struct TurnPayload {
     pub items: Vec<Item>,
     pub diffs: Vec<FileDiff>,
     pub diff_contents: HashMap<DiffId, CapturedDiffContent>,
+    /// How many records of this file could not be read and were skipped. A count, not the reasons:
+    /// each one is logged with its line and error, and this is what a reader can carry to a
+    /// browser without letting an error string of unbounded length onto the wire.
+    pub skipped_records: u32,
 }
 
 impl HistoryHeader {
@@ -243,7 +264,9 @@ impl TurnRecord {
 
     /// Reassemble the whole `Turn` this record indexes from its payload file.
     pub fn into_turn(self, payload: TurnPayload, payload_path: &Path) -> Turn {
-        if payload.items.len() != self.item_count {
+        // A skipped record already explains a disagreement, and it was already warned about with
+        // its line and error. Saying it twice would just make the quieter message harder to find.
+        if payload.items.len() != self.item_count && payload.skipped_records == 0 {
             // A hint, never an invariant: the payload file wins and the turn is still returned.
             // Still a warning, because by construction the two cannot disagree unless something
             // was lost.
@@ -267,6 +290,7 @@ impl TurnRecord {
             diffs: payload.diffs,
             started_at: self.started_at,
             completed_at: self.completed_at,
+            skipped_records: payload.skipped_records,
         }
     }
 }
@@ -280,8 +304,10 @@ fn line_of<T: Serialize>(value: &T) -> Result<String, PersistError> {
 
 /// Serialize a turn's whole payload file, header first.
 ///
-/// Written with temp file + fsync + rename, so a payload is complete or absent — never the torn
-/// half-line a shared append-only file can leave behind.
+/// Written with temp file + fsync + rename, so the file a commit produces is complete or absent.
+/// Afterwards the file is only ever *extended*, by one appended record per late item completion,
+/// and a crash during such an append can leave a torn final line. The reader skips a record it
+/// cannot parse and counts it rather than failing the turn, so a torn tail costs that one record.
 pub fn payload_file_bytes(turn: &Turn) -> Result<Vec<u8>, PersistError> {
     payload_file_bytes_with_diffs(turn, &[])
 }
@@ -303,12 +329,24 @@ pub fn payload_file_bytes_with_diffs(
         status: &turn.status,
     })?);
     for (index, item) in turn.items.iter().enumerate() {
-        out.push_str(&line_of(&PayloadLine::Item { index, item })?);
+        out.push_str(&line_of(&PayloadLine::Item {
+            index: Some(index),
+            item,
+        })?);
     }
     for (index, diff) in turn.diffs.iter().enumerate() {
         out.push_str(&line_of(&PayloadLine::Diff { index, diff })?);
     }
     Ok(out.into_bytes())
+}
+
+/// One `item` record for appending to a payload file that already exists.
+///
+/// No `index`: the amendment refreshes an item the file already carries, and the slot its first
+/// record established is the one that keeps display order right. A settled command is appended at
+/// the end of the file, so folding it by file order would drop it to the bottom of the turn.
+pub fn payload_item_line(item: &Item) -> Result<String, PersistError> {
+    line_of(&PayloadLine::Item { index: None, item })
 }
 
 /// Reconstruct the unchanged format-1 representation from a bounded runtime projection.
@@ -392,16 +430,49 @@ fn record_kind(value: &serde_json::Value) -> Option<&str> {
 
 /// Parse the bounded history index.
 ///
-/// Turn records fold by turn id, **first-wins**: a repeated id is a turn that is already durable,
-/// and the first durable record stays authoritative. (Superseding records — a later record that
-/// *replaces* an earlier one — arrive with the amendment work, which is out of scope here; until a
-/// producer exists, silently preferring a later duplicate would change how today's duplicates
-/// resolve.) The same first-wins rule is what the format 1 reader applies.
-pub fn parse_history_index(path: &Path, data: &str) -> Result<Vec<TurnRecord>, PersistError> {
+/// A turn record with the line positions that place it in the index.
+///
+/// `first_line` fixes the turn's place in history: it is the position of the record that first made
+/// the turn durable, and it never moves. `winning_line` is the position of the record whose content
+/// is in [`Self::record`] — the same line until an amendment supersedes it, and afterwards the
+/// amendment's line. The two together are the amendment clock: a turn is *new* to a client whose
+/// cursor sits at `cursor_first` when its `first_line` is later, and *amended* when its
+/// `winning_line` is, with no new field in the on-disk format.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IndexedTurnRecord {
+    pub record: TurnRecord,
+    pub first_line: usize,
+    pub winning_line: usize,
+}
+
+impl IndexedTurnRecord {
+    /// A record from a source that has no index line positions of its own (the flat layout, which
+    /// reads whole turns), placed at its position in the sequence so ordering comparisons hold.
+    pub fn at(record: TurnRecord, line: usize) -> Self {
+        Self {
+            record,
+            first_line: line,
+            winning_line: line,
+        }
+    }
+}
+
+/// Turn records fold by turn id, **last-wins**: a repeated id is an amendment to a turn that is
+/// already durable — a settled item appended to its payload — and the newest record describes the
+/// bytes on disk. A retry that re-appends an identical record resolves the same either way, because
+/// a retry re-serializes the same turn.
+///
+/// The format 1 reader, and any build older than the amendment work, keeps the *first* record
+/// instead. That downgrade is non-destructive: the only field an amendment moves is `item_count`,
+/// which [`TurnRecord::item_count`] already forbids validating against.
+pub fn parse_history_index(
+    path: &Path,
+    data: &str,
+) -> Result<Vec<IndexedTurnRecord>, PersistError> {
     let lines: Vec<&str> = data.lines().filter(|l| !l.trim().is_empty()).collect();
     let last = lines.len().saturating_sub(1);
-    let mut records: Vec<TurnRecord> = Vec::with_capacity(lines.len());
-    let mut seen: std::collections::HashSet<TurnId> = std::collections::HashSet::new();
+    let mut records: Vec<IndexedTurnRecord> = Vec::with_capacity(lines.len());
+    let mut seen: HashMap<TurnId, usize> = HashMap::new();
     let mut header_seen = false;
 
     for (i, line) in lines.iter().enumerate() {
@@ -464,16 +535,20 @@ pub fn parse_history_index(path: &Path, data: &str) -> Result<Vec<TurnRecord>, P
                         )));
                     }
                 };
-                if !seen.insert(record.turn_id) {
-                    tracing::warn!(
+                if let Some(&pos) = seen.get(&record.turn_id) {
+                    tracing::debug!(
                         path = %path.display(),
                         turn_id = %record.turn_id,
                         line = i + 1,
-                        "skipping duplicate turn id in history index"
+                        first_line = records[pos].first_line + 1,
+                        "superseding turn record in history index"
                     );
+                    records[pos].record = record;
+                    records[pos].winning_line = i;
                     continue;
                 }
-                records.push(record);
+                seen.insert(record.turn_id, records.len());
+                records.push(IndexedTurnRecord::at(record, i));
             }
             // A future downgrade must be non-destructive, so an unrecognised record is skipped
             // rather than failing a thread this build could otherwise read.
@@ -510,10 +585,24 @@ pub fn parse_history_index(path: &Path, data: &str) -> Result<Vec<TurnRecord>, P
 ///   warning because nothing today writes a payload file twice, so a duplicate is a corruption
 ///   signal and must not vanish silently.
 ///
-/// The history index folds turn records *first*-wins, which is not an inconsistency: that answers
-/// "which turn record is authoritative when an append is retried", a question about the index's own
-/// retry safety that does not arise inside a payload file.
+/// The history index folds turn records *last*-wins, which answers a different question — which
+/// record describes the bytes now on disk after an amendment — and does not arise inside a payload
+/// file, where identity already decides.
+///
+/// Reading is **best-effort**. A line that is not JSON, and a record of a known kind that does not
+/// deserialize, are logged with their line and error, counted in [`TurnPayload::skipped_records`],
+/// and skipped; the turn loads from what remains. That is what makes an *appended* payload safe:
+/// the file is extended one record at a time by a late item completion, so a crash mid-append
+/// leaves a torn final line, and a whole turn's transcript is far too much to lose over the last
+/// line of it. It also means damage anywhere in the file costs only the records it touched.
+///
+/// Two failures stay fatal, because nothing can be shown without them: a `turn_header` claiming a
+/// format this build does not understand (`Invalid`, and the file is left alone for a later build),
+/// and a missing `user_input` record (`Corrupt`). Neither can be produced by an amendment — a
+/// commit writes the header and the prompt atomically, before any amendment line can exist — so
+/// reaching them means the file lost its prologue.
 pub fn parse_turn_payload(path: &Path, data: &str) -> Result<TurnPayload, PersistError> {
+    let mut skipped_records: u32 = 0;
     let mut user_input = None;
     let mut status = None;
     // Insertion order is preserved so a replacement that carries no index of its own keeps the slot
@@ -525,6 +614,27 @@ pub fn parse_turn_payload(path: &Path, data: &str) -> Result<TurnPayload, Persis
     let mut diff_slots: HashMap<PathBuf, usize> = HashMap::new();
     let mut header_seen = false;
     let mut diff_contents = HashMap::new();
+
+    /// Deserialize one record of a known kind, or skip it: a record whose shape this build cannot
+    /// read costs that record, never the turn.
+    macro_rules! record_or_skip {
+        ($ty:ty, $value:expr, $kind:expr, $line:expr) => {
+            match serde_json::from_value::<$ty>($value) {
+                Ok(record) => record,
+                Err(e) => {
+                    tracing::warn!(
+                        path = %path.display(),
+                        line = $line,
+                        kind = $kind,
+                        error = %e,
+                        "skipping unreadable record in turn payload"
+                    );
+                    skipped_records += 1;
+                    continue;
+                }
+            }
+        };
+    }
 
     /// Replace a singleton record, warning if one was already there.
     macro_rules! set_singleton {
@@ -545,15 +655,24 @@ pub fn parse_turn_payload(path: &Path, data: &str) -> Result<TurnPayload, Persis
         if line.trim().is_empty() {
             continue;
         }
-        let value: serde_json::Value = serde_json::from_str(line).map_err(|e| {
-            PersistError::Corrupt(format!("{}: line {}: {}", path.display(), i + 1, e))
-        })?;
+        let value: serde_json::Value = match serde_json::from_str(line) {
+            Ok(value) => value,
+            Err(e) => {
+                tracing::warn!(
+                    path = %path.display(),
+                    line = i + 1,
+                    error = %e,
+                    "skipping unreadable record in turn payload"
+                );
+                skipped_records += 1;
+                continue;
+            }
+        };
 
         match record_kind(&value) {
             Some("turn_header") => {
-                let header: PayloadTurnHeader = serde_json::from_value(value).map_err(|e| {
-                    PersistError::Corrupt(format!("{}: line {}: {}", path.display(), i + 1, e))
-                })?;
+                let header: PayloadTurnHeader =
+                    record_or_skip!(PayloadTurnHeader, value, "turn_header", i + 1);
                 // A payload newer than this build understands fails **that one turn**; the index
                 // and every other turn stay readable. That containment is the point of per-file
                 // headers.
@@ -575,21 +694,16 @@ pub fn parse_turn_payload(path: &Path, data: &str) -> Result<TurnPayload, Persis
                 header_seen = true;
             }
             Some("user_input") => {
-                let record: PayloadUserInput = serde_json::from_value(value).map_err(|e| {
-                    PersistError::Corrupt(format!("{}: line {}: {}", path.display(), i + 1, e))
-                })?;
+                let record: PayloadUserInput =
+                    record_or_skip!(PayloadUserInput, value, "user_input", i + 1);
                 set_singleton!(user_input, record.user_input, i + 1);
             }
             Some("status") => {
-                let record: PayloadStatus = serde_json::from_value(value).map_err(|e| {
-                    PersistError::Corrupt(format!("{}: line {}: {}", path.display(), i + 1, e))
-                })?;
+                let record: PayloadStatus = record_or_skip!(PayloadStatus, value, "status", i + 1);
                 set_singleton!(status, record.status, i + 1);
             }
             Some("item") => {
-                let record: PayloadItem = serde_json::from_value(value).map_err(|e| {
-                    PersistError::Corrupt(format!("{}: line {}: {}", path.display(), i + 1, e))
-                })?;
+                let record: PayloadItem = record_or_skip!(PayloadItem, value, "item", i + 1);
                 match item_slots.get(&record.item.id) {
                     Some(&slot) => {
                         if let Some(index) = record.index {
@@ -605,9 +719,7 @@ pub fn parse_turn_payload(path: &Path, data: &str) -> Result<TurnPayload, Persis
                 }
             }
             Some("diff") => {
-                let record: PayloadDiff = serde_json::from_value(value).map_err(|e| {
-                    PersistError::Corrupt(format!("{}: line {}: {}", path.display(), i + 1, e))
-                })?;
+                let record: PayloadDiff = record_or_skip!(PayloadDiff, value, "diff", i + 1);
                 // Keyed by path, the only identity a `FileDiff` has. The same reasoning as items:
                 // `index` is where it renders, not which diff it is.
                 match diff_slots.get(&record.diff.path) {
@@ -659,13 +771,13 @@ pub fn parse_turn_payload(path: &Path, data: &str) -> Result<TurnPayload, Persis
 
     diffs.sort_by_key(|(index, _)| *index);
 
-    // A well-formed file that is missing a required record is still incomplete. Failing the turn
-    // keeps it in the same class as a truncated payload; substituting an empty prompt would
-    // manufacture a turn that reads as one the user submitted blank. `Invalid` rather than
-    // `Corrupt` because the bytes parsed — the content is what is wrong — so the caller reports it
-    // instead of quarantining a file whose surviving records may still be recoverable by hand.
+    // A file missing its prompt is still incomplete, and failing the turn keeps it in the same
+    // class as a payload that never landed: substituting an empty prompt would manufacture a turn
+    // that reads as one the user submitted blank. `Corrupt`, so the caller quarantines it: a
+    // commit writes the prompt before anything can be appended, so a file that reaches here has
+    // lost records it was written with, and the bytes are worth keeping aside for inspection.
     let Some(user_input) = user_input else {
-        return Err(PersistError::Invalid(format!(
+        return Err(PersistError::Corrupt(format!(
             "{}: turn payload has no user_input record",
             path.display()
         )));
@@ -747,6 +859,7 @@ pub fn parse_turn_payload(path: &Path, data: &str) -> Result<TurnPayload, Persis
         items: items.into_iter().map(|(_, item)| item).collect(),
         diffs: diffs.into_iter().map(|(_, diff)| diff).collect(),
         diff_contents,
+        skipped_records,
     })
 }
 
@@ -866,6 +979,7 @@ mod lazy_diff_tests {
             diffs: Vec::new(),
             started_at: now,
             completed_at: Some(now),
+            skipped_records: 0,
         };
 
         let serialized = String::from_utf8(payload_file_bytes(&turn).unwrap()).unwrap();
@@ -965,6 +1079,7 @@ mod lazy_diff_tests {
             diffs: Vec::new(),
             started_at: now,
             completed_at: Some(now),
+            skipped_records: 0,
         };
 
         let bytes = payload_file_bytes_with_diffs(&turn, &[record]).unwrap();
@@ -980,5 +1095,266 @@ mod lazy_diff_tests {
             payload.diff_contents.get(&descriptor.id),
             Some(CapturedDiffContent::Unified { text }) if text.is_empty()
         ));
+    }
+}
+
+#[cfg(test)]
+mod amendment_tests {
+    use super::*;
+    use giskard_core::ids::ItemId;
+    use giskard_core::{
+        Item, ItemPayload, Mode, ModelRef, TokenUsage, TurnStatus, TurnStatusKind, UserInput,
+    };
+
+    fn command_item(id: ItemId, status: &str) -> Item {
+        Item {
+            id,
+            harness_item_id: format!("harness-{id}"),
+            payload: ItemPayload::CommandExecution {
+                command: "cargo test".into(),
+                cwd: "/tmp/project".into(),
+                output: if status == "completed" {
+                    "all passed".into()
+                } else {
+                    String::new()
+                },
+                output_truncated: false,
+                output_original_bytes: None,
+                output_original_lines: None,
+                exit_code: (status == "completed").then_some(0),
+                status: Some(status.into()),
+                process_id: Some("pid-1".into()),
+                duration_ms: None,
+            },
+            created_at: Utc::now(),
+        }
+    }
+
+    fn turn_with(items: Vec<Item>) -> Turn {
+        let now = Utc::now();
+        Turn {
+            id: TurnId::new(),
+            user_input: UserInput::text("run it"),
+            items,
+            model: TurnModel::Known(ModelRef {
+                provider: "test".into(),
+                model: "test".into(),
+                reasoning_effort: None,
+            }),
+            mode: TurnMode::Known(Mode::Build),
+            status: TurnStatus {
+                kind: TurnStatusKind::Completed,
+                message: None,
+            },
+            usage: TokenUsage::new(1, 1),
+            diffs: Vec::new(),
+            started_at: now,
+            completed_at: Some(now),
+            skipped_records: 0,
+        }
+    }
+
+    fn record_for(turn: &Turn) -> TurnRecord {
+        TurnRecord::from_turn(turn)
+    }
+
+    /// The whole-file writer still emits an explicit index, so an amendment is the only line in a
+    /// payload that carries none.
+    #[test]
+    fn the_whole_file_writer_still_carries_an_explicit_index() {
+        let turn = turn_with(vec![command_item(ItemId::new(), "running")]);
+        let bytes = payload_file_bytes(&turn).unwrap();
+        let serialized = String::from_utf8(bytes).unwrap();
+        let item_line = serialized
+            .lines()
+            .find(|line| line.contains(r#""kind":"item""#))
+            .expect("an item line");
+        let value: serde_json::Value = serde_json::from_str(item_line).unwrap();
+        assert_eq!(value["index"], 0);
+
+        let amendment: serde_json::Value =
+            serde_json::from_str(payload_item_line(&turn.items[0]).unwrap().trim()).unwrap();
+        assert_eq!(amendment["kind"], "item");
+        assert!(amendment.get("index").is_none());
+    }
+
+    /// An `item` record appended after the file committed replaces the item in the slot its first
+    /// record established, rather than moving to the bottom of the turn.
+    #[test]
+    fn an_appended_item_record_folds_into_its_original_slot() {
+        let first = ItemId::new();
+        let second = ItemId::new();
+        let turn = turn_with(vec![
+            command_item(first, "running"),
+            command_item(second, "completed"),
+        ]);
+        let mut serialized = String::from_utf8(payload_file_bytes(&turn).unwrap()).unwrap();
+        serialized.push_str(&payload_item_line(&command_item(first, "completed")).unwrap());
+
+        let payload = parse_turn_payload(Path::new("turn.jsonl"), &serialized).unwrap();
+        assert_eq!(payload.items.len(), 2);
+        assert_eq!(
+            payload.items[0].id, first,
+            "the amended item keeps its slot"
+        );
+        assert_eq!(payload.items[1].id, second);
+        assert!(matches!(
+            &payload.items[0].payload,
+            ItemPayload::CommandExecution { status, exit_code, output, .. }
+                if status.as_deref() == Some("completed")
+                    && *exit_code == Some(0)
+                    && output == "all passed"
+        ));
+    }
+
+    /// The index folds turn records last-wins, and reports where the first and the winning record
+    /// sit — the clock a resync delta reads.
+    #[test]
+    fn a_superseding_turn_record_wins_and_reports_its_line() {
+        let older = turn_with(vec![]);
+        let amended = turn_with(vec![command_item(ItemId::new(), "completed")]);
+        let mut superseding = record_for(&amended);
+        superseding.item_count = 7;
+
+        let mut index = HistoryHeader::new(ThreadId::new(), Utc::now())
+            .line()
+            .unwrap();
+        index.push_str(&record_for(&amended).line().unwrap());
+        index.push_str(&record_for(&older).line().unwrap());
+        index.push_str(&superseding.line().unwrap());
+
+        let records = parse_history_index(Path::new("history.jsonl"), &index).unwrap();
+        assert_eq!(records.len(), 2, "a superseding record is not a new turn");
+        assert_eq!(records[0].record.turn_id, amended.id);
+        assert_eq!(records[0].record.item_count, 7, "the last record wins");
+        assert_eq!(records[0].first_line, 1, "its place in history never moves");
+        assert_eq!(records[0].winning_line, 3, "the amendment is the clock");
+        assert_eq!(records[1].record.turn_id, older.id);
+        assert_eq!(records[1].first_line, 2);
+        assert_eq!(records[1].winning_line, 2);
+    }
+
+    /// The retry case `append_turn_unlocked` relies on: a second attempt re-appends an identical
+    /// record, so last-wins and first-wins resolve to the same content.
+    #[test]
+    fn an_identical_re_appended_record_resolves_the_same_either_way() {
+        let turn = turn_with(vec![]);
+        let mut index = HistoryHeader::new(ThreadId::new(), Utc::now())
+            .line()
+            .unwrap();
+        index.push_str(&record_for(&turn).line().unwrap());
+        index.push_str(&record_for(&turn).line().unwrap());
+
+        let records = parse_history_index(Path::new("history.jsonl"), &index).unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].record, record_for(&turn));
+        assert_eq!(records[0].first_line, 1);
+        assert_eq!(records[0].winning_line, 2);
+    }
+
+    /// A payload whose last line was torn by a crash mid-append loses that record and nothing else.
+    #[test]
+    fn a_torn_final_line_costs_one_record_not_the_turn() {
+        let first = ItemId::new();
+        let second = ItemId::new();
+        let turn = turn_with(vec![
+            command_item(first, "completed"),
+            command_item(second, "completed"),
+        ]);
+        let whole = String::from_utf8(payload_file_bytes(&turn).unwrap()).unwrap();
+        let torn = &whole[..whole.len() - 20];
+
+        let payload = parse_turn_payload(Path::new("turn.jsonl"), torn).unwrap();
+        assert_eq!(payload.skipped_records, 1);
+        assert_eq!(payload.items.len(), 1, "the readable records still load");
+        assert_eq!(payload.items[0].id, first);
+        assert_eq!(payload.user_input, turn.user_input);
+    }
+
+    /// Damage in the middle of the file costs the records it touched, not the ones after it.
+    #[test]
+    fn a_bad_interior_record_is_skipped_and_counted() {
+        let first = ItemId::new();
+        let second = ItemId::new();
+        let turn = turn_with(vec![
+            command_item(first, "completed"),
+            command_item(second, "completed"),
+        ]);
+        let whole = String::from_utf8(payload_file_bytes(&turn).unwrap()).unwrap();
+        let mut lines: Vec<String> = whole.lines().map(str::to_owned).collect();
+
+        // Not JSON at all, and an `item` record whose shape this build cannot read: both are
+        // skipped, and the records after them still load.
+        lines.insert(2, "{ not json at all".into());
+        lines.insert(3, r#"{"kind":"item","item":{"id":"nonsense"}}"#.into());
+        let damaged: String = lines.iter().map(|line| format!("{line}\n")).collect();
+
+        let payload = parse_turn_payload(Path::new("turn.jsonl"), &damaged).unwrap();
+        assert_eq!(payload.skipped_records, 2);
+        assert_eq!(
+            payload.items.iter().map(|item| item.id).collect::<Vec<_>>(),
+            vec![first, second]
+        );
+    }
+
+    /// The amend path's own shape: a torn tail, then an appended amendment preceded by a newline.
+    /// The tail is skipped, the amendment is read, and the two never merge into one line.
+    #[test]
+    fn an_amendment_after_a_torn_tail_is_read_and_the_tail_is_counted() {
+        let running = ItemId::new();
+        let turn = turn_with(vec![command_item(running, "running")]);
+        let whole = String::from_utf8(payload_file_bytes(&turn).unwrap()).unwrap();
+        let mut damaged = whole[..whole.len() - 20].to_string();
+        assert!(!damaged.ends_with('\n'), "the tail is torn");
+
+        damaged.push('\n');
+        damaged.push_str(&payload_item_line(&command_item(running, "completed")).unwrap());
+
+        let payload = parse_turn_payload(Path::new("turn.jsonl"), &damaged).unwrap();
+        assert_eq!(payload.skipped_records, 1);
+        assert_eq!(payload.items.len(), 1);
+        assert!(matches!(
+            &payload.items[0].payload,
+            ItemPayload::CommandExecution { status, .. } if status.as_deref() == Some("completed")
+        ));
+    }
+
+    /// The prompt is the one record nothing can be shown without.
+    #[test]
+    fn a_payload_with_no_user_input_is_still_corrupt() {
+        let turn = turn_with(vec![]);
+        let whole = String::from_utf8(payload_file_bytes(&turn).unwrap()).unwrap();
+        let stripped: String = whole
+            .lines()
+            .filter(|line| !line.contains(r#""kind":"user_input""#))
+            .map(|line| format!("{line}\n"))
+            .collect();
+
+        assert!(matches!(
+            parse_turn_payload(Path::new("turn.jsonl"), &stripped),
+            Err(PersistError::Corrupt(_))
+        ));
+    }
+
+    /// A superseding record torn by a crash mid-append leaves the turn readable at its previous
+    /// record, because the index keeps its one-torn-final-line tolerance.
+    #[test]
+    fn a_torn_superseding_record_leaves_the_previous_one_standing() {
+        let turn = turn_with(vec![]);
+        let mut superseding = record_for(&turn);
+        superseding.item_count = 9;
+
+        let mut index = HistoryHeader::new(ThreadId::new(), Utc::now())
+            .line()
+            .unwrap();
+        index.push_str(&record_for(&turn).line().unwrap());
+        let torn = superseding.line().unwrap();
+        index.push_str(&torn[..torn.len() / 2]);
+        index.push('\n');
+
+        let records = parse_history_index(Path::new("history.jsonl"), &index).unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].record.item_count, 0);
+        assert_eq!(records[0].winning_line, 1);
     }
 }
