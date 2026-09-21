@@ -2382,6 +2382,7 @@ mod tests {
                     diffs: vec![],
                     started_at: now,
                     completed_at: Some(now),
+                    skipped_records: 0,
                 },
             )
             .await

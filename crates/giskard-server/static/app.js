@@ -163,7 +163,7 @@ let state = {
   models:[], modelsProject:null, modelsLoadingProject:null, streamEl:null, streamItemId:null, pendingUserEl:null, pendingUserText:null,
   streamElsByItemId:new Map(), renderedItemIds:new Set(), renderedHarnessItemIds:new Set(), renderedItemBodyByKey:new Map(), itemKindsByItemId:new Map(),
   pendingApprovals:new Map(), answeredApprovals:new Map(), answeredApprovalsById:new Map(), renderedApprovalStateKeys:new Set(), pendingServerRequests:new Map(), answeredServerRequests:new Set(), requestStates:new Map(), runtimeOverviewRevision:-1,
-  runningCommands:new Map(), runningTasks:new Map(), runningTasksRevision:-1, commandBodyElsByItemId:new Map(), commandMsgElsByItemId:new Map(), commandStopRequestedByItemId:new Set(), selectedCommandId:null, pendingTaskNavigation:null, pendingTaskOpen:null, taskIntentSeq:0, taskHistoryLoading:false, taskHistoryOwner:0,
+  runningCommands:new Map(), runningTasks:new Map(), runningTasksRevision:-1, lateItemWatch:new Map(), commandBodyElsByItemId:new Map(), commandMsgElsByItemId:new Map(), commandStopRequestedByItemId:new Set(), selectedCommandId:null, pendingTaskNavigation:null, pendingTaskOpen:null, taskIntentSeq:0, taskHistoryLoading:false, taskHistoryOwner:0,
   commandPayloadsByItemId:new Map(), endedCommandsByItemId:new Map(),
   toolPayloadsByItemId:new Map(), toolBodyElsByItemId:new Map(),
   activeTaskGroup:null, taskGroupSeq:0, taskItemSeq:0, taskGroupsById:new Map(), taskGroupsByItemId:new Map(),
@@ -2953,6 +2953,10 @@ async function connectWs(opts) {
   ws.onopen = () => {
     if (state.ws !== ws) return;
     state.runtimeOverviewRevision = -1;
+    // Both revisions number a server-side snapshot sequence, not a global clock: a restarted
+    // server numbers from zero again, and holding the old high-water mark would make us discard
+    // its first snapshot — and with it the running-task set the late-item reconciliation reads.
+    state.runningTasksRevision = -1;
     state.wsReconnectAttempt = 0;
     state.wsLastProblem = "";
     setWsStatus("open", "Connected to agent.");
@@ -4444,8 +4448,15 @@ function renderPersistedTurn(turn) {
   if (st && (st.kind==="failed" || st.kind==="interrupted")) {
     errorBubble(st.message || (st.kind==="interrupted" ? "Turn interrupted." : "Turn failed."));
   }
+  // Part of this turn's stored record could not be read. The server logged why; all the transcript
+  // can honestly say is that what you are looking at may be missing something.
+  if (turn.skipped_records > 0) noticeBubble(skippedRecordsNotice(turn.skipped_records));
   state.currentRenderTurnId = prevRenderTurnId;
   breakTaskGroup();
+}
+function skippedRecordsNotice(count) {
+  const records = count === 1 ? "1 record" : count + " records";
+  return records + " of this turn could not be read and were skipped; the turn may be incomplete.";
 }
 
 // Load older history when the user scrolls near the top (H4/H6 infinite scroll).
@@ -6210,6 +6221,8 @@ function detachRunningCommands() {
 function finishRunningCommand(item, turnId) {
   const key = scopedItemKey(turnId, item && item.id);
   if (!key) return;
+  // Seen settle for ourselves; nothing left to go and ask about.
+  state.lateItemWatch.delete(key);
   const p = item && item.payload;
   if (p && p.kind==="command_execution" && commandIsRunningStatus(p.status)) {
     const cmd = commandFromItem(item, p, turnId, key, state.runningCommands.get(key));
@@ -6262,6 +6275,10 @@ function renderRunningCommandSnapshot(commands) {
     if (cmd.terminating) state.commandStopRequestedByItemId.add(key);
     else state.commandStopRequestedByItemId.delete(key);
     state.runningTasks.set(key, cmd);
+    // The server says this task outlived its turn, so its turn is already persisted and the item
+    // will only ever reach us late. Remember it: this map is our own, not a projection of the
+    // snapshot, because it has to survive the disconnect that loses the snapshot.
+    if (cmd.afterTurn) state.lateItemWatch.set(key, { turnId:cmd.turnId, itemId:info.item_id });
   }
 
   for (const [id] of Array.from(state.runningTasks.entries())) {
@@ -6274,7 +6291,44 @@ function renderRunningCommandSnapshot(commands) {
       state.taskIntentSeq++;
     }
   }
+  // A watched item the snapshot no longer lists has settled. If it settled while we were connected
+  // the transcript event already landed and the entry is long gone; if it settled while we were
+  // away, this is the only notice we get, so go and read it.
+  for (const [key, watch] of Array.from(state.lateItemWatch.entries())) {
+    if (seen.has(key)) continue;
+    reconcileLateItem(key, watch);
+  }
   renderRunningCommands();
+}
+// Fetch one settled item that completed while this client was not listening, and upsert it.
+//
+// The entry stays in the watch set unless the item comes back `completed`: a failed request or a
+// still-`started` answer means try again on the next snapshot, and dropping it would make one lost
+// response a stale row until the page is reloaded.
+async function reconcileLateItem(key, watch) {
+  const projectId = state.projectId;
+  const threadId = state.threadId;
+  const generation = state.activeViewGeneration;
+  if (!projectId || !threadId || !watch.turnId || !watch.itemId) return;
+  // Snapshots can arrive faster than this request completes, and every one of them finds the same
+  // entry missing. One request per watched item at a time.
+  if (watch.pending) return;
+  watch.pending = true;
+  try {
+    const response = await fetch(turnItemUrl(projectId, threadId, watch.turnId, watch.itemId));
+    if (!response.ok) return;
+    const body = await response.json();
+    if (body.state !== "completed" || !body.item) return;
+    if (state.activeViewGeneration !== generation ||
+        state.projectId !== projectId || state.threadId !== threadId) return;
+    state.lateItemWatch.delete(key);
+    addItem(body.item, watch.turnId, true);
+  } catch (e) {
+    // Reconciliation is best-effort: the row stays as it is and the next snapshot retries.
+    console.warn("Giskard could not reconcile a late item completion.", { key, error:String(e) });
+  } finally {
+    watch.pending = false;
+  }
 }
 function renderEndedCommandBody(body, cmd, status, opts) {
   state.endedCommandsByItemId.set(cmd.id, { command:cmd, status, opts:opts || {} });
@@ -7843,6 +7897,7 @@ function resetRenderState() {
   state.runningCommands = new Map();
   state.runningTasks = new Map();
   state.runningTasksRevision = -1;
+  state.lateItemWatch = new Map();
   state.pendingTaskNavigation = null;
   state.pendingTaskOpen = null;
   state.taskIntentSeq++;

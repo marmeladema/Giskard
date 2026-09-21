@@ -31,7 +31,9 @@ use giskard_harness::{
     AgentHarness, EventStreamError, HarnessBootstrap, KnownThreadBinding, OpenThreadOptions,
     ThreadHandle, ThreadUpdate, thread_update_channel,
 };
-use giskard_persist::store::{ProjectConfig, ThreadFile, ThreadMutation, TurnCommitOutcome};
+use giskard_persist::store::{
+    AmendOutcome, ProjectConfig, ThreadFile, ThreadMutation, TurnCommitOutcome,
+};
 use giskard_persist::{HarnessCatalog, PersistStore};
 use giskard_proto::{RunningTask, ThreadRuntimeOverview, WireCommandOutput};
 
@@ -3355,6 +3357,7 @@ mod tests {
                     diffs: Vec::new(),
                     started_at: now,
                     completed_at: Some(now),
+                    skipped_records: 0,
                 },
             )
             .await

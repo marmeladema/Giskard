@@ -142,6 +142,7 @@ mod tests {
             diffs: Vec::new(),
             started_at: Utc::now(),
             completed_at: Some(Utc::now()),
+            skipped_records: 0,
         }
     }
 
