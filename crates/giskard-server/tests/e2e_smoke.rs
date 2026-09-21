@@ -6505,6 +6505,7 @@ async fn replayed_persisted_turn_events_are_not_duplicated() {
                 diffs: vec![],
                 started_at: now,
                 completed_at: Some(now),
+                skipped_records: 0,
             },
         )
         .await
@@ -6699,6 +6700,7 @@ async fn replayed_persisted_turns_keep_reused_item_ids_separate() {
                 diffs: vec![],
                 started_at: now,
                 completed_at: Some(now),
+                skipped_records: 0,
             },
         )
         .await
@@ -7522,6 +7524,7 @@ async fn select_model_rejects_provider_change_on_non_empty_thread() {
                 diffs: vec![],
                 started_at: now,
                 completed_at: Some(now),
+                skipped_records: 0,
             },
         )
         .await
@@ -7617,6 +7620,7 @@ async fn send_input_rejects_persisted_provider_mismatch_on_non_empty_thread() {
                 diffs: vec![],
                 started_at: now,
                 completed_at: Some(now),
+                skipped_records: 0,
             },
         )
         .await

@@ -132,6 +132,7 @@ fn command_turn(output: &str, status: Option<&str>) -> (Turn, ItemId) {
             diffs: vec![],
             started_at: now,
             completed_at: Some(now),
+            skipped_records: 0,
         },
         item_id,
     )

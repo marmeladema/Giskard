@@ -465,6 +465,26 @@ impl ThreadRuntimeSupport {
             .set_command((turn_id, item_id), None);
     }
 
+    /// Drop the cached persisted-output version for one item.
+    ///
+    /// The cache exists so a route does not re-hash an immutable turn's output on every request.
+    /// An amendment makes that item's output no longer immutable exactly once, so the entry has to
+    /// go with it or the route would keep serving the settled output under the version it hashed
+    /// before the command finished.
+    pub(crate) fn forget_persisted_command_output_version(
+        &self,
+        authority: &Arc<ThreadAuthority>,
+        turn_id: TurnId,
+        item_id: ItemId,
+    ) {
+        let Some(entry) = self.existing_entry(authority) else {
+            return;
+        };
+        lock_unpoison(&entry, "thread runtime entry")
+            .persisted_command_output_versions
+            .remove(&(turn_id, item_id));
+    }
+
     pub(crate) fn persisted_command_output_version_permit(
         &self,
         authority: &Arc<ThreadAuthority>,
@@ -2710,6 +2730,7 @@ mod tests {
             diffs: Vec::new(),
             started_at: Utc::now(),
             completed_at: Some(Utc::now()),
+            skipped_records: 0,
         };
         runtime.apply_event(
             &authority,

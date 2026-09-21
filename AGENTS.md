@@ -122,7 +122,14 @@ Cargo workspace with 9 crates under `crates/`:
   methods; do not claim or replace mapper identity and publish its event log as separate
   operations. Traffic discovery must go through the same route methods. Resume-fallback
   replacement must require the exact prior native/Giskard binding.
-- Atomic writes for all persistence (temp file + fsync + rename).
+- Atomic writes (temp file + fsync + rename) for every *whole-file* write. Two files are appended
+  to instead, with one `write_all` and no fsync: `history.jsonl`, which has always been append-only
+  because a turn record is bounded, and a turn payload *amendment* — a terminal item settling after
+  its turn committed, appended rather than rewriting a file whose size is the agent's to decide.
+  Each reader pays for that, but not the same way: the index forgives exactly one torn *final* line
+  and still fails the thread on a bad interior one, while a payload skips and counts any record it
+  cannot parse wherever it sits, so damage costs only the records it touched (spec LA5). Nothing
+  else appends.
 - The store's per-thread locks are in-process `Mutex`es and order nothing between binaries. Anything
   that rewrites or deletes store files from outside `giskard-server` must hold the advisory
   data-directory lock (`giskard_persist::DataDirLock`, `<data_dir>/.giskard.lock`) and fail rather
@@ -133,7 +140,8 @@ Cargo workspace with 9 crates under `crates/`:
   (ids, model, status kind, usage, timestamps, a capped prompt preview, a capped status message,
   attachment descriptors). Anything **agent-driven** (prompt text, provider error text, items,
   diffs, command output) belongs in that turn's payload file,
-  `threads/<id>/turns/<turn_id>.jsonl`, which is written atomically. Never add an agent-driven field
+  `threads/<id>/turns/<turn_id>.jsonl`, which is written atomically at commit and only ever
+  extended afterwards, one appended record per amendment. Never add an agent-driven field
   to a turn record: the index staying small no matter what the agent did is the property the split
   exists to create. A turn commits payload first, index last.
 - Every on-disk format states its own version in the file it governs (the `history.jsonl` header for

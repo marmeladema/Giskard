@@ -2289,6 +2289,106 @@ fn browser_scopes_async_http_results_to_an_active_view_generation() {
     assert!(delta_renderer.contains("resetTranscriptForAuthoritativeSnapshot();"));
 }
 
+/// A task the server said outlived its turn is remembered, and when a reconnect's snapshot no
+/// longer lists it the browser reads the settled item itself. That is how a late completion
+/// reaches a client that was disconnected when it happened: nothing in the index or the resync
+/// delta records the amendment.
+#[test]
+fn browser_reconciles_an_item_that_settled_while_it_was_away() {
+    let body = app_js();
+    assert!(
+        body.contains("lateItemWatch:new Map()")
+            && body.contains("state.lateItemWatch = new Map();"),
+        "the watch set is declared with the rest of the per-thread state and reset with it"
+    );
+
+    let snapshot = between(
+        body,
+        "function renderRunningCommandSnapshot(commands) {",
+        "async function reconcileLateItem(",
+    );
+    assert!(
+        snapshot.contains(
+            "if (cmd.afterTurn) state.lateItemWatch.set(key, { turnId:cmd.turnId, itemId:info.item_id });"
+        ),
+        "the server's own after_turn flag is what puts an item in the watch set"
+    );
+    assert!(
+        snapshot
+            .contains("for (const [key, watch] of Array.from(state.lateItemWatch.entries())) {")
+            && snapshot.contains("reconcileLateItem(key, watch);"),
+        "a watched item the snapshot no longer lists is reconciled"
+    );
+    assert_order(
+        snapshot,
+        "state.lateItemWatch.set(key,",
+        "reconcileLateItem(key, watch);",
+    );
+
+    let reconcile = between(
+        body,
+        "async function reconcileLateItem(key, watch) {",
+        "function renderEndedCommandBody(",
+    );
+    assert!(
+        reconcile.contains("fetch(turnItemUrl(projectId, threadId, watch.turnId, watch.itemId))"),
+        "it asks the item endpoint, which reads the amended payload"
+    );
+    assert!(
+        reconcile.contains("addItem(body.item, watch.turnId, true)"),
+        "and lands the settled item through the ordinary upsert"
+    );
+    assert!(
+        reconcile.contains("if (body.state !== \"completed\" || !body.item) return;")
+            && reconcile.contains("state.activeViewGeneration !== generation"),
+        "a still-running item, or a response for a view the user has left, changes nothing"
+    );
+    assert_order(
+        reconcile,
+        "if (!response.ok) return;",
+        "state.lateItemWatch.delete(key);",
+    );
+
+    // Seeing a completion live retires the entry, so no request is made for it.
+    let finish = between(
+        body,
+        "function finishRunningCommand(item, turnId) {",
+        "function renderRunningCommandSnapshot(",
+    );
+    assert!(finish.contains("state.lateItemWatch.delete(key);"));
+}
+
+/// A turn whose stored record could not be read in full says so in the transcript: the count is on
+/// the turn, the reasons are in the server log.
+#[test]
+fn browser_warns_under_a_turn_whose_payload_records_were_skipped() {
+    let body = app_js();
+    assert!(
+        body.contains("function skippedRecordsNotice(count) {"),
+        "one place composes the warning text"
+    );
+    let renderer = between(
+        body,
+        "function renderPersistedTurn(turn) {",
+        "function skippedRecordsNotice(count) {",
+    );
+    assert!(
+        renderer.contains(
+            "if (turn.skipped_records > 0) noticeBubble(skippedRecordsNotice(turn.skipped_records));"
+        ),
+        "the warning row is rendered inside the turn, with its rows"
+    );
+    assert_order(
+        renderer,
+        "errorBubble(st.message",
+        "noticeBubble(skippedRecordsNotice(turn.skipped_records))",
+    );
+    assert!(
+        body.contains("could not be read and were skipped; the turn may be incomplete."),
+        "the row says what it can: something is missing, not why"
+    );
+}
+
 #[test]
 fn browser_keeps_appended_transcript_rows_anchored_to_bottom() {
     let body = app_js();

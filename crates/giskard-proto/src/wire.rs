@@ -840,6 +840,14 @@ pub struct WireTurn {
     pub started_at: DateTime<Utc>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub completed_at: Option<DateTime<Utc>>,
+    /// Records of this turn's payload that could not be read and were skipped, so the browser can
+    /// say the turn may be incomplete. Omitted when zero, which is every healthy turn.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub skipped_records: u32,
+}
+
+fn is_zero(count: &u32) -> bool {
+    *count == 0
 }
 
 impl From<Turn> for WireTurn {
@@ -859,6 +867,7 @@ impl From<Turn> for WireTurn {
             diffs: t.diffs.into_iter().map(Into::into).collect(),
             started_at: t.started_at,
             completed_at: t.completed_at,
+            skipped_records: t.skipped_records,
         }
     }
 }
