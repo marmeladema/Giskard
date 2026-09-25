@@ -9,7 +9,13 @@
 
 **Document status:** Implementation-ready specification.
 **Audience:** An AI coding agent (and its human reviewer) implementing the system.
-**Version:** 1.95
+**Version:** 1.96
+
+> **Amendment — nested code fences (1.96).** Message Markdown pairs same-length code fences by
+> depth: inside a fenced block, a fence line with an info string opens a nested block and a bare
+> fence closes the innermost one, so a ```` ```markdown ```` plan quoting a ```` ```rust ````
+> snippet renders as one block. The renderer lengthens the outer fences before parsing and keeps
+> the rewrite only when re-parsing confirms it; otherwise CommonMark pairing applies.
 
 > **Amendment — cancellable subscribe (1.95).** A subscribe bootstrap runs in a
 > connection-owned task identified by a server-side generation, so slow attach and read phases do
@@ -198,6 +204,18 @@
 > the intended frontend for the foreseeable future; treat every Dioxus/WASM/`giskard-ui` reference
 > below as historical design context, not a current requirement. The wire contract (`giskard-proto`)
 > and all backend design remain authoritative.
+
+**Changelog (1.95 → 1.96), nested code fences:**
+- **NF1:** Before parsing message Markdown, the renderer scans each fenced block with a depth count:
+  a same-character fence line at least as long as the opener that carries an info string opens a
+  nested block, and a bare one closes the innermost open block. When this pairing ends the block
+  later than CommonMark would, the outer opening and closing fences are lengthened past every
+  inner run, so the parser treats the inner fences as content. Inner lines are never modified.
+- **NF2:** A rewrite is kept only when re-parsing shows a fenced block from the same opener ending
+  at the depth-matched closer. A container that ends first (list item, block quote), a block with
+  no depth-matched closer (including a message still streaming), a fence behind a container
+  marker, and blocks past a per-message limit of 64 rewrite attempts keep CommonMark pairing. A
+  nested opener without an info string stays indistinguishable from a closer and follows CommonMark.
 
 **Changelog (1.94 → 1.95), cancellable subscribe:**
 - **CS1:** A subscribe bootstrap runs in a connection-owned task with a server-side generation;
@@ -3552,6 +3570,8 @@ alongside raw token counts. Off by default; raw token counts are the primary met
   raw HTML in the source is escaped to inert text (never passed through), link URLs are restricted
   to `http`/`https`/`mailto`, and images are not fetched. Path detection runs in the same pass over
   prose text runs (not inside code), emitting the same `.path-link` controls the overlay wires up.
+  Same-length nested fences are paired by depth rather than by CommonMark's first bare closer
+  (changelog 1.96, NF1–NF2), so a fenced plan that quotes fenced code stays one block.
   Fenced code blocks are syntax-highlighted server-side with `syntect` when their fence language is
   recognized, and every code block is rendered with a compact header showing the resolved language
   label (for example `Rust` or `JSON`; unknown fence labels are shown as provided after
