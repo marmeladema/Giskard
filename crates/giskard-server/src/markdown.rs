@@ -32,6 +32,10 @@
 //! document means the same thing to a conforming parser; the rewrite is kept only if re-parsing
 //! confirms it produced exactly that block. A bare inner opener (```` ``` ```` with no language)
 //! stays ambiguous and follows CommonMark.
+//!
+//! This pass exists because `pulldown-cmark` has no such mode; an opt-in parser option is proposed
+//! upstream in <https://github.com/pulldown-cmark/pulldown-cmark/issues/1158>. If one lands, enable
+//! it in `PARSE_OPTIONS` and delete this pass.
 
 use std::borrow::Cow;
 use std::ops::Range;
