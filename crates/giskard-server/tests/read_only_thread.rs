@@ -287,3 +287,77 @@ async fn an_unreachable_harness_does_not_blame_the_provider_config() {
         "warning detail should explain the attach failure: {detail}"
     );
 }
+
+/// A kind that must never be reached: the project below names a declaration the catalog lacks.
+struct UnreachableKind;
+
+#[async_trait::async_trait]
+impl giskard_server::HarnessKind for UnreachableKind {
+    fn name(&self) -> &str {
+        "stub"
+    }
+    fn validate(&self, _declaration: &giskard_persist::HarnessDeclaration) -> Result<(), String> {
+        Ok(())
+    }
+    async fn create(
+        &self,
+        spec: giskard_server::HarnessInstanceSpec<'_>,
+        _bootstrap: giskard_harness::HarnessBootstrap,
+    ) -> Result<Arc<dyn giskard_harness::AgentHarness>, giskard_core::HarnessError> {
+        panic!("declaration {} must not be constructed", spec.name)
+    }
+}
+
+/// A project stamped `codex` on a server whose `config.toml` declares only `other`: the operator
+/// declared `[harnesses]` and so switched off the synthesized `codex`. Its threads open read-only
+/// and new ones are refused, both naming the config key to add.
+#[tokio::test]
+async fn a_project_naming_an_undeclared_harness_names_the_config_key() {
+    let config: giskard_persist::Config =
+        toml::from_str("[harnesses.other]\nkind = \"stub\"\n").unwrap();
+    let catalog = giskard_persist::HarnessCatalog::resolve(&config).unwrap();
+    let factory = giskard_server::HarnessKindFactory::new()
+        .register(Arc::new(UnreachableKind))
+        .unwrap()
+        .with_catalog(catalog);
+    factory.validate().unwrap();
+
+    let (open, server, _tmp) = open_read_only_thread(Arc::new(factory)).await;
+    assert_eq!(open["warning"]["code"], "thread_read_only");
+    let detail = open["warning"]["detail"].as_str().unwrap_or_default();
+    assert!(
+        detail.contains("[harnesses]") && detail.contains("\"codex\"") && detail.contains("other"),
+        "the detail should name the missing declaration and the config key: {detail}"
+    );
+
+    let projects: serde_json::Value = server
+        .client
+        .get(server.url("/api/projects"))
+        .header("cookie", &server.cookie)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let pid = projects["projects"][0]["id"].as_str().unwrap().to_string();
+    let started = server
+        .client
+        .post(server.url(&format!("/api/projects/{pid}/threads/start")))
+        .header("cookie", &server.cookie)
+        .json(&serde_json::json!({
+            "text": "hello",
+            "model_ref": {"provider": "openai", "model": "gpt-5.5", "reasoning_effort": null},
+            "mode": "build",
+            "permission_preset": "ask_first",
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(started.status(), 400);
+    let body = started.text().await.unwrap();
+    assert!(
+        body.contains("[harnesses]") && body.contains("\"codex\"") && body.contains("other"),
+        "the refusal should name the missing declaration and the config key: {body}"
+    );
+}

@@ -3,9 +3,12 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use giskard_core::error::{HarnessError, PersistError};
-use giskard_persist::Config;
-use giskard_persist::store::ProjectConfig;
-use giskard_server::{AppState, HarnessKind, HarnessKindFactory, LogDriverEventSink, build_app};
+use giskard_harness::EnvOverlay;
+use giskard_harness_codex::{CodexDeclarationOptions, CodexHarness, CodexLaunchOptions};
+use giskard_persist::{Config, HarnessCatalog, HarnessDeclaration};
+use giskard_server::{
+    AppState, HarnessInstanceSpec, HarnessKind, HarnessKindFactory, LogDriverEventSink, build_app,
+};
 use tracing::{error, info, warn};
 use tracing_subscriber::prelude::*;
 
@@ -15,23 +18,49 @@ const HTTP_GRACEFUL_SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration:
 
 struct CodexKind;
 
+/// Type-check a `codex` declaration's kind-specific keys.
+fn codex_options(declaration: &HarnessDeclaration) -> Result<CodexDeclarationOptions, String> {
+    let options: CodexDeclarationOptions = toml::Value::Table(declaration.options.clone())
+        .try_into()
+        .map_err(|error: toml::de::Error| error.message().to_owned())?;
+    options.validate()?;
+    Ok(options)
+}
+
 #[async_trait]
 impl HarnessKind for CodexKind {
     fn name(&self) -> &str {
         "codex"
     }
 
+    fn validate(&self, declaration: &HarnessDeclaration) -> Result<(), String> {
+        codex_options(declaration).map(|_| ())
+    }
+
     async fn create(
         &self,
-        config: &ProjectConfig,
+        spec: HarnessInstanceSpec<'_>,
         bootstrap: giskard_harness::HarnessBootstrap,
     ) -> Result<Arc<dyn giskard_harness::AgentHarness>, HarnessError> {
-        let workspace_root =
-            std::path::PathBuf::from(config.workspace_root.as_deref().unwrap_or(&config.dir));
-        Ok(
-            giskard_harness_codex::CodexHarness::start_with_bootstrap(workspace_root, bootstrap)
-                .await?,
-        )
+        let declaration = spec.declaration;
+        // Validated at boot; re-checked rather than trusted so a failure is an error, not a panic.
+        let options = codex_options(declaration).map_err(|message| {
+            HarnessError::Unsupported(format!("[harnesses.{}] {message}", spec.name))
+        })?;
+        let launch = CodexLaunchOptions {
+            command: declaration.command.as_ref().map(std::path::PathBuf::from),
+            args: declaration.args.clone(),
+            env: EnvOverlay::new(
+                declaration
+                    .env
+                    .iter()
+                    .map(|(name, value)| (name.to_owned(), value.to_owned())),
+            ),
+            profile: options.profile,
+            project_id: Some(spec.project_id),
+            declaration: Some(spec.name.to_owned()),
+        };
+        Ok(CodexHarness::launch(spec.workspace_root, launch, bootstrap).await?)
     }
 }
 
@@ -284,6 +313,31 @@ fn configured_file_writer(
     }))
 }
 
+fn harness_catalog(config: &Config) -> Result<HarnessCatalog, String> {
+    HarnessCatalog::resolve(config).map_err(|error| format!("invalid config.toml: {error}"))
+}
+
+/// The production factory: the `codex` kind over the given catalog, every declaration validated.
+fn codex_factory(catalog: HarnessCatalog) -> Result<HarnessKindFactory, String> {
+    let factory = HarnessKindFactory::new()
+        .register(Arc::new(CodexKind))
+        .map_err(|error| error.to_string())?
+        .with_catalog(catalog);
+    factory
+        .validate()
+        .map_err(|error| format!("invalid config.toml: {error}"))?;
+    for (name, declaration) in factory.catalog().iter() {
+        info!(
+            harness = name,
+            kind = %declaration.kind,
+            default = declaration.default,
+            env_names = ?declaration.env.iter().map(|(name, _)| name).collect::<Vec<_>>(),
+            "declared harness"
+        );
+    }
+    Ok(factory)
+}
+
 async fn run(
     startup: Startup,
     shutdown: tokio::sync::watch::Receiver<common::shutdown::Phase>,
@@ -298,11 +352,10 @@ async fn run(
     let viz = startup.config.viz.clone();
     let retention = startup.config.retention.clone();
 
-    let factory = Arc::new(
-        HarnessKindFactory::new()
-            .register(Arc::new(CodexKind))
-            .map_err(|error| error.to_string())?,
-    );
+    // Declarations are read once, from the startup config, and every one is checked before the
+    // listener binds, so a typo refuses startup instead of surfacing on the first project open.
+    let catalog = harness_catalog(&startup.config)?;
+    let factory = Arc::new(codex_factory(catalog)?);
 
     let state = AppState::new_with_config(
         startup.store,
@@ -380,6 +433,67 @@ mod tests {
         );
         let contents = std::fs::read_to_string(generated.path()).expect("read log file");
         assert_eq!(contents, "file logging probe\n");
+    }
+
+    fn startup_factory(src: &str) -> Result<HarnessKindFactory, String> {
+        let config: Config = toml::from_str(src).expect("config parses");
+        harness_catalog(&config).and_then(codex_factory)
+    }
+
+    #[test]
+    fn startup_accepts_no_harnesses_table_and_two_codex_declarations() {
+        let factory = startup_factory("").expect("the synthesized codex is valid");
+        assert_eq!(factory.catalog().default_name(), "codex");
+
+        let factory = startup_factory(
+            r#"
+[harnesses.codex-stable]
+kind = "codex"
+default = true
+
+[harnesses.codex-nightly]
+kind = "codex"
+command = "/opt/codex-nightly/bin/codex"
+profile = "nightly"
+[harnesses.codex-nightly.env]
+CODEX_HOME = "/home/you/.codex-nightly"
+"#,
+        )
+        .expect("the README example is valid");
+        assert_eq!(factory.catalog().default_name(), "codex-stable");
+    }
+
+    #[test]
+    fn startup_refuses_invalid_declarations_naming_the_key() {
+        for (src, expected) in [
+            (
+                "[harnesses.x]\nkind = \"nope\"\n",
+                "invalid config.toml: [harnesses.x] names kind \"nope\"",
+            ),
+            (
+                "[harnesses.x]\nkind = \"codex\"\nprofile = \"\"\n",
+                "invalid config.toml: [harnesses.x] `profile` must not be blank",
+            ),
+            (
+                "[harnesses.x]\nkind = \"codex\"\nprofiel = \"p\"\n",
+                "invalid config.toml: [harnesses.x] unknown field `profiel`",
+            ),
+            (
+                "[harnesses.x]\nkind = \"codex\"\ndefault = true\n\
+                 [harnesses.y]\nkind = \"codex\"\ndefault = true\n",
+                "invalid config.toml: [harnesses.x], [harnesses.y] are all marked",
+            ),
+            (
+                "[harnesses.x]\nkind = \"codex\"\n[harnesses.x.env]\n\"A=B\" = \"v\"\n",
+                "invalid config.toml: [harnesses.x.env] has an invalid variable name",
+            ),
+        ] {
+            let error = match startup_factory(src) {
+                Err(error) => error,
+                Ok(_) => panic!("{src:?} must refuse startup"),
+            };
+            assert!(error.starts_with(expected), "{src:?}: {error}");
+        }
     }
 
     /// A second server on one data directory would interleave writes that each believes its own

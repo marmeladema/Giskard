@@ -31,8 +31,8 @@ use giskard_harness::{
     AgentHarness, EventStreamError, HarnessBootstrap, KnownThreadBinding, OpenThreadOptions,
     ThreadHandle, ThreadUpdate, thread_update_channel,
 };
-use giskard_persist::PersistStore;
 use giskard_persist::store::{ProjectConfig, ThreadFile, ThreadMutation, TurnCommitOutcome};
+use giskard_persist::{HarnessCatalog, PersistStore};
 use giskard_proto::{RunningTask, ThreadRuntimeOverview, WireCommandOutput};
 
 use crate::hub::{Hub, Outbound};
@@ -80,6 +80,12 @@ pub trait HarnessFactory: Send + Sync {
         config: &ProjectConfig,
         bootstrap: HarnessBootstrap,
     ) -> Result<Arc<dyn AgentHarness>, HarnessError>;
+
+    /// The declarations this factory can construct. The default is the synthesized single `codex`,
+    /// which is what every test factory constructs.
+    fn catalog(&self) -> HarnessCatalog {
+        HarnessCatalog::synthesized()
+    }
 }
 
 /// Context describing the turn being started, used to persist a `Turn` on completion (§7.1).
@@ -553,6 +559,11 @@ fn spawn_thread_update_forwarder(
 }
 
 impl HarnessRegistry {
+    /// The harness declarations projects can be created on (`[harnesses.<name>]`).
+    pub fn harness_catalog(&self) -> HarnessCatalog {
+        self.factory.catalog()
+    }
+
     /// Resolves a bound runtime view without interning a thread authority.
     pub async fn thread_runtime(&self, thread_id: ThreadId) -> Option<ResolvedThreadRuntime> {
         let authority = self.shared.thread_authority(thread_id).await?;

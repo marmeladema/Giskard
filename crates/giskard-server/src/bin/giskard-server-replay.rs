@@ -41,7 +41,6 @@ use giskard_harness::{
     AgentEventStream, AgentHarness, EventLog, HarnessBootstrap, HarnessCapabilities,
     OpenThreadOptions, ThreadHandle,
 };
-use giskard_persist::store::ProjectConfig;
 use giskard_server::{AppState, HarnessKind, HarnessKindFactory, LogDriverEventSink, build_app};
 
 mod common;
@@ -1045,16 +1044,25 @@ struct ScriptedKind;
 
 #[async_trait]
 impl HarnessKind for ScriptedKind {
-    /// `create_project` stamps every project with the kind `codex`
-    /// (`crates/giskard-persist/src/store.rs`), so the replay server's seeded projects name that
-    /// kind; Stage 1 replaces this with a declaration named `codex` of kind `replay`.
+    /// The generated `config.toml` declares `[harnesses.codex]` of this kind, so the seeded
+    /// `Demo` project, stamped with the default declaration name `codex`, resolves here under the
+    /// reserved name.
     fn name(&self) -> &str {
-        "codex"
+        "replay"
+    }
+
+    fn validate(&self, declaration: &giskard_persist::HarnessDeclaration) -> Result<(), String> {
+        match declaration.options.keys().next() {
+            None => Ok(()),
+            Some(key) => Err(format!(
+                "has key `{key}`, but the replay kind takes no kind-specific keys"
+            )),
+        }
     }
 
     async fn create(
         &self,
-        _config: &ProjectConfig,
+        _spec: giskard_server::HarnessInstanceSpec<'_>,
         bootstrap: HarnessBootstrap,
     ) -> Result<Arc<dyn AgentHarness>, HarnessError> {
         Ok(Arc::new(ScriptedHarness::new(bootstrap)?))
@@ -1084,6 +1092,10 @@ secure_cookies = false
 
 [auth]
 password_hash = "{password_hash}"
+
+# The scripted harness under the reserved name every seeded project is stamped with.
+[harnesses.codex]
+kind = "replay"
 
 [providers.replay]
 model_listing = false
@@ -1205,11 +1217,13 @@ async fn run(
             .map_err(|e| format!("cannot generate replay session key: {e}"))?;
     }
 
-    let factory = Arc::new(
-        HarnessKindFactory::new()
-            .register(Arc::new(ScriptedKind))
-            .map_err(|error| error.to_string())?,
-    );
+    let catalog = giskard_persist::HarnessCatalog::resolve(&config).map_err(|e| e.to_string())?;
+    let factory = HarnessKindFactory::new()
+        .register(Arc::new(ScriptedKind))
+        .map_err(|error| error.to_string())?
+        .with_catalog(catalog);
+    factory.validate().map_err(|error| error.to_string())?;
+    let factory = Arc::new(factory);
     let state = AppState::new_with_config(
         store,
         factory,
