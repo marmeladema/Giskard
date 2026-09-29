@@ -5,7 +5,7 @@ use async_trait::async_trait;
 use giskard_core::error::{HarnessError, PersistError};
 use giskard_persist::Config;
 use giskard_persist::store::ProjectConfig;
-use giskard_server::{AppState, HarnessFactory, LogDriverEventSink, build_app};
+use giskard_server::{AppState, HarnessKind, HarnessKindFactory, LogDriverEventSink, build_app};
 use tracing::{error, info, warn};
 use tracing_subscriber::prelude::*;
 
@@ -13,22 +13,19 @@ mod common;
 
 const HTTP_GRACEFUL_SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
-struct CodexFactory;
+struct CodexKind;
 
 #[async_trait]
-impl HarnessFactory for CodexFactory {
+impl HarnessKind for CodexKind {
+    fn name(&self) -> &str {
+        "codex"
+    }
+
     async fn create(
         &self,
         config: &ProjectConfig,
         bootstrap: giskard_harness::HarnessBootstrap,
     ) -> Result<Arc<dyn giskard_harness::AgentHarness>, HarnessError> {
-        if config.harness != "codex" {
-            return Err(HarnessError::Unsupported(format!(
-                "unsupported harness kind: {}",
-                config.harness
-            )));
-        }
-
         let workspace_root =
             std::path::PathBuf::from(config.workspace_root.as_deref().unwrap_or(&config.dir));
         Ok(
@@ -301,7 +298,11 @@ async fn run(
     let viz = startup.config.viz.clone();
     let retention = startup.config.retention.clone();
 
-    let factory = Arc::new(CodexFactory);
+    let factory = Arc::new(
+        HarnessKindFactory::new()
+            .register(Arc::new(CodexKind))
+            .map_err(|error| error.to_string())?,
+    );
 
     let state = AppState::new_with_config(
         startup.store,
