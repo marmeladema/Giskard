@@ -21,6 +21,219 @@ pub struct Config {
     /// order is the model picker's order (§8.3): a hashed order would reshuffle the picker on
     /// every restart and change which model a draft starts on when none is marked default.
     pub providers: IndexMap<String, ProviderConfig>,
+    /// Declared harnesses, keyed by name (design: *Configuration*). An `IndexMap` because
+    /// declaration order decides the default when none is marked. Empty means "not declared", which
+    /// `HarnessCatalog::resolve` turns into the synthesized `codex` entry.
+    pub harnesses: IndexMap<String, HarnessDeclaration>,
+}
+
+/// One `[harnesses.<name>]` entry. The neutral keys are parsed here; everything else is kept as
+/// an opaque table for the kind's adapter to type-check at boot, because Codex-specific types
+/// stay in the adapter crate.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HarnessDeclaration {
+    pub kind: String,
+    #[serde(default)]
+    pub default: bool,
+    /// Program to spawn. `None` leaves it to the adapter (Codex: `codex` on `PATH`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<String>,
+    /// Extra arguments appended after the adapter's own.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub args: Vec<String>,
+    /// Environment overlay for every process this instance spawns.
+    #[serde(default, skip_serializing_if = "HarnessEnv::is_empty")]
+    pub env: HarnessEnv,
+    /// Kind-specific keys, validated by the adapter.
+    #[serde(default, flatten)]
+    pub options: toml::Table,
+}
+
+impl HarnessDeclaration {
+    fn synthesized_codex() -> Self {
+        Self {
+            kind: HarnessCatalog::SYNTHESIZED_NAME.to_string(),
+            default: true,
+            command: None,
+            args: Vec::new(),
+            env: HarnessEnv::default(),
+            options: toml::Table::new(),
+        }
+    }
+}
+
+/// A declaration's environment overlay (`[harnesses.<name>.env]`).
+///
+/// Values are literal and may be credentials, so the custom `Debug` implementation prints the
+/// variable names only, on the `ProviderHttpHeaders` pattern.
+#[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct HarnessEnv(IndexMap<String, String>);
+
+impl HarnessEnv {
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.0
+            .iter()
+            .map(|(name, value)| (name.as_str(), value.as_str()))
+    }
+
+    pub fn get(&self, name: &str) -> Option<&str> {
+        self.0.get(name).map(String::as_str)
+    }
+}
+
+impl FromIterator<(String, String)> for HarnessEnv {
+    fn from_iter<I: IntoIterator<Item = (String, String)>>(iter: I) -> Self {
+        Self(iter.into_iter().collect())
+    }
+}
+
+impl std::fmt::Debug for HarnessEnv {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("HarnessEnv")
+            .field("names", &self.0.keys().collect::<Vec<_>>())
+            .finish()
+    }
+}
+
+/// A `[harnesses]` table that breaks one of the declaration rules. Every message names the
+/// `[harnesses.<name>]` key it is about, and never an environment value.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum HarnessConfigError {
+    #[error(
+        "{} are all marked `default = true`; at most one harness may be the default",
+        .0.iter().map(|name| format!("[harnesses.{name}]")).collect::<Vec<_>>().join(", ")
+    )]
+    MultipleDefaults(Vec<String>),
+    /// The name is quoted in the message, since `[harnesses.]` would not say which key it was.
+    #[error("[harnesses.{0:?}] has a blank name; a declaration needs a non-blank table key")]
+    BlankName(String),
+    #[error("[harnesses.{0}] has a blank `kind`")]
+    BlankKind(String),
+    #[error("[harnesses.{0}] has a blank `command`; omit the key to use the adapter's default")]
+    BlankCommand(String),
+    #[error(
+        "[harnesses.{declaration}.env] has an invalid variable name {name:?}: names must be \
+         non-empty and contain neither `=` nor NUL"
+    )]
+    InvalidEnvName { declaration: String, name: String },
+    #[error("[harnesses.{declaration}.env] variable {name:?} has a value containing NUL")]
+    InvalidEnvValue { declaration: String, name: String },
+}
+
+/// The declarations after the rules are applied: every name is declared, exactly one is the
+/// default, and an empty table has become the synthesized `codex`.
+#[derive(Debug, Clone)]
+pub struct HarnessCatalog {
+    declarations: IndexMap<String, HarnessDeclaration>,
+    default: String,
+}
+
+impl HarnessCatalog {
+    pub const SYNTHESIZED_NAME: &str = "codex";
+
+    /// Apply the declaration rules to `config.harnesses`.
+    pub fn resolve(config: &Config) -> Result<Self, HarnessConfigError> {
+        if config.harnesses.is_empty() {
+            return Ok(Self::synthesized());
+        }
+        for (name, declaration) in &config.harnesses {
+            // Checked first: every other message names the key, which a blank one cannot.
+            if name.trim().is_empty() {
+                return Err(HarnessConfigError::BlankName(name.clone()));
+            }
+            if declaration.kind.trim().is_empty() {
+                return Err(HarnessConfigError::BlankKind(name.clone()));
+            }
+            if declaration
+                .command
+                .as_deref()
+                .is_some_and(|command| command.trim().is_empty())
+            {
+                return Err(HarnessConfigError::BlankCommand(name.clone()));
+            }
+            for (variable, value) in declaration.env.iter() {
+                if variable.is_empty() || variable.contains('=') || variable.contains('\0') {
+                    return Err(HarnessConfigError::InvalidEnvName {
+                        declaration: name.clone(),
+                        name: variable.to_string(),
+                    });
+                }
+                if value.contains('\0') {
+                    return Err(HarnessConfigError::InvalidEnvValue {
+                        declaration: name.clone(),
+                        name: variable.to_string(),
+                    });
+                }
+            }
+        }
+        let marked: Vec<String> = config
+            .harnesses
+            .iter()
+            .filter(|(_, declaration)| declaration.default)
+            .map(|(name, _)| name.clone())
+            .collect();
+        if marked.len() > 1 {
+            return Err(HarnessConfigError::MultipleDefaults(marked));
+        }
+        // `harnesses` is non-empty here, so a first entry exists.
+        let default = match marked.into_iter().next() {
+            Some(name) => name,
+            None => match config.harnesses.keys().next() {
+                Some(name) => name.clone(),
+                None => return Ok(Self::synthesized()),
+            },
+        };
+        let declarations = config
+            .harnesses
+            .iter()
+            .map(|(name, declaration)| {
+                let mut declaration = declaration.clone();
+                declaration.default = *name == default;
+                (name.clone(), declaration)
+            })
+            .collect();
+        Ok(Self {
+            declarations,
+            default,
+        })
+    }
+
+    /// The catalog an empty table resolves to: one `codex` of kind `codex`.
+    pub fn synthesized() -> Self {
+        let mut declarations = IndexMap::new();
+        declarations.insert(
+            Self::SYNTHESIZED_NAME.to_string(),
+            HarnessDeclaration::synthesized_codex(),
+        );
+        Self {
+            declarations,
+            default: Self::SYNTHESIZED_NAME.to_string(),
+        }
+    }
+
+    pub fn get(&self, name: &str) -> Option<&HarnessDeclaration> {
+        self.declarations.get(name)
+    }
+
+    pub fn default_name(&self) -> &str {
+        &self.default
+    }
+
+    pub fn names(&self) -> impl Iterator<Item = &str> {
+        self.declarations.keys().map(String::as_str)
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = (&str, &HarnessDeclaration)> {
+        self.declarations
+            .iter()
+            .map(|(name, declaration)| (name.as_str(), declaration))
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -528,5 +741,152 @@ roots = []
             RetentionConfig::DEFAULT_MAX_COMMAND_OUTPUT_BYTES
         );
         assert_eq!(config.providers.len(), 2);
+        let catalog = HarnessCatalog::resolve(&config).expect("the example's harnesses resolve");
+        assert_eq!(catalog.default_name(), HarnessCatalog::SYNTHESIZED_NAME);
+    }
+
+    #[test]
+    fn no_harnesses_table_synthesizes_codex() {
+        let config: Config = toml::from_str("").unwrap();
+        let catalog = HarnessCatalog::resolve(&config).unwrap();
+        let entries: Vec<_> = catalog.iter().collect();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].0, "codex");
+        assert_eq!(entries[0].1.kind, "codex");
+        assert!(entries[0].1.default);
+        assert_eq!(catalog.default_name(), "codex");
+    }
+
+    #[test]
+    fn declared_table_is_exactly_what_it_declares() {
+        let config: Config = toml::from_str(
+            "[harnesses.stable]\nkind = \"codex\"\n[harnesses.nightly]\nkind = \"codex\"\n",
+        )
+        .unwrap();
+        let catalog = HarnessCatalog::resolve(&config).unwrap();
+        assert_eq!(catalog.names().collect::<Vec<_>>(), ["stable", "nightly"]);
+        assert_eq!(catalog.default_name(), "stable");
+        assert!(catalog.get("codex").is_none());
+        assert!(catalog.get("stable").is_some_and(|d| d.default));
+        assert!(catalog.get("nightly").is_some_and(|d| !d.default));
+    }
+
+    #[test]
+    fn a_marked_default_wins_over_order() {
+        let config: Config = toml::from_str(
+            "[harnesses.stable]\nkind = \"codex\"\n\
+             [harnesses.nightly]\nkind = \"codex\"\ndefault = true\n",
+        )
+        .unwrap();
+        let catalog = HarnessCatalog::resolve(&config).unwrap();
+        assert_eq!(catalog.default_name(), "nightly");
+        assert!(catalog.get("stable").is_some_and(|d| !d.default));
+    }
+
+    #[test]
+    fn two_defaults_are_an_error() {
+        let config: Config = toml::from_str(
+            "[harnesses.stable]\nkind = \"codex\"\ndefault = true\n\
+             [harnesses.nightly]\nkind = \"codex\"\ndefault = true\n",
+        )
+        .unwrap();
+        let err = HarnessCatalog::resolve(&config).unwrap_err();
+        assert_eq!(
+            err,
+            HarnessConfigError::MultipleDefaults(vec!["stable".into(), "nightly".into()])
+        );
+        let message = err.to_string();
+        assert!(message.contains("[harnesses.stable]"), "{message}");
+        assert!(message.contains("[harnesses.nightly]"), "{message}");
+    }
+
+    #[test]
+    fn blank_declaration_names_are_errors() {
+        for (key, name) in [("\"\"", ""), ("\" \"", " ")] {
+            let config: Config =
+                toml::from_str(&format!("[harnesses.{key}]\nkind = \"codex\"\n")).unwrap();
+            let err = HarnessCatalog::resolve(&config).unwrap_err();
+            assert_eq!(err, HarnessConfigError::BlankName(name.into()));
+            let message = err.to_string();
+            assert!(
+                message.starts_with(&format!("[harnesses.{name:?}] has a blank name")),
+                "{message}"
+            );
+        }
+    }
+
+    #[test]
+    fn blank_kind_and_command_are_errors() {
+        let config: Config = toml::from_str("[harnesses.x]\nkind = \" \"\n").unwrap();
+        let err = HarnessCatalog::resolve(&config).unwrap_err();
+        assert_eq!(err, HarnessConfigError::BlankKind("x".into()));
+        assert!(err.to_string().contains("[harnesses.x]"));
+
+        let config: Config =
+            toml::from_str("[harnesses.x]\nkind = \"codex\"\ncommand = \"\"\n").unwrap();
+        let err = HarnessCatalog::resolve(&config).unwrap_err();
+        assert_eq!(err, HarnessConfigError::BlankCommand("x".into()));
+        assert!(err.to_string().contains("[harnesses.x]"));
+    }
+
+    #[test]
+    fn kind_specific_keys_are_kept_opaque() {
+        let config: Config =
+            toml::from_str("[harnesses.x]\nkind = \"codex\"\nprofile = \"p\"\n").unwrap();
+        let declaration = &config.harnesses["x"];
+        assert_eq!(declaration.kind, "codex");
+        assert_eq!(declaration.options["profile"].as_str(), Some("p"));
+        assert!(!declaration.options.contains_key("kind"));
+    }
+
+    #[test]
+    fn env_names_are_validated() {
+        for (name, expected) in [("A=B", "A=B"), ("", "")] {
+            let src = format!(
+                "[harnesses.x]\nkind = \"codex\"\n[harnesses.x.env]\n\"{name}\" = \"secret-value\"\n"
+            );
+            let config: Config = toml::from_str(&src).unwrap();
+            let err = HarnessCatalog::resolve(&config).unwrap_err();
+            assert_eq!(
+                err,
+                HarnessConfigError::InvalidEnvName {
+                    declaration: "x".into(),
+                    name: expected.into(),
+                }
+            );
+            let message = err.to_string();
+            assert!(message.contains("[harnesses.x.env]"), "{message}");
+            assert!(message.contains(&format!("{expected:?}")), "{message}");
+            assert!(!message.contains("secret-value"), "{message}");
+        }
+
+        let config: Config = toml::from_str(
+            "[harnesses.x]\nkind = \"codex\"\n[harnesses.x.env]\nTOKEN = \"secret\\u0000value\"\n",
+        )
+        .unwrap();
+        let err = HarnessCatalog::resolve(&config).unwrap_err();
+        assert_eq!(
+            err,
+            HarnessConfigError::InvalidEnvValue {
+                declaration: "x".into(),
+                name: "TOKEN".into(),
+            }
+        );
+        assert!(!err.to_string().contains("secret"));
+    }
+
+    #[test]
+    fn env_debug_redacts_values() {
+        let config: Config = toml::from_str(
+            "[harnesses.x]\nkind = \"codex\"\n[harnesses.x.env]\nCODEX_HOME = \"/very/secret/home\"\n",
+        )
+        .unwrap();
+        let env = &config.harnesses["x"].env;
+        assert_eq!(env.get("CODEX_HOME"), Some("/very/secret/home"));
+        let debug = format!("{env:?}");
+        assert!(debug.contains("CODEX_HOME"), "{debug}");
+        assert!(!debug.contains("/very/secret/home"), "{debug}");
+        let declaration_debug = format!("{:?}", config.harnesses["x"]);
+        assert!(!declaration_debug.contains("/very/secret/home"));
     }
 }
