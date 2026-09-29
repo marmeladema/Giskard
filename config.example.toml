@@ -76,12 +76,6 @@ page = 5
 # UTF-8-safe head and tail with an omission marker. Must be at least 32768 bytes (32 KiB).
 max_command_output_bytes = 134217728   # 128 MiB
 
-[harness]
-# Which agent harness backs projects. v1 ships "codex".
-kind = "codex"
-# Terminate an idle project's harness process after N seconds (0 = keep alive while the app runs).
-idle_shutdown_secs = 0
-
 # ---- Providers ----
 # This whole section is OPTIONAL, and most setups need none of it.
 #

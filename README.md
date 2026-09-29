@@ -260,8 +260,6 @@ service does not silently run with an empty provider list.
 | `[viz]` | `max_highlight_size` | `10485760` (10 MiB) | Files larger than this aren't syntax-highlighted. |
 | `[history]` | `initial` / `page` | `5` / `5` | Turns fetched on open (topped up client-side to ~2 screens) / per scroll-up page. |
 | `[retention]` | `max_command_output_bytes` | `134217728` (128 MiB) | Maximum durable completed-command output. Must be at least `32768` (32 KiB); larger output retains a UTF-8-safe head and tail. |
-| `[harness]` | `kind` | `codex` | Agent harness (v1: `codex`). |
-| | `idle_shutdown_secs` | `0` (keep alive) | Terminate an idle project's harness after N seconds. |
 | `[providers.<id>]` | `model_listing`, `[[providers.<id>.models]]` | — | **Optional.** Models are found without it: every provider Codex has a `base_url` for is discovered from `GET {base_url}/models` with the key Codex holds for it, and the provider Codex routes to also contributes its `model/list` catalog. A built-in Codex has no endpoint for and does not route to — `ollama` or `lmstudio` when you use neither — has nothing to contribute and is not offered; declare models for it if you want it in the picker. Declare a provider only to turn discovery off (`model_listing = false`), to add models by hand for an endpoint with no `/models` route, to override metadata, or to pin picker order — declared providers come first in the order written, the rest by id. Keyed by routing id, the same way Codex keys `[model_providers.<id>]`; the id must name a provider Codex knows (see below). |
 
 Provider config governs the **picker** and optional `/v1/models` discovery only — Codex itself
