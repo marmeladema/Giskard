@@ -42,7 +42,8 @@ The agent harness is a replaceable component behind a neutral `AgentHarness` tra
 - **[Codex CLI](https://github.com/openai/codex) — supported, and required today.** Giskard drives
   Codex over its `app-server` JSON-RPC protocol. A working, authenticated Codex CLI must be installed
   on the machine (see [Prerequisites](#prerequisites)); without it you can create projects, but turns
-  fail.
+  fail. Giskard manages a harness *instance* per project; whether that is one process or one per
+  thread is the adapter's concern.
 - **Claude Code — not yet supported.** The trait makes it addable without touching the rest of the
   app; it just hasn't been built yet. _(Anthropic, if you're reading this: a generous pile of Claude
   credits would move this up the roadmap_ 😁_.)_
@@ -57,8 +58,8 @@ The agent harness is a replaceable component behind a neutral `AgentHarness` tra
   it spawns the app-server. If Codex isn't configured, turns will fail with an "unauthenticated"
   message. See [§12.2 of the spec](specs/giskard-specification.md).
 
-Giskard spawns one `codex app-server` process per project; each project is bound to a filesystem
-directory that becomes the agent's sandbox/workspace.
+Giskard runs one harness instance per project, which for Codex is one `codex app-server` process;
+each project is bound to a filesystem directory that becomes the agent's sandbox/workspace.
 
 ---
 

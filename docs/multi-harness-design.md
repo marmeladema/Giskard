@@ -7,6 +7,8 @@ single Codex harness, and the design for declaring several harnesses in `config.
 than one per project, and binding each thread to one of them. It is written to be executed in the
 stages listed at the end; each stage is independently shippable.
 
+Stage 0 is implemented; see `multi-harness-design/stage-0-plan.md`.
+
 The spec (`specs/giskard-specification.md`) remains authoritative for the harness contract. Where
 this document proposes changes to the spec, they are called out explicitly under *Spec and
 documentation changes*.
@@ -439,9 +441,9 @@ real but benign, and moot for Giskard:
   a badge and scope the picker.
 - The draft's open message carries `harness` beside `model`. `CreateProjectRequest` accepts an
   optional default harness name.
-- `HarnessCapabilities` is serialized in full on the thread-open response, and the UI gates
-  Plan/Build, approvals, effort, diffs, compaction, and MCP on it as spec §13.5 already describes.
-  This is required for a second kind and is independent of everything else here.
+- `HarnessCapabilities` is serialized in full on the project models response, which the draft and
+  every thread open already load, and the UI gates Plan/Build, approvals, effort, model, and
+  compaction on it as spec §13.5 describes. Per-harness groups in Stage 2 carry it per group.
 - The models route returns groups as described above. MCP routes gain a harness segment:
   `/api/projects/{id}/harnesses/{name}/mcp` and `/mcp/reload`. `docs/api-endpoints.md` is updated
   in the same change.
