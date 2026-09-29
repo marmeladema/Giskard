@@ -11,12 +11,14 @@ identifiers.
 
 ## Runtime ownership
 
-`CodexHarness` is the cloneable public API handle. Each project app-server process has exactly one
-non-cloneable `CodexInstance`, owned by exactly one Tokio task, that owns its transport, mapper,
-active turns, pending steering requests, context restores, workspace configuration, command/control
-receivers, and worker lifecycle. It serves every native thread on that process and is unrelated to
-the Primary/sub-agent hierarchy. Helper futures borrow its protocol state through `&mut self`; no
-independent worker mutates that state.
+`CodexHarness` is the cloneable public API handle. Each harness instance runs one app-server
+process, which has exactly one non-cloneable `CodexInstance`, owned by exactly one Tokio task, that
+owns its transport, mapper, active turns, pending steering requests, context restores, workspace
+configuration, command/control receivers, and worker lifecycle. It serves every native thread on
+that process and is unrelated to the Primary/sub-agent hierarchy. Helper futures borrow its protocol
+state through `&mut self`; no independent worker mutates that state. An instance is one
+`CodexHarness`; the server creates one per project today and treats the process count behind it as
+this adapter's concern.
 
 The transport may own internal reader and writer tasks for stdio and request correlation; they
 never access mapper, route, turn, or context-restore state.

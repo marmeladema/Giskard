@@ -9,7 +9,15 @@
 
 **Document status:** Implementation-ready specification.
 **Audience:** An AI coding agent (and its human reviewer) implementing the system.
-**Version:** 1.95
+**Version:** 1.96
+
+> **Amendment — harness instances (1.96).** A harness *instance* is one `AgentHarness` value per
+> working context, created lazily and shut down as a unit; how many operating-system processes
+> stand behind it is the adapter's business. Codex runs one app-server per instance hosting every
+> thread; a per-thread-process adapter spawns in `open_thread` and stops per thread. The browser
+> receives the instance's capability flags with the project model list and gates its controls on
+> them (§13.5). The `[harness]` config section is removed. Neutral layers name "the harness", not
+> Codex.
 
 > **Amendment — cancellable subscribe (1.95).** A subscribe bootstrap runs in a
 > connection-owned task identified by a server-side generation, so slow attach and read phases do
@@ -2360,19 +2368,23 @@ Plan vs build maps to Codex collaboration mode only: **Plan → `plan`**, **Buil
 The thread permission preset maps to Codex's built-in `permissions` profile and approval
 configuration (§9).
 
-### 4.7 Process lifecycle (Codex)
+### 4.7 Harness instances and processes
 
-- **One `codex app-server` process per project.** The process hosts all of that project's
-  threads (Codex threads are durable containers within a connection). This isolates projects
-  from each other, matches Codex's model, and generalizes to future harnesses ("one working
-  context = one harness instance"). See also §4.5 for the object-safety constraint this places
-  on the trait.
-- Transport: **stdio** (newline-delimited JSON-RPC), the stable/production transport. The
+- **One harness instance per working context.** An instance is one `AgentHarness` value:
+  created lazily on first use, bootstrapped with the thread bindings that belong to it, owning
+  one project event driver, and shut down as a unit. How many operating-system processes stand
+  behind it is the adapter's business. **Codex:** one `codex app-server` process per instance,
+  hosting every thread of that instance (Codex threads are durable containers within a
+  connection); a process exit ends every thread stream of the instance. **A per-thread-process
+  adapter** (the shape Claude Code takes): one process per primary thread, spawned in
+  `open_thread` and stopped on delete, archive, shutdown, or an idle policy; a process exit
+  ends that thread's stream only. Today a project has one instance. See §4.5 for the
+  object-safety constraint and `docs/multi-harness-design.md` for several per project.
+- **Codex** transport: **stdio** (newline-delimited JSON-RPC), the stable/production transport. The
   WebSocket transport is not used in v1 (it is for remote, which is out of scope).
 - **Lazy spawn:** the process starts on first interaction with the project, not at app boot.
-- **Idle shutdown (optional, configurable):** a project's process may be terminated after a
-  configurable idle timeout to reclaim memory; threads are resumed on next use via
-  `thread/resume`. Default: keep alive while the app runs (given the ~10-thread scale).
+- **Idle shutdown:** not implemented. `docs/multi-harness-design.md` lists it as an open
+  question, as an instance policy an adapter may apply per process.
 - **Server shutdown:** SIGINT and SIGTERM stop HTTP acceptance, allow in-flight requests a bounded
   drain, then shut every project harness down concurrently. Harness shutdown is completion-based:
   the adapter closes its transport before returning, with a bounded timeout for a stuck provider.
@@ -2381,9 +2393,10 @@ configuration (§9).
   data-directory lock and logging guard. A second shutdown signal cancels that sequence and forces
   termination after a short, bounded file-log flush. The deterministic replay server follows the
   same shutdown sequence.
-- **Crash handling:** if the child exits unexpectedly, the server marks the project's active
-  threads as "disconnected", surfaces an `Error` event to the UI, and offers a "reconnect"
-  action that respawns and resumes.
+- **Crash handling:** when a native process exits unexpectedly, the server handles the ended
+  stream of every thread that process hosted: it marks those threads "disconnected", surfaces
+  an `Error` event to the UI, and offers a "reconnect" action that respawns and resumes. For
+  Codex that is every thread of the instance; for a per-thread process it is that thread.
 - **Native identifier mapping.** The adapter translates native thread, turn, item, and request
   identifiers as required by the Giskard-owned identity and lifecycle rules in §4.4–§4.5. Native
   process handles remain separate control identifiers. The Codex-specific key scopes and routing
@@ -2736,10 +2749,10 @@ yet, so there is no catalog to choose from (§8.3).
   path. This value becomes the harness sandbox boundary passed to Codex.
 - The UI shows the effective workspace root and warns if it differs from the project dir.
 
-### 6.4 Harness process management (per project)
+### 6.4 Harness instance management (per project)
 
-- One `codex app-server` per project, spawned lazily (§4.6), reused across the project's
-  threads, resumed after idle shutdown or crash.
+- One harness instance per project, created lazily (§4.7) and reused across the project's
+  threads. For Codex that instance is one `codex app-server`, resumed after a crash.
 - `RegistryShared` owns the sole strong process-local project map. Each stable `ProjectAuthority`
   records its verified project ID, the adopted lifecycle mutex, and independently synchronized
   optional harness and composed-model-catalog slots. An authority shell is process-local identity,
@@ -2757,7 +2770,7 @@ yet, so there is no catalog to choose from (§8.3).
 
 ### 6.5 Multiple projects & threads in parallel
 
-- Projects are independent; their harness processes run concurrently.
+- Projects are independent; their harness instances run concurrently.
 - Within a project, multiple threads can be active concurrently (the app-server supports
   concurrent turns across threads). The UI lets the user switch among open threads without
   interrupting their in-flight work; background threads keep streaming and their state keeps
