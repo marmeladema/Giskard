@@ -250,7 +250,7 @@
             <span class="mp-label">Build · Ask first</span><span class="mp-caret">▾</span>
           </button>
           <div id="turnPickerMenu" class="mp-popover" hidden>
-            <div class="mp-field">
+            <div class="mp-field" id="modeField">
               <label for="modeSel">Mode</label>
               <select id="modeSel" aria-label="Agent mode">
                 <option value="build">Build</option>
@@ -260,7 +260,7 @@
             <div class="mp-field">
               <label for="permissionPresetSel">Permissions</label>
               <select id="permissionPresetSel" aria-label="Permission preset">
-                <option value="ask_first">Ask first</option>
+                <option id="presetAskFirst" value="ask_first">Ask first</option>
                 <option value="auto_approve">Auto approve</option>
                 <option value="full_access">⚠ Full Access</option>
               </select>

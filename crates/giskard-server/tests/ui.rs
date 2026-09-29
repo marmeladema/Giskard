@@ -165,7 +165,7 @@ async fn index_page_is_served_and_public() {
         "permission preset selector has a visible label"
     );
     assert!(
-        body.contains("<option value=\"ask_first\">Ask first</option>")
+        body.contains("<option id=\"presetAskFirst\" value=\"ask_first\">Ask first</option>")
             && body.contains("<option value=\"auto_approve\">Auto approve</option>")
             && body.contains("<option value=\"full_access\">⚠ Full Access</option>"),
         "permission preset selector uses the wire values and action-oriented labels"
@@ -1802,7 +1802,11 @@ fn browser_has_no_model_list_outside_a_project() {
     );
     assert!(
         composer_controls.contains("const modelCatalogReady = projectModelCatalogReady();")
-            && composer_controls.matches("!modelCatalogReady").count() == 3,
+            && composer_controls.matches("!modelCatalogReady").count() == 1
+            && composer_controls.contains("$(\"modelSel\").disabled = modelControlsDisabled;")
+            && composer_controls
+                .contains("$(\"modelPickerBtn\").disabled = modelControlsDisabled;")
+            && composer_controls.contains("$(\"effortSel\").disabled = modelControlsDisabled;"),
         "model, picker, and effort controls remain disabled until the active catalog is ready"
     );
 
@@ -3644,5 +3648,35 @@ fn assert_order(haystack: &str, first: &str, second: &str) {
     assert!(
         first_index < second_index,
         "`{first}` should appear before `{second}`"
+    );
+}
+
+/// The harness's capability flags arrive with the project model list, and the composer's mode,
+/// permission, model, effort, and compaction controls are gated on them (spec §13.5).
+#[test]
+fn browser_gates_controls_on_harness_capabilities() {
+    let source = app_js();
+    for needle in [
+        "state.harnessCapabilities = res.capabilities || null;",
+        "function harnessCan(flag)",
+        "harnessCan(\"plan_build_modes\")",
+        "harnessCan(\"reasoning_effort\")",
+        "harnessCan(\"per_turn_model\")",
+        "harnessCan(\"context_compaction\")",
+        "harnessCan(\"live_approvals\")",
+        // An <option> title is not rendered inside a native select; the reason sits on the select.
+        "else $(\"permissionPresetSel\").title = \"This harness cannot route approvals to the browser.\";",
+    ] {
+        assert!(source.contains(needle), "app.js must contain {needle:?}");
+    }
+
+    let index = include_str!("../static/index.html");
+    assert!(
+        index.contains("id=\"modeField\""),
+        "the mode field has a stable hook to hide"
+    );
+    assert!(
+        index.contains("id=\"presetAskFirst\""),
+        "the ask-first preset option has a stable hook to disable"
     );
 }

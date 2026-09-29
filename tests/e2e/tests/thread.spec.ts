@@ -40,6 +40,21 @@ test.describe("projects and threads", () => {
     await expect(page.locator(".thread").first()).toBeVisible();
   });
 
+  test("gates the Compact button on the harness's compaction capability", async ({ page }) => {
+    const project = page.locator(".proj", { hasText: "Demo" });
+    await project.locator(".project-add").click();
+    await page.locator("#input").fill("Start a thread to open its usage menu.");
+    await page.locator("#sendBtn").click();
+    await expect(page.locator("#transcript .msg.agent", { hasText: SCRIPTED_REPLY })).toBeVisible();
+
+    // The replay harness reports `context_compaction: false` with the project model list, so the
+    // button stays in place but disabled, with a title that says why (spec §13.5).
+    await page.getByRole("button", { name: "Context usage" }).click();
+    const compact = page.locator("#compactBtn");
+    await expect(compact).toBeDisabled();
+    await expect(compact).toHaveAttribute("title", /does not support context compaction/);
+  });
+
   test("stale UI stops before websocket reconnect and preserves its text draft", async ({ page }) => {
     let ticketReads = 0;
     const sockets: string[] = [];
