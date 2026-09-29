@@ -26,7 +26,10 @@ mod ws;
 pub(crate) mod test_logs;
 
 pub use app::{AppShutdown, AppState, build_app};
-pub use harness_kinds::{DuplicateHarnessKind, HarnessKind, HarnessKindFactory};
+pub use harness_kinds::{
+    DuplicateHarnessKind, HarnessInstanceSpec, HarnessKind, HarnessKindFactory,
+    HarnessValidationError,
+};
 pub use registry::{
     DeferReason, DriverEvent, DriverEventSink, ForwarderExitReason, HarnessFactory,
     HarnessRegistry, LogDriverEventSink, OwnerExitDisposition, RefusedSubject,
