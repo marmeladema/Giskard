@@ -42,7 +42,7 @@ use giskard_harness::{
     OpenThreadOptions, ThreadHandle,
 };
 use giskard_persist::store::ProjectConfig;
-use giskard_server::{AppState, HarnessFactory, LogDriverEventSink, build_app};
+use giskard_server::{AppState, HarnessKind, HarnessKindFactory, LogDriverEventSink, build_app};
 
 mod common;
 
@@ -1040,10 +1040,17 @@ impl AgentHarness for ScriptedHarness {
     }
 }
 
-struct ScriptedFactory;
+struct ScriptedKind;
 
 #[async_trait]
-impl HarnessFactory for ScriptedFactory {
+impl HarnessKind for ScriptedKind {
+    /// `create_project` stamps every project with the kind `codex`
+    /// (`crates/giskard-persist/src/store.rs`), so the replay server's seeded projects name that
+    /// kind; Stage 1 replaces this with a declaration named `codex` of kind `replay`.
+    fn name(&self) -> &str {
+        "codex"
+    }
+
     async fn create(
         &self,
         _config: &ProjectConfig,
@@ -1200,7 +1207,11 @@ async fn run(
             .map_err(|e| format!("cannot generate replay session key: {e}"))?;
     }
 
-    let factory = Arc::new(ScriptedFactory);
+    let factory = Arc::new(
+        HarnessKindFactory::new()
+            .register(Arc::new(ScriptedKind))
+            .map_err(|error| error.to_string())?,
+    );
     let state = AppState::new_with_config(
         store,
         factory,

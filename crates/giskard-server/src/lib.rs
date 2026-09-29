@@ -1,6 +1,7 @@
 pub mod app;
 pub mod auth;
 mod delivery;
+pub mod harness_kinds;
 pub mod headers;
 pub mod highlight;
 pub mod hub;
@@ -25,6 +26,7 @@ mod ws;
 pub(crate) mod test_logs;
 
 pub use app::{AppShutdown, AppState, build_app};
+pub use harness_kinds::{DuplicateHarnessKind, HarnessKind, HarnessKindFactory};
 pub use registry::{
     DeferReason, DriverEvent, DriverEventSink, ForwarderExitReason, HarnessFactory,
     HarnessRegistry, LogDriverEventSink, OwnerExitDisposition, RefusedSubject,
