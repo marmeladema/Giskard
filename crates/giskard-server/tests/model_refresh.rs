@@ -87,6 +87,7 @@ model_listing = true
             base_url: Some(format!("http://{mock_addr}")),
             auth: None,
             http_headers: giskard_harness::ProviderHttpHeaders::default(),
+            env: giskard_harness::EnvOverlay::default(),
         }],
         client_version: None,
         harness_models: Vec::new(),
@@ -265,6 +266,7 @@ model_listing = true
                 ]),
                 HashMap::from([("X-Env".into(), KEY_ENV.into())]),
             ),
+            env: giskard_harness::EnvOverlay::default(),
         }],
     }
     .into_factory();
@@ -300,6 +302,84 @@ model_listing = true
     );
 }
 
+/// A key named only in the instance's declared environment overlay is still found by discovery,
+/// and an overlay-supplied header variable is resolved the same way. The variable is absent from
+/// `.cargo/config.toml`, so nothing but the overlay can supply it.
+#[tokio::test]
+async fn dynamic_model_refresh_resolves_the_key_through_the_env_overlay() {
+    const KEY_ENV: &str = "GISKARD_TEST_OVERLAY_KEY";
+    const KEY: &str = "overlay-only-key";
+    assert!(
+        std::env::var(KEY_ENV).is_err(),
+        "{KEY_ENV} must be unset so only the overlay can supply it"
+    );
+    let mock = Router::new().route(
+        "/models",
+        get(|headers: axum::http::HeaderMap| async move {
+            let authorized = headers.get("authorization").and_then(|v| v.to_str().ok())
+                == Some(&*format!("Bearer {KEY}"))
+                && headers.get("x-env").and_then(|v| v.to_str().ok()) == Some(KEY);
+            let data = if authorized {
+                serde_json::json!([{ "id": "overlay-model" }])
+            } else {
+                serde_json::json!([])
+            };
+            AxumJson(serde_json::json!({ "data": data }))
+        }),
+    );
+    let mock_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let mock_addr = mock_listener.local_addr().unwrap();
+    tokio::spawn(async move { axum::serve(mock_listener, mock).await.unwrap() });
+
+    let factory = DiffHarnessConfig {
+        fixture: fixtures::completed_turn_fixture(),
+        client_version: None,
+        harness_models: Vec::new(),
+        providers: vec![HarnessProvider {
+            id: "overlaid".into(),
+            name: None,
+            base_url: Some(format!("http://{mock_addr}")),
+            auth: Some(ProviderAuth::Env(KEY_ENV.into())),
+            http_headers: ProviderHttpHeaders::new(
+                HashMap::new(),
+                HashMap::from([("X-Env".into(), KEY_ENV.into())]),
+            ),
+            env: giskard_harness::EnvOverlay::new([(KEY_ENV.to_string(), KEY.to_string())]),
+        }],
+    }
+    .into_factory();
+    let server = TestServer::builder(factory)
+        .config("[providers.overlaid]\nmodel_listing = true\n")
+        .start()
+        .await;
+    let project = server.create_project_via_api("overlay", "/tmp").await;
+
+    let refreshed: serde_json::Value = server
+        .client
+        .get(format!("{}/api/projects/{project}/models", server.base))
+        .header("cookie", &server.cookie)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let ids: Vec<&str> = refreshed["models"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["model"].as_str().unwrap())
+        .collect();
+    assert!(
+        ids.contains(&"overlay-model"),
+        "discovery should resolve the key and header through the overlay: {refreshed}"
+    );
+    assert!(
+        !refreshed.to_string().contains(KEY),
+        "the overlay's value must not leak into the response: {refreshed}"
+    );
+}
+
 /// A discovery failure (here: a 401 because the harness names no key for the provider) is reported
 /// as a warning in the catalog response instead of silently yielding no models.
 #[tokio::test]
@@ -332,6 +412,7 @@ model_listing = true
             base_url: Some(format!("http://{mock_addr}")),
             auth: None,
             http_headers: giskard_harness::ProviderHttpHeaders::default(),
+            env: giskard_harness::EnvOverlay::default(),
         }],
     }
     .into_factory();
@@ -393,6 +474,7 @@ async fn unknown_provider_id_is_reported_against_the_harness_table() {
             base_url: None,
             auth: None,
             http_headers: giskard_harness::ProviderHttpHeaders::default(),
+            env: giskard_harness::EnvOverlay::default(),
         }],
     }
     .into_factory();
@@ -663,6 +745,7 @@ model_listing = true
             base_url: Some(format!("http://{mock_addr}")),
             auth: Some(auth),
             http_headers: giskard_harness::ProviderHttpHeaders::default(),
+            env: giskard_harness::EnvOverlay::default(),
         }],
     }
     .into_factory();
@@ -799,6 +882,7 @@ async fn discover_catalog_with(
             base_url: Some(format!("http://{mock_addr}")),
             auth: None,
             http_headers: giskard_harness::ProviderHttpHeaders::default(),
+            env: giskard_harness::EnvOverlay::default(),
         }],
         client_version: client_version.map(str::to_string),
         harness_models: Vec::new(),
@@ -965,6 +1049,7 @@ async fn providers_are_queried_concurrently() {
             base_url: Some(format!("http://{addr}")),
             auth: None,
             http_headers: giskard_harness::ProviderHttpHeaders::default(),
+            env: giskard_harness::EnvOverlay::default(),
         });
     }
 
@@ -1020,6 +1105,7 @@ async fn a_stock_harness_catalog_fills_the_picker_on_its_own() {
             base_url: None,
             auth: None,
             http_headers: giskard_harness::ProviderHttpHeaders::default(),
+            env: giskard_harness::EnvOverlay::default(),
         }],
     }
     .into_factory();
@@ -1069,6 +1155,7 @@ async fn an_empty_picker_explains_itself() {
             base_url: None,
             auth: None,
             http_headers: giskard_harness::ProviderHttpHeaders::default(),
+            env: giskard_harness::EnvOverlay::default(),
         }],
     }
     .into_factory();

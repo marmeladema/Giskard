@@ -54,7 +54,7 @@ use giskard_core::token::TokenUsage;
 use giskard_core::turn::{PermissionPreset, TurnOverrides, TurnStatus, TurnStatusKind};
 use giskard_core::{AttachmentKind, UserAttachment, UserInput};
 use giskard_harness::{
-    AgentEventStream, AgentHarness, DiscoveryStream, EventLog, HarnessBootstrap,
+    AgentEventStream, AgentHarness, DiscoveryStream, EnvOverlay, EventLog, HarnessBootstrap,
     HarnessCapabilities, HarnessNotice, HarnessProvider, OpenThreadOptions, ProviderAuth,
     ProviderAuthCommand, ProviderHttpHeaders, ThreadDiscovered, ThreadHandle, ThreadUpdate,
 };
@@ -2359,6 +2359,7 @@ async fn handle_list_providers(
             base_url: None,
             auth: None,
             http_headers: ProviderHttpHeaders::default(),
+            env: EnvOverlay::default(),
         })
         .collect();
 
@@ -2373,6 +2374,7 @@ async fn handle_list_providers(
             base_url: non_empty(provider.base_url.clone()),
             auth: provider.auth(),
             http_headers,
+            env: EnvOverlay::default(),
         };
         match providers.iter_mut().find(|existing| existing.id == id) {
             Some(existing) => *existing = entry,

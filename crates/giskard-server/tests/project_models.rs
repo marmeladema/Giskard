@@ -27,6 +27,7 @@ fn harness_providers(mock_addr: &str) -> Vec<HarnessProvider> {
             base_url: None,
             auth: None,
             http_headers: giskard_harness::ProviderHttpHeaders::default(),
+            env: giskard_harness::EnvOverlay::default(),
         },
         HarnessProvider {
             id: "mock".into(),
@@ -34,6 +35,7 @@ fn harness_providers(mock_addr: &str) -> Vec<HarnessProvider> {
             base_url: Some(format!("http://{mock_addr}")),
             auth: None,
             http_headers: giskard_harness::ProviderHttpHeaders::default(),
+            env: giskard_harness::EnvOverlay::default(),
         },
     ]
 }

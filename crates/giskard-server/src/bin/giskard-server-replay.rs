@@ -458,6 +458,7 @@ impl AgentHarness for ScriptedHarness {
             base_url: None,
             auth: None,
             http_headers: giskard_harness::ProviderHttpHeaders::default(),
+            env: giskard_harness::EnvOverlay::default(),
         }])
     }
 

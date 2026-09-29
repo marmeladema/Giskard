@@ -1079,7 +1079,7 @@ fn provider_headers(provider: &HarnessProvider) -> (reqwest::header::HeaderMap, 
         insert(name, header, value, None);
     }
     for (name, header, variable) in environment {
-        if let Ok(value) = std::env::var(variable)
+        if let Some(value) = provider.env.var(variable)
             && !value.trim().is_empty()
         {
             insert(name, header, &value, Some(variable));
@@ -1099,6 +1099,7 @@ mod tests {
             base_url: base_url.map(str::to_string),
             auth: None,
             http_headers: giskard_harness::ProviderHttpHeaders::default(),
+            env: giskard_harness::EnvOverlay::default(),
         }
     }
 
