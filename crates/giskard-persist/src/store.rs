@@ -54,6 +54,10 @@ pub struct ProjectConfig {
     pub id: ProjectId,
     pub name: String,
     pub dir: String,
+    /// The `[harnesses.<name>]` declaration this project's threads run on. Stamped at creation
+    /// with the chosen or default declaration name; a creation-time input that nothing reads as a
+    /// default afterwards. Files written before declarations existed carry `codex`, which the
+    /// synthesized catalog (or an explicit `[harnesses.codex]`) resolves unchanged.
     pub harness: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace_root: Option<String>,
@@ -931,12 +935,15 @@ impl PersistStore {
         atomic_write_json(&self.project_json_path(config.id), config).await
     }
 
-    /// Create a new project: add to index + write project.json.
+    /// Create a project on the harness declaration `harness`, which the caller has already
+    /// resolved against the catalog (the request's choice or the catalog's default): add it to the
+    /// index and write its `project.json`.
     pub async fn create_project(
         &self,
         id: ProjectId,
         name: &str,
         dir: &str,
+        harness: &str,
     ) -> Result<ProjectConfig, PersistError> {
         let now = Utc::now();
         let mut index = self.load_project_index().await?;
@@ -956,7 +963,7 @@ impl PersistStore {
             id,
             name: name.into(),
             dir: dir.into(),
-            harness: "codex".into(),
+            harness: harness.into(),
             workspace_root: None,
             _default_model: None,
             created_at: now,
@@ -2675,7 +2682,7 @@ mod tests {
         let (_tmp, store) = make_store();
         let id = ProjectId::new();
         store
-            .create_project(id, "test-project", "/tmp/test")
+            .create_project(id, "test-project", "/tmp/test", "codex")
             .await
             .unwrap();
 
@@ -2693,7 +2700,7 @@ mod tests {
         let (_tmp, store) = make_store();
         let id = ProjectId::new();
         let project = store
-            .create_project(id, "test-project", "/tmp/test")
+            .create_project(id, "test-project", "/tmp/test", "codex")
             .await
             .unwrap();
 
@@ -2718,7 +2725,7 @@ mod tests {
         let (_tmp, store) = make_store();
         let id = ProjectId::new();
         store
-            .create_project(id, "to-delete", "/tmp/test")
+            .create_project(id, "to-delete", "/tmp/test", "codex")
             .await
             .unwrap();
 
@@ -2754,7 +2761,7 @@ mod tests {
         let (_tmp, store) = make_store();
         let pid = ProjectId::new();
         store
-            .create_project(pid, "proj", "/tmp/test")
+            .create_project(pid, "proj", "/tmp/test", "codex")
             .await
             .unwrap();
 
@@ -2806,7 +2813,7 @@ mod tests {
         let (_tmp, store) = make_store();
         let pid = ProjectId::new();
         store
-            .create_project(pid, "proj", "/tmp/test")
+            .create_project(pid, "proj", "/tmp/test", "codex")
             .await
             .unwrap();
 
@@ -2850,7 +2857,7 @@ mod tests {
         let (_tmp, store) = make_store();
         let pid = ProjectId::new();
         store
-            .create_project(pid, "proj", "/tmp/test")
+            .create_project(pid, "proj", "/tmp/test", "codex")
             .await
             .unwrap();
 
@@ -2905,7 +2912,7 @@ mod tests {
         let (_tmp, store) = make_store();
         let pid = ProjectId::new();
         store
-            .create_project(pid, "proj", "/tmp/test")
+            .create_project(pid, "proj", "/tmp/test", "codex")
             .await
             .unwrap();
 
@@ -2952,7 +2959,7 @@ mod tests {
         let (_tmp, store) = make_store();
         let pid = ProjectId::new();
         store
-            .create_project(pid, "proj", "/tmp/test")
+            .create_project(pid, "proj", "/tmp/test", "codex")
             .await
             .unwrap();
 
@@ -2994,7 +3001,7 @@ mod tests {
         let (_tmp, store) = make_store();
         let pid = ProjectId::new();
         store
-            .create_project(pid, "proj", "/tmp/test")
+            .create_project(pid, "proj", "/tmp/test", "codex")
             .await
             .unwrap();
 
@@ -3015,7 +3022,7 @@ mod tests {
         let (_tmp, store) = make_store();
         let pid = ProjectId::new();
         store
-            .create_project(pid, "proj", "/tmp/test")
+            .create_project(pid, "proj", "/tmp/test", "codex")
             .await
             .unwrap();
 
@@ -3055,7 +3062,7 @@ mod tests {
         let (_tmp, store) = make_store();
         let pid = ProjectId::new();
         store
-            .create_project(pid, "proj", "/tmp/test")
+            .create_project(pid, "proj", "/tmp/test", "codex")
             .await
             .unwrap();
 
@@ -3651,7 +3658,7 @@ mod tests {
         let (_tmp, store) = make_store();
         let pid = ProjectId::new();
         store
-            .create_project(pid, "proj", "/tmp/test")
+            .create_project(pid, "proj", "/tmp/test", "codex")
             .await
             .unwrap();
 
@@ -4192,7 +4199,7 @@ mod layout_tests {
         let (_tmp, store) = make_store();
         let pid = ProjectId::new();
         store
-            .create_project(pid, "proj", "/tmp/proj")
+            .create_project(pid, "proj", "/tmp/proj", "codex")
             .await
             .unwrap();
         let tid = ThreadId::new();
@@ -4725,7 +4732,7 @@ mod layout_tests {
         let (_tmp, store) = make_store();
         let pid = ProjectId::new();
         store
-            .create_project(pid, "proj", "/tmp/proj")
+            .create_project(pid, "proj", "/tmp/proj", "codex")
             .await
             .unwrap();
 

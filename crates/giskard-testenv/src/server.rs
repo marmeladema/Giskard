@@ -80,9 +80,10 @@ impl TestServer {
 
     pub async fn create_project_in(&self, name: &str, dir: &Path) -> ProjectId {
         let id = ProjectId::new();
+        let catalog = self.state.registry.harness_catalog();
         self.state
             .store
-            .create_project(id, name, dir.to_str().unwrap())
+            .create_project(id, name, dir.to_str().unwrap(), catalog.default_name())
             .await
             .unwrap();
         id

@@ -59,7 +59,7 @@ async fn list_threads_prints_archived_status() {
     let archived_id = ThreadId::new();
 
     store
-        .create_project(project_id, "proj", "/tmp/proj")
+        .create_project(project_id, "proj", "/tmp/proj", "codex")
         .await
         .unwrap();
     store
@@ -144,7 +144,7 @@ async fn migrate_storage_converts_flat_threads_and_prune_legacy_removes_the_orig
     let project_id = ProjectId::new();
     let thread_id = ThreadId::new();
     store
-        .create_project(project_id, "proj", "/tmp/proj")
+        .create_project(project_id, "proj", "/tmp/proj", "codex")
         .await
         .unwrap();
 
@@ -320,7 +320,7 @@ async fn sweep_orphan_payloads_skips_a_thread_it_cannot_judge_and_keeps_going() 
     let store = PersistStore::new(tmp.path().to_path_buf());
     let project_id = ProjectId::new();
     store
-        .create_project(project_id, "proj", "/tmp/proj")
+        .create_project(project_id, "proj", "/tmp/proj", "codex")
         .await
         .unwrap();
 
@@ -410,7 +410,7 @@ async fn destructive_commands_refuse_and_change_nothing_while_the_data_dir_is_lo
     let project_id = ProjectId::new();
     let thread_id = ThreadId::new();
     store
-        .create_project(project_id, "proj", "/tmp/proj")
+        .create_project(project_id, "proj", "/tmp/proj", "codex")
         .await
         .unwrap();
     store
@@ -549,7 +549,7 @@ async fn sweep_orphan_payloads_deletes_a_freshly_written_orphan() {
     let project_id = ProjectId::new();
     let thread_id = ThreadId::new();
     store
-        .create_project(project_id, "proj", "/tmp/proj")
+        .create_project(project_id, "proj", "/tmp/proj", "codex")
         .await
         .unwrap();
     store

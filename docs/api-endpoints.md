@@ -2,7 +2,7 @@
 
 The browser (and any client) drives everything through a small REST surface plus one multiplexed
 WebSocket. Highlights: `POST /api/login`, `POST /api/logout`, `GET /api/ws-ticket`, `GET /api/ws`,
-`GET/POST /api/projects`, `GET/DELETE /api/projects/{id}`, `GET/POST
+`GET/POST /api/projects`, `GET /api/harnesses`, `GET/DELETE /api/projects/{id}`, `GET/POST
 /api/projects/{id}/threads`, `POST /api/projects/{id}/threads/start`, `DELETE
 /api/projects/{id}/threads/{thread_id}`, `POST
 /api/projects/{id}/threads/{parent_thread_id}/subagent-links/{item_id}/open`, `PATCH
@@ -31,7 +31,20 @@ loaded page before opening or reopening a WebSocket. A mismatch means the tab pr
 upgrade, so it stops reconnecting and asks the user to reload before version-sensitive messages can
 reach stale JavaScript.
 
-`POST /api/projects` takes a name and a directory; there is no `default_model`. A project record
+`POST /api/projects` takes a name, a directory, an optional `workspace_root`, and an optional
+`harness`: the name of a `[harnesses.<name>]` declaration in `config.toml`. Omitted, the project is
+stamped with the declaration marked `default` (the first declared one when none is marked; `codex`
+when no `[harnesses]` table exists). A name the config does not declare is a `400` whose message
+lists the declared names, and nothing is created. The chosen name is stored in `project.json` as
+`harness` and is what every thread of the project runs on; `GET /api/projects/{id}` returns it.
+`GET /api/harnesses` lists the declarations in declaration order as
+`{"harnesses": [{"name", "kind", "default"}]}`, with exactly one entry marked `default`; the
+new-project modal shows its harness select only when more than one is listed. A project whose
+stored name is no longer declared opens its threads read-only with a warning whose `detail` names
+the missing declaration and `[harnesses]`, and `POST /api/projects/{id}/threads/start` on it is a
+`400` with the same message.
+
+`POST /api/projects` has no `default_model`. A project record
 stores no model at all. The model a new thread starts on is derived from the project's catalog when
 the draft opens (the harness's default when it marks one, else the first entry), so it tracks the
 current provider and harness configuration rather than caching a choice that can go stale.

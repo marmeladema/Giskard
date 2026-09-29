@@ -101,7 +101,12 @@ async fn history_pagination_over_http() {
     let other_pid = ProjectId::new();
     state
         .store
-        .create_project(other_pid, "other", &other_proj_dir.path().to_string_lossy())
+        .create_project(
+            other_pid,
+            "other",
+            &other_proj_dir.path().to_string_lossy(),
+            "codex",
+        )
         .await
         .unwrap();
     let wrong_project = client

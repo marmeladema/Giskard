@@ -293,7 +293,7 @@ async fn replay_persisted_state_roundtrip() {
 
     let pid = giskard_core::ProjectId::new();
     store
-        .create_project(pid, "test-proj", "/tmp/test")
+        .create_project(pid, "test-proj", "/tmp/test", "codex")
         .await
         .unwrap();
 

@@ -1574,6 +1574,7 @@ async fn git_status_refuses_a_thread_from_another_project() {
             other_project,
             "other",
             &server.project.dir.path().to_string_lossy(),
+            "codex",
         )
         .await
         .unwrap();

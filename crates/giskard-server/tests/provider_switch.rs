@@ -166,7 +166,7 @@ async fn start_server_inner(report_provider: Option<String>, seed_worktree: bool
         .config(NEW_PROVIDER_TOML)
         .seed(move |store| async move {
             store
-                .create_project(pid, "proj", &project_path)
+                .create_project(pid, "proj", &project_path, "codex")
                 .await
                 .unwrap();
             store

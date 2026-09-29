@@ -1729,6 +1729,52 @@ fn browser_has_no_model_list_outside_a_project() {
         !create_project.contains("gpt-5.5"),
         "no hardcoded model stands in for a catalog the browser cannot see"
     );
+    // The harness is sent only when the select is visible, i.e. when more than one declaration
+    // gives the user a choice; otherwise the server's default declaration applies.
+    assert!(
+        create_project.contains(
+            "if (!$(\"pmHarnessField\").hidden && $(\"pmHarness\").value) body.harness = \
+             $(\"pmHarness\").value;"
+        ) && create_project.matches("harness =").count() == 1
+            && !create_project.contains("harness:"),
+        "project creation names a harness only under the select's visibility condition"
+    );
+    let load_harnesses = between(
+        body,
+        "async function loadProjectModalHarnesses() {",
+        "function closeProjectModal()",
+    );
+    assert!(
+        load_harnesses.contains("api(\"GET\", \"/api/harnesses\")")
+            && load_harnesses.contains("field.hidden = harnesses.length <= 1;")
+            && load_harnesses.contains("Harness list unavailable: "),
+        "the harness select is filled from /api/harnesses, shown only with a choice, and a \
+         failed fetch is reported without blocking creation"
+    );
+    // Reopening the modal while an earlier fetch is in flight must not append its options too:
+    // both the success and the failure path drop a response from a superseded open.
+    assert_order(
+        load_harnesses,
+        "const seq = ++state.pmHarnessRequestSeq;",
+        "await api(\"GET\", \"/api/harnesses\")",
+    );
+    assert_eq!(
+        load_harnesses
+            .matches("if (seq !== state.pmHarnessRequestSeq) return;")
+            .count(),
+        2,
+        "a stale harness response is discarded on both the success and the failure path"
+    );
+    assert_order(
+        load_harnesses,
+        "if (seq !== state.pmHarnessRequestSeq) return;\n  const harnesses",
+        "select.append(opt);",
+    );
+    let index = include_str!("../static/index.html");
+    assert!(
+        index.contains("id=\"pmHarness\"") && index.contains("id=\"pmHarnessField\" hidden"),
+        "the new-project modal carries a harness select, hidden by default"
+    );
 
     let prepare_catalog = between(
         body,

@@ -189,7 +189,7 @@ let state = {
   gitCommitOpen:new Set(), gitCommitFiles:new Map(), gitCommitPending:new Set(), gitCommitFailed:new Set(),
   mcpServers:[], mcpCapabilities:{ status:false, reload:false, oauth_login:false }, mcpLoading:false, mcpError:null, expandedMcps:new Set(),
   threadReadOnly:false, readOnlyProvider:null, readOnlyMessage:null,
-  pickerTypeahead:"", pickerTypeaheadTimer:null, pickerSelectedRow:null,
+  pickerTypeahead:"", pickerTypeaheadTimer:null, pickerSelectedRow:null, pmHarnessError:"", pmHarnessRequestSeq:0,
   currentPlan:null, planExpanded:localStorage.getItem("giskard.planExpanded")==="1",
   threadActivity:new Map(), pendingWaitingFocus:null, notifiedRequests:new Map(), bootstrapNotifiedRequests:new Set(), waitingNotifications:new Map(), browserDiagnostics:[],
   subagentImports:new Map(), projectThreads:new Map(), threadIndex:new Map(),
@@ -2165,9 +2165,41 @@ $("newProj").onclick = () => openProjectModal();
 function openProjectModal() {
   closeDrawers();
   $("pmErr").textContent = "";
+  state.pmHarnessError = "";
   $("projectModal").classList.add("open");
+  loadProjectModalHarnesses();
   // Start browsing where we last were, falling back to the filesystem root.
   browsePicker(localStorage.getItem("giskard.lastBrowse") || "/");
+}
+
+// Fill the harness select from the declared harnesses (`[harnesses.<name>]`). It is shown only
+// when there is a choice to make; with one declaration the server default is the only answer. A
+// failed fetch leaves it hidden so creation falls back to the server default instead of blocking.
+async function loadProjectModalHarnesses() {
+  const field = $("pmHarnessField"), select = $("pmHarness");
+  // One sequence number per open: a response from an earlier open (closed and reopened before it
+  // returned) is discarded rather than appended alongside the current one.
+  const seq = ++state.pmHarnessRequestSeq;
+  field.hidden = true;
+  select.innerHTML = "";
+  let res;
+  try { res = await api("GET", "/api/harnesses"); }
+  catch (e) {
+    if (seq !== state.pmHarnessRequestSeq) return;
+    state.pmHarnessError = "Harness list unavailable: "+apiFailureMessage(e);
+    $("pmErr").textContent = state.pmHarnessError;
+    return;
+  }
+  if (seq !== state.pmHarnessRequestSeq) return;
+  const harnesses = (res && res.harnesses) || [];
+  for (const h of harnesses) {
+    const opt = document.createElement("option");
+    opt.value = h.name;
+    opt.textContent = `${h.name} (${h.kind})`;
+    if (h.default) opt.selected = true;
+    select.append(opt);
+  }
+  field.hidden = harnesses.length <= 1;
 }
 function closeProjectModal() { $("projectModal").classList.remove("open"); }
 $("pmCancel").onclick = closeProjectModal;
@@ -2186,7 +2218,8 @@ async function browsePicker(path) {
   $("pmPath").textContent = res.path;
   // Prefill the project name from the current folder's basename (still editable).
   $("pmName").value = basename(res.path) || res.path;
-  $("pmErr").textContent = "";
+  // Keep a harness-list failure visible: it explains why the harness select is missing.
+  $("pmErr").textContent = state.pmHarnessError || "";
 
   resetPickerTypeahead();
   clearPickerSelection();
@@ -2283,10 +2316,13 @@ $("pmCreate").onclick = async () => {
   if (!dir) { $("pmErr").textContent = "Pick a folder first."; return; }
   if (!name) { $("pmErr").textContent = "Enter a project name."; return; }
   try {
-    // No model is chosen here: the project has no harness yet, so there is no catalog to choose
-    // from. The draft picks one from the project's catalog once that loads (§8.3), which is also
-    // the only way to get the harness's preferred model rather than a guess.
-    const { id } = await api("POST","/api/projects",{ name, dir });
+    // No model is chosen here: the project's harness is not running yet, so there is no catalog
+    // to choose from. The draft picks one from the project's catalog once that loads (§8.3),
+    // which is also the only way to get the harness's preferred model rather than a guess.
+    const body = { name, dir };
+    // Only a visible select is a choice the user made; otherwise the server default applies.
+    if (!$("pmHarnessField").hidden && $("pmHarness").value) body.harness = $("pmHarness").value;
+    const { id } = await api("POST","/api/projects",body);
     closeProjectModal();
     await loadProjects();
     // Land on the new project's draft view rather than leaving the previously

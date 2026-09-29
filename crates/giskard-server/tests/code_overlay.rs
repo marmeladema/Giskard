@@ -826,7 +826,7 @@ async fn code_overlay_endpoints_refuse_a_thread_they_cannot_resolve() {
     let other_project = ProjectId::new();
     state
         .store
-        .create_project(other_project, "other", "/tmp")
+        .create_project(other_project, "other", "/tmp", "codex")
         .await
         .unwrap();
     let foreign = ThreadId::new();

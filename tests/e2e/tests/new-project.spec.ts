@@ -37,9 +37,11 @@ test.describe("new-project modal", () => {
     await page.locator("#newProj").click();
     await expect(page.locator("#projectModal")).toHaveClass(/open/);
 
-    // The modal asks for a folder and a name, and nothing else: a project has no harness until it
-    // exists, so there is no model catalog to offer here.
+    // The modal asks for a folder and a name, and nothing else: a project's harness is not running
+    // until it exists, so there is no model catalog to offer here. The replay server declares one
+    // harness, so the harness select stays hidden too.
     await expect(page.locator("#pmModel")).toHaveCount(0);
+    await expect(page.locator("#pmHarnessField")).toBeHidden();
     const createRequest = page.waitForRequest(
       (r) => r.method() === "POST" && new URL(r.url()).pathname === "/api/projects",
     );
@@ -61,7 +63,10 @@ test.describe("new-project modal", () => {
     await page.locator("#pmCreate").click();
     // Absent from the DOM is not the same as absent from the request: the payload must name no
     // model either, since a project record no longer stores one.
-    expect((await createRequest).postDataJSON()).not.toHaveProperty("default_model");
+    const payload = (await createRequest).postDataJSON();
+    expect(payload).not.toHaveProperty("default_model");
+    // With a single declaration there is no choice, so the server default applies.
+    expect(payload).not.toHaveProperty("harness");
     const createdJson = (await (await created).json()) as { id: string };
     const projectId = createdJson.id;
 
@@ -113,6 +118,52 @@ test.describe("new-project modal", () => {
     } finally {
       await cleanupProject(page, projectId);
     }
+  });
+
+  // Closing and reopening the modal while the first harness fetch is still in flight must not
+  // leave both responses' options in the select: the first open's response is stale and dropped.
+  test("reopening during a harness fetch does not duplicate options", async ({ page }) => {
+    const harnesses = {
+      harnesses: [
+        { name: "codex-stable", kind: "codex", default: true },
+        { name: "codex-nightly", kind: "codex", default: false },
+      ],
+    };
+    let releaseFirst: () => void = () => {};
+    const firstHeld = new Promise<void>((resolve) => { releaseFirst = resolve; });
+    let firstServed: () => void = () => {};
+    const firstDone = new Promise<void>((resolve) => { firstServed = resolve; });
+    let calls = 0;
+    await page.route("**/api/harnesses", async (route) => {
+      calls += 1;
+      if (calls === 1) {
+        await firstHeld;
+        await route.fulfill({ json: harnesses });
+        firstServed();
+        return;
+      }
+      await route.fulfill({ json: harnesses });
+    });
+
+    await page.locator("#newProj").click();
+    await expect(page.locator("#projectModal")).toHaveClass(/open/);
+    await expect.poll(() => calls).toBe(1);
+    await page.locator("#pmCancel").click();
+    await expect(page.locator("#projectModal")).not.toHaveClass(/open/);
+
+    await page.locator("#newProj").click();
+    await expect(page.locator("#projectModal")).toHaveClass(/open/);
+    await expect(page.locator("#pmHarness option")).toHaveCount(2);
+
+    // Only now let the first open's response arrive; it must not append a second set.
+    releaseFirst();
+    await firstDone;
+    // Give the stale response's handler a chance to run before asserting it did nothing.
+    await page.evaluate(() => new Promise((resolve) => setTimeout(resolve, 100)));
+    await expect(page.locator("#pmHarness option")).toHaveCount(2);
+    await expect(page.locator("#pmHarnessField")).toBeVisible();
+    await expect(page.locator("#pmHarness")).toHaveValue("codex-stable");
+    await page.locator("#pmCancel").click();
   });
 });
 
