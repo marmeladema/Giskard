@@ -133,17 +133,19 @@ impl WsError {
 
     fn from_harness(error: HarnessError, action: &str, thread_id: Option<ThreadId>) -> Self {
         let (code, message) = match &error {
-            HarnessError::Spawn(_) => ("harness_spawn_failed", "Codex CLI could not start."),
-            HarnessError::NotInitialized => (
-                "harness_not_initialized",
-                "Codex is not ready for this request.",
-            ),
-            HarnessError::Unauthenticated => {
-                ("harness_unauthenticated", "Codex is not authenticated.")
+            HarnessError::Spawn(_) => ("harness_spawn_failed", "The harness could not start."),
+            HarnessError::NotInitialized => {
+                ("harness_not_initialized", "The harness is not ready.")
             }
-            HarnessError::Transport(_) => ("harness_transport_error", "Codex transport failed."),
-            HarnessError::Protocol(_) => ("harness_protocol_error", "Codex protocol error."),
-            HarnessError::Overloaded => ("harness_overloaded", "Codex is overloaded."),
+            HarnessError::Unauthenticated => (
+                "harness_unauthenticated",
+                "The harness is not authenticated.",
+            ),
+            HarnessError::Transport(_) => {
+                ("harness_transport_error", "The harness transport failed.")
+            }
+            HarnessError::Protocol(_) => ("harness_protocol_error", "Harness protocol error."),
+            HarnessError::Overloaded => ("harness_overloaded", "The harness is overloaded."),
             HarnessError::Unsupported(_) => (
                 "harness_unsupported",
                 "The active harness does not support this action.",
@@ -157,7 +159,7 @@ impl WsError {
             HarnessError::ThreadReadOnly { .. } => {
                 ("thread_read_only", "Agent-owned threads are read-only.")
             }
-            HarnessError::Timeout(_) => ("harness_timeout", "Codex operation timed out."),
+            HarnessError::Timeout(_) => ("harness_timeout", "Harness operation timed out."),
         };
         let mut ws_error = Self::new(code, ErrorSeverity::Error, message)
             .detail(error.to_string())
@@ -944,7 +946,7 @@ async fn handle_client_msg(
                         request_id = %request_id_for_broadcast,
                         timeout_ms = HARNESS_CONTROL_TIMEOUT.as_millis(),
                         elapsed_ms = response_started.elapsed().as_millis(),
-                        "approval decision timed out waiting for Codex"
+                        "approval decision timed out waiting for the harness"
                     );
                     // Cancelling the registry future drops its claim and rolls Responding back to
                     // Pending. Republish the rollback so every tab becomes actionable again.
@@ -954,7 +956,7 @@ async fn handle_client_msg(
                         .await;
                     return Err(WsError::from_harness(
                         HarnessError::Timeout(
-                            "approval decision timed out waiting for Codex".into(),
+                            "approval decision timed out waiting for the harness".into(),
                         ),
                         "approval_decision",
                         Some(thread_id),
@@ -993,7 +995,7 @@ async fn handle_client_msg(
                         request_id = %request_id_for_log,
                         timeout_ms = HARNESS_CONTROL_TIMEOUT.as_millis(),
                         elapsed_ms = response_started.elapsed().as_millis(),
-                        "server request response timed out waiting for Codex"
+                        "server request response timed out waiting for the harness"
                     );
                     // Cancelling the registry future drops its claim and rolls Responding back to
                     // Pending. Publish that authoritative rollback so peer tabs do not remain
@@ -1004,7 +1006,7 @@ async fn handle_client_msg(
                         .await;
                     return Err(WsError::from_harness(
                         HarnessError::Timeout(
-                            "server request response timed out waiting for Codex".into(),
+                            "server request response timed out waiting for the harness".into(),
                         ),
                         "server_request_response",
                         Some(thread_id),
@@ -1021,11 +1023,11 @@ async fn handle_client_msg(
                     error!(
                         %thread_id,
                         timeout_ms = HARNESS_CONTROL_TIMEOUT.as_millis(),
-                        "interrupt request timed out waiting for Codex"
+                        "interrupt request timed out waiting for the harness"
                     );
                     WsError::from_harness(
                         HarnessError::Timeout(
-                            "interrupt request timed out waiting for Codex".into(),
+                            "interrupt request timed out waiting for the harness".into(),
                         ),
                         "interrupt",
                         Some(thread_id),
@@ -1087,11 +1089,11 @@ async fn handle_client_msg(
                 error!(
                     %thread_id,
                     timeout_ms = HARNESS_CONTROL_TIMEOUT.as_millis(),
-                    "context compaction request timed out waiting for Codex"
+                    "context compaction request timed out waiting for the harness"
                 );
                 WsError::from_harness(
                     HarnessError::Timeout(
-                        "context compaction request timed out waiting for Codex".into(),
+                        "context compaction request timed out waiting for the harness".into(),
                     ),
                     "compact_context",
                     Some(thread_id),
@@ -1134,10 +1136,10 @@ async fn handle_client_msg(
                         .as_ref()
                         .map(|cmd| cmd.after_turn)
                         .unwrap_or(false),
-                    "terminate command request timed out waiting for Codex"
+                    "terminate command request timed out waiting for the harness"
                 );
                 HarnessError::Timeout(
-                    "terminate command request timed out waiting for Codex".into(),
+                    "terminate command request timed out waiting for the harness".into(),
                 )
             });
             if let Err(error) = terminate_result.and_then(|result| result) {
@@ -1973,7 +1975,7 @@ async fn ensure_provider_change_allowed(
         active,
         turn_count = turns.len(),
         %action,
-        "rejecting provider change on provider-bound Codex thread"
+        "rejecting provider change on provider-bound thread"
     );
     Err(provider_locked_error(
         thread_id,
@@ -2022,7 +2024,7 @@ async fn ensure_send_harness_provider_current(
         selected_model = %selected_model.model,
         active,
         turn_count = turns.len(),
-        "rejecting persisted provider mismatch on provider-bound Codex thread"
+        "rejecting persisted provider mismatch on provider-bound thread"
     );
     Err(provider_locked_error(
         thread_id,
@@ -2041,7 +2043,7 @@ fn provider_locked_error(
     WsError::new(
         "thread_provider_locked",
         ErrorSeverity::Error,
-        "This Codex thread is bound to a different provider. Create a new thread to use the selected provider.",
+        "This thread is bound to a different provider. Create a new thread to use the selected provider.",
     )
     .detail(format!(
         "native provider: {native_provider}; selected provider: {selected_provider}"

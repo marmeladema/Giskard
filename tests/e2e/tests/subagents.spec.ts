@@ -110,7 +110,7 @@ test.describe("linked sub-agent threads", () => {
     await parentRowContainer.locator(".thread-menu .danger").click();
     await expect(page.locator("#removeThreadModal")).toHaveClass(/open/);
     await expect(page.locator("#removeThreadCascade")).toContainText("1 linked sub-agent thread");
-    await expect(page.locator("#removeThreadCascade")).toContainText("all corresponding Codex threads");
+    await expect(page.locator("#removeThreadCascade")).toContainText("all corresponding harness threads");
     await expect(page.locator("#removeThreadModal")).toContainText("cannot be undone");
     await page.locator("#removeThreadConfirm").click();
     await expect(parentRow).toHaveCount(0);

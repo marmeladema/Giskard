@@ -256,8 +256,8 @@ async fn index_page_is_served_and_public() {
         "command approval cwd is rendered as metadata, not as a second detail line"
     );
     assert!(
-        body.contains("if (!kind.path) return \"File list was not provided by Codex.\";"),
-        "file approvals must explain when Codex omitted the changed paths"
+        body.contains("if (!kind.path) return \"File list was not provided by the harness.\";"),
+        "file approvals must explain when the harness omitted the changed paths"
     );
     assert!(
         body.contains("item.kind === \"path\" && item.source_link"),
@@ -532,7 +532,7 @@ async fn index_page_is_served_and_public() {
     assert!(
         body.contains("function threadDescendantIds(pid, tid)")
            && body.contains("linked sub-agent thread")
-           && body.contains("all corresponding Codex threads")
+           && body.contains("all corresponding harness threads")
            && body.contains("This cannot be undone")
            // Deleting the active thread now drops into a fresh draft in the same project instead
            // of leaving an empty view titled with the deleted thread's name.
