@@ -11,7 +11,10 @@ pub mod preview;
 pub mod store;
 
 pub use command_output::{command_output_descriptor, normalize_command_output};
-pub use config::{Config, HistoryConfig, ModelConfig, ModelRate, ProviderConfig, RetentionConfig};
+pub use config::{
+    Config, HarnessCatalog, HarnessConfigError, HarnessDeclaration, HarnessEnv, HistoryConfig,
+    ModelConfig, ModelRate, ProviderConfig, RetentionConfig,
+};
 pub use giskard_core::PersistError;
 pub use layout::ThreadLayout;
 pub use lock::{DataDirLock, LOCK_FILE_NAME};
