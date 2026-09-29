@@ -42,7 +42,10 @@ harness's own catalog, with unknown provider ids and per-provider discovery fail
 provider's endpoint, which only a harness knows, and there is no harness until a project is open —
 so a project-less list could only ever repeat `config.toml` back, which is why neither
 `GET /api/models` nor `POST /api/models/refresh` exists. The thread picker's reload button re-runs
-this endpoint for the active project.
+this endpoint for the active project. The response also carries `capabilities`, the project
+harness's capability flags (spec §4.2), present only when the harness answered; when it could not
+be reached the field is omitted and `warnings` carries a `harness:<kind>` entry. The browser gates
+its mode, permission, model, effort, and compaction controls on these flags (spec §13.5).
 
 `POST /api/projects/{id}/threads/start` takes `git_strategy`, which decides where the thread's
 working tree comes from: `shared` (the project's own checkout — the default, and what an omitted

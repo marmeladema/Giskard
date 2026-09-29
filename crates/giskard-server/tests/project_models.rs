@@ -4,9 +4,11 @@
 //! configured metadata; discovery-only models pick up the harness catalog's names and efforts.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use axum::{Router, response::Json as AxumJson, routing::get};
 use futures::SinkExt;
+use giskard_core::HarnessError;
 use giskard_core::ids::ProjectId;
 use giskard_core::model::{Effort, ModelDescriptor, ModelRef};
 use giskard_harness::HarnessProvider;
@@ -442,4 +444,98 @@ async fn unmarked_catalog_exposes_no_default_and_falls_back_to_first() {
         "no model claims to be the default: {catalog}"
     );
     assert_eq!(models[0]["model"], "gpt-5.5", "first entry is the fallback");
+}
+
+/// A harness whose every browser-gated capability is off (`caps::RESUMABLE`).
+struct ResumableOnlyScript;
+
+#[async_trait::async_trait]
+impl giskard_testenv::fake::Script for ResumableOnlyScript {
+    fn capabilities(&self) -> giskard_harness::HarnessCapabilities {
+        giskard_testenv::fake::caps::RESUMABLE
+    }
+}
+
+async fn get_models(fixture: &Fixture) -> serde_json::Value {
+    let base = &fixture.server.base;
+    let project_id = fixture.project_id;
+    let resp = fixture
+        .server
+        .client
+        .get(format!("{base}/api/projects/{project_id}/models"))
+        .header("cookie", &fixture.server.cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 200);
+    resp.json().await.unwrap()
+}
+
+#[tokio::test]
+async fn project_models_carry_harness_capabilities() {
+    let fixture = spawn_project(|_| {
+        factory::from_fn(|_, _| Ok(giskard_testenv::fake::FakeHarness::new(ResumableOnlyScript)))
+    })
+    .await;
+    let body = get_models(&fixture).await;
+
+    let caps = &body["capabilities"];
+    assert_eq!(caps["plan_build_modes"], false, "{body}");
+    assert_eq!(caps["per_turn_model"], false, "{body}");
+    assert_eq!(caps["reasoning_effort"], false, "{body}");
+    assert_eq!(caps["context_compaction"], false, "{body}");
+    assert_eq!(caps["live_approvals"], false, "{body}");
+    assert_eq!(caps["resumable_threads"], true, "{body}");
+    let keys = [
+        "live_approvals",
+        "plan_build_modes",
+        "per_turn_model",
+        "reasoning_effort",
+        "structured_diffs",
+        "resumable_threads",
+        "model_listing",
+        "provider_listing",
+        "token_usage",
+        "mcp_status",
+        "mcp_reload",
+        "mcp_oauth_login",
+        "context_compaction",
+        "turn_steering",
+    ];
+    let object = caps.as_object().expect("capabilities is an object");
+    assert_eq!(object.len(), keys.len(), "{body}");
+    for key in keys {
+        assert!(object.contains_key(key), "capability {key} missing: {body}");
+    }
+}
+
+#[tokio::test]
+async fn project_models_omit_capabilities_when_the_harness_cannot_start() {
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let counted = attempts.clone();
+    let fixture = spawn_project(move |_| {
+        factory::from_fn(move |_, _| {
+            counted.fetch_add(1, Ordering::SeqCst);
+            Err(HarnessError::Spawn("boom".into()))
+        })
+    })
+    .await;
+    let before = attempts.load(Ordering::SeqCst);
+    let body = get_models(&fixture).await;
+
+    // The refresh resolves the harness for its provider table and its metadata overlay, and the
+    // capabilities come from the overlay's attempt: reading them must not spawn a third time.
+    assert_eq!(
+        attempts.load(Ordering::SeqCst) - before,
+        2,
+        "capabilities must reuse the refresh's harness resolution"
+    );
+    assert!(body.get("capabilities").is_none(), "{body}");
+    let warnings = body["warnings"].as_array().expect("warnings present");
+    assert!(
+        warnings.iter().any(|w| w["source"]
+            .as_str()
+            .is_some_and(|source| source.starts_with("harness:"))),
+        "a harness warning explains the missing capabilities: {body}"
+    );
 }

@@ -704,6 +704,31 @@ pub struct ListModelsResponse {
     /// Non-fatal provider or harness listing failures (empty for the static listing).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub warnings: Vec<ModelListingWarning>,
+    /// The project harness's capabilities, when it answered. Absent when the harness could not be
+    /// reached; `warnings` then carries a `harness:<kind>` entry saying why.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capabilities: Option<HarnessCapabilitiesInfo>,
+}
+
+/// The capability flags of a project's harness (spec §4.2), mirrored for the browser so it can
+/// gate its controls (§13.5). A mirror rather than the harness type itself: this crate holds wire
+/// shapes and depends on `giskard-core` alone.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HarnessCapabilitiesInfo {
+    pub live_approvals: bool,
+    pub plan_build_modes: bool,
+    pub per_turn_model: bool,
+    pub reasoning_effort: bool,
+    pub structured_diffs: bool,
+    pub resumable_threads: bool,
+    pub model_listing: bool,
+    pub provider_listing: bool,
+    pub token_usage: bool,
+    pub mcp_status: bool,
+    pub mcp_reload: bool,
+    pub mcp_oauth_login: bool,
+    pub context_compaction: bool,
+    pub turn_steering: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]

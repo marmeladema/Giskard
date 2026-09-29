@@ -175,7 +175,7 @@ let state = {
   // are dropped only when the thread they belong to is left (see clearReasoningChoices).
   reasoningChoicesByRowKey:new Map(),
   linkifyCache:new Map(), markdownCache:new Map(), codePath:null, codeLine:null, codeOverlaySource:null, outputOverlay:null, outputOverlayRequestSeq:0, activeTurn:false, turnSteering:false, pendingSteer:null, interruptPending:false, compactPending:false,
-  awaitingInitialThreadState:false, awaitingThreadResync:false, awaitingIncrementalResync:false, resyncStickBottom:false, contextWindow:0, contextUsed:null, permissionPreset:"ask_first", currentModel:null,
+  awaitingInitialThreadState:false, awaitingThreadResync:false, awaitingIncrementalResync:false, resyncStickBottom:false, contextWindow:0, contextUsed:null, permissionPreset:"ask_first", currentModel:null, harnessCapabilities:null,
   threadAuthorities:new Map(), pendingDetailConflictResyncs:new Set(),
   pendingMetadataActions:new Map(), threadListRefreshes:new Map(),
   pendingLiveSnapshotReconcile:false,
@@ -340,10 +340,18 @@ function projectModelCatalogReady() {
 function prepareProjectModelCatalog(pid) {
   if (state.modelsProject === pid) return;
   state.models = [];
+  state.harnessCapabilities = null;
   state.modelsProject = null;
   closeModelPicker();
   renderModelSelect();
   updateComposerControls();
+}
+// A flag is gated only when the harness answered. Unknown capabilities (no harness yet, or one
+// that could not be reached) leave every control as it is: the read-only paths already cover a
+// thread that cannot attach, and a draft must not lose its pickers to a transient failure.
+function harnessCan(flag) {
+  const caps = state.harnessCapabilities;
+  return !caps || caps[flag] !== false;
 }
 async function loadProjectModels(pid, opts) {
   opts = opts || {};
@@ -362,6 +370,7 @@ async function loadProjectModels(pid, opts) {
     const res = await api("GET", `/api/projects/${pid}/models`);
     if (res && Array.isArray(res.models) && pid === state.projectId) {
       state.models = res.models;
+      state.harnessCapabilities = res.capabilities || null;
       state.modelsProject = pid;
       renderModelSelect();
       updateModelButton();
@@ -3010,12 +3019,24 @@ function updateComposerControls() {
   $("attachBtn").disabled = !attachmentInputAllowed;
   const modelCatalogReady = projectModelCatalogReady();
   const modelMutationPending = !draft && pendingMetadataGroup(state.threadId, "model");
-  $("modelSel").disabled = managedReadOnly || !hasThreadSurface || !modelCatalogReady || modelMutationPending || (!ready && !draft);
-  $("modelPickerBtn").disabled = managedReadOnly || !hasThreadSurface || !modelCatalogReady || modelMutationPending || (!ready && !draft);
-  $("effortSel").disabled = managedReadOnly || !hasThreadSurface || !modelCatalogReady || modelMutationPending || (!ready && !draft);
+  // A harness without per-turn model changes fixes the model when the thread is created; a draft
+  // has not been created yet, so it keeps its picker.
+  const modelFixed = !draft && !harnessCan("per_turn_model");
+  const modelControlsDisabled = managedReadOnly || !hasThreadSurface || !modelCatalogReady ||
+    modelMutationPending || (!ready && !draft) || modelFixed;
+  $("modelSel").disabled = modelControlsDisabled;
+  $("modelPickerBtn").disabled = modelControlsDisabled;
+  $("effortSel").disabled = modelControlsDisabled;
+  $("modelPickerBtn").title = modelFixed
+    ? "This harness fixes the model when a thread is created."
+    : "Model & reasoning effort for this thread";
   const compactBtn = $("compactBtn");
   if (compactBtn) {
-    compactBtn.disabled = managedReadOnly || !state.threadId || draft || state.activeTurn || state.compactPending || !ready;
+    const compactSupported = harnessCan("context_compaction");
+    compactBtn.disabled = managedReadOnly || !state.threadId || draft || state.activeTurn || state.compactPending || !ready || !compactSupported;
+    compactBtn.title = compactSupported
+      ? "Compact this thread's context"
+      : "This harness does not support context compaction.";
     compactBtn.textContent = state.compactPending ? "Compacting..." : "Compact context";
   }
   $("input").disabled = !hasThreadSurface || readOnly;
@@ -3033,6 +3054,17 @@ function updateComposerControls() {
     (!draft && pendingMetadataGroup(state.threadId, "permission")) || (!ready && !draft);
   $("modeSel").disabled = managedReadOnly || !hasThreadSurface ||
     (!draft && pendingMetadataGroup(state.threadId, "mode")) || (!ready && !draft);
+  const planBuildModes = harnessCan("plan_build_modes");
+  $("modeField").hidden = !planBuildModes;
+  // A draft on a harness without Plan/Build starts in `build` (S7). An existing thread's mode is
+  // left to the server, which already resolves it.
+  if (draft && !planBuildModes && state.mode !== "build") setMode("build");
+  const liveApprovals = harnessCan("live_approvals");
+  $("presetAskFirst").disabled = !liveApprovals;
+  // Chromium and WebKit render no tooltip for an <option> inside a native select, so the reason a
+  // greyed "Ask first" is unavailable goes on the select itself.
+  if (liveApprovals) $("permissionPresetSel").removeAttribute("title");
+  else $("permissionPresetSel").title = "This harness cannot route approvals to the browser.";
   $("turnPickerBtn").disabled = !hasThreadSurface || (!ready && !draft);
 }
 function setTurnActive(active) {
@@ -10533,7 +10565,7 @@ function syncEffortControl() {
   const desc = model ? findModelDescriptor(model.provider, model.model) : null;
   const efforts = effortOptionsForModel(desc);
   sel.innerHTML = "";
-  if (!efforts.length) {
+  if (!efforts.length || !harnessCan("reasoning_effort")) {
     control.hidden = true;
     return;
   }

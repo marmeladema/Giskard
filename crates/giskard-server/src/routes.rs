@@ -27,7 +27,7 @@ use giskard_git_parser::{
     GitNumstatEntry, apply_numstat_counts, index_numstat, parse_git_log_numstat,
     parse_git_name_status, parse_git_numstat, parse_git_ref_listing, parse_git_status,
 };
-use giskard_harness::HarnessProvider;
+use giskard_harness::{HarnessCapabilities, HarnessProvider};
 use giskard_persist::Config;
 use giskard_persist::store::{
     ProjectConfig, ThreadFile, ThreadGitWorkspace, ThreadRecency, ThreadWorktree,
@@ -3866,8 +3866,55 @@ async fn project_list_models(
         .await?
         .ok_or(ApiError::NotFound)?;
     let config = state.store.load_config().await?;
-    let (models, warnings) = refresh_project_model_catalog(&state, &project_config, &config).await;
-    Ok(Json(ListModelsResponse { models, warnings }))
+    let RefreshedCatalog {
+        models,
+        warnings,
+        capabilities,
+    } = refresh_project_model_catalog(&state, &project_config, &config).await;
+    // Capabilities come from the harness the refresh already resolved rather than a second
+    // get-or-create: when the harness cannot start, that would be one more spawn attempt per
+    // picker load. `None` here means the refresh reported the harness in `warnings`.
+    Ok(Json(ListModelsResponse {
+        models,
+        warnings,
+        capabilities: capabilities.map(capabilities_info),
+    }))
+}
+
+fn capabilities_info(caps: HarnessCapabilities) -> HarnessCapabilitiesInfo {
+    // Destructured exhaustively so a flag added to the harness type cannot be forgotten here.
+    let HarnessCapabilities {
+        live_approvals,
+        plan_build_modes,
+        per_turn_model,
+        reasoning_effort,
+        structured_diffs,
+        resumable_threads,
+        model_listing,
+        provider_listing,
+        token_usage,
+        mcp_status,
+        mcp_reload,
+        mcp_oauth_login,
+        context_compaction,
+        turn_steering,
+    } = caps;
+    HarnessCapabilitiesInfo {
+        live_approvals,
+        plan_build_modes,
+        per_turn_model,
+        reasoning_effort,
+        structured_diffs,
+        resumable_threads,
+        model_listing,
+        provider_listing,
+        token_usage,
+        mcp_status,
+        mcp_reload,
+        mcp_oauth_login,
+        context_compaction,
+        turn_steering,
+    }
 }
 
 /// Return the last catalog fetched for this project, refreshing it on demand when a client starts
@@ -3884,7 +3931,7 @@ pub(crate) async fn project_model_catalog(
     }
     refresh_project_model_catalog(state, project_config, config)
         .await
-        .0
+        .models
 }
 
 /// Normalize a persisted thread's selected model and repair its context-window cache while holding
@@ -3922,11 +3969,20 @@ pub(crate) async fn normalize_persisted_thread_model(
         .map(|mutation| mutation.into_current())
 }
 
+/// A freshly composed project catalog, with what the refresh learned about the harness on the way.
+struct RefreshedCatalog {
+    models: Vec<ModelDescriptor>,
+    warnings: Vec<ModelListingWarning>,
+    /// The capabilities of the harness the refresh reached; `None` when it could not be created,
+    /// in which case `warnings` carries a `harness:<kind>` entry saying why.
+    capabilities: Option<HarnessCapabilities>,
+}
+
 async fn refresh_project_model_catalog(
     state: &AppState,
     project_config: &ProjectConfig,
     config: &Config,
-) -> (Vec<ModelDescriptor>, Vec<ModelListingWarning>) {
+) -> RefreshedCatalog {
     let (harness_providers, mut warnings) = harness_provider_table(state, project_config).await;
     // Only an answered table can convict a configured id of being unknown. When the harness cannot
     // say, every id is unverified rather than wrong, and discovery simply does not run.
@@ -3985,7 +4041,7 @@ async fn refresh_project_model_catalog(
     )
     .await;
     warnings.extend(discovery.warnings);
-    let (composed, harness_warning) = overlay_harness_metadata(
+    let (composed, harness_warning, capabilities) = overlay_harness_metadata(
         state,
         project_config,
         config,
@@ -4022,7 +4078,11 @@ async fn refresh_project_model_catalog(
         .registry
         .replace_project_model_catalog(project_config, models.clone())
         .await;
-    (models, warnings)
+    RefreshedCatalog {
+        models,
+        warnings,
+        capabilities,
+    }
 }
 
 /// Read the providers the project's harness is configured to route to (§8.2).
@@ -4079,14 +4139,19 @@ async fn harness_provider_table(
 /// Overlay the project harness's model metadata (friendly names + advertised reasoning efforts) onto
 /// `base` when the harness supports model listing. Best-effort: capability or listing failures are
 /// logged and leave `base` unchanged, so a non-Codex harness (or a Codex process that can't answer)
-/// just yields config/discovered metadata.
+/// just yields config/discovered metadata. Also returns the capabilities of the harness it reached,
+/// or `None` when the harness could not be created.
 async fn overlay_harness_metadata(
     state: &AppState,
     project_config: &ProjectConfig,
     config: &Config,
     base: Vec<ModelDescriptor>,
     efforts_from_discovery: &std::collections::HashSet<(String, String)>,
-) -> (Vec<ModelDescriptor>, Option<ModelListingWarning>) {
+) -> (
+    Vec<ModelDescriptor>,
+    Option<ModelListingWarning>,
+    Option<HarnessCapabilities>,
+) {
     let harness = match state.registry.harness(project_config).await {
         Ok(harness) => harness,
         Err(e) => {
@@ -4102,11 +4167,13 @@ async fn overlay_harness_metadata(
                     source: format!("harness:{}", project_config.harness),
                     message: format!("could not read model-listing capabilities: {e}"),
                 }),
+                None,
             );
         }
     };
-    if !harness.capabilities().model_listing {
-        return (base, None);
+    let capabilities = harness.capabilities();
+    if !capabilities.model_listing {
+        return (base, None, Some(capabilities));
     }
     match harness.list_models().await {
         Ok(harness_models) => (
@@ -4117,6 +4184,7 @@ async fn overlay_harness_metadata(
                 efforts_from_discovery,
             ),
             None,
+            Some(capabilities),
         ),
         Err(e) => {
             warn!(
@@ -4131,6 +4199,7 @@ async fn overlay_harness_metadata(
                     source: format!("harness:{}", project_config.harness),
                     message: format!("model listing failed: {e}"),
                 }),
+                Some(capabilities),
             )
         }
     }
