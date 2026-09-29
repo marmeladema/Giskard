@@ -1084,9 +1084,6 @@ secure_cookies = false
 [auth]
 password_hash = "{password_hash}"
 
-[harness]
-kind = "replay"
-
 [providers.replay]
 model_listing = false
   [[providers.replay.models]]

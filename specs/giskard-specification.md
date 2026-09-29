@@ -4386,10 +4386,6 @@ model_listing = false           # opt out — e.g. an endpoint with no /models r
   id = "@cf/z-ai/glm-4.7"
   context_window = 131072
   # display_name / supports_reasoning_effort may be set to override the harness catalog (§8.3)
-
-[harness]
-kind = "codex"
-idle_shutdown_secs = 0          # 0 ⇒ keep alive while app runs
 ```
 
 ### Appendix D — Open items to confirm during implementation

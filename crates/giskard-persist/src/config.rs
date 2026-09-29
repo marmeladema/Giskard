@@ -21,7 +21,6 @@ pub struct Config {
     /// order is the model picker's order (§8.3): a hashed order would reshuffle the picker on
     /// every restart and change which model a draft starts on when none is marked default.
     pub providers: IndexMap<String, ProviderConfig>,
-    pub harness: HarnessConfig,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -258,22 +257,6 @@ pub struct ModelConfig {
     pub supports_reasoning_effort: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
-pub struct HarnessConfig {
-    pub kind: String,
-    pub idle_shutdown_secs: u64,
-}
-
-impl Default for HarnessConfig {
-    fn default() -> Self {
-        Self {
-            kind: "codex".into(),
-            idle_shutdown_secs: 0,
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -343,10 +326,6 @@ model_listing = true
   display_name = "GLM-4.7 (Workers AI)"
   context_window = 131072
   supports_reasoning_effort = false
-
-[harness]
-kind = "codex"
-idle_shutdown_secs = 0
 "#;
         let config: Config = toml::from_str(toml).unwrap();
         assert_eq!(config.server.bind, "127.0.0.1:8787");
@@ -363,7 +342,6 @@ idle_shutdown_secs = 0
         let litellm = &config.providers["cloudflare-litellm"];
         assert_eq!(litellm.models[0].id, "@cf/z-ai/glm-4.7");
         assert!(!litellm.models[0].supports_reasoning_effort);
-        assert_eq!(config.harness.kind, "codex");
     }
 
     /// Two providers with the same routing id is a config mistake, and keying the table by id
@@ -452,14 +430,29 @@ model_listing = true
             RetentionConfig::DEFAULT_MAX_COMMAND_OUTPUT_BYTES
         );
         assert!(config.providers.is_empty());
-        assert_eq!(config.harness.kind, "codex");
+    }
+
+    /// A `config.toml` written before the `[harness]` section was removed keeps parsing: `Config`
+    /// ignores unknown tables, so the stale section is dropped rather than refusing startup.
+    #[test]
+    fn a_removed_harness_table_is_ignored() {
+        let config: Config =
+            toml::from_str("[harness]\nkind = \"codex\"\nidle_shutdown_secs = 0\n").unwrap();
+        let defaults = Config::default();
+        assert_eq!(config.server.bind, defaults.server.bind);
+        assert_eq!(config.server.secure_cookies, defaults.server.secure_cookies);
+        assert_eq!(config.auth.session_days, defaults.auth.session_days);
+        assert!(config.providers.is_empty());
+        assert_eq!(
+            config.retention.max_command_output_bytes,
+            defaults.retention.max_command_output_bytes
+        );
     }
 
     #[test]
     fn empty_config_uses_defaults() {
         let config: Config = toml::from_str("").unwrap();
         assert_eq!(config.server.bind, "127.0.0.1:8787");
-        assert_eq!(config.harness.kind, "codex");
         assert_eq!(
             config.retention.max_command_output_bytes,
             RetentionConfig::DEFAULT_MAX_COMMAND_OUTPUT_BYTES
@@ -530,7 +523,6 @@ roots = []
         assert_eq!(config.server.bind, "127.0.0.1:8787");
         // Example intentionally documents plain-HTTP local dev.
         assert!(!config.server.secure_cookies);
-        assert_eq!(config.harness.kind, "codex");
         assert_eq!(
             config.retention.max_command_output_bytes,
             RetentionConfig::DEFAULT_MAX_COMMAND_OUTPUT_BYTES
