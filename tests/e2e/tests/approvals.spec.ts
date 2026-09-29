@@ -17,7 +17,7 @@ test("a path-free file approval keeps grant root separate from changed files", a
   const approval = page.locator("#transcript .msg.approval");
   await expect(approval.locator(".approval-title")).toHaveText("Apply file changes?");
   await expect(approval.locator(".approval-detail")).toHaveText(
-    "File list was not provided by Codex.",
+    "File list was not provided by the harness.",
   );
   await expect(approval.locator(".approval-detail")).not.toContainText("modified");
   const metadata = approval.locator(".approval-meta-row");

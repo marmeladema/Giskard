@@ -1917,8 +1917,8 @@ function threadDescendantIds(pid, tid) {
 async function deleteThread(pid, tid, title) {
   const descendants = threadDescendantIds(pid, tid);
   const cascade = descendants.length
-    ? `, its ${descendants.length} linked sub-agent thread${descendants.length === 1 ? "" : "s"}, and all corresponding Codex threads`
-    : " and its corresponding Codex thread";
+    ? `, its ${descendants.length} linked sub-agent thread${descendants.length === 1 ? "" : "s"}, and all corresponding harness threads`
+    : " and its corresponding harness thread";
   // Open the modal instead of a native confirm() so the user gets the same confirmation card
   // style as project removal. The cascade description is mirrored into the dialog content.
   openRemoveThreadModal(pid, tid, title, cascade);
@@ -4687,7 +4687,7 @@ function approvalDetail(request) {
     return kind.command || "(empty command)";
   }
   if (kind.kind==="file_change") {
-    if (!kind.path) return "File list was not provided by Codex.";
+    if (!kind.path) return "File list was not provided by the harness.";
     return [kind.change, kind.path].filter(Boolean).join(" ");
   }
   if (kind.kind==="permission") return kind.detail || "";
@@ -4915,7 +4915,7 @@ function serverRequestTitle(request) {
   if (method === "item/tool/call") return "Tool call needs a browser response";
   if (method === "item/tool/requestUserInput") return "Agent needs your answer";
   if (method === "mcpServer/elicitation/request") return "MCP server needs input";
-  return "Codex server request";
+  return "Harness server request";
 }
 function serverRequestPrompt(request) {
   const p = objectValue(request.params);
@@ -5934,7 +5934,7 @@ function renderCommandBody(body, cmd) {
   term.className = "danger";
   term.textContent = cmd.terminating ? "Stop requested" : "Stop";
   term.disabled = cmd.terminating || !cmd.processId;
-  term.title = cmd.processId ? "Ask Codex to stop this running command" : "No process id available";
+  term.title = cmd.processId ? "Ask the harness to stop this running command" : "No process id available";
   term.onclick = (e) => { e.stopPropagation(); terminateCommand(cmd.id); };
   actions.append(term);
   head.append(title, status, actions);
@@ -7136,7 +7136,7 @@ function renderTaskCards(box, cmds, emptyText) {
     term.textContent = cmd.terminating ? "Stop requested" : "Stop";
     // Commands stop by process id; tools have no process, so stopping interrupts the owning turn.
     term.disabled = cmd.terminating || (cmd.kind !== "tool" && !cmd.processId);
-    term.title = cmd.kind === "tool" ? "Interrupt the turn running this tool call" : (cmd.processId ? "Ask Codex to stop this running command" : "No process id available");
+    term.title = cmd.kind === "tool" ? "Interrupt the turn running this tool call" : (cmd.processId ? "Ask the harness to stop this running command" : "No process id available");
     term.onclick = (e) => { e.stopPropagation(); stopTask(cmd.id); };
     actions.append(term);
     row.append(title, meta, actions);
@@ -8812,7 +8812,7 @@ function renderMcpMenu() {
       ? `<div class="muted">MCP status is not supported by this harness.</div>`
     : state.mcpLoading && !state.mcpServers.length
       ? `<div class="muted">Loading MCP servers...</div>`
-      : rows || `<div class="muted">No MCP servers reported by Codex.</div>`;
+      : rows || `<div class="muted">No MCP servers reported by the harness.</div>`;
   menu.innerHTML = `
     <div class="mcp-head">
       <strong>MCP Servers</strong>
@@ -10707,7 +10707,7 @@ function renderUsageMenu() {
     </div>
     <div class="usage-section">
       <div class="usage-section-title">Actions</div>
-      <button id="compactBtn" class="btn" type="button" title="Compact this thread's Codex context">Compact context</button>
+      <button id="compactBtn" class="btn" type="button" title="Compact this thread's context">Compact context</button>
     </div>
     <div class="usage-section">
       <div class="usage-section-title">Cumulative Tokens</div>
