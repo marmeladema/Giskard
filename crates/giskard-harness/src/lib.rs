@@ -5,6 +5,7 @@ pub use event_log::{EVENT_LOG_RETAIN_LIMIT, EventLog, EventLogReader, EventStrea
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -76,6 +77,51 @@ pub struct HarnessProvider {
     pub auth: Option<ProviderAuth>,
     /// Additional headers the harness applies to requests for this provider.
     pub http_headers: ProviderHttpHeaders,
+    /// The reporting instance's environment overlay. Env-backed keys, env-backed headers, and auth
+    /// commands resolve through it so discovery sees names the way the instance's processes do.
+    pub env: EnvOverlay,
+}
+
+/// A harness instance's environment overlay: the declaration's variables over Giskard's own.
+/// Cheap to clone; every `HarnessProvider` an instance reports carries one so discovery resolves
+/// names the way the instance's processes see them.
+#[derive(Clone, Default, PartialEq, Eq)]
+pub struct EnvOverlay(Arc<Vec<(String, String)>>);
+
+impl EnvOverlay {
+    pub fn new(entries: impl IntoIterator<Item = (String, String)>) -> Self {
+        Self(Arc::new(entries.into_iter().collect()))
+    }
+
+    /// The overlay's value first, then the process environment.
+    pub fn var(&self, name: &str) -> Option<String> {
+        match self.0.iter().rev().find(|(key, _)| key == name) {
+            Some((_, value)) => Some(value.clone()),
+            None => std::env::var(name).ok(),
+        }
+    }
+
+    pub fn entries(&self) -> &[(String, String)] {
+        &self.0
+    }
+
+    /// The overlay's variable names, for logs; never the values.
+    pub fn names(&self) -> Vec<&str> {
+        self.0.iter().map(|(name, _)| name.as_str()).collect()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+impl std::fmt::Debug for EnvOverlay {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("EnvOverlay")
+            .field("names", &self.names())
+            .finish()
+    }
 }
 
 /// Provider request headers inherited from the harness configuration.
@@ -202,13 +248,13 @@ impl HarnessProvider {
         match self.auth.as_ref() {
             None => Ok(None),
             // An unset variable and one holding only whitespace mean the same thing.
-            Some(ProviderAuth::Env(var)) => match std::env::var(var).ok() {
+            Some(ProviderAuth::Env(var)) => match self.env.var(var) {
                 None => Ok(None),
                 Some(value) => usable_token(value.trim()).map_err(|tail| {
                     ProviderAuthError::env(var, format!("holds a value that {tail}"))
                 }),
             },
-            Some(ProviderAuth::Command(auth)) => run_auth_command(auth).await.map(Some),
+            Some(ProviderAuth::Command(auth)) => run_auth_command(auth, &self.env).await.map(Some),
         }
     }
 }
@@ -245,7 +291,10 @@ fn truncated_stderr(stderr: &[u8]) -> Option<String> {
     Some(format!("{}…", &text[..cut]))
 }
 
-async fn run_auth_command(auth: &ProviderAuthCommand) -> Result<String, ProviderAuthError> {
+async fn run_auth_command(
+    auth: &ProviderAuthCommand,
+    overlay: &EnvOverlay,
+) -> Result<String, ProviderAuthError> {
     // The arguments are not logged: they are a credential helper's invocation, and a helper that
     // takes its secret as an argument would otherwise put it in the log. The count is enough to
     // tell one configured provider's command from another.
@@ -258,8 +307,11 @@ async fn run_auth_command(auth: &ProviderAuthCommand) -> Result<String, Provider
     );
     let started = std::time::Instant::now();
     let mut command = tokio::process::Command::new(&auth.command);
+    // The overlay is applied over the inherited environment, not in place of it, so a helper
+    // still sees `PATH` and `HOME`.
     command
         .args(&auth.args)
+        .envs(overlay.entries().iter().map(|(name, value)| (name, value)))
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -741,6 +793,7 @@ mod tests {
                 timeout,
             })),
             http_headers: ProviderHttpHeaders::default(),
+            env: EnvOverlay::default(),
         }
     }
 
@@ -875,7 +928,67 @@ mod tests {
             base_url: None,
             auth: Some(ProviderAuth::Env(var.into())),
             http_headers: ProviderHttpHeaders::default(),
+            env: EnvOverlay::default(),
         }
+    }
+
+    /// A variable only the instance's declaration supplies is still found: discovery resolves names
+    /// the way the instance's processes see them.
+    #[tokio::test]
+    async fn an_overlay_value_wins_over_an_unset_variable() {
+        let mut provider = env_provider("GISKARD_TEST_OVERLAY_ONLY_KEY");
+        assert_eq!(provider.resolve_api_key().await.unwrap(), None);
+        provider.env = EnvOverlay::new([(
+            "GISKARD_TEST_OVERLAY_ONLY_KEY".to_string(),
+            "overlay-key".to_string(),
+        )]);
+        assert_eq!(
+            provider.resolve_api_key().await.unwrap(),
+            Some("overlay-key".to_string())
+        );
+    }
+
+    /// A key from Giskard's own shell must not be sent for an instance that declares a different
+    /// one. `GISKARD_TEST_DISCOVERY_KEY` is supplied by `.cargo/config.toml`.
+    #[tokio::test]
+    async fn an_overlay_value_wins_over_a_set_variable() {
+        let mut provider = env_provider("GISKARD_TEST_DISCOVERY_KEY");
+        assert_eq!(
+            provider.resolve_api_key().await.unwrap(),
+            Some("secret-key".to_string())
+        );
+        provider.env = EnvOverlay::new([(
+            "GISKARD_TEST_DISCOVERY_KEY".to_string(),
+            "instance-key".to_string(),
+        )]);
+        assert_eq!(
+            provider.resolve_api_key().await.unwrap(),
+            Some("instance-key".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn the_auth_command_sees_the_overlay() {
+        let mut provider = command_provider(
+            &["-c", "printf %s \"$GISKARD_TEST_OVERLAY_TOKEN\""],
+            Duration::from_secs(5),
+        );
+        provider.env = EnvOverlay::new([(
+            "GISKARD_TEST_OVERLAY_TOKEN".to_string(),
+            "overlay-token".to_string(),
+        )]);
+        assert_eq!(
+            provider.resolve_api_key().await.unwrap(),
+            Some("overlay-token".to_string())
+        );
+    }
+
+    #[test]
+    fn env_overlay_debug_prints_names_only() {
+        let overlay = EnvOverlay::new([("CODEX_HOME".to_string(), "/secret/home".to_string())]);
+        let debug = format!("{overlay:?}");
+        assert!(debug.contains("CODEX_HOME"), "{debug}");
+        assert!(!debug.contains("/secret/home"), "{debug}");
     }
 
     /// An environment-supplied key gets the same treatment as a command's stdout: a variable set
@@ -929,6 +1042,7 @@ mod tests {
             base_url: None,
             auth: None,
             http_headers: ProviderHttpHeaders::default(),
+            env: EnvOverlay::default(),
         };
         assert_eq!(provider.resolve_api_key().await.unwrap(), None);
     }
