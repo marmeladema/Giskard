@@ -9,7 +9,20 @@
 
 **Document status:** Implementation-ready specification.
 **Audience:** An AI coding agent (and its human reviewer) implementing the system.
-**Version:** 1.96
+**Version:** 1.97
+
+> **Amendment — harness declarations (1.97).** `config.toml` may declare named harnesses as
+> `[harnesses.<name>]` tables carrying a `kind`, an optional `default`, `command`, `args`, an `env`
+> overlay, and kind-specific keys (Codex: `profile`) that the kind's adapter type-checks at boot.
+> At most one declaration is marked `default`; with none marked, the first declared is. An absent
+> table synthesizes one declaration named `codex` of kind `codex`; declaring the table replaces
+> it. Every declaration is validated before the server listens. A project names its declaration
+> in `project.json`'s `harness`, stamped at creation with the declaration the user picked when more
+> than one is declared, or the default otherwise; a name no longer declared opens the project's
+> threads read-only and refuses new ones, naming `[harnesses]`. The declaration's environment
+> overlay applies to every process the instance spawns and to Giskard's own discovery on its
+> behalf: env-backed keys, env-backed headers, and auth commands resolve through it before
+> Giskard's own environment (§8.2).
 
 > **Amendment — harness instances (1.96).** A harness *instance* is one `AgentHarness` value per
 > working context, created lazily and shut down as a unit; how many operating-system processes
@@ -1616,7 +1629,7 @@ Robot series). The Cargo workspace uses `giskard-*` crate names throughout (see 
 ```
 Config (global)
 └── Project (1 directory, 1 harness process)
-    ├── ProjectConfig (workspace root, harness kind, …)
+    ├── ProjectConfig (workspace root, harness declaration name, …)
     └── Thread (durable conversation)
         ├── ThreadState (mode, current model, permission preset, token totals, context window)
         └── Turn (initial user input → agent work + optional steering messages)
@@ -2441,7 +2454,7 @@ giskard/
 ├── projects.json               # index of projects (id, name, dir, created_at, order)
 ├── projects/
 │   └── <project_id>/
-│       ├── project.json        # ProjectConfig: workspace root, harness kind
+│       ├── project.json        # ProjectConfig: workspace root, harness declaration name
 │       ├── threads/
 │       │   └── <thread_id>/            # a thread is a directory (§5.4)
 │       │       ├── thread.json         # thread metadata, permission preset, token cache — no history
@@ -2485,7 +2498,7 @@ All defined in `giskard-core`, serialized by `giskard-persist`. Illustrative sha
   "id": "01J…",
   "name": "ostinato-radio",
   "dir": "/home/user/dev/ostinato-radio",
-  "harness": "codex",
+  "harness": "codex",                   // [harnesses.<name>] declaration, stamped at creation
   "workspace_root": null,               // null ⇒ defaults to `dir`
   // no default model: a new thread's starting model is derived from the project's catalog (§8.3).
   // A file written before that change still carries `default_model`; it is ignored on load and
@@ -2721,8 +2734,10 @@ This section exists so the migration path is pre-approved; do **not** implement 
 ### 6.1 Project creation
 
 Flow: user clicks "New project" → names it → picks a directory via the file browser (§6.2)
-→ optionally sets workspace root → confirm. No model is chosen here: the project has no harness
-yet, so there is no catalog to choose from (§8.3).
+→ optionally sets workspace root → picks a declared harness when more than one is declared, the
+default otherwise (§16.3 `[harnesses.<name>]`) → confirm. The chosen declaration name is stamped
+into `project.json` as `harness`; an undeclared name is refused. No model is chosen here: the
+project's harness is not running yet, so there is no catalog to choose from (§8.3).
 
 - The chosen directory may be **empty or existing, git or non-git** — all valid. No git
   requirement, no scaffolding.
@@ -3043,6 +3058,10 @@ through
 user to restate them. Restating them is not merely redundant: two copies of an endpoint drift,
 and the copy Giskard holds is not the one that routes turns. A harness that cannot introspect its
 own configuration reports nothing, and Giskard falls back to the declared list alone.
+
+Env-backed keys, env-backed headers, and auth commands resolve through the instance's declared
+environment overlay (`[harnesses.<name>.env]`) before Giskard's own environment, so discovery sees
+the variables the instance's processes see.
 
 Only the **location** of a key is read, never an inline secret. A harness reports either the name
 of an environment variable holding it, or a command whose stdout is the token (Codex's
@@ -4375,6 +4394,27 @@ cost_estimation = false
 [retention]
 # Completed command output above this limit retains a UTF-8-safe head and tail. Minimum: 32768.
 max_command_output_bytes = 134217728
+
+# Optional in full. Absent ⇒ one harness named `codex` of kind `codex`; declaring the table
+# replaces that synthesized entry, so keep one named `codex` for projects created before it.
+# The table key is the durable name a project stores in project.json (`harness`).
+# Validated at startup: a blank name, an unknown kind, two defaults, a blank command/profile, a bad
+# env name, or an unknown kind-specific key refuses to start, naming [harnesses.<name>].
+[harnesses.codex-stable]
+kind = "codex"
+default = true                  # at most one; with none marked, the first declared is the default
+# command = "codex"             # program to spawn; default `codex` on PATH. A bare name resolves on
+#                               # Giskard's PATH, never an `env` PATH: absolute for anything else
+# args = []                     # appended after `app-server --listen stdio://`
+
+[harnesses.codex-nightly]
+kind = "codex"
+command = "/opt/codex-nightly/bin/codex"
+profile = "nightly"             # Codex-only: `-c profile=<name>`
+  # applied over Giskard's environment for the instance's processes and for discovery on its
+  # behalf (§8.2); values are literal and never logged
+  [harnesses.codex-nightly.env]
+  CODEX_HOME = "/home/you/.codex-nightly"
 
 # Optional in full: discovery runs for every provider the harness reports, and the harness's own
 # catalog covers the provider it routes to (§8.3). A provider with neither contributes nothing.

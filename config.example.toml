@@ -76,6 +76,44 @@ page = 5
 # UTF-8-safe head and tail with an omission marker. Must be at least 32768 bytes (32 KiB).
 max_command_output_bytes = 134217728   # 128 MiB
 
+# ---- Harnesses ----
+# This whole section is OPTIONAL. Omitting it means exactly one harness, named `codex`, of kind
+# `codex`, launched as `codex` on PATH with Codex's own configuration — which is what every setup
+# had before this section existed.
+#
+# Declare harnesses to run more than one Codex side by side (a stable and a nightly build, or two
+# CODEX_HOMEs) and choose one per project in the new-project dialog. The rules:
+#   * The table key (`codex-stable` below) is the harness's name. It is durable: each project
+#     stores the name it was created on in its project.json, so renaming or removing a declaration
+#     leaves those projects' threads read-only until a declaration of that name exists again.
+#   * `default = true` may be set on at most one declaration. With none marked, the first declared
+#     one is the default. The default is what new projects get when no choice is made.
+#   * Declaring the table switches off the synthesized `codex`. Projects created before you
+#     declared it are stamped `codex`, so keep a declaration named `codex` for them to open.
+#   * `command` is the program to spawn (default: `codex` on PATH); `args` are appended after
+#     `app-server --listen stdio://`. A bare name is looked up on Giskard's own PATH, not on a
+#     PATH set in this declaration's `env`: use an absolute path for a binary that is not on
+#     Giskard's PATH, or the `codex` on Giskard's PATH runs instead, with no error.
+#   * `[harnesses.<name>.env]` is applied over Giskard's own environment for every process that
+#     instance spawns, and for Giskard's own model discovery on its behalf (env-backed keys,
+#     headers, and auth commands resolve through it first). Values are literal and are never
+#     logged; only the variable names are.
+#   * The only Codex-specific key is `profile`, passed as `-c profile=<name>`. Any other key is a
+#     startup error, as are a blank declaration name, an unknown `kind`, two defaults, a blank
+#     command or profile, and an environment variable name that is empty or contains `=`.
+# Declarations are read once at startup; restart giskard-server after editing them.
+#
+# [harnesses.codex-stable]
+# kind = "codex"
+# default = true
+#
+# [harnesses.codex-nightly]
+# kind = "codex"
+# command = "/opt/codex-nightly/bin/codex"
+# profile = "nightly"
+# [harnesses.codex-nightly.env]
+# CODEX_HOME = "/home/you/.codex-nightly"
+
 # ---- Providers ----
 # This whole section is OPTIONAL, and most setups need none of it.
 #
