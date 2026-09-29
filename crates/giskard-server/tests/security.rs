@@ -42,7 +42,14 @@ async fn security_headers_are_set_on_all_responses() {
     let js = attr_after(&index, "<script src=\"");
     let css = attr_after(&index, "<link rel=\"stylesheet\" href=\"");
 
-    for path in ["/", "/favicon.svg", &js, &css, "/api/projects"] {
+    for path in [
+        "/",
+        "/favicon.svg",
+        &js,
+        &css,
+        "/api/projects",
+        "/api/harnesses",
+    ] {
         let resp = client.get(format!("{base}{path}")).send().await.unwrap();
         let headers = resp.headers();
         let csp = headers
@@ -295,4 +302,184 @@ async fn create_project_is_confined_to_browse_roots() {
 
     let resp = create(allowed_path.to_string_lossy().to_string()).await;
     assert_eq!(resp.status(), 200);
+}
+
+/// A kind that records nothing and constructs nothing: these tests only create projects.
+struct StubKind(&'static str);
+
+#[async_trait::async_trait]
+impl giskard_server::HarnessKind for StubKind {
+    fn name(&self) -> &str {
+        self.0
+    }
+    fn validate(&self, _declaration: &giskard_persist::HarnessDeclaration) -> Result<(), String> {
+        Ok(())
+    }
+    async fn create(
+        &self,
+        _spec: giskard_server::HarnessInstanceSpec<'_>,
+        _bootstrap: giskard_harness::HarnessBootstrap,
+    ) -> Result<std::sync::Arc<dyn giskard_harness::AgentHarness>, HarnessError> {
+        Err(HarnessError::Unsupported(
+            "no harness in security tests".into(),
+        ))
+    }
+}
+
+/// A server whose factory declares `codex-stable` (default, second) and `codex-nightly` (first),
+/// so declaration order and the default are distinguishable.
+async fn start_two_harness_server() -> TestServer {
+    let config: giskard_persist::Config = toml::from_str(
+        r#"
+[harnesses.codex-nightly]
+kind = "codex"
+
+[harnesses.codex-stable]
+kind = "codex"
+default = true
+"#,
+    )
+    .unwrap();
+    let catalog = giskard_persist::HarnessCatalog::resolve(&config).unwrap();
+    let factory = giskard_server::HarnessKindFactory::new()
+        .register(std::sync::Arc::new(StubKind("codex")))
+        .unwrap()
+        .with_catalog(catalog);
+    factory.validate().unwrap();
+    TestServer::builder(std::sync::Arc::new(factory))
+        .start()
+        .await
+}
+
+async fn post_project(server: &TestServer, body: serde_json::Value) -> reqwest::Response {
+    server
+        .client
+        .post(server.url("/api/projects"))
+        .header("cookie", &server.cookie)
+        .json(&body)
+        .send()
+        .await
+        .unwrap()
+}
+
+async fn project_harness(server: &TestServer, id: &str) -> String {
+    let project: serde_json::Value = server
+        .client
+        .get(server.url(&format!("/api/projects/{id}")))
+        .header("cookie", &server.cookie)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    project["harness"].as_str().unwrap().to_string()
+}
+
+#[tokio::test]
+async fn create_project_stamps_the_requested_or_default_harness() {
+    let server = start_two_harness_server().await;
+    let dir = tempfile::TempDir::new().unwrap();
+    let dir = dir.path().to_string_lossy().to_string();
+
+    let resp = post_project(&server, serde_json::json!({"name": "a", "dir": dir})).await;
+    assert_eq!(resp.status(), 200);
+    let id = resp.json::<serde_json::Value>().await.unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(project_harness(&server, &id).await, "codex-stable");
+
+    let resp = post_project(
+        &server,
+        serde_json::json!({"name": "b", "dir": dir, "harness": "codex-nightly"}),
+    )
+    .await;
+    assert_eq!(resp.status(), 200);
+    let id = resp.json::<serde_json::Value>().await.unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert_eq!(project_harness(&server, &id).await, "codex-nightly");
+}
+
+#[tokio::test]
+async fn create_project_rejects_an_undeclared_harness() {
+    let server = start_two_harness_server().await;
+    let dir = tempfile::TempDir::new().unwrap();
+    let resp = post_project(
+        &server,
+        serde_json::json!({
+            "name": "c",
+            "dir": dir.path().to_string_lossy(),
+            "harness": "codex",
+        }),
+    )
+    .await;
+    assert_eq!(resp.status(), 400);
+    let body = resp.text().await.unwrap();
+    assert!(
+        body.contains("unknown harness \"codex\"") && body.contains("codex-nightly, codex-stable"),
+        "the refusal should name the declared list: {body}"
+    );
+    let projects: serde_json::Value = server
+        .client
+        .get(server.url("/api/projects"))
+        .header("cookie", &server.cookie)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(projects["projects"].as_array().unwrap().len(), 0);
+}
+
+#[tokio::test]
+async fn list_harnesses_returns_declarations_in_order_with_the_default_marked() {
+    let server = start_two_harness_server().await;
+    let resp = server
+        .client
+        .get(server.url("/api/harnesses"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), 401, "the route is protected");
+
+    let listed: serde_json::Value = server
+        .client
+        .get(server.url("/api/harnesses"))
+        .header("cookie", &server.cookie)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        listed,
+        serde_json::json!({"harnesses": [
+            {"name": "codex-nightly", "kind": "codex", "default": false},
+            {"name": "codex-stable", "kind": "codex", "default": true},
+        ]})
+    );
+}
+
+#[tokio::test]
+async fn list_harnesses_without_a_table_is_the_synthesized_codex() {
+    let server = start_server("").await;
+    let listed: serde_json::Value = server
+        .client
+        .get(server.url("/api/harnesses"))
+        .header("cookie", &server.cookie)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        listed,
+        serde_json::json!({"harnesses": [{"name": "codex", "kind": "codex", "default": true}]})
+    );
 }

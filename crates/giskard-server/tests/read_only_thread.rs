@@ -70,7 +70,10 @@ async fn open_read_only_thread(
     let path = proj_dir.path().to_string_lossy().to_string();
     let server = TestServer::builder(factory)
         .seed(move |store| async move {
-            store.create_project(pid, "proj", &path).await.unwrap();
+            store
+                .create_project(pid, "proj", &path, "codex")
+                .await
+                .unwrap();
             store
                 .save_thread(
                     pid,
@@ -162,7 +165,10 @@ async fn an_unreachable_harness_does_not_blame_the_provider_config() {
         "unknown provider: cloudflare-litellm".into(),
     )))
     .seed(move |store| async move {
-        store.create_project(pid, "proj", &path).await.unwrap();
+        store
+            .create_project(pid, "proj", &path, "codex")
+            .await
+            .unwrap();
         store
             .save_thread(
                 pid,

@@ -2481,7 +2481,7 @@ mod tests {
     async fn create_test_project(store: &PersistStore, name: &str) -> (ProjectId, ProjectConfig) {
         let project_id = ProjectId::new();
         store
-            .create_project(project_id, name, "/tmp/test")
+            .create_project(project_id, name, "/tmp/test", "codex")
             .await
             .unwrap();
         let config = store
@@ -3090,7 +3090,7 @@ mod tests {
         );
 
         store
-            .create_project(project, "discovery-recovery", "/tmp/test")
+            .create_project(project, "discovery-recovery", "/tmp/test", "codex")
             .await
             .unwrap();
         let admitted = ThreadId::new();
@@ -3134,7 +3134,7 @@ mod tests {
         let store = Arc::new(PersistStore::new(tmp.path().to_path_buf()));
         let project_id = ProjectId::new();
         store
-            .create_project(project_id, "proj", "/tmp/test")
+            .create_project(project_id, "proj", "/tmp/test", "codex")
             .await
             .unwrap();
         let harness = Arc::new(BindingOrderHarness {
@@ -3353,7 +3353,7 @@ mod tests {
         let store = Arc::new(PersistStore::new(tmp.path().to_path_buf()));
         let project_id = ProjectId::new();
         store
-            .create_project(project_id, "proj", "/tmp/test")
+            .create_project(project_id, "proj", "/tmp/test", "codex")
             .await
             .unwrap();
         let now = Utc::now();

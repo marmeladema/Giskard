@@ -1192,6 +1192,13 @@ async fn run(
         warn!(workspace = %workspace.display(), %error, "could not seed replay workspace git repository");
     }
 
+    let catalog = giskard_persist::HarnessCatalog::resolve(&config).map_err(|e| e.to_string())?;
+    let factory = HarnessKindFactory::new()
+        .register(Arc::new(ScriptedKind))
+        .map_err(|error| error.to_string())?
+        .with_catalog(catalog);
+    factory.validate().map_err(|error| error.to_string())?;
+
     let projects = store
         .load_project_index()
         .await
@@ -1202,6 +1209,7 @@ async fn run(
                 giskard_core::ids::ProjectId::new(),
                 "Demo",
                 &workspace.to_string_lossy(),
+                factory.catalog().default_name(),
             )
             .await
             .map_err(|e| format!("cannot seed demo project: {e}"))?;
@@ -1217,12 +1225,6 @@ async fn run(
             .map_err(|e| format!("cannot generate replay session key: {e}"))?;
     }
 
-    let catalog = giskard_persist::HarnessCatalog::resolve(&config).map_err(|e| e.to_string())?;
-    let factory = HarnessKindFactory::new()
-        .register(Arc::new(ScriptedKind))
-        .map_err(|error| error.to_string())?
-        .with_catalog(catalog);
-    factory.validate().map_err(|error| error.to_string())?;
     let factory = Arc::new(factory);
     let state = AppState::new_with_config(
         store,

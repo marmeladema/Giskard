@@ -3106,7 +3106,7 @@ mod tests {
             reasoning_effort: None,
         };
         store
-            .create_project(project_id, "proj", "/tmp/test")
+            .create_project(project_id, "proj", "/tmp/test", "codex")
             .await
             .unwrap();
         let now = Utc::now();
@@ -3237,7 +3237,7 @@ mod tests {
             reasoning_effort: None,
         };
         store
-            .create_project(project_id, "proj", "/tmp/test")
+            .create_project(project_id, "proj", "/tmp/test", "codex")
             .await
             .unwrap();
         let now = Utc::now();
@@ -3355,7 +3355,7 @@ mod tests {
             reasoning_effort: None,
         };
         store
-            .create_project(project_id, "proj", "/tmp/test")
+            .create_project(project_id, "proj", "/tmp/test", "codex")
             .await
             .unwrap();
         let now = Utc::now();
@@ -3729,7 +3729,7 @@ mod tests {
             reasoning_effort: None,
         };
         store
-            .create_project(project_id, "proj", "/tmp/test")
+            .create_project(project_id, "proj", "/tmp/test", "codex")
             .await
             .unwrap();
         let now = Utc::now();
@@ -3871,7 +3871,7 @@ mod tests {
             reasoning_effort: None,
         };
         store
-            .create_project(project_id, "proj", "/tmp/test")
+            .create_project(project_id, "proj", "/tmp/test", "codex")
             .await
             .unwrap();
         let now = Utc::now();
@@ -4016,7 +4016,7 @@ mod tests {
             reasoning_effort: None,
         };
         store
-            .create_project(project_id, "proj", "/tmp/test")
+            .create_project(project_id, "proj", "/tmp/test", "codex")
             .await
             .unwrap();
         let now = Utc::now();
@@ -4214,7 +4214,7 @@ mod tests {
             reasoning_effort: None,
         };
         store
-            .create_project(project_id, "proj", "/tmp/test")
+            .create_project(project_id, "proj", "/tmp/test", "codex")
             .await
             .unwrap();
         let now = Utc::now();
@@ -4383,7 +4383,7 @@ mod tests {
             reasoning_effort: None,
         };
         store
-            .create_project(project_id, "proj", "/tmp/test")
+            .create_project(project_id, "proj", "/tmp/test", "codex")
             .await
             .unwrap();
         let now = Utc::now();
@@ -4510,7 +4510,7 @@ mod tests {
             reasoning_effort: None,
         };
         store
-            .create_project(project_id, "proj", "/tmp/test")
+            .create_project(project_id, "proj", "/tmp/test", "codex")
             .await
             .unwrap();
         let now = Utc::now();
@@ -4665,7 +4665,7 @@ mod tests {
             reasoning_effort: None,
         };
         store
-            .create_project(project_id, "proj", "/tmp/test")
+            .create_project(project_id, "proj", "/tmp/test", "codex")
             .await
             .unwrap();
         let now = Utc::now();
@@ -4758,7 +4758,7 @@ mod tests {
             reasoning_effort: None,
         };
         store
-            .create_project(project_id, "proj", "/tmp/test")
+            .create_project(project_id, "proj", "/tmp/test", "codex")
             .await
             .unwrap();
         let now = Utc::now();
@@ -4909,7 +4909,7 @@ mod tests {
             reasoning_effort: None,
         };
         store
-            .create_project(project_id, "proj", "/tmp/test")
+            .create_project(project_id, "proj", "/tmp/test", "codex")
             .await
             .unwrap();
         let now = Utc::now();
@@ -5210,7 +5210,7 @@ mod tests {
             reasoning_effort: None,
         };
         store
-            .create_project(project_id, "proj", "/tmp/test")
+            .create_project(project_id, "proj", "/tmp/test", "codex")
             .await
             .unwrap();
         let now = Utc::now();
@@ -5352,7 +5352,7 @@ mod tests {
             reasoning_effort: None,
         };
         store
-            .create_project(project_id, "proj", "/tmp/test")
+            .create_project(project_id, "proj", "/tmp/test", "codex")
             .await
             .unwrap();
         let now = Utc::now();
@@ -5594,7 +5594,7 @@ mod tests {
             reasoning_effort: None,
         };
         store
-            .create_project(project_id, "proj", "/tmp/test")
+            .create_project(project_id, "proj", "/tmp/test", "codex")
             .await
             .unwrap();
         let now = Utc::now();
@@ -5862,7 +5862,7 @@ mod tests {
             reasoning_effort: None,
         };
         store
-            .create_project(project_id, "proj", "/tmp/test")
+            .create_project(project_id, "proj", "/tmp/test", "codex")
             .await
             .unwrap();
         let now = Utc::now();
@@ -6050,7 +6050,7 @@ mod tests {
             reasoning_effort: None,
         };
         store
-            .create_project(project_id, "proj", "/tmp/test")
+            .create_project(project_id, "proj", "/tmp/test", "codex")
             .await
             .unwrap();
         let now = Utc::now();
@@ -6248,7 +6248,7 @@ mod tests {
             reasoning_effort: None,
         };
         store
-            .create_project(project_id, "proj", "/tmp/test")
+            .create_project(project_id, "proj", "/tmp/test", "codex")
             .await
             .unwrap();
         let now = Utc::now();
@@ -6398,7 +6398,7 @@ mod tests {
             reasoning_effort: None,
         };
         store
-            .create_project(project_id, "proj", "/tmp/test")
+            .create_project(project_id, "proj", "/tmp/test", "codex")
             .await
             .unwrap();
         let now = Utc::now();

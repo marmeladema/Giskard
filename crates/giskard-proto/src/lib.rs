@@ -554,6 +554,23 @@ pub struct CreateProjectRequest {
     pub name: String,
     pub dir: String,
     pub workspace_root: Option<String>,
+    /// The `[harnesses.<name>]` declaration to create the project on. Omitted means the
+    /// declaration marked default.
+    #[serde(default)]
+    pub harness: Option<String>,
+}
+
+/// One declared harness, as `GET /api/harnesses` lists it.
+#[derive(Debug, Clone, Serialize)]
+pub struct HarnessDeclarationSummary {
+    pub name: String,
+    pub kind: String,
+    pub default: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ListHarnessesResponse {
+    pub harnesses: Vec<HarnessDeclarationSummary>,
 }
 
 #[derive(Debug, Clone, Serialize)]

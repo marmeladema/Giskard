@@ -62,7 +62,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = PersistStore::new(dir.path().to_path_buf());
         store
-            .create_project(ProjectId::new(), "test", "/tmp")
+            .create_project(ProjectId::new(), "test", "/tmp", "codex")
             .await
             .unwrap()
     }

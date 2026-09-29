@@ -314,7 +314,7 @@ mod tests {
         let store = PersistStore::new(dir.path().to_path_buf());
         let project_id = ProjectId::new();
         store
-            .create_project(project_id, "inheritance", "/repo")
+            .create_project(project_id, "inheritance", "/repo", "codex")
             .await
             .unwrap();
 
@@ -391,7 +391,7 @@ mod tests {
         let store = PersistStore::new(dir.path().to_path_buf());
         let project_id = ProjectId::new();
         store
-            .create_project(project_id, "workspace", "/project")
+            .create_project(project_id, "workspace", "/project", "codex")
             .await
             .unwrap();
         let mut project = store.load_project(project_id).await.unwrap().unwrap();
@@ -420,7 +420,7 @@ mod tests {
         let store = PersistStore::new(dir.path().to_path_buf());
         let project_id = ProjectId::new();
         store
-            .create_project(project_id, "workspace", "/project")
+            .create_project(project_id, "workspace", "/project", "codex")
             .await
             .unwrap();
         let mut project = store.load_project(project_id).await.unwrap().unwrap();
@@ -455,7 +455,7 @@ mod tests {
         let store = PersistStore::new(dir.path().to_path_buf());
         let project_id = ProjectId::new();
         store
-            .create_project(project_id, "workspace", "/project")
+            .create_project(project_id, "workspace", "/project", "codex")
             .await
             .unwrap();
         let mut project = store.load_project(project_id).await.unwrap().unwrap();

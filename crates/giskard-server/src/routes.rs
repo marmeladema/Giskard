@@ -79,6 +79,7 @@ pub(crate) async fn http_request_context_middleware(
 pub fn protected_routes(state: AppState) -> Router<AppState> {
     Router::new()
         .route("/api/projects", get(list_projects).post(create_project))
+        .route("/api/harnesses", get(list_harnesses))
         .route(
             "/api/projects/{id}",
             get(get_project).delete(delete_project),
@@ -430,7 +431,27 @@ async fn create_project(
     if let Some(ws_root) = &req.workspace_root {
         ensure_dir_within_browse_roots(ws_root, &config.browse.roots)?;
     }
-    state.store.create_project(id, &req.name, &req.dir).await?;
+    let catalog = state.registry.harness_catalog();
+    let harness = req
+        .harness
+        .as_deref()
+        .unwrap_or_else(|| catalog.default_name());
+    if catalog.get(harness).is_none() {
+        let declared = catalog.names().collect::<Vec<_>>().join(", ");
+        debug!(
+            harness,
+            declared = %declared,
+            action = "create_project",
+            "rejecting project creation on an undeclared harness"
+        );
+        return Err(ApiError::BadRequest(format!(
+            "unknown harness {harness:?}; declared: {declared}"
+        )));
+    }
+    state
+        .store
+        .create_project(id, &req.name, &req.dir, harness)
+        .await?;
 
     if let Some(ws_root) = &req.workspace_root {
         let mut config = state
@@ -443,6 +464,21 @@ async fn create_project(
     }
 
     Ok(Json(CreateProjectResponse { id }))
+}
+
+/// `GET /api/harnesses` — the declared harnesses in declaration order, the default marked.
+async fn list_harnesses(State(state): State<AppState>) -> Json<ListHarnessesResponse> {
+    let catalog = state.registry.harness_catalog();
+    Json(ListHarnessesResponse {
+        harnesses: catalog
+            .iter()
+            .map(|(name, declaration)| HarnessDeclarationSummary {
+                name: name.to_owned(),
+                kind: declaration.kind.clone(),
+                default: declaration.default,
+            })
+            .collect(),
+    })
 }
 
 async fn get_project(
@@ -2208,6 +2244,7 @@ mod tests {
                 project_id,
                 "runtime precedence",
                 &workspace.path().to_string_lossy(),
+                "codex",
             )
             .await
             .unwrap();

@@ -6934,7 +6934,7 @@ async fn open_thread_normalization_reuses_live_handle() {
     let pid = ProjectId::new();
     state
         .store
-        .create_project(pid, "test-project", "/tmp/test")
+        .create_project(pid, "test-project", "/tmp/test", "codex")
         .await
         .unwrap();
     let tid = ThreadId::new();
@@ -7017,7 +7017,7 @@ async fn concurrent_cold_opens_install_one_native_owner() {
     let project_id = ProjectId::new();
     state
         .store
-        .create_project(project_id, "test-project", "/tmp/test")
+        .create_project(project_id, "test-project", "/tmp/test", "codex")
         .await
         .unwrap();
     let config = state.store.load_project(project_id).await.unwrap().unwrap();
@@ -7058,7 +7058,7 @@ async fn concurrent_subagent_cold_opens_install_one_native_owner() {
     let project_id = ProjectId::new();
     state
         .store
-        .create_project(project_id, "test-project", "/tmp/test")
+        .create_project(project_id, "test-project", "/tmp/test", "codex")
         .await
         .unwrap();
     let config = state.store.load_project(project_id).await.unwrap().unwrap();

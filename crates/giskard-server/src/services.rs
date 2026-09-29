@@ -97,7 +97,7 @@ mod tests {
         let project_id = ProjectId::new();
         let thread_id = ThreadId::new();
         store
-            .create_project(project_id, "services", "/tmp/test")
+            .create_project(project_id, "services", "/tmp/test", "codex")
             .await
             .unwrap();
 

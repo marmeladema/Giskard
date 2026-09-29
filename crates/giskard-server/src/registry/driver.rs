@@ -1361,7 +1361,7 @@ mod tests {
 
     async fn persist_thread(store: &PersistStore, project_id: ProjectId, thread_id: ThreadId) {
         store
-            .create_project(project_id, "project", "/tmp/test")
+            .create_project(project_id, "project", "/tmp/test", "codex")
             .await
             .unwrap();
         let now = chrono::Utc::now();
@@ -1501,7 +1501,7 @@ mod tests {
         let (shared, harness, _driver, project_id, store, sink) = setup();
         let mut probe = sink.probe();
         store
-            .create_project(project_id, "project", "/tmp/test")
+            .create_project(project_id, "project", "/tmp/test", "codex")
             .await
             .unwrap();
         let discovered = ThreadId::new();
@@ -2039,7 +2039,7 @@ mod tests {
     async fn a_discovery_creates_a_hidden_orphan_and_its_owner() {
         let (shared, harness, _driver, project_id, store, _sink) = setup();
         store
-            .create_project(project_id, "project", "/tmp/test")
+            .create_project(project_id, "project", "/tmp/test", "codex")
             .await
             .unwrap();
         let thread = ThreadId::new();
@@ -2162,7 +2162,7 @@ mod tests {
     async fn an_invalid_link_still_records_the_claimed_identity_as_an_orphan() {
         let (shared, _harness, driver, project_id, store, _sink) = setup();
         store
-            .create_project(project_id, "project", "/tmp/test")
+            .create_project(project_id, "project", "/tmp/test", "codex")
             .await
             .unwrap();
         let parent = ThreadId::new();
@@ -2198,7 +2198,7 @@ mod tests {
     async fn a_reverse_link_returns_none_and_creates_nothing() {
         let (_shared, harness, driver, project_id, store, _sink) = setup();
         store
-            .create_project(project_id, "project", "/tmp/test")
+            .create_project(project_id, "project", "/tmp/test", "codex")
             .await
             .unwrap();
         let root = ThreadId::new();
