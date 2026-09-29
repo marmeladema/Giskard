@@ -459,6 +459,70 @@ trait CodexTransport: Send {
         Self: Sized;
 }
 
+/// How to launch this instance's app-server (design: *Configuration*).
+#[derive(Debug, Clone, Default)]
+pub struct CodexLaunchOptions {
+    /// Binary path or name. `None` is `codex` on `PATH`, the SDK's default.
+    pub command: Option<PathBuf>,
+    /// Appended after `app-server --listen stdio://` (`AppServerBuilder::extra_args`).
+    pub args: Vec<String>,
+    /// Applied on the child over the inherited environment (`AppServerBuilder::envs`).
+    pub env: EnvOverlay,
+    /// `-c profile=<name>` (`AppServerBuilder::config_override`).
+    pub profile: Option<String>,
+    /// The project this instance serves. Only reported on the spawn log line.
+    pub project_id: Option<ProjectId>,
+    /// The `[harnesses.<name>]` declaration this instance comes from. Only reported on the spawn
+    /// log line.
+    pub declaration: Option<String>,
+}
+
+/// The kind-specific keys of a `[harnesses.<name>]` declaration of kind `codex`.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CodexDeclarationOptions {
+    #[serde(default)]
+    pub profile: Option<String>,
+}
+
+impl CodexDeclarationOptions {
+    /// Reject values that parse but cannot work. The caller prefixes the declaration's key.
+    pub fn validate(&self) -> Result<(), String> {
+        if self
+            .profile
+            .as_deref()
+            .is_some_and(|profile| profile.trim().is_empty())
+        {
+            return Err("`profile` must not be blank; omit the key to use Codex's default".into());
+        }
+        Ok(())
+    }
+}
+
+/// Assemble the app-server builder for one instance.
+///
+/// Order matters only for readability; the SDK places `-c` overrides before the `app-server`
+/// subcommand and extra args after `--listen stdio://`, and applies `envs` over the inherited
+/// environment, so the precedence is: command, then environment, then the profile override and
+/// args.
+fn app_server_builder(options: &CodexLaunchOptions) -> codex_codes::AppServerBuilder {
+    let mut builder = codex_codes::AppServerBuilder::new();
+    if let Some(command) = &options.command {
+        builder = builder.command(command);
+    }
+    builder = builder.envs(
+        options
+            .env
+            .entries()
+            .iter()
+            .map(|(name, value)| (name, value)),
+    );
+    if let Some(profile) = &options.profile {
+        builder = builder.config_override("profile", profile);
+    }
+    builder.extra_args(options.args.iter().cloned())
+}
+
 /// Codex CLI harness adapter (one app-server process per project).
 pub struct CodexHarness {
     /// Kept so `list_providers` can resolve Codex's config for this project's directory: config is
@@ -468,6 +532,9 @@ pub struct CodexHarness {
     /// `client_version` on `/models` discovery so a provider serving Codex's catalog answers
     /// Giskard the way it would answer Codex (§8.3). `None` when the user agent did not parse.
     client_version: Option<String>,
+    /// The declaration's environment overlay, set on every provider `list_providers` reports so
+    /// discovery resolves keys the way this instance's app-server does.
+    env: EnvOverlay,
     cmd_tx: mpsc::Sender<QueuedHarnessCommand>,
     control_tx: mpsc::Sender<QueuedControlCommand>,
     // ENTITY-AUTHORITY-EXCEPTION:
@@ -493,33 +560,41 @@ impl CodexHarness {
         workspace_root: PathBuf,
         bootstrap: HarnessBootstrap,
     ) -> Result<Arc<Self>, HarnessError> {
-        let workspace_root = normalize_workspace_root(workspace_root)?;
-        let (mut client, client_version) =
-            start_codex_client(codex_codes::AppServerBuilder::new()).await?;
-        let writable_roots = configured_workspace_write_roots(&mut client, &workspace_root).await;
-        Self::spawn_harness(
-            client,
-            workspace_root,
-            writable_roots,
-            client_version,
-            bootstrap,
-        )
+        Self::launch(workspace_root, CodexLaunchOptions::default(), bootstrap).await
     }
 
-    pub async fn start_with(
+    /// Spawn this instance's app-server with the declaration's launch options.
+    pub async fn launch(
         workspace_root: PathBuf,
-        codex_path: PathBuf,
+        options: CodexLaunchOptions,
+        bootstrap: HarnessBootstrap,
     ) -> Result<Arc<Self>, HarnessError> {
         let workspace_root = normalize_workspace_root(workspace_root)?;
-        let builder = codex_codes::cli::AppServerBuilder::new().command(codex_path);
-        let (mut client, client_version) = start_codex_client(builder).await?;
+        // Names only: the overlay's values and the extra args may carry credentials.
+        info!(
+            action = "start_codex_client",
+            project_id = display_opt(options.project_id),
+            harness = display_opt(options.declaration.as_deref()),
+            workspace_root = %workspace_root.display(),
+            command = %options
+                .command
+                .as_deref()
+                .map(|command| command.display().to_string())
+                .unwrap_or_else(|| "codex".to_string()),
+            profile = display_opt(options.profile.as_deref()),
+            extra_args = options.args.len(),
+            env_names = ?options.env.names(),
+            "spawning Codex app-server"
+        );
+        let (mut client, client_version) = start_codex_client(app_server_builder(&options)).await?;
         let writable_roots = configured_workspace_write_roots(&mut client, &workspace_root).await;
         Self::spawn_harness(
             client,
             workspace_root,
             writable_roots,
             client_version,
-            HarnessBootstrap::default(),
+            options.env,
+            bootstrap,
         )
     }
 
@@ -528,6 +603,7 @@ impl CodexHarness {
         workspace_root: PathBuf,
         writable_roots: Vec<PathBuf>,
         client_version: Option<String>,
+        env: EnvOverlay,
         bootstrap: HarnessBootstrap,
     ) -> Result<Arc<Self>, HarnessError>
     where
@@ -559,6 +635,7 @@ impl CodexHarness {
         let harness = Arc::new(Self {
             workspace_root,
             client_version,
+            env,
             cmd_tx,
             control_tx,
             senders,
@@ -951,8 +1028,13 @@ impl AgentHarness for CodexHarness {
             },
         )
         .await?;
-        rx.await
-            .map_err(|_| HarnessError::Transport("background task dropped response".into()))?
+        let mut providers = rx
+            .await
+            .map_err(|_| HarnessError::Transport("background task dropped response".into()))??;
+        for provider in &mut providers {
+            provider.env = self.env.clone();
+        }
+        Ok(providers)
     }
 
     async fn list_mcp_servers(&self) -> Result<Vec<McpServerStatus>, HarnessError> {
@@ -3261,12 +3343,20 @@ mod tests {
     fn spawn_fake_harness_with_bootstrap(
         bootstrap: HarnessBootstrap,
     ) -> (Arc<CodexHarness>, FakeCodexController) {
+        spawn_fake_harness_with(EnvOverlay::default(), bootstrap)
+    }
+
+    fn spawn_fake_harness_with(
+        env: EnvOverlay,
+        bootstrap: HarnessBootstrap,
+    ) -> (Arc<CodexHarness>, FakeCodexController) {
         let (transport, controller) = fake_codex();
         let harness = CodexHarness::spawn_harness(
             transport,
             PathBuf::from("/tmp"),
             Vec::new(),
             Some("1.2.3".into()),
+            env,
             bootstrap,
         )
         .expect("fake harness should spawn");
@@ -4529,6 +4619,97 @@ mod tests {
             requests.iter().any(|req| req.method == "config/read"),
             "list_providers should issue a config/read request"
         );
+    }
+
+    #[tokio::test]
+    async fn listed_providers_carry_the_instance_overlay() {
+        let overlay = EnvOverlay::new([(
+            "CODEX_HOME".to_string(),
+            "/home/you/.codex-nightly".to_string(),
+        )]);
+        let (harness, _controller) =
+            spawn_fake_harness_with(overlay.clone(), HarnessBootstrap::default());
+        let providers = timeout(Duration::from_secs(1), harness.list_providers())
+            .await
+            .expect("list_providers should complete")
+            .expect("list_providers should succeed");
+        assert!(!providers.is_empty());
+        for provider in &providers {
+            assert_eq!(provider.env, overlay, "{} lacks the overlay", provider.id);
+        }
+    }
+
+    #[test]
+    fn app_server_builder_maps_every_option() {
+        let options = CodexLaunchOptions {
+            command: Some(PathBuf::from("/bin/true")),
+            args: vec!["--foo".into()],
+            env: EnvOverlay::new([("CODEX_HOME".to_string(), "/tmp/x".to_string())]),
+            profile: Some("nightly".into()),
+            project_id: Some(ProjectId::new()),
+            declaration: Some("codex-nightly".into()),
+        };
+        let command = app_server_builder(&options)
+            .build_command_sync()
+            .expect("an absolute command needs no PATH lookup");
+        assert_eq!(command.get_program(), "/bin/true");
+        let args: Vec<_> = command.get_args().collect();
+        assert_eq!(
+            args,
+            [
+                "-c",
+                "profile=nightly",
+                "app-server",
+                "--listen",
+                "stdio://",
+                "--foo"
+            ]
+        );
+        let envs: Vec<_> = command.get_envs().collect();
+        assert!(
+            envs.contains(&(
+                std::ffi::OsStr::new("CODEX_HOME"),
+                Some(std::ffi::OsStr::new("/tmp/x"))
+            )),
+            "{envs:?}"
+        );
+    }
+
+    #[test]
+    fn default_launch_options_leave_the_sdk_defaults() {
+        let command = app_server_builder(&CodexLaunchOptions {
+            command: Some(PathBuf::from("/bin/true")),
+            ..CodexLaunchOptions::default()
+        })
+        .build_command_sync()
+        .expect("an absolute command needs no PATH lookup");
+        let args: Vec<_> = command.get_args().collect();
+        assert_eq!(args, ["app-server", "--listen", "stdio://"]);
+        assert_eq!(command.get_envs().count(), 0);
+    }
+
+    #[test]
+    fn blank_profile_is_rejected() {
+        let options: CodexDeclarationOptions =
+            toml_like_options(serde_json::json!({ "profile": "  " }));
+        let err = options.validate().expect_err("a blank profile cannot work");
+        assert!(err.contains("profile"), "{err}");
+        let options: CodexDeclarationOptions =
+            toml_like_options(serde_json::json!({ "profile": "nightly" }));
+        assert!(options.validate().is_ok());
+    }
+
+    #[test]
+    fn unknown_codex_option_is_rejected() {
+        let err = serde_json::from_value::<CodexDeclarationOptions>(
+            serde_json::json!({ "profiel": "nightly" }),
+        )
+        .expect_err("a typo must not be ignored");
+        assert!(err.to_string().contains("unknown field `profiel`"), "{err}");
+    }
+
+    fn toml_like_options(value: serde_json::Value) -> CodexDeclarationOptions {
+        serde_json::from_value(value).expect("options parse")
     }
 
     #[tokio::test]
