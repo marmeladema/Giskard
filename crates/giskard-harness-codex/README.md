@@ -23,6 +23,48 @@ this adapter's concern.
 The transport may own internal reader and writer tasks for stdio and request correlation; they
 never access mapper, route, turn, or context-restore state.
 
+## Launch options
+
+`CodexHarness::launch(workspace_root, CodexLaunchOptions, bootstrap)` spawns one instance's
+app-server from a `[harnesses.<name>]` declaration of kind `codex`. The server's factory builds the
+options from the declaration; `start_with_bootstrap` is `launch` with the defaults. One function,
+`app_server_builder`, maps them onto the `codex-codes` `AppServerBuilder`:
+
+| Option | Declaration key | SDK call | Default |
+|---|---|---|---|
+| `command` | `command` | `AppServerBuilder::command` | `codex` on `PATH` |
+| `env` | `[harnesses.<name>.env]` | `AppServerBuilder::envs` | nothing added |
+| `profile` | `profile` | `AppServerBuilder::config_override("profile", …)` (`-c profile=<name>`) | Codex's own |
+| `args` | `args` | `AppServerBuilder::extra_args` | none |
+
+The resulting command line is `<command> [-c profile=<name>] app-server --listen stdio:// [args…]`.
+The SDK places `-c` overrides before the subcommand and extra arguments after `--listen stdio://`,
+and applies `envs` on top of the inherited environment, so precedence runs: the command, then the
+environment (a variable such as `CODEX_HOME` decides which configuration Codex reads), then the
+profile override and arguments on top of that configuration.
+
+The overlay does **not** decide which binary runs. The SDK resolves a non-absolute `command`
+(including the default `codex`) with `which` against Giskard's own `PATH` before the child exists,
+and the overlay is applied only to the child. A `PATH` in `[harnesses.<name>.env]` therefore
+changes what the spawned Codex's own subprocesses find, but not which Codex is spawned: omitting
+`command` still launches the `codex` on Giskard's `PATH`, with no error. A binary that is not on
+Giskard's `PATH` needs an absolute `command`.
+
+`profile` is the only Codex-specific
+declaration key; `CodexDeclarationOptions` rejects any other with `deny_unknown_fields`, and a
+blank profile, so a typo is a boot error rather than a silently ignored key.
+
+The spawn is logged once, at `info` with `action = "start_codex_client"`: the project id and
+declaration name the caller put in `CodexLaunchOptions`, the command, the profile, the count of
+extra arguments, and the overlay's variable names. Values are never logged. The instance
+keeps its overlay and sets it on every `HarnessProvider` that `list_providers` reports, so Giskard's
+own `/models` discovery resolves env-backed keys, env-backed headers, and auth commands the way this
+instance's app-server does.
+
+`model/list` describes the instance's startup provider only (see *Model catalog*). A profile that
+sets `model_provider` therefore changes what that catalog contains and which provider it is
+attributed to.
+
 ## Manual compaction
 
 `compact_thread` sends `thread/compact/start` and returns once Codex acknowledges it. Codex
