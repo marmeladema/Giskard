@@ -151,6 +151,7 @@ declaration order is preserved for the picker.
 ```toml
 [harnesses.codex-stable]
 kind = "codex"
+default = true                    # new threads start here unless a project or draft says otherwise
 command = "codex"                 # optional; PATH lookup by default
 # args = ["--foo"]                # extra arguments appended after Giskard's own
 idle_shutdown_secs = 0
@@ -171,9 +172,6 @@ kind = "claude-code"
 # command = "claude"
 [harnesses.claude.env]
 ANTHROPIC_API_KEY = "sk-ant-..."
-
-[harness]
-default = "codex-stable"
 ```
 
 Rules:
@@ -202,18 +200,30 @@ Rules:
   first place a config mistake surfaces.
 - **The name is a durable identifier.** It is persisted on projects and threads. Renaming a
   declaration is a migration, exactly as renaming a provider id would be. The README must say so.
-- **`codex` is the reserved default name.** With no `[harnesses]` table, Giskard synthesizes one
-  declaration named `codex` of kind `codex` with default options, and `[harness] default` defaults
-  to it. Every existing `project.json` already says `harness = "codex"`, which reinterprets as that
-  name unchanged, and a thread file without a `harness` field belongs to it (see *Persistence*).
-  A config that declares `[harnesses]` must therefore keep an entry named `codex` while the data
-  directory holds projects or threads from before harnesses were declared. The README says so.
+- **The default harness is marked on its entry.** `default = true` on at most one declaration;
+  two or more is a boot error naming both keys. None marked means the first declared entry, which
+  is the rule the model catalog already uses for its default model, and declaration order is
+  already what the `IndexMap` preserves for the picker. There is no separate `[harness]` section:
+  one table describes the harnesses and which one is the default.
+- **`codex` is the reserved default name, and only when nothing is declared.** With no
+  `[harnesses]` table at all, Giskard synthesizes one declaration named `codex` of kind `codex`
+  with default options, and it is the default because it is the only entry. Every existing
+  `project.json` already says `harness = "codex"`, which reinterprets as that name unchanged, and
+  a thread file without a `harness` field belongs to it (see *Persistence*).
+- **Declaring the table is the off switch.** As soon as any `[harnesses.<name>]` entry exists,
+  the config is exactly what it declares and nothing is synthesized. A Claude Code only setup
+  declares `[harnesses.claude]` and never has a Codex harness. Pre-declaration projects and
+  threads still resolve to the name `codex`, so a table without that entry leaves them in the
+  degraded state below, with the config key named; adding the entry back reopens them. The README
+  says so.
 - **Unknown name is a visible degraded state.** A project or thread naming a harness that is not
   declared opens read-only with a structured error naming the config key. It never falls back to
   another harness silently.
-- **`[harness] kind` is removed.** `[harness] default` replaces it. `idle_shutdown_secs` moves onto
-  each declaration and is either implemented as an instance policy or removed; parsed-but-unused
-  keys are not kept.
+- **The `[harness]` section is removed.** Its `kind` was never read at runtime, and nothing
+  replaces it at the top level: the default lives on the entry. An old config still carrying the
+  section is ignored, as unknown top-level tables are today, since no config is known to have
+  used the key. `idle_shutdown_secs` moves onto each declaration and is either implemented as an
+  instance policy or removed; parsed-but-unused keys are not kept.
 - **Providers are not declarations.** A provider is something an instance reports, not something
   the user declares as a harness. See *Provider scoping* for what is global and what is not.
 
@@ -225,7 +235,7 @@ field with a constant default, following the precedent `ThreadFile` already set 
 
 **Project.** `ProjectConfig.harness` keeps its name and its existing values, and changes meaning:
 it is the project's *default harness for new threads*. It becomes optional, with a missing value
-meaning the global `[harness] default`; existing files carry `codex`, which resolves unchanged. It
+meaning the declaration marked `default`; existing files carry `codex`, which resolves unchanged. It
 is a creation-time input only. No runtime path may read it once a thread exists; the thread's own
 field is authoritative. Document this on the field the way `_default_model` is documented in
 `store.rs`.
@@ -306,7 +316,7 @@ model switching stays inside that harness for the same reason provider switching
 bound Codex thread.
 
 **Default.** The preselected entry is the default harness's default model, where the default
-harness is the project's field, else `[harness] default`.
+harness is the project's field, else the declaration marked `default`, else the first declared.
 
 **Claude Code models.** Giskard's discovery mechanism is already the right one and is
 harness-neutral: the harness reports providers with an endpoint and a key location, and Giskard
@@ -447,7 +457,8 @@ real but benign, and moot for Giskard:
   shutdown, or idle. The crash-handling paragraph becomes "marks the threads whose stream ended",
   which is what the server already does per thread.
 - §1.2 and §13.5 stand; §13.5 becomes true rather than aspirational.
-- Appendix C replaces `[harness] kind` with `[harnesses.<name>]` and `[harness] default`.
+- Appendix C replaces the `[harness]` section with `[harnesses.<name>]`, including the `default`
+  flag.
 - §8.2 gains the auth-placement note and the Anthropic body shape.
 - README: the *Supported harnesses* section, the config table, the storage layout comment on
   `project.json`, a note that a harness name is a durable identifier, and the rule that a
@@ -467,14 +478,15 @@ not opt in.
 1. **Stage 0, no behaviour change.**
    Replace Codex wording in the neutral layers. Serialize `HarnessCapabilities` to the browser and
    gate the UI on it. Turn `CodexFactory` into a kind-dispatching factory that also owns validation.
-   Remove the dead `[harness] kind` and either implement or remove `idle_shutdown_secs`. Rewrite
+   Remove the dead `[harness]` section and either implement or remove `idle_shutdown_secs`. Rewrite
    §4.7, §6.4, and the adapter README around instances.
 2. **Stage 1, named declarations, one harness per project.**
-   `[harnesses.<name>]`, `[harness] default`, the synthesized `codex` default, boot-time validation,
-   the project field reinterpreted as a name, `HarnessFactory::create` taking a declaration, and
-   the Codex adapter accepting `command`, `args`, `env`, and `profile`. The replay binary declares
-   its scripted harness under the name `codex` so its seeded projects resolve unchanged. Stable
-   versus nightly already works at project granularity here, and this is the cheap win.
+   `[harnesses.<name>]` with its `default` flag, the synthesized `codex` default, boot-time
+   validation, the project field reinterpreted as a name, `HarnessFactory::create` taking a
+   declaration, and the Codex adapter accepting `command`, `args`, `env`, and `profile`. The
+   replay binary declares its scripted harness under the name `codex` so its seeded projects
+   resolve unchanged. Stable versus nightly already works at project granularity here, and this
+   is the cheap win.
 3. **Stage 2, per-thread harness.**
    The defaulted thread field, per-name slots on the project authority, per-harness
    bootstrap filtering, grouped model composition, harness-scoped MCP routes, the wire fields, and
