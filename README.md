@@ -43,7 +43,9 @@ The agent harness is a replaceable component behind a neutral `AgentHarness` tra
   Codex over its `app-server` JSON-RPC protocol. A working, authenticated Codex CLI must be installed
   on the machine (see [Prerequisites](#prerequisites)); without it you can create projects, but turns
   fail. Giskard manages a harness *instance* per project; whether that is one process or one per
-  thread is the adapter's concern.
+  thread is the adapter's concern. Several Codex declarations (different binaries, profiles, or
+  `CODEX_HOME`s) can run side by side, chosen per project; see
+  [Configuration](#configuration).
 - **Claude Code — not yet supported.** The trait makes it addable without touching the rest of the
   app; it just hasn't been built yet. _(Anthropic, if you're reading this: a generous pile of Claude
   credits would move this up the roadmap_ 😁_.)_
@@ -261,7 +263,23 @@ service does not silently run with an empty provider list.
 | `[viz]` | `max_highlight_size` | `10485760` (10 MiB) | Files larger than this aren't syntax-highlighted. |
 | `[history]` | `initial` / `page` | `5` / `5` | Turns fetched on open (topped up client-side to ~2 screens) / per scroll-up page. |
 | `[retention]` | `max_command_output_bytes` | `134217728` (128 MiB) | Maximum durable completed-command output. Must be at least `32768` (32 KiB); larger output retains a UTF-8-safe head and tail. |
+| `[harnesses.<name>]` | `kind` | — | **Optional.** A named harness declaration; the whole table defaults to one harness named `codex` of kind `codex`. `kind` is the adapter (`codex`). |
+| | `default` | first declared | At most one declaration may be `true`; new projects use it when no harness is chosen. |
+| | `command` | `codex` on `PATH` | Program to spawn. A bare name is resolved on Giskard's own `PATH`, not a `PATH` set in `env`, so use an absolute path for a binary that is not on Giskard's `PATH`; otherwise the `codex` on Giskard's `PATH` runs instead, silently. |
+| | `args` | `[]` | Extra arguments, appended after `app-server --listen stdio://`. |
+| | `env` | `{}` | `[harnesses.<name>.env]`: variables applied over Giskard's environment for the instance's processes and for discovery on its behalf. Values are never logged. |
+| | `profile` | Codex's own | **Codex only.** Passed as `-c profile=<name>`. Any other Codex key is a startup error. |
 | `[providers.<id>]` | `model_listing`, `[[providers.<id>.models]]` | — | **Optional.** Models are found without it: every provider Codex has a `base_url` for is discovered from `GET {base_url}/models` with the key Codex holds for it, and the provider Codex routes to also contributes its `model/list` catalog. A built-in Codex has no endpoint for and does not route to — `ollama` or `lmstudio` when you use neither — has nothing to contribute and is not offered; declare models for it if you want it in the picker. Declare a provider only to turn discovery off (`model_listing = false`), to add models by hand for an endpoint with no `/models` route, to override metadata, or to pin picker order — declared providers come first in the order written, the rest by id. Keyed by routing id, the same way Codex keys `[model_providers.<id>]`; the id must name a provider Codex knows (see below). |
+
+Harness declarations are read once at startup and validated before the server listens: a blank
+name (`[harnesses.""]`), an unknown `kind`, two `default = true` entries, a blank `command` or
+`profile`, an invalid `env` variable name, or an unrecognised Codex key refuses startup with a
+message naming the `[harnesses.<name>]` key. A declaration's name is durable — each project stores the name it was
+created on — so the new-project dialog offers a choice only when more than one is declared, and
+renaming or removing a declaration leaves its projects' threads read-only (with the missing name
+and `[harnesses]` in the warning) until it is declared again. Declaring the table switches off the
+synthesized `codex`; projects created before you declared it are stamped `codex`, so keep a
+declaration named `codex` for them.
 
 Provider config governs the **picker** and optional `/v1/models` discovery only — Codex itself
 reads `~/.codex/config.toml` for real provider/auth, so any model you select must be one Codex can
@@ -282,7 +300,10 @@ provider to Codex.
 
 Discovery authenticates the way Codex does. A provider with `env_key` has its key read from that
 environment variable; one with `[model_providers.<id>.auth]` has its command run and the stdout
-sent as the bearer token, recomputed each time rather than cached. A key set inline as
+sent as the bearer token, recomputed each time rather than cached. Variables, including those
+named by `env_http_headers` and those an auth command inherits, resolve through the project
+harness's `[harnesses.<name>.env]` first and Giskard's own environment second, so discovery sees
+what that instance's Codex sees. A key set inline as
 `experimental_bearer_token` is deliberately not read — discovery against such a provider needs
 `env_key` or `auth` instead.
 
@@ -410,7 +431,7 @@ $GISKARD_DATA_DIR/
 ├── logs/                        # optional daily server logs when file logging is enabled
 ├── projects.json                # project index (id, name, dir, created_at, order)
 ├── projects/<project_id>/
-│   ├── project.json             # workspace root, harness kind
+│   ├── project.json             # workspace root, harness declaration name
 │   ├── threads/<thread_id>/
 │   │   ├── thread.json           # thread metadata, permission preset, token cache
 │   │   ├── history.jsonl         # turn index — a header line, then one bounded record per turn

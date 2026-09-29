@@ -9,6 +9,8 @@ stages listed at the end; each stage is independently shippable.
 
 Stage 0 is implemented; see `multi-harness-design/stage-0-plan.md`.
 
+Stage 1 is implemented; see `multi-harness-design/stage-1-plan.md`.
+
 The spec (`specs/giskard-specification.md`) remains authoritative for the harness contract. Where
 this document proposes changes to the spec, they are called out explicitly under *Spec and
 documentation changes*.
@@ -156,7 +158,6 @@ kind = "codex"
 default = true                    # new threads start here unless a project or draft says otherwise
 command = "codex"                 # optional; PATH lookup by default
 # args = ["--foo"]                # extra arguments appended after Giskard's own
-idle_shutdown_secs = 0
 
 [harnesses.codex-nightly]
 kind = "codex"
@@ -178,7 +179,7 @@ ANTHROPIC_API_KEY = "sk-ant-..."
 
 Rules:
 
-- **Neutral keys are `kind`, `command`, `args`, `env`, and `idle_shutdown_secs`.** Spawning a
+- **Neutral keys are `kind`, `command`, `args`, and `env`** (plus `default`, below). Spawning a
   process is common to every kind, so these are parsed by `giskard-persist` and apply to every
   process an instance spawns: Codex's one app-server and Claude Code's per-thread processes alike.
 - **`env` is an overlay on Giskard's inherited environment.** Each entry is set on top of what
@@ -196,10 +197,10 @@ Rules:
   TOML table of everything else. The binary's factory deserializes that table into the adapter's
   typed options with `deny_unknown_fields`, so a typo is an error rather than a silently ignored
   key. For Codex the only such key is `profile`.
-- **Validate at boot.** `HarnessFactory` gains a `validate(&HarnessDeclaration)` step that the
-  binary runs over every declaration before serving. A declaration with an unknown kind or bad
-  options fails startup with a message naming the table key. Instance creation must not be the
-  first place a config mistake surfaces.
+- **Validate at boot.** `HarnessKind` has a `validate(&HarnessDeclaration)` step, and the
+  binary's `HarnessKindFactory::validate` runs it over every declaration before serving. A
+  declaration with an unknown kind or bad options fails startup with a message naming the table
+  key. Instance creation must not be the first place a config mistake surfaces.
 - **The name is a durable identifier.** It is persisted on projects and threads. Renaming a
   declaration is a migration, exactly as renaming a provider id would be. The README must say so.
 - **The default harness is marked on its entry.** `default = true` on at most one declaration;
@@ -224,8 +225,8 @@ Rules:
 - **The `[harness]` section is removed.** Its `kind` was never read at runtime, and nothing
   replaces it at the top level: the default lives on the entry. An old config still carrying the
   section is ignored, as unknown top-level tables are today, since no config is known to have
-  used the key. `idle_shutdown_secs` moves onto each declaration and is either implemented as an
-  instance policy or removed; parsed-but-unused keys are not kept.
+  used the key. `idle_shutdown_secs` was removed with it in Stage 0 rather than kept parsed but
+  unused; idle shutdown as an instance policy remains an open question.
 - **Providers are not declarations.** A provider is something an instance reports, not something
   the user declares as a harness. See *Provider scoping* for what is global and what is not.
 
@@ -236,10 +237,10 @@ field with a constant default, following the precedent `ThreadFile` already set 
 `kind`: existing files predate the field, and the default is what they always meant.
 
 **Project.** `ProjectConfig.harness` keeps its name and its existing values, and changes meaning:
-it is the project's *default harness for new threads*. It becomes optional, with a missing value
-meaning the declaration marked `default`; existing files carry `codex`, which resolves unchanged. It
-is a creation-time input only. No runtime path may read it once a thread exists; the thread's own
-field is authoritative. Document this on the field the way `_default_model` is documented in
+it is the project's *default harness for new threads*. It stays a required string, stamped at
+creation with the chosen or default declaration name; existing files carry `codex`, which resolves
+unchanged. It is a creation-time input only. No runtime path may read it once a thread exists; the
+thread's own field is authoritative. Document this on the field the way `_default_model` is documented in
 `store.rs`.
 
 It is kept rather than dropped because "this project runs on nightly" is naturally a project
@@ -280,9 +281,11 @@ record needs no harness field. Token ledger keys stay `provider/model`.
   the user's choice.
 - `known_thread_bindings(project)` becomes `known_thread_bindings(project, harness)` and filters
   the thread graph by the thread field. Native id uniqueness is checked within that filtered set.
-- `HarnessFactory::create` receives a `HarnessInstanceSpec { project_id, workspace_root,
-  declaration }` rather than a `&ProjectConfig`, so the factory never reads the project's default
-  field.
+- `HarnessFactory::create` keeps its `&ProjectConfig` signature (Stage 1). The binary's
+  `HarnessKindFactory` owns the `HarnessCatalog`, resolves the project's `harness` name to a
+  declaration, and hands `HarnessKind::create` a `HarnessInstanceSpec { project_id,
+  workspace_root, name, declaration }`; nothing outside that factory reads a declaration. Stage 2's
+  per-thread resolution changes the `HarnessFactory::create` call when it needs to.
 - Project deletion and registry shutdown quiesce every driver of the project before taking owner
   sets or shutting harnesses down, in the same order as today, iterated over the map.
 - The harness transition gate stays root-wide and non-keyed.
@@ -440,7 +443,8 @@ real but benign, and moot for Giskard:
 - Thread summaries and the thread-open response carry the thread's harness name, so the UI can show
   a badge and scope the picker.
 - The draft's open message carries `harness` beside `model`. `CreateProjectRequest` accepts an
-  optional default harness name.
+  optional default harness name (done in Stage 1, with `GET /api/harnesses` listing the
+  declarations for the new-project modal; `ProjectSummary` is left for Stage 2).
 - `HarnessCapabilities` is serialized in full on the project models response, which the draft and
   every thread open already load, and the UI gates Plan/Build, approvals, effort, model, and
   compaction on it as spec §13.5 describes. Per-harness groups in Stage 2 carry it per group.
