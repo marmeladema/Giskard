@@ -74,12 +74,14 @@ use thread::{
 
 #[async_trait]
 pub trait HarnessFactory: Send + Sync {
-    /// Construct a harness with its complete durable identity table installed before it can
-    /// dispatch ordinary events. The bootstrap is construction input, not a command sent to an
-    /// already-running harness; returning success means every binding was validated and installed.
+    /// Construct the project's instance of the `harness` declaration with its complete durable
+    /// identity table installed before it can dispatch ordinary events. The bootstrap is
+    /// construction input, not a command sent to an already-running harness; returning success
+    /// means every binding was validated and installed.
     async fn create(
         &self,
         config: &ProjectConfig,
+        harness: &str,
         bootstrap: HarnessBootstrap,
     ) -> Result<Arc<dyn AgentHarness>, HarnessError>;
 
@@ -779,7 +781,7 @@ impl HarnessRegistry {
             return Ok(harness);
         }
         let binding_count = bootstrap.known_threads.len();
-        let h = self.factory.create(config, bootstrap).await?;
+        let h = self.factory.create(config, harness, bootstrap).await?;
         debug!(project_id = %project, harness, bindings = binding_count,
             "created harness with durable thread bindings installed");
 
@@ -2356,6 +2358,7 @@ mod tests {
         async fn create(
             &self,
             _config: &ProjectConfig,
+            _harness: &str,
             bootstrap: HarnessBootstrap,
         ) -> Result<Arc<dyn AgentHarness>, HarnessError> {
             let harness = Arc::new(DiscoveryHarness::new(bootstrap));
@@ -2435,6 +2438,7 @@ mod tests {
         async fn create(
             &self,
             _config: &ProjectConfig,
+            _harness: &str,
             _bootstrap: giskard_harness::HarnessBootstrap,
         ) -> Result<Arc<dyn giskard_harness::AgentHarness>, HarnessError> {
             Err(HarnessError::Protocol(
@@ -2529,6 +2533,7 @@ mod tests {
         async fn create(
             &self,
             _config: &ProjectConfig,
+            _harness: &str,
             bootstrap: giskard_harness::HarnessBootstrap,
         ) -> Result<Arc<dyn AgentHarness>, HarnessError> {
             self.calls.fetch_add(1, Ordering::SeqCst);
@@ -2553,6 +2558,7 @@ mod tests {
         async fn create(
             &self,
             _config: &ProjectConfig,
+            _harness: &str,
             _bootstrap: giskard_harness::HarnessBootstrap,
         ) -> Result<Arc<dyn AgentHarness>, HarnessError> {
             self.calls.fetch_add(1, Ordering::SeqCst);
@@ -2578,6 +2584,7 @@ mod tests {
         async fn create(
             &self,
             _config: &ProjectConfig,
+            _harness: &str,
             _bootstrap: giskard_harness::HarnessBootstrap,
         ) -> Result<Arc<dyn AgentHarness>, HarnessError> {
             self.started.notify_one();
