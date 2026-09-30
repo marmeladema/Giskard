@@ -1706,7 +1706,11 @@ fn browser_has_no_model_list_outside_a_project() {
         "// Remember that the user",
     );
     assert!(
-        settle.contains("state.models.find(m => m.is_default) || state.models[0] || null")
+        settle.contains(
+            "const group = state.models.filter(m => m.harness === state.projectHarness);"
+        ) && settle
+            .contains("(group.find(m => m.is_default) || group[0] || state.models[0] || null)")
+            && settle.contains("draft.harness = chosen.harness || null;")
             && settle.contains("draft.modelPinned")
             && !settle.contains("default_model"),
         "the draft model is derived from the live catalog, and a user's own pick still wins"
@@ -1778,16 +1782,24 @@ fn browser_has_no_model_list_outside_a_project() {
 
     let prepare_catalog = between(
         body,
-        "function prepareProjectModelCatalog(pid) {",
+        "function prepareProjectModelCatalog(pid, harness) {",
         "async function loadProjectModels(pid, opts) {",
     );
     assert_order(
         prepare_catalog,
         "state.models = [];",
-        "renderModelSelect();",
+        "closeModelPicker();\n  renderModelSelect();",
+    );
+    // Opening a thread from its project's full list (a draft's first send) narrows that list to the
+    // thread's harness instead of refetching and blanking the picker.
+    assert!(
+        prepare_catalog.contains("state.models = state.models.filter(m => m.harness === harness);")
+            && prepare_catalog.contains("state.modelsProject = modelCatalogKey(pid, harness);"),
+        "a loaded full catalog is narrowed to a thread's harness in place"
     );
     assert!(
-        prepare_catalog.contains("if (state.modelsProject === pid) return;")
+        prepare_catalog
+            .contains("if (state.modelsProject === modelCatalogKey(pid, harness)) return;")
             && prepare_catalog.contains("state.modelsProject = null;")
             && prepare_catalog.contains("updateComposerControls();"),
         "switching projects invalidates and disables the previous project catalog immediately"
@@ -1801,7 +1813,7 @@ fn browser_has_no_model_list_outside_a_project() {
     assert!(
         load_catalog.contains("pid === state.projectId")
             && load_catalog.contains("state.models = res.models;")
-            && load_catalog.contains("state.modelsProject = pid;")
+            && load_catalog.contains("state.modelsProject = key;")
             && !load_catalog.contains("populateModalModels();"),
         "project responses stay scoped to the active project and cannot replace modal options"
     );
@@ -1833,12 +1845,12 @@ fn browser_has_no_model_list_outside_a_project() {
     assert_order(
         open_thread,
         "state.currentModel = null;",
-        "prepareProjectModelCatalog(pid);",
+        "prepareProjectModelCatalog(pid, state.threadHarness);",
     );
     assert_order(
         open_thread,
-        "prepareProjectModelCatalog(pid);",
-        "loadProjectModels(pid);",
+        "prepareProjectModelCatalog(pid, state.threadHarness);",
+        "loadProjectModels(pid, { harness:state.threadHarness });",
     );
 
     let composer_controls = between(
@@ -1862,7 +1874,7 @@ fn browser_has_no_model_list_outside_a_project() {
         "function modelOptionLabel(m) {",
     );
     assert!(
-        render_models.contains("o.value = modelKey(state.currentModel);")
+        render_models.contains("o.value = modelKey(state.currentModel, activeModelHarness());")
             && render_models.contains("o.textContent = modelOptionLabel(state.currentModel);")
             && render_models.contains("(loading models...)"),
         "catalog invalidation preserves the current model display while hiding old options"
@@ -3697,13 +3709,93 @@ fn assert_order(haystack: &str, first: &str, second: &str) {
     );
 }
 
+/// The picker groups models by harness only when the draft has a choice of one; an existing thread
+/// loads its own harness's group alone; and a draft names its harness only when it picked one.
+#[test]
+fn browser_groups_the_picker_by_harness_only_with_a_choice() {
+    let source = app_js();
+    let render_models = between(
+        source,
+        "function renderModelSelect() {",
+        "function modelOptionLabel(m) {",
+    );
+    assert_order(
+        render_models,
+        "if (state.harnesses.length > 1) {",
+        "const group = document.createElement(\"optgroup\");",
+    );
+    assert!(
+        render_models.contains("group.label = h.name;")
+            && render_models.contains("o.dataset.harness = m.harness || \"\";"),
+        "each group is labelled with its declaration and each option names its harness"
+    );
+
+    let open_thread = between(
+        source,
+        "async function openThread(pid, tid, title, opts) {",
+        "function clearWsReconnectTimer()",
+    );
+    assert_order(
+        open_thread,
+        "state.threadHarness = res.harness || null;",
+        "loadProjectModels(pid, { harness:state.threadHarness });",
+    );
+    let load_catalog = between(
+        source,
+        "async function loadProjectModels(pid, opts) {",
+        "// Reload re-runs discovery",
+    );
+    assert!(
+        load_catalog.contains(
+            "const scope = opts.harness ? `?harness=${encodeURIComponent(opts.harness)}` : \"\";"
+        ) && load_catalog.contains("api(\"GET\", `/api/projects/${pid}/models${scope}`)"),
+        "an existing thread's catalog request is scoped to its harness"
+    );
+
+    let start = between(
+        source,
+        "async function startDraftThread(text, attachments) {",
+        "const tid = res && res.thread_id;",
+    );
+    assert!(
+        start.contains("...(draftHarnessChoice(draft) ? { harness: draft.harness } : {})"),
+        "the start request names the draft's harness only when there was a choice"
+    );
+    assert!(
+        source.contains("return !!draft && !!draft.harness && state.harnesses.length > 1;"),
+        "a choice exists only with more than one declaration"
+    );
+    assert!(
+        source.contains("`Create a new thread to use models from harness ${model.harness}.`"),
+        "an existing thread refuses another harness's model"
+    );
+    assert!(
+        source.contains("/harnesses/${encodeURIComponent(harness)}/mcp`"),
+        "MCP requests address the active thread's harness instance"
+    );
+    // The sidebar names a thread's harness only when there is more than one to tell apart, and
+    // learns the declarations at start so a view scoped to one thread still knows them all.
+    let thread_row = between(source, "function threadRow(pid, t) {", "const menuBtn");
+    assert!(
+        thread_row.contains(
+            "if (t.harness && state.knownHarnesses.size > 1) el.title = `${title} · harness ${t.harness}`;"
+        ),
+        "a sidebar row names its harness only when several are known"
+    );
+    assert!(
+        source.contains("harness:payload.harness,")
+            && source.contains("await loadDeclaredHarnesses();"),
+        "thread summaries keep their harness and the declarations load at start"
+    );
+}
+
 /// The harness's capability flags arrive with the project model list, and the composer's mode,
 /// permission, model, effort, and compaction controls are gated on them (spec §13.5).
 #[test]
 fn browser_gates_controls_on_harness_capabilities() {
     let source = app_js();
     for needle in [
-        "state.harnessCapabilities = res.capabilities || null;",
+        "state.harnessCapabilities = Object.fromEntries(",
         "function harnessCan(flag)",
         "harnessCan(\"plan_build_modes\")",
         "harnessCan(\"reasoning_effort\")",

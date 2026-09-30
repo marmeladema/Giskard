@@ -124,10 +124,14 @@ test.describe("draft composer", () => {
     await fetched;
     await expect(modelButton(page)).toContainText("Replay Model");
     await expect(page.locator("#sendBtn")).toBeEnabled();
+    // The replay server declares one harness, so the picker is not grouped by harness.
+    await expect(page.locator("#modelSel optgroup")).toHaveCount(0);
 
     await page.locator("#sendBtn").click();
     const body = (await started).postDataJSON();
     expect(body.model_ref).toMatchObject({ provider: "replay", model: "replay-model" });
+    // With a single declaration there is no choice, so the project's default harness applies.
+    expect(body).not.toHaveProperty("harness");
     await expect(
       page.locator("#transcript .msg.agent", { hasText: SCRIPTED_REPLY }),
     ).toBeVisible();
