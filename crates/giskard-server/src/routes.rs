@@ -167,10 +167,16 @@ pub fn protected_routes(state: AppState) -> Router<AppState> {
         .route("/api/browse", get(browse))
         .route("/api/browse/mkdir", post(browse_mkdir))
         .route("/api/projects/{id}/models", get(project_list_models))
-        .route("/api/projects/{id}/mcp", get(list_mcp_servers))
-        .route("/api/projects/{id}/mcp/reload", post(reload_mcp_servers))
         .route(
-            "/api/projects/{id}/mcp/oauth-login",
+            "/api/projects/{id}/harnesses/{name}/mcp",
+            get(list_mcp_servers),
+        )
+        .route(
+            "/api/projects/{id}/harnesses/{name}/mcp/reload",
+            post(reload_mcp_servers),
+        )
+        .route(
+            "/api/projects/{id}/harnesses/{name}/mcp/oauth-login",
             post(start_mcp_oauth_login),
         )
         .route("/api/tokens", get(global_tokens))
@@ -698,6 +704,7 @@ async fn open_thread(
         return Ok(Json(OpenThreadResponse {
             thread_id: handle.thread,
             harness_thread_id: handle.harness_thread_id.clone(),
+            harness: thread_file.harness,
             turn_steering: binding.turn_steering(),
             warning: None,
         }));
@@ -766,6 +773,7 @@ async fn open_thread(
             return Ok(Json(OpenThreadResponse {
                 thread_id,
                 harness_thread_id: thread_file.harness_thread_id,
+                harness: thread_file.harness,
                 turn_steering: false,
                 warning: Some(read_only_info(
                     context.as_ref(),
@@ -808,6 +816,7 @@ async fn open_thread(
     Ok(Json(OpenThreadResponse {
         thread_id,
         harness_thread_id: handle.harness_thread_id,
+        harness: thread_file.harness,
         turn_steering,
         warning,
     }))
@@ -865,7 +874,29 @@ async fn start_thread_with_message(
         .load_project(project_id)
         .await?
         .ok_or(ApiError::NotFound)?;
-    let harness_name = project_config.harness.clone();
+    // A thread runs on the declaration the draft chose, else on the project's default. A named
+    // declaration must exist; the project's own name is not checked here, so a project whose
+    // declaration was removed keeps failing where it always has, naming the config key.
+    let harness_name = match req.harness.as_deref() {
+        Some(harness) => {
+            let catalog = state.registry.harness_catalog();
+            if catalog.get(harness).is_none() {
+                let declared = catalog.names().collect::<Vec<_>>().join(", ");
+                debug!(
+                    %project_id,
+                    harness,
+                    declared = %declared,
+                    action = "start_thread",
+                    "rejecting thread creation on an undeclared harness"
+                );
+                return Err(ApiError::BadRequest(format!(
+                    "unknown harness {harness:?}; declared: {declared}"
+                )));
+            }
+            harness.to_string()
+        }
+        None => project_config.harness.clone(),
+    };
     let catalog = project_model_catalog(&state, &project_config, &app_config, &harness_name).await;
     let (model_ref, model_descriptor) =
         resolve_initial_thread_model(&app_config, &catalog, req.model_ref);
@@ -877,6 +908,7 @@ async fn start_thread_with_message(
     info!(
         %project_id,
         %thread_id,
+        harness = %harness_name,
         provider = %model_ref.provider,
         model = %model_ref.model,
         mode = ?req.mode,
@@ -1060,6 +1092,7 @@ async fn start_thread_with_message(
         thread_id,
         title,
         harness_thread_id: handle.harness_thread_id,
+        harness: harness_name,
         turn_id,
         turn_steering,
         warning,
@@ -1734,6 +1767,7 @@ fn thread_summary(tf: &ThreadFile, workspace_root: String) -> ThreadSummary {
         id: tf.id,
         revision: tf.revision,
         title: tf.title.clone(),
+        harness: tf.harness.clone(),
         workspace_root,
         parent_thread_id: tf.parent_thread_id,
         spawned_by_turn_id: tf.spawned_by_turn_id,
@@ -4335,25 +4369,40 @@ async fn overlay_harness_metadata(
     }
 }
 
-async fn list_mcp_servers(
-    State(state): State<AppState>,
-    AxumPath(project_id): AxumPath<ProjectId>,
-) -> Result<Json<ListMcpServersResponse>, ApiError> {
+/// One declaration's instance for a project, for the harness-scoped routes. An unknown project or
+/// an undeclared name is `404`; an instance that cannot start is the harness's own error.
+async fn declared_project_harness(
+    state: &AppState,
+    project_id: ProjectId,
+    harness_name: &str,
+) -> Result<std::sync::Arc<dyn giskard_harness::AgentHarness>, ApiError> {
     let project_config = state
         .store
         .load_project(project_id)
         .await?
         .ok_or(ApiError::NotFound)?;
-    let harness = state
+    if state.registry.harness_catalog().get(harness_name).is_none() {
+        debug!(%project_id, harness = %harness_name, action = "harness_route",
+            "request names an undeclared harness");
+        return Err(ApiError::NotFound);
+    }
+    state
         .registry
-        .harness(&project_config, &project_config.harness)
+        .harness(&project_config, harness_name)
         .await
-        .map_err(harness_api_error)?;
+        .map_err(harness_api_error)
+}
+
+async fn list_mcp_servers(
+    State(state): State<AppState>,
+    AxumPath((project_id, harness_name)): AxumPath<(ProjectId, String)>,
+) -> Result<Json<ListMcpServersResponse>, ApiError> {
+    let harness = declared_project_harness(&state, project_id, &harness_name).await?;
     let capabilities = harness.capabilities();
     if !capabilities.mcp_status {
         warn!(
             %project_id,
-            harness = %project_config.harness,
+            harness = %harness_name,
             "MCP status requested but harness reports it unsupported"
         );
     }
@@ -4367,7 +4416,7 @@ async fn list_mcp_servers(
     };
     info!(
         %project_id,
-        harness = %project_config.harness,
+        harness = %harness_name,
         mcp_status_supported = capabilities.mcp_status,
         mcp_reload_supported = capabilities.mcp_reload,
         mcp_oauth_login_supported = capabilities.mcp_oauth_login,
@@ -4386,23 +4435,14 @@ async fn list_mcp_servers(
 
 async fn reload_mcp_servers(
     State(state): State<AppState>,
-    AxumPath(project_id): AxumPath<ProjectId>,
+    AxumPath((project_id, harness_name)): AxumPath<(ProjectId, String)>,
 ) -> Result<Json<ReloadMcpServersResponse>, ApiError> {
-    let project_config = state
-        .store
-        .load_project(project_id)
-        .await?
-        .ok_or(ApiError::NotFound)?;
-    let harness = state
-        .registry
-        .harness(&project_config, &project_config.harness)
-        .await
-        .map_err(harness_api_error)?;
+    let harness = declared_project_harness(&state, project_id, &harness_name).await?;
     let capabilities = harness.capabilities();
     if !capabilities.mcp_reload {
         warn!(
             %project_id,
-            harness = %project_config.harness,
+            harness = %harness_name,
             "MCP reload requested but harness reports it unsupported"
         );
         return Err(ApiError::BadRequest(
@@ -4415,7 +4455,7 @@ async fn reload_mcp_servers(
         .map_err(harness_api_error)?;
     info!(
         %project_id,
-        harness = %project_config.harness,
+        harness = %harness_name,
         "MCP server reload completed"
     );
     Ok(Json(ReloadMcpServersResponse { ok: true }))
@@ -4423,7 +4463,7 @@ async fn reload_mcp_servers(
 
 async fn start_mcp_oauth_login(
     State(state): State<AppState>,
-    AxumPath(project_id): AxumPath<ProjectId>,
+    AxumPath((project_id, harness_name)): AxumPath<(ProjectId, String)>,
     Json(req): Json<StartMcpOauthLoginRequest>,
 ) -> Result<Json<McpOauthStart>, ApiError> {
     let name = req.name.trim();
@@ -4432,21 +4472,12 @@ async fn start_mcp_oauth_login(
             "MCP server name cannot be empty".into(),
         ));
     }
-    let project_config = state
-        .store
-        .load_project(project_id)
-        .await?
-        .ok_or(ApiError::NotFound)?;
-    let harness = state
-        .registry
-        .harness(&project_config, &project_config.harness)
-        .await
-        .map_err(harness_api_error)?;
+    let harness = declared_project_harness(&state, project_id, &harness_name).await?;
     let capabilities = harness.capabilities();
     if !capabilities.mcp_oauth_login {
         warn!(
             %project_id,
-            harness = %project_config.harness,
+            harness = %harness_name,
             server = name,
             "MCP OAuth login requested but harness reports it unsupported"
         );
@@ -4460,7 +4491,7 @@ async fn start_mcp_oauth_login(
         .map_err(harness_api_error)?;
     info!(
         %project_id,
-        harness = %project_config.harness,
+        harness = %harness_name,
         server = name,
         authorization_url_returned = !login.authorization_url.is_empty(),
         "MCP OAuth login started"

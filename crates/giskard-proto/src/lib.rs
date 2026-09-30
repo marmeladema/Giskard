@@ -584,6 +584,8 @@ pub struct ThreadSummary {
     /// Same durable metadata revision carried by `ThreadState`.
     pub revision: u64,
     pub title: String,
+    /// The `[harnesses.<name>]` declaration this thread runs on, fixed at creation.
+    pub harness: String,
     /// Workspace root this thread reads and writes through. For isolated threads this is the
     /// worktree workspace, inherited by sub-agents; otherwise it is the project's workspace.
     pub workspace_root: String,
@@ -624,6 +626,8 @@ pub struct OpenSubagentLinkResponse {
 pub struct OpenThreadResponse {
     pub thread_id: ThreadId,
     pub harness_thread_id: String,
+    /// The `[harnesses.<name>]` declaration this thread runs on.
+    pub harness: String,
     /// Whether this attached harness accepts text input during an active turn.
     pub turn_steering: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -644,6 +648,10 @@ pub struct StartThreadRequest {
     /// endpoint that changes it afterwards.
     #[serde(default)]
     pub git_strategy: GitStrategy,
+    /// The `[harnesses.<name>]` declaration the thread is created on, fixed for its lifetime like
+    /// its provider. `None` means the project's default declaration.
+    #[serde(default)]
+    pub harness: Option<String>,
 }
 
 /// Where a thread's working tree comes from.
@@ -673,6 +681,8 @@ pub struct StartThreadResponse {
     pub thread_id: ThreadId,
     pub title: String,
     pub harness_thread_id: String,
+    /// The `[harnesses.<name>]` declaration the thread was created on.
+    pub harness: String,
     pub turn_id: TurnId,
     /// Whether this attached harness accepts text input during an active turn.
     pub turn_steering: bool,
