@@ -1360,18 +1360,18 @@ impl HarnessRegistry {
             return Ok(Some(parent_target));
         }
 
-        // A child is admitted by the instance that ran its parent.
-        let parent = self
-            .shared
-            .services
-            .store
-            .load_thread(project_id, parent_thread_id)
-            .await
-            .map_err(|error| HarnessError::Protocol(error.to_string()))?
-            .ok_or(HarnessError::ThreadNotFound(parent_thread_id))?;
+        // A child is admitted by the instance that ran its parent, which is named by the parent's
+        // live owner. Without one there is no instance to ask, and the driver would refuse the
+        // link for the same reason: the caller answers "no live parent" (409).
+        let Some(parent) = self.shared.coordinator(parent_thread_id).await else {
+            warn!(%project_id, %parent_thread_id, origin = "explicit_open",
+                "refusing native identity link from a parent without a live owner");
+            return Ok(None);
+        };
+        let harness = parent.binding().await.harness;
         let driver = self
             .shared
-            .event_driver(project_id, &parent.harness)
+            .event_driver(project_id, &harness)
             .await
             .ok_or_else(|| HarnessError::Protocol("project event driver is gone".into()))?;
         let (reply, response) = oneshot::channel();
@@ -1491,11 +1491,11 @@ impl HarnessRegistry {
         &self,
         config: &ProjectConfig,
         thread_id: ThreadId,
-        harness: String,
+        harness: &str,
         harness_thread_id: String,
     ) -> Result<(), HarnessError> {
         let harness = self
-            .get_or_create_harness(config.id, config, &harness)
+            .get_or_create_harness(config.id, config, harness)
             .await?;
         let handle = self
             .loaded_thread_binding(thread_id)
@@ -1669,9 +1669,10 @@ impl HarnessRegistry {
     /// any harness is shut down, so no instance admits a native thread into a project whose other
     /// instances are already gone. A failure before the first shutdown restores every instance; a
     /// failed shutdown restores that instance and the ones not yet reached, while the ones already
-    /// stopped stay removed, since a stopped harness cannot serve again.
+    /// stopped stay removed, since a stopped harness cannot serve again, and their threads are
+    /// released so a reopen or a retried deletion starts clean.
     pub async fn delete_project(&self, project_id: ProjectId) -> Result<(), HarnessError> {
-        let mut thread_ids = HashSet::new();
+        let mut threads = Vec::new();
         let authority = self.shared.project_authority(project_id).await;
         let deleting = if let Some(authority) = authority.as_ref() {
             let mut transitions = self.shared.harness_transitions.lock().await;
@@ -1699,8 +1700,9 @@ impl HarnessRegistry {
             }
         }
         for (thread_id, coordinator) in self.shared.coordinator_snapshot().await {
-            if coordinator.binding().await.project_id == project_id {
-                thread_ids.insert(thread_id);
+            let binding = coordinator.binding().await;
+            if binding.project_id == project_id {
+                threads.push((thread_id, binding.harness));
             }
         }
 
@@ -1709,6 +1711,16 @@ impl HarnessRegistry {
             if let Err(error) = harness.shutdown().await {
                 warn!(%project_id, harness = %name, %error,
                     "project harness shutdown failed during project deletion");
+                // The instances already stopped stay removed, so their threads must not keep a
+                // coordinator bound to a harness that is gone: release them now, so a reopen
+                // attaches afresh and a retried deletion finds nothing stale.
+                let stopped = threads
+                    .iter()
+                    .filter(|(_, harness)| retained_drivers.contains_key(harness))
+                    .cloned()
+                    .collect::<Vec<_>>();
+                self.release_deleted_threads(&stopped, &retained_drivers)
+                    .await;
                 let remaining = &deleting[index..];
                 for (_, (_, driver)) in remaining {
                     if let Err(resume_error) = driver.resume().await {
@@ -1731,35 +1743,35 @@ impl HarnessRegistry {
             }
         }
 
+        self.release_deleted_threads(&threads, &retained_drivers)
+            .await;
+        Ok(())
+    }
+
+    /// Forget the loaded threads of stopped instances: each is detached through its instance's
+    /// retained (quiesced) driver, or forgotten directly when its instance had none, and its
+    /// runtime state is dropped.
+    async fn release_deleted_threads(
+        &self,
+        threads: &[(ThreadId, String)],
+        stopped_drivers: &HashMap<String, DriverHandle>,
+    ) {
         let mut thread_authorities = Vec::new();
-        for thread_id in &thread_ids {
-            let thread_authority = self.shared.thread_authority(*thread_id).await;
-            let driver = match thread_authority.as_ref() {
-                Some(thread_authority) => match thread_authority.coordinator().await {
-                    Some(coordinator) => retained_drivers
-                        .get(&coordinator.binding().await.harness)
-                        .cloned(),
-                    None => None,
-                },
-                None => None,
-            };
-            if let Some(thread_authority) = thread_authority {
+        for (thread_id, harness) in threads {
+            if let Some(thread_authority) = self.shared.thread_authority(*thread_id).await {
                 thread_authorities.push(thread_authority);
             }
-            if let Some(driver) = driver {
+            if let Some(driver) = stopped_drivers.get(harness) {
                 driver.detach(*thread_id).await;
             } else {
                 self.forget_thread(*thread_id).await;
             }
         }
-        drop(retained_drivers);
         self.shared
             .services
             .runtime
             .forget_threads(&thread_authorities);
         self.shared.services.publish_runtime_overview().await;
-
-        Ok(())
     }
 
     /// Restore the deleting slots of a failed project deletion to active use.
@@ -2723,16 +2735,26 @@ mod tests {
         thread: ThreadId,
         native: &str,
     ) {
+        attach_primary_on(registry, project, thread, native, "codex").await;
+    }
+
+    async fn attach_primary_on(
+        registry: &super::HarnessRegistry,
+        project: ProjectId,
+        thread: ThreadId,
+        native: &str,
+        harness: &str,
+    ) {
         let driver = registry
             .shared
-            .event_driver(project, "codex")
+            .event_driver(project, harness)
             .await
             .unwrap();
         driver
             .attach(
                 super::LoadedThreadBinding {
                     project_id: project,
-                    harness: "codex".into(),
+                    harness: harness.into(),
                     handle: ThreadHandle::opened(thread, native.into(), PathBuf::from("/tmp/test")),
                     turn_steering: false,
                     native_model: None,
@@ -3148,6 +3170,10 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let store = Arc::new(PersistStore::new(tmp.path().to_path_buf()));
         let (project, config) = create_test_project(&store, "delete-partial-failure").await;
+        let stable_thread = ThreadId::new();
+        let nightly_thread = ThreadId::new();
+        save_thread_on(&store, project, stable_thread, "native-stable", "stable").await;
+        save_thread_on(&store, project, nightly_thread, "native-nightly", "nightly").await;
         let (registry, factory, _sink) = discovery_registry(store).await;
         for harness in ["stable", "nightly"] {
             registry
@@ -3155,6 +3181,30 @@ mod tests {
                 .await
                 .unwrap();
         }
+        attach_primary_on(&registry, project, stable_thread, "native-stable", "stable").await;
+        attach_primary_on(
+            &registry,
+            project,
+            nightly_thread,
+            "native-nightly",
+            "nightly",
+        )
+        .await;
+        // Runtime state the deletion must drop for the stopped instance's thread and keep for the
+        // restored one's. The coordinator alone cannot tell: a teardown exit clears it too, but
+        // only once the stopped harness closes the thread's stream, and it leaves runtime behind.
+        let stable_authority = registry
+            .shared
+            .thread_authority(stable_thread)
+            .await
+            .unwrap();
+        let nightly_authority = registry
+            .shared
+            .thread_authority(nightly_thread)
+            .await
+            .unwrap();
+        stable_authority.runtime_entry_or_create();
+        nightly_authority.runtime_entry_or_create();
         let created = factory.created.lock().unwrap().clone();
         created[1].fail_next_shutdown();
 
@@ -3175,6 +3225,89 @@ mod tests {
             .expect("the instance whose shutdown failed is restored");
         let nightly: Arc<dyn AgentHarness> = created[1].clone();
         assert!(Arc::ptr_eq(&restored, &nightly));
+        assert!(
+            registry.shared.coordinator(stable_thread).await.is_none(),
+            "a thread of a stopped instance must not stay bound to a harness that is gone"
+        );
+        assert!(
+            registry.shared.coordinator(nightly_thread).await.is_some(),
+            "a thread of a restored instance keeps its owner"
+        );
+        assert!(
+            stable_authority.runtime_entry().is_none(),
+            "a thread of a stopped instance is released with its runtime state"
+        );
+        assert!(nightly_authority.runtime_entry().is_some());
+
+        // The retried deletion finds only the restored instance and completes.
+        registry.delete_project(project).await.unwrap();
+        assert_eq!(created[0].shutdown_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(created[1].shutdown_calls.load(Ordering::SeqCst), 2);
+        assert!(registry.shared.coordinator(nightly_thread).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn an_explicit_link_from_a_parent_without_a_live_owner_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(PersistStore::new(tmp.path().to_path_buf()));
+        let (project, _config) = create_test_project(&store, "link-without-owner").await;
+        let parent = ThreadId::new();
+        save_thread_on(&store, project, parent, "native-parent", "nightly").await;
+        let item_id = ItemId::new();
+        let now = Utc::now();
+        store
+            .append_turn(
+                project,
+                parent,
+                &giskard_core::turn::Turn {
+                    id: TurnId::new(),
+                    user_input: UserInput::text("spawn a child"),
+                    items: vec![Item {
+                        id: item_id,
+                        harness_item_id: "native-link".into(),
+                        payload: ItemPayload::Activity {
+                            title: "Sub-agent running".into(),
+                            detail: None,
+                            metadata: None,
+                            subagent: Some(giskard_core::item::SubagentLink {
+                                harness_thread_id: "native-child".into(),
+                                path: None,
+                                initial_prompt: None,
+                                action: giskard_core::item::SubagentAction::Started,
+                                status: None,
+                                message: None,
+                            }),
+                        },
+                        created_at: now,
+                    }],
+                    model: TurnModel::Known(test_model()),
+                    mode: TurnMode::Known(Mode::Build),
+                    status: TurnStatus {
+                        kind: TurnStatusKind::Completed,
+                        message: None,
+                    },
+                    usage: TokenUsage::default(),
+                    diffs: Vec::new(),
+                    started_at: now,
+                    completed_at: Some(now),
+                },
+            )
+            .await
+            .unwrap();
+        let (registry, factory, _sink) = discovery_registry(store).await;
+
+        let opened = registry
+            .open_subagent_link(project, parent, item_id)
+            .await
+            .unwrap();
+        assert_eq!(
+            opened, None,
+            "the route answers 409 for a parent with no live owner"
+        );
+        assert!(
+            factory.created.lock().unwrap().is_empty(),
+            "no instance is started to admit a link nobody can own"
+        );
     }
 
     #[tokio::test]
