@@ -72,6 +72,7 @@ fn thread_file(pid: ProjectId, tid: ThreadId) -> giskard_persist::store::ThreadF
         project_id: pid,
         title: "code overlay".into(),
         harness_thread_id: format!("native-{tid}"),
+        harness: "codex".into(),
         parent_thread_id: None,
         spawned_by_turn_id: None,
         kind: giskard_core::thread::ThreadKind::Primary,

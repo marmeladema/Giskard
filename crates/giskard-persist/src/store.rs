@@ -18,7 +18,7 @@ use giskard_core::turn::{PermissionPreset, Turn, TurnMode, TurnModel};
 
 use crate::PersistError;
 use crate::atomic::{atomic_write, atomic_write_json, read_json, read_json_or_quarantine};
-use crate::config::Config;
+use crate::config::{Config, HarnessCatalog};
 use crate::history::{self, HistoryHeader, TurnRecord};
 use crate::layout::{ThreadLayout, ThreadPaths};
 use crate::migrate::{self, MigrationOutcome};
@@ -90,6 +90,17 @@ pub struct ThreadFile {
     pub revision: u64,
     pub title: String,
     pub harness_thread_id: String,
+    /// The `[harnesses.<name>]` declaration this thread runs on. Fixed at native creation, for
+    /// the same reason `current_model`'s provider is: the native id exists in exactly one harness
+    /// home. Files written before the field carry no value and belong to the reserved `codex`,
+    /// which is what they always meant; the constant default keeps the project file
+    /// non-load-bearing at read time. Skipped on write when it is that constant so a thread on the
+    /// default harness stays readable by an older binary under `deny_unknown_fields`.
+    #[serde(
+        default = "default_thread_harness",
+        skip_serializing_if = "is_default_thread_harness"
+    )]
+    pub harness: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_thread_id: Option<ThreadId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -310,6 +321,14 @@ impl ThreadWorktree {
 
 fn is_false(value: &bool) -> bool {
     !*value
+}
+
+fn default_thread_harness() -> String {
+    HarnessCatalog::SYNTHESIZED_NAME.to_string()
+}
+
+fn is_default_thread_harness(value: &str) -> bool {
+    value == HarnessCatalog::SYNTHESIZED_NAME
 }
 
 fn is_zero(value: &u64) -> bool {
@@ -2374,6 +2393,7 @@ mod tests {
             project_id,
             title: "Thread".into(),
             harness_thread_id: "native-thread".into(),
+            harness: "codex".into(),
             parent_thread_id: None,
             spawned_by_turn_id: None,
             kind: ThreadKind::Primary,
@@ -2774,6 +2794,7 @@ mod tests {
             project_id: pid,
             title: "Fix auth".into(),
             harness_thread_id: "th_abc".into(),
+            harness: "codex".into(),
             parent_thread_id: None,
             spawned_by_turn_id: None,
             kind: ThreadKind::Primary,
@@ -2870,6 +2891,7 @@ mod tests {
             project_id: pid,
             title: "Fix auth".into(),
             harness_thread_id: "th_abc".into(),
+            harness: "codex".into(),
             parent_thread_id: None,
             spawned_by_turn_id: None,
             kind: ThreadKind::Primary,
@@ -2907,6 +2929,38 @@ mod tests {
         assert_eq!(legacy_auto, PermissionPreset::AutoApprove);
     }
 
+    #[test]
+    fn a_thread_file_without_harness_reads_as_codex() {
+        let thread = test_thread(ProjectId::new(), ThreadId::new());
+        let mut value = serde_json::to_value(&thread).unwrap();
+        assert!(value.as_object_mut().unwrap().remove("harness").is_none());
+
+        let loaded: ThreadFile = serde_json::from_value(value).unwrap();
+        assert_eq!(loaded.harness, "codex");
+    }
+
+    #[test]
+    fn a_default_harness_is_not_written_and_another_is() {
+        let thread = test_thread(ProjectId::new(), ThreadId::new());
+        let value = serde_json::to_value(&thread).unwrap();
+        assert!(
+            value.get("harness").is_none(),
+            "a thread on the reserved default stays readable by an older binary"
+        );
+        assert_eq!(serde_json::from_value::<ThreadFile>(value).unwrap(), thread);
+
+        let nightly = ThreadFile {
+            harness: "nightly".into(),
+            ..test_thread(ProjectId::new(), ThreadId::new())
+        };
+        let value = serde_json::to_value(&nightly).unwrap();
+        assert_eq!(value["harness"], "nightly");
+        assert_eq!(
+            serde_json::from_value::<ThreadFile>(value).unwrap(),
+            nightly
+        );
+    }
+
     #[tokio::test]
     async fn load_thread_requires_permission_preset() {
         let (_tmp, store) = make_store();
@@ -2925,6 +2979,7 @@ mod tests {
             project_id: pid,
             title: "Fix auth".into(),
             harness_thread_id: "th_abc".into(),
+            harness: "codex".into(),
             parent_thread_id: None,
             spawned_by_turn_id: None,
             kind: ThreadKind::Primary,
@@ -2974,6 +3029,7 @@ mod tests {
                 project_id: pid,
                 title: "t".into(),
                 harness_thread_id: "th".into(),
+                harness: "codex".into(),
                 parent_thread_id: None,
                 spawned_by_turn_id: None,
                 kind: ThreadKind::Primary,
@@ -3291,6 +3347,7 @@ mod tests {
                     project_id: pid,
                     title: "t".into(),
                     harness_thread_id: "th".into(),
+                    harness: "codex".into(),
                     parent_thread_id: None,
                     spawned_by_turn_id: None,
                     kind: ThreadKind::Primary,
@@ -3625,6 +3682,7 @@ mod tests {
                     project_id: pid,
                     title: "t".into(),
                     harness_thread_id: "th".into(),
+                    harness: "codex".into(),
                     parent_thread_id: None,
                     spawned_by_turn_id: None,
                     kind: ThreadKind::Primary,
@@ -3674,6 +3732,7 @@ mod tests {
                     project_id: pid,
                     title: "t".into(),
                     harness_thread_id: "th".into(),
+                    harness: "codex".into(),
                     parent_thread_id: None,
                     spawned_by_turn_id: None,
                     kind: ThreadKind::Primary,

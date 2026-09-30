@@ -70,6 +70,7 @@ async fn thread_lifecycle_native_failure_preserves_local_thread() {
                 project_id: pid,
                 title: "Local thread".into(),
                 harness_thread_id: "native-thread".into(),
+                harness: "codex".into(),
                 parent_thread_id: None,
                 spawned_by_turn_id: None,
                 kind: giskard_core::ThreadKind::Primary,

@@ -114,6 +114,7 @@ mod tests {
                     project_id,
                     title: "services".into(),
                     harness_thread_id: format!("native-{thread_id}"),
+                    harness: "codex".into(),
                     parent_thread_id: None,
                     spawned_by_turn_id: None,
                     kind: ThreadKind::Primary,

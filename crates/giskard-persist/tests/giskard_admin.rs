@@ -33,6 +33,7 @@ fn test_thread(
         project_id,
         title: title.into(),
         harness_thread_id: format!("harness-{thread_id}"),
+        harness: "codex".into(),
         parent_thread_id: None,
         spawned_by_turn_id: None,
         kind: ThreadKind::Primary,
