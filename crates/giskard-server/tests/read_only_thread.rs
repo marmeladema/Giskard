@@ -366,4 +366,94 @@ async fn a_project_naming_an_undeclared_harness_names_the_config_key() {
         body.contains("[harnesses]") && body.contains("\"codex\"") && body.contains("other"),
         "the refusal should name the missing declaration and the config key: {body}"
     );
+
+    // The same rule per thread: a thread stamped with a declaration the server does not know
+    // opens read-only naming it, while its sibling on a declared harness opens normally. A
+    // missing declaration is a per-thread degraded state, not a project-wide failure.
+    let config: giskard_persist::Config =
+        toml::from_str("[harnesses.stable]\nkind = \"replay\"\n").unwrap();
+    let catalog = giskard_persist::HarnessCatalog::resolve(&config).unwrap();
+    let factory = giskard_server::HarnessKindFactory::new()
+        .register(Arc::new(ReplayKind))
+        .unwrap()
+        .with_catalog(catalog);
+    factory.validate().unwrap();
+    let pid = ProjectId::new();
+    let stable_thread = ThreadId::new();
+    let nightly_thread = ThreadId::new();
+    let proj_dir = tempfile::TempDir::new().unwrap();
+    let path = proj_dir.path().to_string_lossy().to_string();
+    let server = TestServer::builder(Arc::new(factory))
+        .seed(move |store| async move {
+            store
+                .create_project(pid, "proj", &path, "stable")
+                .await
+                .unwrap();
+            fixtures::persist_primary_thread_on(
+                &store,
+                pid,
+                stable_thread,
+                "native-stable",
+                fixtures::fake_native_model(),
+                "stable",
+            )
+            .await;
+            fixtures::persist_primary_thread_on(
+                &store,
+                pid,
+                nightly_thread,
+                "native-nightly",
+                fixtures::fake_native_model(),
+                "nightly",
+            )
+            .await;
+        })
+        .start()
+        .await;
+    let open = |thread: ThreadId| {
+        let server = &server;
+        async move {
+            let response = server
+                .client
+                .post(server.url(&format!("/api/projects/{pid}/threads")))
+                .header("cookie", &server.cookie)
+                .json(&serde_json::json!({"thread_id": thread}))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), 200);
+            response.json::<serde_json::Value>().await.unwrap()
+        }
+    };
+    let nightly = open(nightly_thread).await;
+    assert_eq!(nightly["warning"]["code"], "thread_read_only", "{nightly}");
+    assert_eq!(nightly["harness"], "nightly", "{nightly}");
+    let detail = nightly["warning"]["detail"].as_str().unwrap_or_default();
+    assert!(
+        detail.contains("[harnesses]") && detail.contains("\"nightly\""),
+        "the detail should name the missing declaration and the config key: {detail}"
+    );
+    let stable = open(stable_thread).await;
+    assert!(stable.get("warning").is_none(), "{stable}");
+    assert_eq!(stable["harness"], "stable", "{stable}");
+}
+
+/// A kind constructing a replay harness, so a declared thread can attach.
+struct ReplayKind;
+
+#[async_trait::async_trait]
+impl giskard_server::HarnessKind for ReplayKind {
+    fn name(&self) -> &str {
+        "replay"
+    }
+    fn validate(&self, _declaration: &giskard_persist::HarnessDeclaration) -> Result<(), String> {
+        Ok(())
+    }
+    async fn create(
+        &self,
+        _spec: giskard_server::HarnessInstanceSpec<'_>,
+        _bootstrap: giskard_harness::HarnessBootstrap,
+    ) -> Result<Arc<dyn giskard_harness::AgentHarness>, giskard_core::HarnessError> {
+        Ok(Arc::new(giskard_harness_replay::ReplayHarness::new()))
+    }
 }

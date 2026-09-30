@@ -436,6 +436,46 @@ async fn create_project_rejects_an_undeclared_harness() {
 }
 
 #[tokio::test]
+async fn start_thread_rejects_an_undeclared_harness() {
+    let server = start_two_harness_server().await;
+    let dir = tempfile::TempDir::new().unwrap();
+    let resp = post_project(
+        &server,
+        serde_json::json!({"name": "d", "dir": dir.path().to_string_lossy()}),
+    )
+    .await;
+    assert_eq!(resp.status(), 200);
+    let pid: giskard_core::ids::ProjectId = resp.json::<serde_json::Value>().await.unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+
+    let started = server
+        .client
+        .post(server.url(&format!("/api/projects/{pid}/threads/start")))
+        .header("cookie", &server.cookie)
+        .json(&serde_json::json!({
+            "text": "hello",
+            "model_ref": {"provider": "openai", "model": "gpt-5.5", "reasoning_effort": null},
+            "mode": "build",
+            "permission_preset": "ask_first",
+            "harness": "nope",
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(started.status(), 400);
+    let body = started.text().await.unwrap();
+    assert!(
+        body.contains("unknown harness \"nope\"") && body.contains("codex-nightly, codex-stable"),
+        "the refusal should name the declared list: {body}"
+    );
+    let threads = server.store().list_threads(pid).await.unwrap();
+    assert!(threads.is_empty(), "no thread file is created: {threads:?}");
+}
+
+#[tokio::test]
 async fn list_harnesses_returns_declarations_in_order_with_the_default_marked() {
     let server = start_two_harness_server().await;
     let resp = server

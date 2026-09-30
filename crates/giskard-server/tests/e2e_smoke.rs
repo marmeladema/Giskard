@@ -3238,7 +3238,9 @@ async fn mcp_status_routes_surface_empty_replay_status_and_reload() {
     let (project_id, _) = create_project_and_thread(state, &client, &base, &cookie).await;
 
     let status: serde_json::Value = client
-        .get(format!("{base}/api/projects/{project_id}/mcp"))
+        .get(format!(
+            "{base}/api/projects/{project_id}/harnesses/codex/mcp"
+        ))
         .header("cookie", &cookie)
         .send()
         .await
@@ -3252,7 +3254,9 @@ async fn mcp_status_routes_surface_empty_replay_status_and_reload() {
     assert_eq!(status["capabilities"]["oauth_login"], false);
 
     let reload: serde_json::Value = client
-        .post(format!("{base}/api/projects/{project_id}/mcp/reload"))
+        .post(format!(
+            "{base}/api/projects/{project_id}/harnesses/codex/mcp/reload"
+        ))
         .header("cookie", &cookie)
         .json(&serde_json::json!({}))
         .send()
@@ -3262,6 +3266,24 @@ async fn mcp_status_routes_surface_empty_replay_status_and_reload() {
         .await
         .unwrap();
     assert_eq!(reload["ok"], true);
+
+    // The routes moved under the harness declaration; the project-wide paths are gone.
+    let old = client
+        .get(format!("{base}/api/projects/{project_id}/mcp"))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(old.status(), 404);
+    let undeclared = client
+        .get(format!(
+            "{base}/api/projects/{project_id}/harnesses/nope/mcp"
+        ))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(undeclared.status(), 404);
 }
 
 #[tokio::test]
@@ -3273,7 +3295,9 @@ async fn mcp_status_routes_surface_unsupported_capabilities_without_failing() {
     let project_id = create_project_only(&client, &base, &cookie).await;
 
     let status: serde_json::Value = client
-        .get(format!("{base}/api/projects/{project_id}/mcp"))
+        .get(format!(
+            "{base}/api/projects/{project_id}/harnesses/codex/mcp"
+        ))
         .header("cookie", &cookie)
         .send()
         .await
@@ -3287,7 +3311,9 @@ async fn mcp_status_routes_surface_unsupported_capabilities_without_failing() {
     assert_eq!(status["capabilities"]["oauth_login"], false);
 
     let reload = client
-        .post(format!("{base}/api/projects/{project_id}/mcp/reload"))
+        .post(format!(
+            "{base}/api/projects/{project_id}/harnesses/codex/mcp/reload"
+        ))
         .header("cookie", &cookie)
         .json(&serde_json::json!({}))
         .send()
@@ -3313,7 +3339,9 @@ async fn mcp_oauth_login_rejects_empty_and_unsupported_requests() {
     let (project_id, _) = create_project_and_thread(state, &client, &base, &cookie).await;
 
     let empty = client
-        .post(format!("{base}/api/projects/{project_id}/mcp/oauth-login"))
+        .post(format!(
+            "{base}/api/projects/{project_id}/harnesses/codex/mcp/oauth-login"
+        ))
         .header("cookie", &cookie)
         .json(&serde_json::json!({"name": "   "}))
         .send()
@@ -3323,7 +3351,9 @@ async fn mcp_oauth_login_rejects_empty_and_unsupported_requests() {
     assert!(empty.text().await.unwrap().contains("cannot be empty"));
 
     let unsupported = client
-        .post(format!("{base}/api/projects/{project_id}/mcp/oauth-login"))
+        .post(format!(
+            "{base}/api/projects/{project_id}/harnesses/codex/mcp/oauth-login"
+        ))
         .header("cookie", &cookie)
         .json(&serde_json::json!({"name": "cf-mcp"}))
         .send()
