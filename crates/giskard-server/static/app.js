@@ -175,7 +175,7 @@ let state = {
   // are dropped only when the thread they belong to is left (see clearReasoningChoices).
   reasoningChoicesByRowKey:new Map(),
   linkifyCache:new Map(), markdownCache:new Map(), codePath:null, codeLine:null, codeOverlaySource:null, outputOverlay:null, outputOverlayRequestSeq:0, activeTurn:false, turnSteering:false, pendingSteer:null, interruptPending:false, compactPending:false,
-  awaitingInitialThreadState:false, awaitingThreadResync:false, awaitingIncrementalResync:false, resyncStickBottom:false, contextWindow:0, contextUsed:null, permissionPreset:"ask_first", currentModel:null, harnessCapabilities:null,
+  awaitingInitialThreadState:false, awaitingThreadResync:false, awaitingIncrementalResync:false, resyncStickBottom:false, contextWindow:0, contextUsed:null, permissionPreset:"ask_first", currentModel:null, harnessCapabilities:{}, harnesses:[], projectHarness:null, threadHarness:null, knownHarnesses:new Set(),
   threadAuthorities:new Map(), pendingDetailConflictResyncs:new Set(),
   pendingMetadataActions:new Map(), threadListRefreshes:new Map(),
   pendingLiveSnapshotReconcile:false,
@@ -321,7 +321,20 @@ async function startApp() {
   initServiceWorkerNotifications();
   initNotificationSettings();
   renderModelSelect();
+  await loadDeclaredHarnesses();
   await loadProjects();
+}
+
+// The declared harnesses, learned once at start so a sidebar row can name its thread's harness
+// when there is more than one — even when the only open view is a thread scoped to its own.
+// Best-effort: without the list the rows simply carry no harness in their tooltip.
+async function loadDeclaredHarnesses() {
+  try {
+    const res = await api("GET", "/api/harnesses");
+    for (const h of (res && res.harnesses) || []) noteKnownHarness(h.name);
+  } catch (e) {
+    console.warn("Could not load the declared harnesses", e);
+  }
 }
 
 // The per-project model list is authoritative when a project is open: configured models + each
@@ -332,15 +345,45 @@ async function startApp() {
 // project's response landing after a project switch.
 let _loadingProjectModels = false;
 let _pendingProjectModelLoad = null;
+// A loaded catalog is keyed by project and scope: an existing thread's picker holds only its own
+// harness's group, which must not be mistaken for the full list a draft of the same project needs.
+function modelCatalogKey(pid, harness) {
+  return JSON.stringify([String(pid), harness || null]);
+}
+// The harness declaration whose models the picker offers: the draft's selected group on a draft
+// (the project's default until one is picked), the thread's own declaration otherwise.
+function activeModelHarness() {
+  if (isDraftThread()) {
+    return state.draftThread.harness || state.projectHarness ||
+      (state.harnesses[0] && state.harnesses[0].name) || null;
+  }
+  return state.threadHarness;
+}
+// The scope the active view loads its catalog with: none for a draft, which offers every harness.
+function activeModelScope() {
+  return isDraftThread() ? null : state.threadHarness;
+}
 function projectModelCatalogReady() {
   return !!state.projectId &&
-    state.modelsProject === state.projectId &&
+    state.modelsProject === modelCatalogKey(state.projectId, activeModelScope()) &&
     state.modelsLoadingProject !== state.projectId;
 }
-function prepareProjectModelCatalog(pid) {
-  if (state.modelsProject === pid) return;
+function prepareProjectModelCatalog(pid, harness) {
+  if (state.modelsProject === modelCatalogKey(pid, harness)) return;
+  // A thread opened while its project's full list is loaded (a draft that just started) narrows
+  // that list to its own group: it is exactly what the scoped request would return, and refetching
+  // it would blank the picker the user just chose from.
+  if (harness && state.modelsProject === modelCatalogKey(pid, null) &&
+      state.harnesses.some(h => h.name === harness)) {
+    state.models = state.models.filter(m => m.harness === harness);
+    state.harnesses = state.harnesses.filter(h => h.name === harness);
+    state.modelsProject = modelCatalogKey(pid, harness);
+    renderModelSelect();
+    return;
+  }
   state.models = [];
-  state.harnessCapabilities = null;
+  state.harnessCapabilities = {};
+  state.harnesses = [];
   state.modelsProject = null;
   closeModelPicker();
   renderModelSelect();
@@ -350,8 +393,16 @@ function prepareProjectModelCatalog(pid) {
 // that could not be reached) leave every control as it is: the read-only paths already cover a
 // thread that cannot attach, and a draft must not lose its pickers to a transient failure.
 function harnessCan(flag) {
-  const caps = state.harnessCapabilities;
+  const caps = state.harnessCapabilities[activeModelHarness()];
   return !caps || caps[flag] !== false;
+}
+// Whether the draft offers a choice of harness, and so names the one it picked when it starts.
+function draftHarnessChoice(draft) {
+  return !!draft && !!draft.harness && state.harnesses.length > 1;
+}
+// Harness declarations seen in a models response or a thread list, for the sidebar tooltip.
+function noteKnownHarness(name) {
+  if (name) state.knownHarnesses.add(String(name));
 }
 async function loadProjectModels(pid, opts) {
   opts = opts || {};
@@ -359,7 +410,8 @@ async function loadProjectModels(pid, opts) {
   // A load is in flight: remember the latest requested project instead of dropping it, so switching
   // A→B while A is loading still fetches B's authoritative list once A settles.
   if (_loadingProjectModels) { _pendingProjectModelLoad = { pid, opts }; return; }
-  if (!opts.force && pid === state.modelsProject) return;   // already loaded for this project
+  const key = modelCatalogKey(pid, opts.harness);
+  if (!opts.force && key === state.modelsProject) return;   // already loaded for this scope
   _loadingProjectModels = true;
   if (pid === state.projectId) {
     state.modelsLoadingProject = pid;
@@ -367,11 +419,17 @@ async function loadProjectModels(pid, opts) {
   }
   const btn = $("refreshModels"); if (btn) btn.disabled = true;
   try {
-    const res = await api("GET", `/api/projects/${pid}/models`);
-    if (res && Array.isArray(res.models) && pid === state.projectId) {
+    const scope = opts.harness ? `?harness=${encodeURIComponent(opts.harness)}` : "";
+    const res = await api("GET", `/api/projects/${pid}/models${scope}`);
+    if (res && Array.isArray(res.models) && pid === state.projectId &&
+        key === modelCatalogKey(pid, activeModelScope())) {
       state.models = res.models;
-      state.harnessCapabilities = res.capabilities || null;
-      state.modelsProject = pid;
+      state.harnesses = Array.isArray(res.harnesses) ? res.harnesses : [];
+      state.projectHarness = res.project_harness || null;
+      state.harnessCapabilities = Object.fromEntries(
+        state.harnesses.filter(h => h.capabilities).map(h => [h.name, h.capabilities]));
+      for (const h of state.harnesses) noteKnownHarness(h.name);
+      state.modelsProject = key;
       renderModelSelect();
       updateModelButton();
       settleDraftModel();
@@ -379,7 +437,10 @@ async function loadProjectModels(pid, opts) {
     // Only surface warnings/errors while `pid` is still the active project — a switch mid-request
     // must not misattribute the previous project's discovery failures to the new one.
     if (opts.announce && res && Array.isArray(res.warnings) && pid === state.projectId) {
-      for (const w of res.warnings) notice(`Model discovery — ${w.source}: ${w.message}`, "warning");
+      for (const w of res.warnings) {
+        const where = state.harnesses.length > 1 && w.harness ? `${w.harness} · ${w.source}` : w.source;
+        notice(`Model discovery — ${where}: ${w.message}`, "warning");
+      }
     }
   } catch (e) {
     // Always surfaced for the active project, unlike the per-source discovery warnings above: those
@@ -405,7 +466,8 @@ async function loadProjectModels(pid, opts) {
   }
 }
 // Reload re-runs discovery and re-pulls this project's harness names for the current project.
-$("refreshModels").onclick = () => loadProjectModels(state.projectId, { force:true, announce:true });
+$("refreshModels").onclick = () =>
+  loadProjectModels(state.projectId, { force:true, announce:true, harness:activeModelScope() });
 
 function initNotificationSettings() {
   const buttons = notificationPermissionButtons();
@@ -957,6 +1019,7 @@ function normalizedThreadProjection(kind, payload, threadId, revision) {
     id:threadId,
     revision,
     title:payload.title,
+    harness:payload.harness,
     workspace_root:payload.workspace_root,
     parent_thread_id:payload.parent_thread_id || null,
     spawned_by_turn_id:payload.spawned_by_turn_id || null,
@@ -1347,6 +1410,7 @@ function appendThreadRows(box, pid, threads) {
       roots.push(t);
     }
   }
+  for (const t of threads) noteKnownHarness(t.harness);
   const rendered = new Set();
   const appendOne = (t) => {
     const id = String(t.id);
@@ -1422,6 +1486,7 @@ function threadRow(pid, t) {
   const title = t.title || t.id.slice(0,8);
   const el = document.createElement("div"); el.className="thread mono";
   applyThreadTitleToElement(el, pid, t.id, title);
+  if (t.harness && state.knownHarnesses.size > 1) el.title = `${title} · harness ${t.harness}`;
   markSidebarRowActive(el, !!state.threadId && String(t.id) === String(state.threadId));
 
   const menuBtn = document.createElement("button");
@@ -2127,6 +2192,7 @@ function clearThreadView(tid) {
   state.compactPending = false;
   state.currentModel = null;
   state.currentModelUnreported = false;
+  state.threadHarness = null;
   $("effortControl").hidden = true;
   setTurnActive(false);
   state.awaitingInitialThreadState = false;
@@ -2398,12 +2464,19 @@ function newThread(pid) {
 function settleDraftModel(failure) {
   const draft = state.draftThread;
   if (!draft || draft.modelPinned) return;
-  if (!failure && state.modelsProject !== draft.projectId) return;   // catalog not in yet
-  const chosen = failure ? null : (state.models.find(m => m.is_default) || state.models[0] || null);
+  if (!failure && state.modelsProject !== modelCatalogKey(draft.projectId, null)) return;   // catalog not in yet
+  // The project's default harness first: its default model, else its first. Only a project whose
+  // default declaration offers nothing starts from another harness's first model.
+  const group = state.models.filter(m => m.harness === state.projectHarness);
+  const chosen = failure ? null :
+    (group.find(m => m.is_default) || group[0] || state.models[0] || null);
   if (!failure && !chosen) failure = "this project has no models to choose from";
   draft.modelLoading = false;
   draft.modelError = failure || null;
-  if (chosen) state.currentModel = normalizeDraftModel(chosen);
+  if (chosen) {
+    state.currentModel = normalizeDraftModel(chosen);
+    draft.harness = chosen.harness || null;
+  }
   syncModelControls();
   updateComposerControls();
   if (failure) notice("Cannot start a thread here — " + failure + ".", "error");
@@ -2569,7 +2642,7 @@ function openDraftThread(pid) {
   renderParentThreadButton();
   // `modelLoading` until the project's default arrives; `currentModel` stays null until then so a
   // placeholder can never reach `threads/start` (LT7).
-  state.draftThread = { projectId:pid, title:"New thread", modelLoading:true, modelError:null };
+  state.draftThread = { projectId:pid, title:"New thread", modelLoading:true, modelError:null, harness:null };
   setDraftGitStrategy(GIT_STRATEGY_SHARED);   // chosen per draft: never carried over from the last one
   state.firstTurnStartingThreadId = null;
   state.pendingUserEl = null;
@@ -2579,6 +2652,7 @@ function openDraftThread(pid) {
   state.compactPending = false;
   state.currentModel = null;
   state.currentModelUnreported = false;
+  state.threadHarness = null;
   prepareProjectModelCatalog(pid);
   resetGitState();
   state.mcpServers = []; state.mcpError = null; state.expandedMcps = new Set();
@@ -2664,8 +2738,10 @@ async function openThread(pid, tid, title, opts) {
   state.compactPending = false;
   state.currentModel = null;
   state.currentModelUnreported = false;
+  // The thread's declaration scopes its picker, capabilities, and MCP menu; it is fixed at creation.
+  state.threadHarness = res.harness || null;
   clearPendingMetadataActions();
-  prepareProjectModelCatalog(pid);
+  prepareProjectModelCatalog(pid, state.threadHarness);
   $("effortControl").hidden = true;
   resetGitState();
   state.mcpServers = []; state.mcpError = null; state.expandedMcps = new Set();
@@ -2678,7 +2754,8 @@ async function openThread(pid, tid, title, opts) {
   renderSubagentsButton();
   loadGitStatus(pid);
   loadMcpServers({ announce:false });
-  loadProjectModels(pid);   // load this project's model list (config + discovery + Codex names)
+  // Only this thread's harness: opening a thread on one declaration must not start the others.
+  loadProjectModels(pid, { harness:state.threadHarness });
   setTurnActive(false);
   state.historyLoaded = false; state.oldestTurnId = null; state.hasMoreHistory = false;
   state.loadingHistory = false; state.pendingOlder = false; state.autoFilledTurns = 0;
@@ -8809,15 +8886,20 @@ function renderMcpButton() {
   $("mcpBtn").disabled = !state.projectId || (!caps.status && !state.mcpLoading && !state.mcpError && !(state.mcpServers || []).length);
   if (!$("mcpMenu").hidden) renderMcpMenu();
 }
+// MCP servers belong to one harness instance: the active thread's. A view with none yet (a draft)
+// has no instance to ask, so the menu stays hidden rather than guessing one.
 async function loadMcpServers(opts) {
   opts = opts || {};
   if (!state.projectId || state.mcpLoading) return;
+  const harness = activeModelScope();
+  if (!harness) { $("mcpMenu").hidden = true; return; }
   const projectId = state.projectId;
   state.mcpLoading = true;
   state.mcpError = null;
   renderMcpButton();
   try {
-    const res = await api("GET", `/api/projects/${projectId}/mcp`);
+    const res = await api("GET",
+      `/api/projects/${projectId}/harnesses/${encodeURIComponent(harness)}/mcp`);
     if (state.projectId !== projectId) return;
     state.mcpServers = Array.isArray(res.servers) ? res.servers : [];
     state.mcpCapabilities = res.capabilities || { status:true, reload:false, oauth_login:false };
@@ -8836,8 +8918,11 @@ async function reloadMcpServers() {
   if (!state.projectId || state.mcpLoading) return;
   const caps = state.mcpCapabilities || {};
   if (!caps.reload) { await loadMcpServers(); return; }
+  const harness = activeModelScope();
+  if (!harness) { $("mcpMenu").hidden = true; return; }
   try {
-    await api("POST", `/api/projects/${state.projectId}/mcp/reload`, {});
+    await api("POST",
+      `/api/projects/${state.projectId}/harnesses/${encodeURIComponent(harness)}/mcp/reload`, {});
     await loadMcpServers();
     notice("MCP servers reloaded.", "info");
   } catch (e) {
@@ -8846,8 +8931,12 @@ async function reloadMcpServers() {
 }
 async function startMcpOauthLogin(name) {
   if (!state.projectId || !name) return;
+  const harness = activeModelScope();
+  if (!harness) { $("mcpMenu").hidden = true; return; }
   try {
-    const res = await api("POST", `/api/projects/${state.projectId}/mcp/oauth-login`, { name });
+    const res = await api("POST",
+      `/api/projects/${state.projectId}/harnesses/${encodeURIComponent(harness)}/mcp/oauth-login`,
+      { name });
     if (!res.authorization_url) {
       notice(`No OAuth URL returned for ${name}.`, "error");
       return;
@@ -10095,7 +10184,10 @@ async function startDraftThread(text, attachments) {
       // Gated on the workspace still being a repository, not just on the flag. The toggle renders
       // unchecked once it isn't one, so sending `true` here would ask for isolation the user can no
       // longer see they requested — and the start would fail rather than the box simply being off.
-      git_strategy: isDraftWorkspaceRepo() ? state.draftGitStrategy : GIT_STRATEGY_SHARED
+      git_strategy: isDraftWorkspaceRepo() ? state.draftGitStrategy : GIT_STRATEGY_SHARED,
+      // Named only when the picker offered a choice of harness; otherwise the project's default
+      // applies, and the request is the one a single-declaration server has always received.
+      ...(draftHarnessChoice(draft) ? { harness: draft.harness } : {})
     });
     const tid = res && res.thread_id;
     if (!tid) throw new Error("new thread response did not include thread_id");
@@ -10105,6 +10197,7 @@ async function startDraftThread(text, attachments) {
     }
     state.firstTurnStartingThreadId = String(tid);
     state.turnSteering = !!res.turn_steering;
+    state.threadHarness = res.harness || null;
     clearComposerDraft(draftKey);
     clearPendingAttachments();
     state.draftThread = null;
@@ -10487,7 +10580,7 @@ $("permissionPresetSel").onchange = () => {
 
 function renderModelSelect() {
   const sel = $("modelSel");
-  const prev = state.currentModel ? modelKey(state.currentModel) : sel.value;
+  const prev = state.currentModel ? modelKey(state.currentModel, activeModelHarness()) : sel.value;
   sel.innerHTML="";
   if (state.currentModelUnreported) {
     const unreported = document.createElement("option");
@@ -10497,20 +10590,37 @@ function renderModelSelect() {
     unreported.selected = true;
     sel.append(unreported);
   }
-  for (const m of state.models) {
+  const option = (m) => {
     const o = document.createElement("option");
     o.value = modelKey(m);
     o.textContent = modelOptionLabel(m);
+    o.dataset.harness = m.harness || "";
     o.dataset.provider=m.provider;
     o.dataset.model=m.model;
     o.dataset.supportsReasoningEffort = m.supports_reasoning_effort ? "true" : "false";
-    sel.append(o);
+    return o;
+  };
+  // Grouped by harness only when there is a choice of one; an existing thread's list is already
+  // scoped to its own harness by the server.
+  if (state.harnesses.length > 1) {
+    const grouped = new Set();
+    for (const h of state.harnesses) {
+      const group = document.createElement("optgroup");
+      group.label = h.name;
+      for (const m of state.models) if (m.harness === h.name) group.append(option(m));
+      grouped.add(h.name);
+      sel.append(group);
+    }
+    for (const m of state.models) if (!grouped.has(m.harness)) sel.append(option(m));
+  } else {
+    for (const m of state.models) sel.append(option(m));
   }
   if (!state.models.length) {
     const o=document.createElement("option");
     if (state.currentModel && state.currentModel.provider && state.currentModel.model) {
-      o.value = modelKey(state.currentModel);
+      o.value = modelKey(state.currentModel, activeModelHarness());
       o.textContent = modelOptionLabel(state.currentModel);
+      o.dataset.harness = activeModelHarness() || "";
       o.dataset.provider = state.currentModel.provider;
       o.dataset.model = state.currentModel.model;
     } else {
@@ -10529,11 +10639,17 @@ function modelOptionLabel(m) {
   return m.provider ? `${name} [${m.provider}]` : name;
 }
 const UNREPORTED_MODEL_OPTION = "__unreported__";
-function modelKey(m) {
-  return m && m.provider && m.model ? `${m.provider}/${m.model}` : "";
+// The picker option value for one model of one harness declaration. A declaration name is an
+// arbitrary TOML key, so no separator is safe; a JSON array of the three parts cannot collide.
+// A catalog entry carries its own `harness`; a `ModelRef` (the current model) never does, so its
+// callers pass the active harness.
+function modelKey(m, harness) {
+  if (!m || !m.provider || !m.model) return "";
+  return JSON.stringify([harness === undefined ? (m.harness || "") : (harness || ""), m.provider, m.model]);
 }
-function findModelDescriptor(provider, model) {
-  return state.models.find(m => m.provider === provider && m.model === model) || null;
+function findModelDescriptor(provider, model, harness) {
+  return state.models.find(m => m.provider === provider && m.model === model &&
+    (!harness || !m.harness || m.harness === harness)) || null;
 }
 function effortOptionsForModel(desc) {
   if (!desc || !desc.supports_reasoning_effort) return [];
@@ -10547,7 +10663,7 @@ function effortOptionsForModel(desc) {
 }
 function syncModelControls() {
   if (state.currentModelUnreported) setModel(UNREPORTED_MODEL_OPTION);
-  else if (state.currentModel) setModel(modelKey(state.currentModel));
+  else if (state.currentModel) setModel(modelKey(state.currentModel, activeModelHarness()));
   syncModelOptionAvailability();
   syncEffortControl();
 }
@@ -10559,16 +10675,28 @@ function modelProviderLocked(provider) {
     !!state.currentModel.provider &&
     provider !== state.currentModel.provider;
 }
+// A thread's harness is fixed at creation like its provider: its native id exists in one harness
+// home only. The server scopes an existing thread's list to its harness, so this is a backstop.
+function modelHarnessLocked(harness) {
+  return !!state.threadId &&
+    !isDraftThread() &&
+    !!state.threadHarness &&
+    !!harness &&
+    harness !== state.threadHarness;
+}
 function syncModelOptionAvailability() {
   const sel = $("modelSel"); if (!sel) return;
   const lockedProvider = state.currentModel && state.currentModel.provider;
   for (const o of sel.options) {
     if (!o.dataset || !o.dataset.provider) continue;
-    const locked = modelProviderLocked(o.dataset.provider);
+    const harnessLocked = modelHarnessLocked(o.dataset.harness);
+    const locked = harnessLocked || modelProviderLocked(o.dataset.provider);
     o.disabled = locked;
-    o.title = locked
-      ? `This thread is bound to provider ${lockedProvider}. Create a new thread to use ${o.dataset.provider}.`
-      : "";
+    o.title = harnessLocked
+      ? `This thread runs on harness ${state.threadHarness}. Create a new thread to use ${o.dataset.harness}.`
+      : locked
+        ? `This thread is bound to provider ${lockedProvider}. Create a new thread to use ${o.dataset.provider}.`
+        : "";
   }
 }
 // Summarise the current model (and effort, when set) on the picker chip below the composer.
@@ -10583,7 +10711,7 @@ function updateModelButton() {
       : "Model";
     return;
   }
-  const desc = findModelDescriptor(m.provider, m.model);
+  const desc = findModelDescriptor(m.provider, m.model, activeModelHarness());
   let txt = modelOptionLabel(desc || m);
   // Models that support reasoning effort always show it — "Default" when left unset — so the chip
   // reflects the same two settings the popover holds. Models without an effort concept show nothing.
@@ -10598,7 +10726,7 @@ function syncEffortControl() {
   const control = $("effortControl");
   const sel = $("effortSel");
   const model = selectedModelFromControl();
-  const desc = model ? findModelDescriptor(model.provider, model.model) : null;
+  const desc = model ? findModelDescriptor(model.provider, model.model, model.harness) : null;
   const efforts = effortOptionsForModel(desc);
   sel.innerHTML = "";
   if (!efforts.length || !harnessCan("reasoning_effort")) {
@@ -10616,7 +10744,8 @@ function syncEffortControl() {
     o.textContent = effort.label;
     sel.append(o);
   }
-  sel.value = state.currentModel && modelKey(state.currentModel) === modelKey(model)
+  sel.value = state.currentModel &&
+    modelKey(state.currentModel, activeModelHarness()) === modelKey(model, model.harness)
     ? (state.currentModel.reasoning_effort || "")
     : "";
   sel.onchange = sendSelectedEffort;
@@ -10624,12 +10753,17 @@ function syncEffortControl() {
 function selectedModelFromControl() {
   const opt = $("modelSel").selectedOptions[0];
   if (!opt || !opt.dataset.model) return null;
-  return { provider:opt.dataset.provider, model:opt.dataset.model };
+  return { harness:opt.dataset.harness || null, provider:opt.dataset.provider, model:opt.dataset.model };
 }
 function sendSelectedModel() {
   const model = selectedModelFromControl();
   if (!model) {
     syncEffortControl();
+    return;
+  }
+  if (modelHarnessLocked(model.harness)) {
+    syncModelControls();
+    notice(`Create a new thread to use models from harness ${model.harness}.`, "warning");
     return;
   }
   if (modelProviderLocked(model.provider)) {
@@ -10640,6 +10774,8 @@ function sendSelectedModel() {
   const next = { provider:model.provider, model:model.model, reasoning_effort:null };
   if (isDraftThread()) {
     state.currentModel = next;
+    // Picking a model picks its harness: the thread is created on that instance.
+    state.draftThread.harness = model.harness;
     pinDraftModel();
     syncEffortControl();
     return;
