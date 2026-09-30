@@ -66,6 +66,7 @@ fn orphan_file(
     project_id: giskard_core::ids::ProjectId,
     thread_id: giskard_core::ids::ThreadId,
     harness_thread_id: String,
+    harness: String,
     current_model: TurnModel,
 ) -> ThreadFile {
     let now = Utc::now();
@@ -76,6 +77,7 @@ fn orphan_file(
         project_id,
         title: "Unclassified native thread".into(),
         harness_thread_id,
+        harness,
         parent_thread_id: None,
         spawned_by_turn_id: None,
         kind: ThreadKind::Orphan,
@@ -121,6 +123,7 @@ pub(super) async fn admit(
                 project_id,
                 record.thread,
                 record.harness_thread_id.clone(),
+                project.harness.clone(),
                 TurnModel::Unknown,
             );
             let root =
@@ -179,6 +182,7 @@ pub(super) async fn admit(
                 project_id,
                 handle.thread,
                 handle.harness_thread_id.clone(),
+                project.harness.clone(),
                 current_model,
             );
             if let Some((link, parent)) = link.as_ref() {

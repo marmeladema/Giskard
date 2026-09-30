@@ -305,6 +305,7 @@ async fn replay_persisted_state_roundtrip() {
         project_id: pid,
         title: "Fix auth".into(),
         harness_thread_id: handle.harness_thread_id.clone(),
+        harness: "codex".into(),
         parent_thread_id: None,
         spawned_by_turn_id: None,
         kind: giskard_core::ThreadKind::Primary,

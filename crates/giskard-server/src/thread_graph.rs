@@ -273,6 +273,7 @@ mod tests {
             project_id: ProjectId::new(),
             title: id.to_string(),
             harness_thread_id: format!("native-{id}"),
+            harness: "codex".into(),
             parent_thread_id: parent,
             spawned_by_turn_id: None,
             kind,

@@ -310,6 +310,7 @@ mod tests {
             project_id,
             title: "Thread".into(),
             harness_thread_id: "native".into(),
+            harness: "codex".into(),
             parent_thread_id: None,
             spawned_by_turn_id: None,
             kind: ThreadKind::Primary,

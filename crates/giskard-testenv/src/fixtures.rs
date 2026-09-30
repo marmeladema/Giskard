@@ -39,6 +39,26 @@ pub async fn persist_primary_thread(
     harness_thread_id: impl Into<String>,
     model: ModelRef,
 ) -> ThreadId {
+    persist_primary_thread_on(
+        store,
+        project_id,
+        thread_id,
+        harness_thread_id,
+        model,
+        "codex",
+    )
+    .await
+}
+
+/// [`persist_primary_thread`] on a named `[harnesses.<name>]` declaration.
+pub async fn persist_primary_thread_on(
+    store: &PersistStore,
+    project_id: ProjectId,
+    thread_id: ThreadId,
+    harness_thread_id: impl Into<String>,
+    model: ModelRef,
+    harness: &str,
+) -> ThreadId {
     let now = Utc::now();
     store
         .create_thread(
@@ -50,6 +70,7 @@ pub async fn persist_primary_thread(
                 revision: 0,
                 title: "Test thread".into(),
                 harness_thread_id: harness_thread_id.into(),
+                harness: harness.into(),
                 parent_thread_id: None,
                 spawned_by_turn_id: None,
                 kind: ThreadKind::Primary,
@@ -157,6 +178,7 @@ pub fn orphaned_thread(
         project_id,
         title: "Orphaned thread".into(),
         harness_thread_id: format!("harness-{thread_id}"),
+        harness: "codex".into(),
         parent_thread_id: None,
         spawned_by_turn_id: None,
         kind: ThreadKind::Primary,
