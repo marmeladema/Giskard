@@ -2330,6 +2330,7 @@ mod tests {
         let coordinator = Arc::new(ThreadCoordinator::new_live(
             LoadedThreadBinding {
                 project_id,
+                harness: "codex".into(),
                 handle: ThreadHandle::detached(thread_id, format!("native-{thread_id}")),
                 turn_steering: false,
                 native_model: None,
@@ -3920,6 +3921,7 @@ mod tests {
         let coordinator = Arc::new(super::ThreadCoordinator::new_live(
             super::LoadedThreadBinding {
                 project_id,
+                harness: "codex".into(),
                 handle: ThreadHandle::detached(thread_id, "native-orphan".into()),
                 turn_steering: false,
                 native_model: Some(initial_model),
@@ -5693,6 +5695,7 @@ mod tests {
         let coordinator = Arc::new(super::ThreadCoordinator::new_live(
             super::LoadedThreadBinding {
                 project_id,
+                harness: "codex".into(),
                 handle: native_handle.clone(),
                 turn_steering: false,
                 native_model: Some(model),
@@ -5762,6 +5765,7 @@ mod tests {
         let coordinator = Arc::new(super::ThreadCoordinator::new_live(
             super::LoadedThreadBinding {
                 project_id,
+                harness: "codex".into(),
                 handle: native_handle,
                 turn_steering: false,
                 native_model: Some(ModelRef {

@@ -6980,6 +6980,7 @@ async fn open_thread_normalization_reuses_live_handle() {
         .registry
         .open_thread(
             &project_config,
+            "codex",
             "/tmp/test",
             tid,
             Some("th_live".into()),
@@ -7032,6 +7033,7 @@ async fn concurrent_cold_opens_install_one_native_owner() {
 
     let first = state.registry.open_thread(
         &config,
+        "codex",
         "/tmp/test",
         thread_id,
         Some("native-thread".into()),
@@ -7039,6 +7041,7 @@ async fn concurrent_cold_opens_install_one_native_owner() {
     );
     let second = state.registry.open_thread(
         &config,
+        "codex",
         "/tmp/test",
         thread_id,
         Some("native-thread".into()),

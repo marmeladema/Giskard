@@ -732,6 +732,7 @@ async fn open_thread(
             .registry
             .open_thread(
                 &project_config,
+                &thread_file.harness,
                 &ws_root,
                 thread_id,
                 Some(thread_file.harness_thread_id.clone()),
@@ -869,6 +870,7 @@ async fn start_thread_with_message(
     let catalog = project_model_catalog(&state, &project_config, &app_config).await;
     let (model_ref, model_descriptor) =
         resolve_initial_thread_model(&app_config, &catalog, req.model_ref);
+    let harness_name = project_config.harness.clone();
     let project_ws_root = project_config
         .workspace_root
         .as_deref()
@@ -922,7 +924,14 @@ async fn start_thread_with_message(
 
     let binding = match state
         .registry
-        .open_thread(&project_config, ws_root, thread_id, None, model_ref.clone())
+        .open_thread(
+            &project_config,
+            &harness_name,
+            ws_root,
+            thread_id,
+            None,
+            model_ref.clone(),
+        )
         .await
     {
         Ok(binding) => binding,
@@ -937,6 +946,7 @@ async fn start_thread_with_message(
         cleanup_new_thread_after_start_failure(
             &state,
             &project_config,
+            &harness_name,
             handle.thread,
             handle.harness_thread_id.clone(),
             false,
@@ -966,7 +976,7 @@ async fn start_thread_with_message(
         project_id,
         title: title.clone(),
         harness_thread_id: handle.harness_thread_id.clone(),
-        harness: project_config.harness.clone(),
+        harness: harness_name.clone(),
         parent_thread_id: None,
         spawned_by_turn_id: None,
         kind: ThreadKind::Primary,
@@ -989,6 +999,7 @@ async fn start_thread_with_message(
             cleanup_new_thread_after_start_failure(
                 &state,
                 &project_config,
+                &harness_name,
                 thread_id,
                 handle.harness_thread_id.clone(),
                 false,
@@ -1020,6 +1031,7 @@ async fn start_thread_with_message(
             cleanup_new_thread_after_start_failure(
                 &state,
                 &project_config,
+                &harness_name,
                 thread_id,
                 handle.harness_thread_id.clone(),
                 true,
@@ -1665,6 +1677,7 @@ async fn remove_worktree_after_start_failure(
 async fn cleanup_new_thread_after_start_failure(
     state: &AppState,
     project_config: &ProjectConfig,
+    harness: &str,
     thread_id: ThreadId,
     harness_thread_id: String,
     remove_local_thread: bool,
@@ -1672,7 +1685,12 @@ async fn cleanup_new_thread_after_start_failure(
 ) {
     match state
         .registry
-        .delete_thread(project_config, thread_id, harness_thread_id.clone())
+        .delete_thread(
+            project_config,
+            thread_id,
+            harness.to_string(),
+            harness_thread_id.clone(),
+        )
         .await
     {
         Ok(()) => {
@@ -1770,6 +1788,7 @@ async fn archive_thread(
         .set_thread_archived(
             &project_config,
             thread_id,
+            &thread_file.harness,
             thread_file.harness_thread_id,
             req.archived,
         )
@@ -1820,6 +1839,7 @@ async fn rename_thread(
         .set_thread_name(
             &project_config,
             thread_id,
+            &thread_file.harness,
             thread_file.harness_thread_id,
             title.clone(),
         )
@@ -2024,6 +2044,7 @@ async fn delete_thread(
             .delete_thread(
                 &project_config,
                 *candidate,
+                thread_file.harness.clone(),
                 thread_file.harness_thread_id.clone(),
             )
             .await
@@ -3965,7 +3986,11 @@ pub(crate) async fn project_model_catalog(
     project_config: &ProjectConfig,
     config: &Config,
 ) -> Vec<ModelDescriptor> {
-    if let Some(models) = state.registry.project_model_catalog(project_config).await {
+    if let Some(models) = state
+        .registry
+        .project_model_catalog(project_config, &project_config.harness)
+        .await
+    {
         return models;
     }
     refresh_project_model_catalog(state, project_config, config)
@@ -4066,7 +4091,7 @@ async fn refresh_project_model_catalog(
     ) {
         state
             .registry
-            .harness(project_config)
+            .harness(project_config, &project_config.harness)
             .await
             .ok()
             .and_then(|harness| harness.client_version())
@@ -4115,7 +4140,7 @@ async fn refresh_project_model_catalog(
     }
     state
         .registry
-        .replace_project_model_catalog(project_config, models.clone())
+        .replace_project_model_catalog(project_config, &project_config.harness, models.clone())
         .await;
     RefreshedCatalog {
         models,
@@ -4134,7 +4159,11 @@ async fn harness_provider_table(
     state: &AppState,
     project_config: &ProjectConfig,
 ) -> (Option<Vec<HarnessProvider>>, Vec<ModelListingWarning>) {
-    let harness = match state.registry.harness(project_config).await {
+    let harness = match state
+        .registry
+        .harness(project_config, &project_config.harness)
+        .await
+    {
         Ok(harness) => harness,
         Err(e) => {
             warn!(
@@ -4191,7 +4220,11 @@ async fn overlay_harness_metadata(
     Option<ModelListingWarning>,
     Option<HarnessCapabilities>,
 ) {
-    let harness = match state.registry.harness(project_config).await {
+    let harness = match state
+        .registry
+        .harness(project_config, &project_config.harness)
+        .await
+    {
         Ok(harness) => harness,
         Err(e) => {
             warn!(
@@ -4255,7 +4288,7 @@ async fn list_mcp_servers(
         .ok_or(ApiError::NotFound)?;
     let harness = state
         .registry
-        .harness(&project_config)
+        .harness(&project_config, &project_config.harness)
         .await
         .map_err(harness_api_error)?;
     let capabilities = harness.capabilities();
@@ -4304,7 +4337,7 @@ async fn reload_mcp_servers(
         .ok_or(ApiError::NotFound)?;
     let harness = state
         .registry
-        .harness(&project_config)
+        .harness(&project_config, &project_config.harness)
         .await
         .map_err(harness_api_error)?;
     let capabilities = harness.capabilities();
@@ -4348,7 +4381,7 @@ async fn start_mcp_oauth_login(
         .ok_or(ApiError::NotFound)?;
     let harness = state
         .registry
-        .harness(&project_config)
+        .harness(&project_config, &project_config.harness)
         .await
         .map_err(harness_api_error)?;
     let capabilities = harness.capabilities();
@@ -4981,7 +5014,11 @@ async fn harness_knows_provider(
     // The capability gate matters as much as the call: a harness that does not support provider
     // listing may still answer with an empty table, and taking that as gospel would convict every
     // provider — the very accusation this function exists to stop making.
-    let harness = match state.registry.harness(project_config).await {
+    let harness = match state
+        .registry
+        .harness(project_config, &project_config.harness)
+        .await
+    {
         Ok(harness) => harness,
         Err(error) => {
             warn!(

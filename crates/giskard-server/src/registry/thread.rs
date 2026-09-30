@@ -412,6 +412,7 @@ mod tests {
         Arc::new(ThreadCoordinator::new(
             LoadedThreadBinding {
                 project_id: ProjectId::new(),
+                harness: "codex".into(),
                 handle: ThreadHandle::detached(thread_id, native_id.into()),
                 turn_steering: false,
                 native_model: None,

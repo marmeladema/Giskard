@@ -1,9 +1,11 @@
+use std::collections::HashMap;
 use std::sync::{Arc, Weak};
 
 use giskard_core::error::HarnessError;
 use giskard_core::ids::ProjectId;
 use giskard_core::model::ModelDescriptor;
 use giskard_harness::AgentHarness;
+use indexmap::IndexMap;
 use tokio::sync::{Mutex, MutexGuard, OwnedMutexGuard, RwLock};
 
 use super::driver::DriverHandle;
@@ -53,8 +55,16 @@ impl WeakLifecycleLock {
 pub(super) struct ProjectAuthority {
     project_id: ProjectId,
     lifecycle: LifecycleLock,
-    harness: ProjectHarnessSlot,
-    model_catalog: ProjectModelCatalogSlot,
+    /// One installed instance per `[harnesses.<name>]` declaration this project has used.
+    ///
+    /// Lifetime class: entries are created on first use by `get_or_create_harness`, removed by
+    /// `delete_project` and registry `shutdown` through the same transition guard, and never
+    /// otherwise. Keyed by declaration name, which is configuration, not entity identity: this is
+    /// the authority's own state, not a peer owning map.
+    harnesses: Mutex<IndexMap<String, ProjectHarnessState>>,
+    /// The composed catalog per declaration, keyed the same way and cleared by
+    /// `clear_model_catalog` (project delete) or replaced whole by a refresh.
+    model_catalogs: RwLock<HashMap<String, Vec<ModelDescriptor>>>,
 }
 
 impl ProjectAuthority {
@@ -63,8 +73,8 @@ impl ProjectAuthority {
         Self {
             project_id,
             lifecycle,
-            harness: ProjectHarnessSlot::default(),
-            model_catalog: ProjectModelCatalogSlot::default(),
+            harnesses: Mutex::new(IndexMap::new()),
+            model_catalogs: RwLock::new(HashMap::new()),
         }
     }
 
@@ -78,37 +88,28 @@ impl ProjectAuthority {
         self.lifecycle.clone()
     }
 
-    /// Returns a cloned catalog while preserving `None` as meaningful absence.
-    pub(super) async fn model_catalog(&self) -> Option<Vec<ModelDescriptor>> {
-        self.model_catalog.current.read().await.clone()
+    /// Returns one declaration's cloned catalog while preserving `None` as meaningful absence.
+    pub(super) async fn model_catalog(&self, harness: &str) -> Option<Vec<ModelDescriptor>> {
+        self.model_catalogs.read().await.get(harness).cloned()
     }
 
-    /// Atomically replaces the complete discovered model catalog.
-    pub(super) async fn replace_model_catalog(&self, models: Vec<ModelDescriptor>) {
-        *self.model_catalog.current.write().await = Some(models);
+    /// Atomically replaces one declaration's complete discovered model catalog.
+    pub(super) async fn replace_model_catalog(&self, harness: &str, models: Vec<ModelDescriptor>) {
+        self.model_catalogs
+            .write()
+            .await
+            .insert(harness.to_string(), models);
     }
 
-    /// Restores meaningful catalog absence without removing the authority.
+    /// Restores meaningful catalog absence for every declaration without removing the authority.
     pub(super) async fn clear_model_catalog(&self) {
-        *self.model_catalog.current.write().await = None;
+        self.model_catalogs.write().await.clear();
     }
 
     #[cfg(test)]
     pub(super) async fn harness_is_empty(&self) -> bool {
-        self.harness.current.lock().await.is_none()
+        self.harnesses.lock().await.is_empty()
     }
-}
-
-/// Independently synchronized whole-catalog storage for one project.
-#[derive(Default)]
-struct ProjectModelCatalogSlot {
-    current: RwLock<Option<Vec<ModelDescriptor>>>,
-}
-
-/// Harness storage acquired only through the root transition guard.
-#[derive(Default)]
-struct ProjectHarnessSlot {
-    current: Mutex<Option<ProjectHarnessState>>,
 }
 
 /// Whether the installed harness accepts normal use or is being deleted.
@@ -118,6 +119,9 @@ enum ProjectHarnessState {
 }
 
 type HarnessAndDriver = (Arc<dyn AgentHarness>, DriverHandle);
+
+/// One declaration's harness and driver, taken together by a whole-project transition.
+pub(super) type NamedHarness = (String, HarnessAndDriver);
 
 /// Root serialization point for harness creation, deletion, and shutdown.
 pub(super) struct HarnessTransitions {
@@ -151,15 +155,30 @@ pub(super) struct HarnessTransitionGuard<'a> {
 }
 
 impl<'a> HarnessTransitionGuard<'a> {
-    /// Acquires a project's harness slot while retaining the root gate.
+    /// Acquires one declaration's harness slot of a project while retaining the root gate.
     pub(super) async fn project<'guard, 'authority>(
         &'guard mut self,
         authority: &'authority ProjectAuthority,
+        harness: &str,
     ) -> ProjectHarnessGuard<'guard, 'a, 'authority> {
         ProjectHarnessGuard {
             transitions: self,
             project_id: authority.project_id,
-            slot: authority.harness.current.lock().await,
+            name: harness.to_string(),
+            slots: authority.harnesses.lock().await,
+        }
+    }
+
+    /// Acquires every declaration slot of a project, for the whole-project paths: deletion and
+    /// shutdown.
+    pub(super) async fn project_all<'guard, 'authority>(
+        &'guard mut self,
+        authority: &'authority ProjectAuthority,
+    ) -> ProjectHarnessesGuard<'guard, 'a, 'authority> {
+        ProjectHarnessesGuard {
+            _transitions: self,
+            project_id: authority.project_id,
+            slots: authority.harnesses.lock().await,
         }
     }
 
@@ -174,17 +193,22 @@ impl<'a> HarnessTransitionGuard<'a> {
     }
 }
 
-/// Access to one harness slot, structurally nested under the root transition guard.
+/// Access to one declaration's harness slot, structurally nested under the root transition guard.
 pub(super) struct ProjectHarnessGuard<'guard, 'transition, 'authority> {
     transitions: &'guard mut HarnessTransitionGuard<'transition>,
     project_id: ProjectId,
-    slot: MutexGuard<'authority, Option<ProjectHarnessState>>,
+    name: String,
+    slots: MutexGuard<'authority, IndexMap<String, ProjectHarnessState>>,
 }
 
 impl ProjectHarnessGuard<'_, '_, '_> {
+    fn slot(&self) -> Option<&ProjectHarnessState> {
+        self.slots.get(&self.name)
+    }
+
     /// Clones an active harness; empty and deleting slots are not reachable.
     pub(super) fn active(&self) -> Option<Arc<dyn AgentHarness>> {
-        match self.slot.as_ref() {
+        match self.slot() {
             Some(ProjectHarnessState::Active(harness, _)) => Some(harness.clone()),
             Some(ProjectHarnessState::Deleting(_, _)) | None => None,
         }
@@ -199,11 +223,11 @@ impl ProjectHarnessGuard<'_, '_, '_> {
                 "server is shutting down; refusing to start a harness".into(),
             ));
         }
-        match self.slot.as_ref() {
+        match self.slot() {
             Some(ProjectHarnessState::Active(harness, _)) => Ok(Some(harness.clone())),
             Some(ProjectHarnessState::Deleting(_, _)) => Err(HarnessError::Protocol(format!(
-                "project {} harness is being deleted",
-                self.project_id
+                "project {} harness {} is being deleted",
+                self.project_id, self.name
             ))),
             None => Ok(None),
         }
@@ -211,68 +235,88 @@ impl ProjectHarnessGuard<'_, '_, '_> {
 
     /// Publishes a newly created harness into the same slot checked for creation.
     pub(super) fn publish_active(&mut self, harness: Arc<dyn AgentHarness>, driver: DriverHandle) {
-        *self.slot = Some(ProjectHarnessState::Active(harness, driver));
+        self.slots.insert(
+            self.name.clone(),
+            ProjectHarnessState::Active(harness, driver),
+        );
     }
 
     pub(super) fn driver(&self) -> Option<DriverHandle> {
-        match self.slot.as_ref() {
+        match self.slot() {
             Some(ProjectHarnessState::Active(_, driver))
             | Some(ProjectHarnessState::Deleting(_, driver)) => Some(driver.clone()),
             None => None,
         }
     }
 
-    /// Marks an active harness deleting and returns it for shutdown outside the guards.
-    pub(super) fn begin_delete(&mut self) -> Result<Option<HarnessAndDriver>, HarnessError> {
-        match self.slot.as_ref() {
-            Some(ProjectHarnessState::Active(harness, driver)) => {
-                let harness = harness.clone();
-                let driver = driver.clone();
-                *self.slot = Some(ProjectHarnessState::Deleting(
-                    harness.clone(),
-                    driver.clone(),
-                ));
-                Ok(Some((harness, driver)))
-            }
-            Some(ProjectHarnessState::Deleting(_, _)) => Err(HarnessError::Protocol(format!(
-                "project {} harness deletion is already in progress",
-                self.project_id
-            ))),
-            None => Ok(None),
-        }
-    }
-
     /// Restores only the same deleting harness, and never after shutdown begins.
     pub(super) fn rollback_delete_if_running(&mut self, harness: Arc<dyn AgentHarness>) {
-        if !self.transitions.state.shutting_down
-            && matches!(
-                self.slot.as_ref(),
-                Some(ProjectHarnessState::Deleting(current, _)) if Arc::ptr_eq(current, &harness)
-            )
+        if self.transitions.state.shutting_down {
+            return;
+        }
+        let Some(state) = self.slots.get_mut(&self.name) else {
+            return;
+        };
+        if let ProjectHarnessState::Deleting(current, driver) = state
+            && Arc::ptr_eq(current, &harness)
         {
-            let Some(ProjectHarnessState::Deleting(_, driver)) = self.slot.take() else {
-                return;
-            };
-            *self.slot = Some(ProjectHarnessState::Active(harness, driver));
+            let driver = driver.clone();
+            *state = ProjectHarnessState::Active(harness, driver);
         }
     }
 
     /// Clears only the pointer-identical harness whose deletion completed.
     pub(super) fn finish_delete(&mut self, harness: &Arc<dyn AgentHarness>) {
         if matches!(
-            self.slot.as_ref(),
+            self.slot(),
             Some(ProjectHarnessState::Deleting(current, _)) if Arc::ptr_eq(current, harness)
         ) {
-            *self.slot = None;
+            self.slots.shift_remove(&self.name);
         }
     }
+}
 
-    /// Drains either harness state while the global shutdown fence is held.
-    pub(super) fn take_for_shutdown(&mut self) -> Option<HarnessAndDriver> {
-        self.slot.take().map(|state| match state {
-            ProjectHarnessState::Active(harness, driver)
-            | ProjectHarnessState::Deleting(harness, driver) => (harness, driver),
-        })
+/// Access to every declaration slot of one project, nested under the root transition guard.
+pub(super) struct ProjectHarnessesGuard<'guard, 'transition, 'authority> {
+    _transitions: &'guard mut HarnessTransitionGuard<'transition>,
+    project_id: ProjectId,
+    slots: MutexGuard<'authority, IndexMap<String, ProjectHarnessState>>,
+}
+
+impl ProjectHarnessesGuard<'_, '_, '_> {
+    /// Marks every active harness of the project deleting and returns them, in declaration-use
+    /// order, for shutdown outside the guards. Refuses without changing anything when any slot is
+    /// already being deleted, so a second deletion never interleaves with the first.
+    pub(super) fn begin_delete_all(&mut self) -> Result<Vec<NamedHarness>, HarnessError> {
+        if let Some(name) = self.slots.iter().find_map(|(name, state)| {
+            matches!(state, ProjectHarnessState::Deleting(_, _)).then_some(name)
+        }) {
+            return Err(HarnessError::Protocol(format!(
+                "project {} harness {name} deletion is already in progress",
+                self.project_id
+            )));
+        }
+        let mut deleting = Vec::with_capacity(self.slots.len());
+        for (name, state) in self.slots.iter_mut() {
+            if let ProjectHarnessState::Active(harness, driver) = state {
+                let harness = harness.clone();
+                let driver = driver.clone();
+                *state = ProjectHarnessState::Deleting(harness.clone(), driver.clone());
+                deleting.push((name.clone(), (harness, driver)));
+            }
+        }
+        Ok(deleting)
+    }
+
+    /// Drains every harness state of the project while the global shutdown fence is held.
+    pub(super) fn take_all_for_shutdown(&mut self) -> Vec<NamedHarness> {
+        self.slots
+            .drain(..)
+            .map(|(name, state)| match state {
+                ProjectHarnessState::Active(harness, driver)
+                | ProjectHarnessState::Deleting(harness, driver) => (name, (harness, driver)),
+            })
+            .collect()
     }
 }
 
