@@ -506,7 +506,7 @@ async fn handle_client_msg(
             text,
             attachments,
         } => {
-            let project_id = project_for_readonly(state, thread_id, "send_input").await?;
+            let (project_id, harness) = thread_for_readonly(state, thread_id, "send_input").await?;
             state
                 .registry
                 .ensure_thread_writable(project_id, thread_id)
@@ -553,7 +553,6 @@ async fn handle_client_msg(
                     .thread(thread_id)
                     .action("send_input")
                 })?;
-            let harness = load_thread_harness(state, project_id, thread_id, "send_input").await?;
             let catalog =
                 project_model_catalog(state, &project_config, &app_config, &harness).await;
             // RMW under the per-thread lock: bump activity and read back the resolved state.
@@ -730,7 +729,8 @@ async fn handle_client_msg(
             // Resolve the project without forcing a harness attach: model selection must work on
             // a *cold* thread too — that is exactly how an orphaned thread (provider removed from
             // config) gets rescued.
-            let project_id = project_for_readonly(state, thread_id, "select_model").await?;
+            let (project_id, harness) =
+                thread_for_readonly(state, thread_id, "select_model").await?;
             state
                 .registry
                 .ensure_thread_writable(project_id, thread_id)
@@ -755,7 +755,6 @@ async fn handle_client_msg(
                     .thread(thread_id)
                     .action("select_model")
                 })?;
-            let harness = load_thread_harness(state, project_id, thread_id, "select_model").await?;
             let catalog = project_model_catalog(state, &project_config, &config, &harness).await;
             let model_ref = crate::models::normalize_model_ref(&config, &catalog, &model_ref);
 
@@ -1507,31 +1506,6 @@ async fn run_subscribe_bootstrap(
     Ok(())
 }
 
-/// The declaration a thread runs on, read once before a mutation of its file so the catalog the
-/// mutation normalizes against is that thread's instance's.
-async fn load_thread_harness(
-    state: &AppState,
-    project_id: ProjectId,
-    thread_id: ThreadId,
-    action: &str,
-) -> Result<String, WsError> {
-    state
-        .store
-        .load_thread(project_id, thread_id)
-        .await
-        .map_err(|e| WsError::from_persist(e, action, Some(thread_id)))?
-        .map(|thread| thread.harness)
-        .ok_or_else(|| {
-            WsError::new(
-                "thread_not_found",
-                ErrorSeverity::Error,
-                "Thread not found.",
-            )
-            .thread(thread_id)
-            .action(action)
-        })
-}
-
 struct ThreadAccess {
     project_id: ProjectId,
     warning: Option<ErrorInfo>,
@@ -1759,6 +1733,19 @@ async fn project_for_readonly(
     thread_id: ThreadId,
     action: &str,
 ) -> Result<ProjectId, WsError> {
+    thread_for_readonly(state, thread_id, action)
+        .await
+        .map(|(project_id, _)| project_id)
+}
+
+/// [`project_for_readonly`], also returning the `[harnesses.<name>]` declaration the thread runs
+/// on, taken from the same thread-file read: callers that pick a catalog before mutating the
+/// thread need it, and the declaration is fixed at creation.
+async fn thread_for_readonly(
+    state: &AppState,
+    thread_id: ThreadId,
+    action: &str,
+) -> Result<(ProjectId, String), WsError> {
     if let Some(binding) = state.registry.loaded_thread_binding(thread_id).await {
         let project_id = binding.project_id();
         let visible = state
@@ -1766,9 +1753,9 @@ async fn project_for_readonly(
             .load_thread(project_id, thread_id)
             .await
             .map_err(|e| WsError::from_persist(e, action, Some(thread_id)))?
-            .is_some_and(|thread| thread.kind != ThreadKind::Orphan);
-        if visible {
-            return Ok(project_id);
+            .filter(|thread| thread.kind != ThreadKind::Orphan);
+        if let Some(thread) = visible {
+            return Ok((project_id, thread.harness));
         }
         return Err(WsError::new(
             "thread_not_found",
@@ -1786,7 +1773,7 @@ async fn project_for_readonly(
         )
         .thread(thread_id)
         .action(action)),
-        Some((project_config, _)) => Ok(project_config.id),
+        Some((project_config, thread_file)) => Ok((project_config.id, thread_file.harness)),
         None => Err(WsError::new(
             "thread_not_found",
             ErrorSeverity::Error,

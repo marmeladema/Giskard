@@ -1719,7 +1719,7 @@ async fn cleanup_new_thread_after_start_failure(
         .delete_thread(
             project_config,
             thread_id,
-            harness.to_string(),
+            harness,
             harness_thread_id.clone(),
         )
         .await
@@ -2076,7 +2076,7 @@ async fn delete_thread(
             .delete_thread(
                 &project_config,
                 *candidate,
-                thread_file.harness.clone(),
+                &thread_file.harness,
                 thread_file.harness_thread_id.clone(),
             )
             .await
