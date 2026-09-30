@@ -706,23 +706,49 @@ pub struct BrowseResponse {
 
 /// A non-fatal failure from one source participating in model-list composition (§8.3).
 ///
-/// `source` identifies either a configured provider (`provider:<id>`) or the project harness
-/// (`harness:<kind>`), so the browser can report degraded discovery without conflating the two.
+/// `source` identifies either a configured provider (`provider:<id>`) or a harness declaration
+/// (`harness:<name>`), so the browser can report degraded discovery without conflating the two.
+/// `harness` names the declaration whose catalog composition raised it.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ModelListingWarning {
+    pub harness: String,
     pub source: String,
     pub message: String,
 }
 
-/// Static model list for the model picker (spec §8.3).
+/// The model picker list (spec §8.3): one flat list over every composed declaration, with a
+/// per-declaration index.
 #[derive(Debug, Clone, Serialize)]
 pub struct ListModelsResponse {
-    pub models: Vec<ModelDescriptor>,
+    /// Every offered model, each naming the declaration whose instance offers it. A single
+    /// declaration yields exactly the list served before this field existed.
+    pub models: Vec<HarnessModelEntry>,
     /// Non-fatal provider or harness listing failures (empty for the static listing).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub warnings: Vec<ModelListingWarning>,
-    /// The project harness's capabilities, when it answered. Absent when the harness could not be
-    /// reached; `warnings` then carries a `harness:<kind>` entry saying why.
+    /// One entry per composed declaration, in declaration order.
+    pub harnesses: Vec<HarnessModelGroup>,
+    /// The project's default declaration, which the draft preselects.
+    pub project_harness: String,
+}
+
+/// One model of the picker, stamped with the declaration that offers it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HarnessModelEntry {
+    pub harness: String,
+    #[serde(flatten)]
+    pub model: ModelDescriptor,
+}
+
+/// One composed `[harnesses.<name>]` declaration in a models response.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HarnessModelGroup {
+    pub name: String,
+    pub kind: String,
+    /// Whether this is the catalog's default declaration.
+    pub default: bool,
+    /// The instance's capabilities, when it answered. Absent when it could not be reached;
+    /// `warnings` then carries a `harness:<name>` entry saying why.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub capabilities: Option<HarnessCapabilitiesInfo>,
 }

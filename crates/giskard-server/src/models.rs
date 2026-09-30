@@ -512,7 +512,7 @@ pub fn merge_models(
 pub fn validate_provider_ids(
     config: &Config,
     harness_providers: &[HarnessProvider],
-    harness_kind: &str,
+    harness_name: &str,
 ) -> Vec<ModelListingWarning> {
     config
         .providers
@@ -521,14 +521,15 @@ pub fn validate_provider_ids(
         .map(|(id, _)| {
             warn!(
                 provider = %id,
-                harness = %harness_kind,
+                harness = %harness_name,
                 action = "validate_provider_ids",
                 "configured provider is not one the harness knows; its models cannot be routed"
             );
             ModelListingWarning {
+                harness: harness_name.to_string(),
                 source: format!("provider:{id}"),
                 message: format!(
-                    "provider id is not configured in {harness_kind}; models under it cannot \
+                    "provider id is not configured in {harness_name}; models under it cannot \
                      be routed until it is added there"
                 ),
             }
@@ -889,6 +890,8 @@ async fn discover_provider(
                 "provider requests model listing but the harness reports no base_url for it"
             );
             warnings.push(ModelListingWarning {
+                // Stamped with the declaration by the catalog refresh that ran this discovery.
+                harness: String::new(),
                 source: format!("provider:{id}"),
                 message: "model_listing is on but the harness reports no base_url for this \
                           provider; only declared models are offered"
@@ -911,6 +914,8 @@ async fn discover_provider(
             "invalid provider header was skipped"
         );
         warnings.push(ModelListingWarning {
+            // Stamped with the declaration by the catalog refresh that ran this discovery.
+            harness: String::new(),
             source: format!("provider:{id}"),
             message,
         });
@@ -919,6 +924,8 @@ async fn discover_provider(
     let mut fail = |message: String| {
         warn!(provider = %id, %url, %message, "model discovery failed; skipping provider");
         warnings.push(ModelListingWarning {
+            // Stamped with the declaration by the catalog refresh that ran this discovery.
+            harness: String::new(),
             source: format!("provider:{id}"),
             message,
         });
@@ -992,6 +999,8 @@ async fn discover_provider(
     }
     if !invalid_metadata_models.is_empty() {
         warnings.push(ModelListingWarning {
+            // Stamped with the declaration by the catalog refresh that ran this discovery.
+            harness: String::new(),
             source: format!("provider:{id}"),
             message: format!(
                 "ignored invalid context capacity metadata for {} model(s)",
