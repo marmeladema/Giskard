@@ -9,7 +9,22 @@
 
 **Document status:** Implementation-ready specification.
 **Audience:** An AI coding agent (and its human reviewer) implementing the system.
-**Version:** 1.97
+**Version:** 1.98
+
+> **Amendment — one harness per thread (1.98).** Each thread runs on one `[harnesses.<name>]`
+> declaration, stored as `thread.json`'s `harness` and fixed at native creation for the reason its
+> provider is: the native id exists in exactly one harness home. A file without the field belongs
+> to the reserved `codex`, and a thread on `codex` is written without it, so older files and older
+> binaries keep reading each other. The project's `harness` becomes its default declaration. A
+> project runs one instance per declaration its threads use, each bootstrapped with only the
+> threads stamped with that declaration, so two instances may hold the same native id string. The
+> draft's model picker lists every declaration's models, grouped by harness when more than one is
+> declared; picking a model picks its harness, and the thread is created on that instance.
+> Sub-agents inherit their parent's declaration. An existing thread's picker, capabilities, and MCP
+> menu address its own instance only: the models route composes one declaration when asked with
+> `?harness=<name>`, and the MCP routes live under `/api/projects/{id}/harnesses/{name}/mcp`. A
+> thread whose declaration is no longer declared opens read-only naming it while its siblings open
+> normally.
 
 > **Amendment — harness declarations (1.97).** `config.toml` may declare named harnesses as
 > `[harnesses.<name>]` tables carrying a `kind`, an optional `default`, `command`, `args`, an `env`
@@ -2517,6 +2532,9 @@ All defined in `giskard-core`, serialized by `giskard-persist`. Illustrative sha
   "revision": 42,                       // durable per-thread metadata ordering clock
   "title": "Fix Qobuz OAuth refresh",
   "harness_thread_id": "th_abc123",     // native id used for resume
+  "harness": "nightly",                 // [harnesses.<name>] declaration the thread runs on, fixed
+                                         //   at native creation. Omitted when it is "codex", which
+                                         //   is also what a file without the key means (1.98).
   "mode": "build",                       // "plan" | "build"
   "current_model": { "provider": "openai", "model": "gpt-5.5", "reasoning_effort": "high" },
   "context_window": 258400,              // CACHE ONLY (C4): effective window for current_model;
@@ -2815,11 +2833,19 @@ project's harness is not running yet, so there is no catalog to choose from (§8
   draft immediately, with mode and permission preset defaulted synchronously and the composer
   editable. The model is resolved asynchronously (LT6/LT7): until it lands the draft has no model
   and the first send is unavailable, so the turn can never start on a stand-in. There is no local
-  `<thread_id>.json` and no native Codex thread yet.
+  `<thread_id>.json` and no native Codex thread yet. The draft also chooses the thread's harness
+  declaration through the picker: it lists the models of every declared harness, grouped by harness
+  when more than one is declared, and preselects the project's default declaration's default
+  model. Picking a model picks its harness.
 - **Create + first send:** user submits the first message; the browser calls
-  `POST /api/projects/{id}/threads/start` with text, model/provider, mode, and permission preset.
-  The server calls `open_thread` (Codex `thread/start`) with that provider/model, stores the
-  returned `harness_thread_id`, writes `<thread_id>.json`, and immediately calls `start_turn`.
+  `POST /api/projects/{id}/threads/start` with text, model/provider, mode, permission preset, and,
+  when the picker offered a choice, the chosen `harness`. The server opens the thread on that
+  declaration's instance of the project (the project's default when none is named; an undeclared
+  name is refused before anything is created), calls `open_thread` (Codex `thread/start`) with that
+  provider/model, stores the returned `harness_thread_id` and the declaration as `harness`, writes
+  `<thread_id>.json`, and immediately calls `start_turn`. The declaration is fixed from then on,
+  and every later operation on the thread resolves its instance from it. A sub-agent is admitted by
+  the instance that ran its parent and inherits its declaration.
   If native creation fails, nothing is persisted. If persistence or synchronous `turn/start` fails
   after native creation, cleanup is best-effort and failures are logged.
   This first turn begins before the browser subscribes to the new thread, so the composer opens
@@ -3135,9 +3161,17 @@ are wrong.
 - **Discovery is on for every provider the harness reports**, refreshing the list from
   `GET {base_url}/models` and merging the results over the static list. The `base_url`, headers,
   and key
-  come from the harness's provider table (§8.2), so discovery is a per-project operation: there is
+  come from the harness's provider table (§8.2), so discovery is a per-instance operation: there is
   no endpoint to query until a harness can name one. A manual "refresh models" action triggers
-  this; results are cached in memory per project.
+  this; results are cached in memory per project and harness declaration.
+- **Catalogs are per instance.** Each declaration's instance of a project composes its own catalog
+  from config, its own provider table's discovery, and its own harness catalog. The models route
+  composes every declaration for a draft, creating each instance, and only the thread's own for an
+  existing thread (`?harness=<name>`), so opening a thread never starts another declaration's
+  instance. The response is one flat list whose entries each name their `harness`, plus a
+  `harnesses` index carrying each declaration's kind, default flag, and capabilities; an instance
+  that cannot start contributes a warning and a group without capabilities rather than failing
+  the list. A thread's model mutations normalize against its own instance's catalog.
 
   Which providers end up *offered* is narrower than which are queried: one with no endpoint yields
   nothing, so it appears only if the harness catalog covers it (below) or config declares its
@@ -3837,8 +3871,11 @@ latest persisted turn timestamp; it never uses the repair time.
   rejected, so the endpoint accepts neither native routing identifiers nor client-asserted linked
   ownership or lifecycle evidence. New first-message creation uses
   `POST /api/projects/{project_id}/threads/start` with
-  `{ text, attachments?, model_ref, mode, permission_preset }` and returns
-  `{ thread_id, harness_thread_id, turn_id, warning? }`.
+  `{ text, attachments?, model_ref, mode, permission_preset, git_strategy?, harness? }` and returns
+  `{ thread_id, title, harness_thread_id, harness, turn_id, turn_steering, warning? }`. `harness`
+  names the `[harnesses.<name>]` declaration the thread is created on; omitted, the project's
+  default applies, and an undeclared name is a `400`. The open response and thread summaries also
+  carry the thread's `harness`.
 
 - **Completed-history pages are REST-backed:**
   `GET /api/projects/{project_id}/threads/{thread_id}/history?before?&limit?` returns

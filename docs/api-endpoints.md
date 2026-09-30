@@ -21,9 +21,16 @@ WebSocket. Highlights: `POST /api/login`, `POST /api/logout`, `GET /api/ws-ticke
 /api/projects/{id}/threads/{thread_id}/linkify`, `POST
 /api/projects/{id}/threads/{thread_id}/render`,
 `GET /api/projects/{id}/git/status`, `GET /api/projects/{id}/git/diff`, `GET /api/browse`, `POST
-/api/browse/mkdir`, `GET /api/projects/{id}/mcp`, `POST /api/projects/{id}/mcp/reload`, and `POST
-/api/projects/{id}/mcp/oauth-login`. Wire types are defined once in `giskard-proto`. See
+/api/browse/mkdir`, `GET /api/projects/{id}/harnesses/{name}/mcp`, `POST
+/api/projects/{id}/harnesses/{name}/mcp/reload`, and `POST
+/api/projects/{id}/harnesses/{name}/mcp/oauth-login`. Wire types are defined once in
+`giskard-proto`. See
 [§13.6](../specs/giskard-specification.md) for the message protocol.
+
+The MCP routes address one harness instance of the project: `{name}` is a `[harnesses.<name>]`
+declaration, and an undeclared name is a `404`. The browser addresses the open thread's harness and
+hides the MCP menu on a draft, which has no instance yet. There are no project-wide
+`/api/projects/{id}/mcp` paths.
 
 `GET /api/ws-ticket` returns the short-lived `ticket` and `ui_version`, the content identity of the
 server's embedded JavaScript. The browser compares `ui_version` with the identity embedded in its
@@ -36,13 +43,14 @@ reach stale JavaScript.
 stamped with the declaration marked `default` (the first declared one when none is marked; `codex`
 when no `[harnesses]` table exists). A name the config does not declare is a `400` whose message
 lists the declared names, and nothing is created. The chosen name is stored in `project.json` as
-`harness` and is what every thread of the project runs on; `GET /api/projects/{id}` returns it.
+`harness` and is the project's default declaration: what a new thread runs on unless its draft
+picks a model of another declaration; `GET /api/projects/{id}` returns it.
 `GET /api/harnesses` lists the declarations in declaration order as
 `{"harnesses": [{"name", "kind", "default"}]}`, with exactly one entry marked `default`; the
 new-project modal shows its harness select only when more than one is listed. A project whose
-stored name is no longer declared opens its threads read-only with a warning whose `detail` names
-the missing declaration and `[harnesses]`, and `POST /api/projects/{id}/threads/start` on it is a
-`400` with the same message.
+stored name is no longer declared opens its threads on that name read-only with a warning whose
+`detail` names the missing declaration and `[harnesses]`, and `POST
+/api/projects/{id}/threads/start` on it without a `harness` is a `400` with the same message.
 
 `POST /api/projects` has no `default_model`. A project record
 stores no model at all. The model a new thread starts on is derived from the project's catalog when
@@ -55,10 +63,33 @@ harness's own catalog, with unknown provider ids and per-provider discovery fail
 provider's endpoint, which only a harness knows, and there is no harness until a project is open —
 so a project-less list could only ever repeat `config.toml` back, which is why neither
 `GET /api/models` nor `POST /api/models/refresh` exists. The thread picker's reload button re-runs
-this endpoint for the active project. The response also carries `capabilities`, the project
-harness's capability flags (spec §4.2), present only when the harness answered; when it could not
-be reached the field is omitted and `warnings` carries a `harness:<kind>` entry. The browser gates
-its mode, permission, model, effort, and compaction controls on these flags (spec §13.5).
+this endpoint for the active project.
+
+Each project runs one harness instance per declaration it uses, and each instance has its own
+catalog. Without a query the endpoint composes every declared harness in declaration order,
+creating each instance if needed — what a draft offers. `?harness=<name>` composes that declaration
+alone, which is what an existing thread's picker requests, so opening a thread on one declaration
+never starts the others; an undeclared `<name>` is a `404`. The response is one flat `models` list
+in which every entry carries `harness`, the declaration whose instance offers it, beside the
+descriptor fields. `warnings` entries carry `harness` too, and a harness-level warning's `source`
+is `harness:<name>`. `harnesses` indexes the composed declarations in declaration order as
+`{"name", "kind", "default", "capabilities"}`: `default` marks the catalog's default declaration,
+and `capabilities` holds that instance's capability flags (spec §4.2), present only when it
+answered. An instance that cannot start is not a failure of the response: its group is listed
+without `capabilities` and `warnings` carries its `harness:<name>` entry. `project_harness` names
+the project's default declaration, which the draft preselects. There is no top-level
+`capabilities`. The browser gates its mode, permission, model, effort, and compaction controls on
+the flags of the active harness — the draft's selected group, or the open thread's own (spec
+§13.5) — and groups the picker by harness only when more than one is declared.
+
+`POST /api/projects/{id}/threads/start` takes an optional `harness`, the declaration the thread is
+created on; omitted, the project's `harness` applies. The browser sends it only when the picker
+offered a choice. A named declaration the config does not declare is a `400` whose message lists
+the declared names, and no thread is created. The thread's `harness` is fixed from then on, like its
+provider: its native id exists in exactly one harness home. The start and open responses and every
+thread summary carry the thread's `harness`. A thread stamped with a declaration that is no longer
+declared opens read-only naming it, while its siblings on declared harnesses open normally: a
+missing declaration degrades that thread, not the project.
 
 `POST /api/projects/{id}/threads/start` takes `git_strategy`, which decides where the thread's
 working tree comes from: `shared` (the project's own checkout — the default, and what an omitted

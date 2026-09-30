@@ -49,6 +49,8 @@ Persisted child metadata contains:
 - `parent_thread_id`
 - `spawned_by_turn_id`
 - the native harness thread ID
+- the harness declaration, inherited from the instance that ran its parent: a child is admitted by
+  its parent's instance, so its native ID is resolved in the same harness home
 
 Ownership is immutable after import. Giskard rejects self-links, cycles, reparenting, a child linked
 under the wrong parent, and a native child whose harness-reported parent disagrees with the proposed
