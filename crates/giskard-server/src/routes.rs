@@ -12,6 +12,7 @@ use axum::{
 };
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 use chrono::Utc;
+use futures::future::join_all;
 use serde::Deserialize;
 use tracing::{debug, error, info, warn};
 
@@ -674,15 +675,11 @@ async fn open_thread(
     );
 
     let thread_id = req.thread_id;
-    if state
-        .store
-        .load_thread(project_id, thread_id)
-        .await?
-        .is_none()
-    {
+    let Some(persisted) = state.store.load_thread(project_id, thread_id).await? else {
         return Err(ApiError::NotFound);
-    }
-    let catalog = project_model_catalog(&state, &project_config, &app_config).await;
+    };
+    let catalog =
+        project_model_catalog(&state, &project_config, &app_config, &persisted.harness).await;
     let thread_file =
         normalize_persisted_thread_model(&state, project_id, thread_id, &app_config, &catalog)
             .await?
@@ -757,6 +754,7 @@ async fn open_thread(
                     configured: provider_is_known(
                         &state,
                         &project_config,
+                        &thread_file.harness,
                         Some(&app_config),
                         &current_model.provider,
                     )
@@ -867,10 +865,10 @@ async fn start_thread_with_message(
         .load_project(project_id)
         .await?
         .ok_or(ApiError::NotFound)?;
-    let catalog = project_model_catalog(&state, &project_config, &app_config).await;
+    let harness_name = project_config.harness.clone();
+    let catalog = project_model_catalog(&state, &project_config, &app_config, &harness_name).await;
     let (model_ref, model_descriptor) =
         resolve_initial_thread_model(&app_config, &catalog, req.model_ref);
-    let harness_name = project_config.harness.clone();
     let project_ws_root = project_config
         .workspace_root
         .as_deref()
@@ -3907,19 +3905,32 @@ fn safe_git_relative_path(path: &str) -> Option<String> {
     }
 }
 
+/// Optional scope of a models request: one declaration's group instead of all of them.
+#[derive(Debug, Deserialize)]
+struct ListModelsQuery {
+    harness: Option<String>,
+}
+
 /// `GET /api/projects/{id}/models` — the model picker list for a project, and the only model
 /// listing there is: every configured model merged with each `model_listing` provider's
-/// `/v1/models` discovery, and the project harness's friendly `display_name` overlaid by model id
-/// where the config left one unset (spec §8.3). For a Codex project this surfaces Codex's
+/// `/v1/models` discovery, and each harness instance's friendly `display_name` overlaid by model
+/// id where the config left one unset (spec §8.3). For a Codex instance this surfaces Codex's
 /// `model/list` names instead of raw ids.
 ///
+/// Without a query every declared harness is composed, in declaration order, and each instance is
+/// created if needed: that is what a draft offers. `?harness=<name>` composes that declaration
+/// alone, which is what an existing thread's picker asks for, so opening a thread on one
+/// declaration never spawns the others. An undeclared scope is `404`.
+///
 /// `warnings` carries everything that degraded the list rather than failing it: a configured
-/// provider id the harness does not know (§8.2), per-provider discovery failures, and a harness
+/// provider id a harness does not know (§8.2), per-provider discovery failures, and an instance
 /// that could not answer at all. Each is best-effort — the usable part of the list is always
-/// returned.
+/// returned, and an instance that cannot start contributes a warning and a group without
+/// capabilities rather than failing the response.
 async fn project_list_models(
     State(state): State<AppState>,
     AxumPath(project_id): AxumPath<ProjectId>,
+    Query(query): Query<ListModelsQuery>,
 ) -> Result<Json<ListModelsResponse>, ApiError> {
     let project_config = state
         .store
@@ -3927,18 +3938,56 @@ async fn project_list_models(
         .await?
         .ok_or(ApiError::NotFound)?;
     let config = state.store.load_config().await?;
-    let RefreshedCatalog {
-        models,
-        warnings,
-        capabilities,
-    } = refresh_project_model_catalog(&state, &project_config, &config).await;
-    // Capabilities come from the harness the refresh already resolved rather than a second
-    // get-or-create: when the harness cannot start, that would be one more spawn attempt per
-    // picker load. `None` here means the refresh reported the harness in `warnings`.
+    let catalog = state.registry.harness_catalog();
+    let names: Vec<String> = match query.harness {
+        Some(name) => {
+            if catalog.get(&name).is_none() {
+                debug!(%project_id, harness = %name, action = "list_models",
+                    "models requested for an undeclared harness");
+                return Err(ApiError::NotFound);
+            }
+            vec![name]
+        }
+        None => catalog.names().map(str::to_string).collect(),
+    };
+    let refreshed = join_all(
+        names
+            .iter()
+            .map(|name| refresh_project_model_catalog(&state, &project_config, &config, name)),
+    )
+    .await;
+    let mut models = Vec::new();
+    let mut warnings = Vec::new();
+    let mut harnesses = Vec::with_capacity(names.len());
+    for (name, refreshed) in names.into_iter().zip(refreshed) {
+        let RefreshedCatalog {
+            models: group_models,
+            warnings: group_warnings,
+            capabilities,
+        } = refreshed;
+        models.extend(group_models.into_iter().map(|model| HarnessModelEntry {
+            harness: name.clone(),
+            model,
+        }));
+        warnings.extend(group_warnings);
+        // Capabilities come from the instance the refresh already resolved rather than a second
+        // get-or-create: when it cannot start, that would be one more spawn attempt per picker
+        // load. `None` here means the refresh reported the instance in `warnings`.
+        harnesses.push(HarnessModelGroup {
+            kind: catalog
+                .get(&name)
+                .map(|declaration| declaration.kind.clone())
+                .unwrap_or_default(),
+            default: name == catalog.default_name(),
+            capabilities: capabilities.map(capabilities_info),
+            name,
+        });
+    }
     Ok(Json(ListModelsResponse {
         models,
         warnings,
-        capabilities: capabilities.map(capabilities_info),
+        harnesses,
+        project_harness: project_config.harness,
     }))
 }
 
@@ -3978,23 +4027,25 @@ fn capabilities_info(caps: HarnessCapabilities) -> HarnessCapabilitiesInfo {
     }
 }
 
-/// Return the last catalog fetched for this project, refreshing it on demand when a client starts
-/// or mutates a thread before the browser has loaded the picker. This keeps model mutation aligned
-/// with the descriptors that drive the UI without repeating provider and harness discovery for
-/// every turn.
+/// Return the last catalog fetched for one of this project's harness instances, refreshing it on
+/// demand when a client starts or mutates a thread before the browser has loaded the picker. This
+/// keeps model mutation aligned with the descriptors that drive the UI without repeating provider
+/// and harness discovery for every turn. `harness` is the thread's declaration, or the draft's
+/// choice for a thread being created.
 pub(crate) async fn project_model_catalog(
     state: &AppState,
     project_config: &ProjectConfig,
     config: &Config,
+    harness: &str,
 ) -> Vec<ModelDescriptor> {
     if let Some(models) = state
         .registry
-        .project_model_catalog(project_config, &project_config.harness)
+        .project_model_catalog(project_config, harness)
         .await
     {
         return models;
     }
-    refresh_project_model_catalog(state, project_config, config)
+    refresh_project_model_catalog(state, project_config, config, harness)
         .await
         .models
 }
@@ -4034,12 +4085,14 @@ pub(crate) async fn normalize_persisted_thread_model(
         .map(|mutation| mutation.into_current())
 }
 
-/// A freshly composed project catalog, with what the refresh learned about the harness on the way.
+/// A freshly composed catalog of one harness instance, with what the refresh learned about the
+/// instance on the way.
 struct RefreshedCatalog {
     models: Vec<ModelDescriptor>,
+    /// Every warning, stamped with the declaration whose composition raised it.
     warnings: Vec<ModelListingWarning>,
     /// The capabilities of the harness the refresh reached; `None` when it could not be created,
-    /// in which case `warnings` carries a `harness:<kind>` entry saying why.
+    /// in which case `warnings` carries a `harness:<name>` entry saying why.
     capabilities: Option<HarnessCapabilities>,
 }
 
@@ -4047,16 +4100,14 @@ async fn refresh_project_model_catalog(
     state: &AppState,
     project_config: &ProjectConfig,
     config: &Config,
+    harness: &str,
 ) -> RefreshedCatalog {
-    let (harness_providers, mut warnings) = harness_provider_table(state, project_config).await;
+    let (harness_providers, mut warnings) =
+        harness_provider_table(state, project_config, harness).await;
     // Only an answered table can convict a configured id of being unknown. When the harness cannot
     // say, every id is unverified rather than wrong, and discovery simply does not run.
     if let Some(table) = &harness_providers {
-        warnings.extend(crate::models::validate_provider_ids(
-            config,
-            table,
-            &project_config.harness,
-        ));
+        warnings.extend(crate::models::validate_provider_ids(config, table, harness));
     }
     // Discovery needs endpoints only the harness can name. Without a table it cannot run at all,
     // and a provider configured for listing would otherwise come back short with no explanation.
@@ -4071,12 +4122,13 @@ async fn refresh_project_model_catalog(
     {
         warn!(
             project_id = %project_config.id,
-            harness = %project_config.harness,
+            harness = %harness,
             action = "refresh_project_model_catalog",
             "no harness provider table; /v1/models discovery cannot run"
         );
         warnings.push(ModelListingWarning {
-            source: format!("harness:{}", project_config.harness),
+            source: format!("harness:{harness}"),
+            harness: harness.to_string(),
             message: "model discovery needs the provider endpoints this harness cannot report; \
                       only declared models are offered"
                 .into(),
@@ -4092,7 +4144,7 @@ async fn refresh_project_model_catalog(
     ) {
         state
             .registry
-            .harness(project_config, &project_config.harness)
+            .harness(project_config, harness)
             .await
             .ok()
             .and_then(|harness| harness.client_version())
@@ -4109,6 +4161,7 @@ async fn refresh_project_model_catalog(
     let (composed, harness_warning, capabilities) = overlay_harness_metadata(
         state,
         project_config,
+        harness,
         config,
         discovery.models,
         &discovery.efforts_from_discovery,
@@ -4127,12 +4180,13 @@ async fn refresh_project_model_catalog(
     if models.is_empty() && warnings.is_empty() {
         warn!(
             project_id = %project_config.id,
-            harness = %project_config.harness,
+            harness = %harness,
             action = "refresh_project_model_catalog",
             "composed model catalog is empty"
         );
         warnings.push(ModelListingWarning {
-            source: format!("harness:{}", project_config.harness),
+            source: format!("harness:{harness}"),
+            harness: harness.to_string(),
             message: "no models are available for this project: the harness reported no catalog \
                       and no provider offered one. Check that the harness starts, and that its \
                       providers are reachable."
@@ -4141,8 +4195,13 @@ async fn refresh_project_model_catalog(
     }
     state
         .registry
-        .replace_project_model_catalog(project_config, &project_config.harness, models.clone())
+        .replace_project_model_catalog(project_config, harness, models.clone())
         .await;
+    // Discovery warnings do not know which instance asked for them; every warning of this
+    // composition belongs to this declaration.
+    for warning in &mut warnings {
+        warning.harness = harness.to_string();
+    }
     RefreshedCatalog {
         models,
         warnings,
@@ -4159,24 +4218,22 @@ async fn refresh_project_model_catalog(
 async fn harness_provider_table(
     state: &AppState,
     project_config: &ProjectConfig,
+    harness_name: &str,
 ) -> (Option<Vec<HarnessProvider>>, Vec<ModelListingWarning>) {
-    let harness = match state
-        .registry
-        .harness(project_config, &project_config.harness)
-        .await
-    {
+    let harness = match state.registry.harness(project_config, harness_name).await {
         Ok(harness) => harness,
         Err(e) => {
             warn!(
                 project_id = %project_config.id,
-                harness = %project_config.harness,
+                harness = %harness_name,
                 error = %e,
                 "cannot read harness capabilities; serving models without provider resolution"
             );
             return (
                 None,
                 vec![ModelListingWarning {
-                    source: format!("harness:{}", project_config.harness),
+                    harness: harness_name.to_string(),
+                    source: format!("harness:{harness_name}"),
                     message: format!("could not read provider-listing capabilities: {e}"),
                 }],
             );
@@ -4190,14 +4247,15 @@ async fn harness_provider_table(
         Err(e) => {
             warn!(
                 project_id = %project_config.id,
-                harness = %project_config.harness,
+                harness = %harness_name,
                 error = %e,
                 "harness provider listing failed; serving models without provider resolution"
             );
             (
                 None,
                 vec![ModelListingWarning {
-                    source: format!("harness:{}", project_config.harness),
+                    harness: harness_name.to_string(),
+                    source: format!("harness:{harness_name}"),
                     message: format!("provider listing failed: {e}"),
                 }],
             )
@@ -4213,6 +4271,7 @@ async fn harness_provider_table(
 async fn overlay_harness_metadata(
     state: &AppState,
     project_config: &ProjectConfig,
+    harness_name: &str,
     config: &Config,
     base: Vec<ModelDescriptor>,
     efforts_from_discovery: &std::collections::HashSet<(String, String)>,
@@ -4221,23 +4280,20 @@ async fn overlay_harness_metadata(
     Option<ModelListingWarning>,
     Option<HarnessCapabilities>,
 ) {
-    let harness = match state
-        .registry
-        .harness(project_config, &project_config.harness)
-        .await
-    {
+    let harness = match state.registry.harness(project_config, harness_name).await {
         Ok(harness) => harness,
         Err(e) => {
             warn!(
                 project_id = %project_config.id,
-                harness = %project_config.harness,
+                harness = %harness_name,
                 error = %e,
                 "cannot read harness capabilities; serving models without harness metadata"
             );
             return (
                 base,
                 Some(ModelListingWarning {
-                    source: format!("harness:{}", project_config.harness),
+                    harness: harness_name.to_string(),
+                    source: format!("harness:{harness_name}"),
                     message: format!("could not read model-listing capabilities: {e}"),
                 }),
                 None,
@@ -4262,14 +4318,15 @@ async fn overlay_harness_metadata(
         Err(e) => {
             warn!(
                 project_id = %project_config.id,
-                harness = %project_config.harness,
+                harness = %harness_name,
                 error = %e,
                 "harness model listing failed; serving models without harness metadata"
             );
             (
                 base,
                 Some(ModelListingWarning {
-                    source: format!("harness:{}", project_config.harness),
+                    harness: harness_name.to_string(),
+                    source: format!("harness:{harness_name}"),
                     message: format!("model listing failed: {e}"),
                 }),
                 Some(capabilities),
@@ -4969,6 +5026,7 @@ pub(crate) struct ReadOnlyProviderContext {
 pub(crate) async fn provider_is_known(
     state: &AppState,
     project_config: &ProjectConfig,
+    harness_name: &str,
     config: Option<&Config>,
     provider: &str,
 ) -> bool {
@@ -4982,7 +5040,7 @@ pub(crate) async fn provider_is_known(
     const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
     match tokio::time::timeout(
         PROBE_TIMEOUT,
-        harness_knows_provider(state, project_config, provider),
+        harness_knows_provider(state, project_config, harness_name, provider),
     )
     .await
     {
@@ -4990,7 +5048,7 @@ pub(crate) async fn provider_is_known(
         Err(_) => {
             warn!(
                 project_id = %project_config.id,
-                harness = %project_config.harness,
+                harness = %harness_name,
                 %provider,
                 action = "provider_is_known",
                 timeout_ms = PROBE_TIMEOUT.as_millis() as u64,
@@ -5010,21 +5068,18 @@ pub(crate) async fn provider_is_known(
 async fn harness_knows_provider(
     state: &AppState,
     project_config: &ProjectConfig,
+    harness_name: &str,
     provider: &str,
 ) -> bool {
     // The capability gate matters as much as the call: a harness that does not support provider
     // listing may still answer with an empty table, and taking that as gospel would convict every
     // provider — the very accusation this function exists to stop making.
-    let harness = match state
-        .registry
-        .harness(project_config, &project_config.harness)
-        .await
-    {
+    let harness = match state.registry.harness(project_config, harness_name).await {
         Ok(harness) => harness,
         Err(error) => {
             warn!(
                 project_id = %project_config.id,
-                harness = %project_config.harness,
+                harness = %harness_name,
                 %provider,
                 %error,
                 action = "provider_is_known",
@@ -5041,7 +5096,7 @@ async fn harness_knows_provider(
         Err(error) => {
             warn!(
                 project_id = %project_config.id,
-                harness = %project_config.harness,
+                harness = %harness_name,
                 %provider,
                 %error,
                 action = "provider_is_known",

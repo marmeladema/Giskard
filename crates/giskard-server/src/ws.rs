@@ -553,7 +553,9 @@ async fn handle_client_msg(
                     .thread(thread_id)
                     .action("send_input")
                 })?;
-            let catalog = project_model_catalog(state, &project_config, &app_config).await;
+            let harness = load_thread_harness(state, project_id, thread_id, "send_input").await?;
+            let catalog =
+                project_model_catalog(state, &project_config, &app_config, &harness).await;
             // RMW under the per-thread lock: bump activity and read back the resolved state.
             let tf = state
                 .thread_metadata
@@ -753,7 +755,8 @@ async fn handle_client_msg(
                     .thread(thread_id)
                     .action("select_model")
                 })?;
-            let catalog = project_model_catalog(state, &project_config, &config).await;
+            let harness = load_thread_harness(state, project_id, thread_id, "select_model").await?;
+            let catalog = project_model_catalog(state, &project_config, &config, &harness).await;
             let model_ref = crate::models::normalize_model_ref(&config, &catalog, &model_ref);
 
             let native_model = state
@@ -1504,6 +1507,31 @@ async fn run_subscribe_bootstrap(
     Ok(())
 }
 
+/// The declaration a thread runs on, read once before a mutation of its file so the catalog the
+/// mutation normalizes against is that thread's instance's.
+async fn load_thread_harness(
+    state: &AppState,
+    project_id: ProjectId,
+    thread_id: ThreadId,
+    action: &str,
+) -> Result<String, WsError> {
+    state
+        .store
+        .load_thread(project_id, thread_id)
+        .await
+        .map_err(|e| WsError::from_persist(e, action, Some(thread_id)))?
+        .map(|thread| thread.harness)
+        .ok_or_else(|| {
+            WsError::new(
+                "thread_not_found",
+                ErrorSeverity::Error,
+                "Thread not found.",
+            )
+            .thread(thread_id)
+            .action(action)
+        })
+}
+
 struct ThreadAccess {
     project_id: ProjectId,
     warning: Option<ErrorInfo>,
@@ -1548,7 +1576,13 @@ async fn ensure_thread_open(
         .load_config()
         .await
         .map_err(|e| WsError::from_persist(e, action, Some(thread_id)))?;
-    let catalog = project_model_catalog(state, &project_config, &app_config).await;
+    let catalog = project_model_catalog(
+        state,
+        &project_config,
+        &app_config,
+        &persisted_thread.harness,
+    )
+    .await;
     let thread_file = normalize_persisted_thread_model(
         state,
         project_config.id,
@@ -1770,20 +1804,19 @@ async fn read_only_provider_context(
     project_id: ProjectId,
     thread_id: ThreadId,
 ) -> Option<ReadOnlyProviderContext> {
-    let provider = state
+    let thread = state
         .store
         .load_thread(project_id, thread_id)
         .await
-        .ok()??
-        .current_model
-        .into_known()?
-        .provider;
+        .ok()??;
+    let harness = thread.harness;
+    let provider = thread.current_model.into_known()?.provider;
     let config = state.store.load_config().await.ok();
     // Without the project we cannot ask its harness which providers exist, so config is all there
     // is — and config alone can no longer convict a provider.
     let configured = match state.store.load_project(project_id).await.ok().flatten() {
         Some(project_config) => {
-            provider_is_known(state, &project_config, config.as_ref(), &provider).await
+            provider_is_known(state, &project_config, &harness, config.as_ref(), &provider).await
         }
         None => true,
     };

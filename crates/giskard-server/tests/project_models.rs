@@ -135,6 +135,7 @@ async fn project_models_compose_discovery_and_harness_catalog() {
     // Config-declared `gpt-5.5`: config name wins over the catalog, and the declared effort setting
     // is preserved — the catalog does NOT override a declared model's efforts.
     let gpt = find("gpt-5.5");
+    assert_eq!(gpt["harness"], "codex", "each entry names its declaration");
     assert_eq!(gpt["display_name"], "GPT-5.5");
     assert_eq!(gpt["supports_reasoning_effort"], false);
     assert!(
@@ -157,6 +158,12 @@ async fn project_models_compose_discovery_and_harness_catalog() {
     assert!(
         warnings.is_none_or(|w| w.is_empty()),
         "no discovery warnings expected: {warnings:?}"
+    );
+    assert_eq!(body["project_harness"], "codex", "{body}");
+    assert_eq!(
+        body["harnesses"].as_array().map(Vec::len),
+        Some(1),
+        "{body}"
     );
 }
 
@@ -222,6 +229,7 @@ async fn project_models_degrade_when_harness_catalog_query_fails() {
     let warnings = body["warnings"].as_array().unwrap();
     assert_eq!(warnings.len(), 1, "harness failure is surfaced: {body}");
     assert_eq!(warnings[0]["source"], "harness:codex");
+    assert_eq!(warnings[0]["harness"], "codex");
     assert!(warnings[0]["message"].as_str().unwrap().contains("boom"));
 }
 
@@ -481,7 +489,15 @@ async fn project_models_carry_harness_capabilities() {
     .await;
     let body = get_models(&fixture).await;
 
-    let caps = &body["capabilities"];
+    assert!(
+        body.get("capabilities").is_none(),
+        "capabilities live on each group now: {body}"
+    );
+    let group = &body["harnesses"][0];
+    assert_eq!(group["name"], "codex", "{body}");
+    assert_eq!(group["kind"], "codex", "{body}");
+    assert_eq!(group["default"], true, "{body}");
+    let caps = &group["capabilities"];
     assert_eq!(caps["plan_build_modes"], false, "{body}");
     assert_eq!(caps["per_turn_model"], false, "{body}");
     assert_eq!(caps["reasoning_effort"], false, "{body}");
@@ -532,7 +548,8 @@ async fn project_models_omit_capabilities_when_the_harness_cannot_start() {
         2,
         "capabilities must reuse the refresh's harness resolution"
     );
-    assert!(body.get("capabilities").is_none(), "{body}");
+    assert!(body["harnesses"][0].get("capabilities").is_none(), "{body}");
+    assert_eq!(body["harnesses"][0]["name"], "codex", "{body}");
     let warnings = body["warnings"].as_array().expect("warnings present");
     assert!(
         warnings.iter().any(|w| w["source"]
@@ -540,4 +557,175 @@ async fn project_models_omit_capabilities_when_the_harness_cannot_start() {
             .is_some_and(|source| source.starts_with("harness:"))),
         "a harness warning explains the missing capabilities: {body}"
     );
+}
+
+/// A server declaring `stable` (default, first) and `nightly`, each constructed by `make` from its
+/// declaration name, with a project created on the default.
+async fn spawn_two_declaration_project(
+    make: impl Fn(&str, &str) -> Result<Arc<dyn giskard_harness::AgentHarness>, HarnessError>
+    + Send
+    + Sync
+    + 'static,
+) -> Fixture {
+    spawn_project(move |mock_addr| {
+        let mock_addr = mock_addr.to_string();
+        factory::with_catalog(
+            factory::from_fn_by_harness(move |_, harness, _| make(harness, &mock_addr)),
+            factory::catalog(
+                r#"
+[harnesses.stable]
+kind = "codex"
+default = true
+
+[harnesses.nightly]
+kind = "codex"
+"#,
+            ),
+        )
+    })
+    .await
+}
+
+/// A catalog entry the harness attributes to `openai`, so it is appended to that instance's
+/// group only.
+fn routed_model(model: &str) -> ModelDescriptor {
+    ModelDescriptor {
+        provider: "openai".into(),
+        ..catalog_model(model, model, &[])
+    }
+}
+
+fn instance_offering(model: &str, mock_addr: &str) -> Arc<dyn giskard_harness::AgentHarness> {
+    Arc::new(
+        ReplayHarness::new()
+            .with_models(vec![routed_model(model)])
+            .with_providers(harness_providers(mock_addr)),
+    )
+}
+
+async fn get_models_scoped(fixture: &Fixture, harness: &str) -> reqwest::Response {
+    let base = &fixture.server.base;
+    let project_id = fixture.project_id;
+    fixture
+        .server
+        .client
+        .get(format!(
+            "{base}/api/projects/{project_id}/models?harness={harness}"
+        ))
+        .header("cookie", &fixture.server.cookie)
+        .send()
+        .await
+        .unwrap()
+}
+
+fn models_of<'a>(body: &'a serde_json::Value, harness: &str) -> Vec<&'a str> {
+    body["models"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|entry| entry["harness"] == harness)
+        .map(|entry| entry["model"].as_str().unwrap())
+        .collect()
+}
+
+#[tokio::test]
+async fn project_models_group_two_declarations() {
+    let fixture = spawn_two_declaration_project(|harness, mock_addr| {
+        Ok(instance_offering(&format!("{harness}-only"), mock_addr))
+    })
+    .await;
+    let body = get_models(&fixture).await;
+
+    let stable = models_of(&body, "stable");
+    let nightly = models_of(&body, "nightly");
+    assert!(stable.contains(&"stable-only"), "{body}");
+    assert!(!stable.contains(&"nightly-only"), "{body}");
+    assert!(nightly.contains(&"nightly-only"), "{body}");
+    assert!(!nightly.contains(&"stable-only"), "{body}");
+    // Config-declared models are offered by every instance.
+    assert!(
+        stable.contains(&"gpt-5.5") && nightly.contains(&"gpt-5.5"),
+        "{body}"
+    );
+
+    let groups = body["harnesses"].as_array().unwrap();
+    let names: Vec<_> = groups.iter().map(|g| g["name"].as_str().unwrap()).collect();
+    assert_eq!(names, ["stable", "nightly"], "declaration order: {body}");
+    assert_eq!(groups[0]["default"], true, "{body}");
+    assert_eq!(groups[1]["default"], false, "{body}");
+    assert_eq!(groups[0]["kind"], "codex", "{body}");
+    assert!(
+        groups.iter().all(|g| g["capabilities"].is_object()),
+        "{body}"
+    );
+    assert_eq!(body["project_harness"], "stable", "{body}");
+}
+
+#[tokio::test]
+async fn a_scoped_models_request_composes_one_instance() {
+    let stable_calls = Arc::new(AtomicUsize::new(0));
+    let counted = stable_calls.clone();
+    let fixture = spawn_two_declaration_project(move |harness, mock_addr| {
+        if harness == "stable" {
+            counted.fetch_add(1, Ordering::SeqCst);
+        }
+        Ok(instance_offering(&format!("{harness}-only"), mock_addr))
+    })
+    .await;
+    let response = get_models_scoped(&fixture, "nightly").await;
+    assert_eq!(response.status(), 200);
+    let body: serde_json::Value = response.json().await.unwrap();
+
+    assert!(models_of(&body, "stable").is_empty(), "{body}");
+    assert!(
+        models_of(&body, "nightly").contains(&"nightly-only"),
+        "{body}"
+    );
+    let groups = body["harnesses"].as_array().unwrap();
+    assert_eq!(groups.len(), 1, "{body}");
+    assert_eq!(groups[0]["name"], "nightly", "{body}");
+    assert_eq!(
+        stable_calls.load(Ordering::SeqCst),
+        0,
+        "a scoped request must not spawn another declaration's instance"
+    );
+}
+
+#[tokio::test]
+async fn an_undeclared_scope_is_not_found() {
+    let fixture = spawn_two_declaration_project(|harness, mock_addr| {
+        Ok(instance_offering(harness, mock_addr))
+    })
+    .await;
+    let response = get_models_scoped(&fixture, "nope").await;
+    assert_eq!(response.status(), 404);
+}
+
+#[tokio::test]
+async fn an_instance_that_cannot_start_degrades_its_group() {
+    let fixture = spawn_two_declaration_project(|harness, mock_addr| {
+        if harness == "nightly" {
+            return Err(HarnessError::Spawn("nightly is broken".into()));
+        }
+        Ok(instance_offering("stable-only", mock_addr))
+    })
+    .await;
+    let body = get_models(&fixture).await;
+
+    assert!(
+        models_of(&body, "stable").contains(&"stable-only"),
+        "{body}"
+    );
+    let warnings = body["warnings"].as_array().expect("warnings present");
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w["source"] == "harness:nightly" && w["harness"] == "nightly"),
+        "the broken instance is reported: {body}"
+    );
+    let groups = body["harnesses"].as_array().unwrap();
+    assert_eq!(groups.len(), 2, "{body}");
+    assert!(groups[0]["capabilities"].is_object(), "{body}");
+    assert_eq!(groups[1]["name"], "nightly", "{body}");
+    assert!(groups[1].get("capabilities").is_none(), "{body}");
 }

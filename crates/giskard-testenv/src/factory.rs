@@ -4,6 +4,7 @@ use async_trait::async_trait;
 use giskard_core::HarnessError;
 use giskard_harness::{AgentHarness, HarnessBootstrap};
 use giskard_harness_replay::{ReplayFixture, ReplayHarness};
+use giskard_persist::HarnessCatalog;
 use giskard_persist::store::ProjectConfig;
 use giskard_server::HarnessFactory;
 
@@ -50,6 +51,43 @@ where
         + 'static,
 {
     Arc::new(FnFactory(f))
+}
+
+/// A factory that delegates construction to `inner` and declares `catalog`, for servers with
+/// several `[harnesses.<name>]` declarations.
+struct CatalogFactory {
+    inner: Arc<dyn HarnessFactory>,
+    catalog: HarnessCatalog,
+}
+
+#[async_trait]
+impl HarnessFactory for CatalogFactory {
+    async fn create(
+        &self,
+        config: &ProjectConfig,
+        harness: &str,
+        bootstrap: HarnessBootstrap,
+    ) -> Result<Arc<dyn AgentHarness>, HarnessError> {
+        self.inner.create(config, harness, bootstrap).await
+    }
+
+    fn catalog(&self) -> HarnessCatalog {
+        self.catalog.clone()
+    }
+}
+
+pub fn with_catalog(
+    inner: Arc<dyn HarnessFactory>,
+    catalog: HarnessCatalog,
+) -> Arc<dyn HarnessFactory> {
+    Arc::new(CatalogFactory { inner, catalog })
+}
+
+/// The catalog a `config.toml` fragment of `[harnesses.<name>]` tables resolves to.
+pub fn catalog(toml_src: &str) -> HarnessCatalog {
+    let config: giskard_persist::Config =
+        toml::from_str(toml_src).expect("harness catalog fixture parses");
+    HarnessCatalog::resolve(&config).expect("harness catalog fixture resolves")
 }
 
 pub fn shared(harness: Arc<dyn AgentHarness>) -> Arc<dyn HarnessFactory> {
