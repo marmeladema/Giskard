@@ -1,0 +1,2 @@
+{"type": "user", "message": {"role": "user", "content": [{"type": "text", "text": "Use the Agent tool to delegate this: run the shell command `sleep 20 && cat data.txt` with Bash and report the magic number it prints. Then tell me the number."}]}}
+{"type": "control_request", "request_id": "29ad1d4f-01ab-4b9d-8f15-6f03011bad29", "request": {"subtype": "interrupt"}}

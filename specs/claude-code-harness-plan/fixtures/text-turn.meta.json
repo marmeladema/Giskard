@@ -1,0 +1,28 @@
+{
+ "scenario": "text-turn",
+ "argv": [
+  "claude",
+  "-p",
+  "--input-format",
+  "stream-json",
+  "--output-format",
+  "stream-json",
+  "--verbose",
+  "--permission-prompt-tool",
+  "stdio",
+  "--setting-sources",
+  "",
+  "--model",
+  "haiku",
+  "--permission-mode",
+  "manual",
+  "--include-partial-messages",
+  "--session-id",
+  "f18693ff-2d11-4f87-9556-2b527e19e081"
+ ],
+ "cwd": "/work/project",
+ "exit": 0,
+ "results": 1,
+ "asks": 0,
+ "elapsed_s": 2.1
+}

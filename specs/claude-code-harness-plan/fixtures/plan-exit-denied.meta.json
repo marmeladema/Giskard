@@ -1,0 +1,27 @@
+{
+ "scenario": "plan-exit-denied",
+ "argv": [
+  "claude",
+  "-p",
+  "--input-format",
+  "stream-json",
+  "--output-format",
+  "stream-json",
+  "--verbose",
+  "--permission-prompt-tool",
+  "stdio",
+  "--setting-sources",
+  "",
+  "--model",
+  "haiku",
+  "--permission-mode",
+  "plan",
+  "--session-id",
+  "e511b51a-79cd-4701-b218-97d810d88681"
+ ],
+ "cwd": "/work/project",
+ "exit": 0,
+ "results": 1,
+ "asks": 1,
+ "elapsed_s": 6.9
+}

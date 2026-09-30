@@ -41,7 +41,7 @@ has to make.
 | Structured diffs | **`structured_diffs: false` in v1.** Synthesize `FileChange`/`DiffUpdated` from `Edit`/`Write` tool calls + git in a later phase. |
 | `AcceptForSession` when the harness offers no rule to persist | **Keep the button visible anyway** (§9.3). It behaves as a one-off `Accept`; log the degradation and revisit only if users report it. |
 | Settings sources for child processes | **`--setting-sources user`** (§8.3): the user's own `~/.claude/settings.json` applies, so extra writable roots and personal rules are configured where the user already keeps them. Project and local scopes stay excluded. The accepted cost is that a user allow-rule can pre-approve a call `ask_first` would otherwise have asked about. |
-| Live approvals | **Supported (§9).** MVP uses the `--permission-prompt-tool stdio` channel, in the adapter's first working milestone. The hook route is postponed to a later decision and refactor (§9.4); the MCP-tool route is rejected (§9.1). |
+| Live approvals | **Supported (§9).** MVP uses the `--permission-prompt-tool stdio` channel, in milestone 3 (§11). The hook route is postponed to a later decision and refactor (§9.4); the MCP-tool route is rejected (§9.1). |
 
 ---
 
@@ -110,7 +110,7 @@ keeps serving turns until stdin closes.
 | `assistant` | complete message with `text` / `thinking` / `tool_use` blocks → `AgentMessage` / `Reasoning` / `ToolCall` items |
 | `user` (tool_result) | tool output + `tool_use_result` (stdout/stderr/interrupted) → `ItemCompleted` |
 | `result` | terminal per turn: `usage`, `total_cost_usd`, `modelUsage[model].contextWindow`, `stop_reason`, `is_error`, `permission_denials`, `terminal_reason` → `TurnCompleted` |
-| `autocompact_state` | `effective_window` / `threshold` → `ContextWindowUpdated` (the *effective* window, exactly the Codex analogue: 947 000 for a 1 M Sonnet) |
+| `autocompact_state` | **A top-level frame type, not a `system` subtype**: `{type:"autocompact_state", value:{enabled, effective_window, threshold, enforced, source}}`, beside a similar top-level `active_goal`. `claude-codes` has no variant for either, so both are among the frames the mapper must read raw (§3.7). `effective_window` / `threshold` → `TurnUsageUpdated.context_window` on the next turn (the *effective* window, exactly the Codex analogue: 947 000 for a 1 M Sonnet). There is no `ContextWindowUpdated` event; `AgentEvent::TurnUsageUpdated` is the only channel that carries a window. Emitted at session start only in some environments (a scrubbed one emitted none), so it is an optional refinement of the `modelUsage` fallback |
 | `rate_limit_event` | `rateLimitType: "five_hour"`, `resetsAt`, `overageStatus` → **subscription-plan headroom**; surface as `Notice` |
 | `system/status`, `system/task_summary`, `system/post_turn_summary` | activity/labels; `post_turn_summary` carries `status_category` (`review_ready`, `blocked`, …), `status_detail` and `needs_action` |
 | `system/thinking_tokens` | running reasoning-token estimate during a turn |
@@ -376,8 +376,19 @@ that tracks the CLI release it models.
   `CLAUDE_CODE_PROJECT_DIR_NAME` pins the directory name instead of deriving it from cwd, for exactly
   the embedding-host case Giskard is.
 
-**Forward compatibility** is designed in — enums carry `Unknown(String)` variants that round-trip
-verbatim, which is the same tolerance §12 asks of the mapper.
+**Forward compatibility is partial, and the adapter must not rely on it at the frame boundary.**
+String enums carry `Unknown(String)` variants that round-trip verbatim, `ContentBlock` has
+`Unknown(Value)`, and `SystemMessage` keeps its whole payload in a flattened `data` map, so an unknown
+`system` subtype still parses. But three things fail outright rather than degrading: an unknown
+top-level `type` (`ClaudeOutput` has no fallback variant), an unknown inbound `control_request`
+subtype (`ControlRequestPayload` types only `can_use_tool`, `hook_callback`, `mcp_message`,
+`initialize` and `interrupt`, so a `request_user_dialog` or `rename_session` ask fails the whole
+line), and a missing required field (`AssistantMessageContent.id` / `.model`,
+`ThinkingBlock.signature`, `ResultMessage.total_cost_usd`). `stream_event.event` is an untyped
+`Value`, and `post_turn_summary` / `autocompact_state` have no typed view. The mapper therefore
+reads every line as raw JSON first, dispatches on `type` and `subtype` itself, and converts into the
+crate's structs per frame with `serde_json::from_value`; a frame the crate cannot type is logged
+with its `type` and `subtype` and skipped, never allowed to fail the stream (§12, milestone 1).
 
 ### 3.7.1 Gaps in `claude-codes` — candidates to upstream
 
@@ -442,7 +453,7 @@ the whole `task_started` / `task_progress` / `task_updated` / `task_notification
 | `context_compaction` | **true** | `/compact` as a user message over stream-json: `system/status` → `system/compact_boundary` → re-emitted `system/init`, with the conversation surviving and a degenerate `result` (empty text, `stop_reason: null`) that must not be persisted as an assistant turn. `autocompact_state` feeds the gauge when emitted, with `result.modelUsage[].contextWindow` as the fallback (§6) |
 | Native rename | **supported** | `set_thread_name` forwards to `rename_session` with `source: "host"` (§3.3), or returns `Ok` when no child is live |
 | Native archive / delete | **supported** | Not because the CLI has archive or delete, but because these are where a per-thread adapter stops its process: `delete_thread` and `set_thread_archived(true)` stop the child and return `Ok` (§5.2). Leaving them at the trait default would keep a 450 MB process alive for a thread the user has deleted |
-| `terminate_command` | **unsupported (v1)** — scope, not absence | `stop_task` kills a live `task_type: "local_bash"` task from a stdio host (§3.3). Supporting it means tracking `task_started` → `task_id` per item and keying completion off `task_updated` rather than the control reply. A Phase 3/5 candidate |
+| `terminate_command` | **unsupported (v1)** — scope, not absence | `stop_task` kills a live `task_type: "local_bash"` task from a stdio host (§3.3). Supporting it means tracking `task_started` → `task_id` per item and keying completion off `task_updated` rather than the control reply. A candidate for after milestone 4 (§11) |
 | Linked sub-agent threads | **supported, as local child threads** | The child is not a resumable session, but its whole transcript is forwarded and is materialized as a read-only Giskard thread keyed by the Task call's `tool_use_id`. **Requires implementing `claim_native_thread`** — that is the only path by which such a thread is created, and the trait default fails every delegation into an unbounded retry (§5.3) |
 
 *Every flag above reaches the browser.* Stage 0 serializes `HarnessCapabilities` as
@@ -575,7 +586,7 @@ releases its child immediately — but it does not close the gap: **a thread the
 looking at keeps its process**, so memory tracks threads *opened* rather than threads *open*. At the
 spec's ~10-thread scale (§1.4) that is gigabytes.
 
-The MVP should at minimum log the live-child count. Reaping is Phase 5;
+The MVP should at minimum log the live-child count. Reaping is milestone 6;
 `docs/multi-harness-design.md` carries "idle shutdown" as an open question, and this adapter is the
 reason to answer it.
 
@@ -749,7 +760,7 @@ nesting tree by following those IDs"* — exactly the thread graph this design b
   > reported. When no child is live, the instance spawns a probe child, sends `initialize`, reads
   > `models`, closes stdin, and caches the result.**
 
-  **This is on Phase 2's critical path, not a later phase's.** The picker calls `list_models` on the
+  **This is on milestone 2's critical path (§11), not a later milestone's.** The picker calls `list_models` on the
   *instance*, before any thread exists, so without an answer the first Claude thread of a project
   cannot be created at all unless the user hand-declares `[providers.anthropic.models]`.
 
@@ -784,8 +795,10 @@ nesting tree by following those IDs"* — exactly the thread graph this design b
   from the catalog — see the next bullet. `[providers.anthropic.models]` remains available for
   hand-declaring models, and composition merges it as before.
 
-- **Context window.** Emit `ContextWindowUpdated` from `autocompact_state.effective_window`, falling
-  back to `result.modelUsage[<model>].contextWindow`. This is the effective, post-headroom number,
+- **Context window.** Emit it as `AgentEvent::TurnUsageUpdated { context_window }` — the only event
+  that carries a window (`giskard-core/src/event.rs`); there is no `ContextWindowUpdated` variant —
+  from `autocompact_state.effective_window`, falling back to
+  `result.modelUsage[<model>].contextWindow`. This is the effective, post-headroom number,
   which is exactly what the spec's context gauge (§10.3) wants. `autocompact_state` often arrives
   unprompted at session start (`{enabled, effective_window, threshold, enforced, source}`), but
   **it is not guaranteed** — some sessions emit none — so the `modelUsage` fallback is load-bearing
@@ -821,7 +834,7 @@ nesting tree by following those IDs"* — exactly the thread graph this design b
 
 `get_workspace_diff` (§3.3) answers from a stdio host, returning real stats, per-file counts and
 hunks. It is nevertheless the wrong source for this capability, and the distinction matters because it
-decides whether the Phase 5 work exists at all.
+decides whether the milestone 7 work exists at all.
 
 **`structured_diffs` is a turn-attribution feature, not a diff feature.** The trait defines it as a
 "structured, per-file diff *stream*"; it feeds `DiffUpdated { thread, turn, diff }` and persists as
@@ -840,7 +853,7 @@ Giskard controls its own base-ref policy (which it must, given per-thread worktr
 Routing a workspace diff through a child process to get an answer Giskard can compute directly would
 add a dependency and lose control, for nothing.
 
-So the Phase 5 plan is unchanged: synthesize `FileChange` / `DiffUpdated` from the `Edit` / `Write` /
+So the milestone 7 plan is unchanged: synthesize `FileChange` / `DiffUpdated` from the `Edit` / `Write` /
 `NotebookEdit` tool calls — which *are* turn-attributed, because they arrive inside a turn — using git
 for the before/after content. `get_workspace_diff` is worth knowing about for a future workspace-level
 diff view, where its base-ref resolution is a reasonable default to copy. It is not worth wiring into
@@ -1450,179 +1463,146 @@ and refactor (§9.4); and **honouring a repository's own `.claude/settings.json`
 `local` settings scopes stay excluded, gated on the security review in §8.3, while the user scope is
 loaded.
 
-"v1" here means the Phase 2 MVP. Linked sub-agent child threads (§5.3) are **not** on this list: if
-they are deferred to Phase 3 the transcript stays readable without them — but only if `SubagentLink`
-is deferred too, since emitting it without `claim_native_thread` retries forever (Phase 2). Rename, archive and delete are not on it either — they are implemented, because
+"v1" here means the MVP that milestone 4 (§11) makes reachable. Linked sub-agent child threads (§5.3) are **not** on this list: if
+they are deferred to milestone 5 the transcript stays readable without them — but only if `SubagentLink`
+is deferred too, since emitting it without `claim_native_thread` retries forever (milestone 4). Rename, archive and delete are not on it either — they are implemented, because
 they are where this adapter stops a child process (§5.2).
 
 ---
 
-## 11. Phasing
+## 11. Milestones
 
-Each phase carries the `AGENTS.md` obligations: `cargo fmt`/`clippy -D warnings`, error-path tests,
-structured logs at new boundaries, and doc sync in the same change.
+The work is cut into milestones that are each **one commit**. A milestone leaves `cargo fmt --all
+--check`, `cargo clippy --workspace --all-targets --locked -- -D warnings`, `cargo test --workspace
+--locked` and `cargo deny check` green, carries its own tests, and syncs every document it affects, as
+`AGENTS.md` requires. They land in order; each one's detailed plan, written for an implementing agent,
+lives in `specs/claude-code-harness-plan/milestone-<n>-plan.md` and is written when the previous
+milestone has merged, against the tree it left.
 
-### Phase 0 — remaining protocol verification
+Nothing is user-visible before milestone 4: the crate exists and is tested from milestone 1, but no
+`[harnesses.<name>]` declaration can name it until the kind is registered. That is deliberate. The
+adapter is built bottom-up in units that can each be reviewed on their own, and the first reachable
+version already has approvals, the catalog and the lifecycle methods, so no intermediate shape ships
+with a preset that hangs or a thread that cannot be created.
 
-The protocol behaviours this adapter depends on are established (§3, §9) — the approval round trip in
-all four decisions, `interrupt` including mid-tool-call and mid-delegation, `set_model` /
-`set_permission_mode` / `apply_flag_settings` with `get_settings` read-back, `/compact`, concurrent
-same-cwd sessions, the nine control subtypes in §3.3, sub-agent forwarding and sub-agent approvals,
-and the settings-scope boundary. **`initialize` needs neither credentials nor the network** — it
-answers in ~1.5 s from an empty config directory and writes no transcript — which is what §6's catalog
-probe rests on.
+| # | Milestone | Ships | Depends on |
+| --- | --- | --- | --- |
+| 1 | Crate, fixtures, output mapper | `giskard-harness-claude` as a workspace member with `claude-codes`; recorded and sanitized protocol fixtures; the pure mapper from stream-json frames to `AgentEvent`s and control replies, tested on the fixtures | nothing |
+| 2 | Child supervisor and thread lifecycle | one `claude` process per thread; `open_thread` / resume / resume-fallback, `subscribe`, `start_turn` with attachments, `interrupt`, `shutdown`, `delete_thread`, `set_thread_archived`, `set_thread_name`; the catalog probe and provider report | 1 |
+| 3 | Approvals, server requests, per-turn settings | `can_use_tool` ↔ `respond_approval` with the §9.3 mapping, `AskUserQuestion` and dialogs ↔ `respond_server_request`, the permission mode per turn, `set_model` / effort with read-back, `/compact` | 2 |
+| 4 | Registration and documentation | `ClaudeCodeKind` in the server binary, `config.example.toml`, README, spec mapping section, the adapter README; P8 hygiene. **The MVP becomes reachable here** | 3, and Stage 3 of `docs/multi-harness-design.md` |
+| 5 | Sub-agent child threads | `--forward-subagent-text`, `SubagentLink` on the `Agent` item, `claim_native_thread` for `task:` ids, `parent_tool_use_id` routing, sub-agent approvals, `docs/subagents.md` | 4 |
+| 6 | Idle reaping | an adapter-level idle policy over children, answering the design doc's open question | 4 |
+| 7 | Synthesized diffs | `FileChange` / `DiffUpdated` from `Edit` / `Write` / `NotebookEdit` plus git | 4 |
+| 8 | Drift and headroom surfacing | `system/init.capabilities` feature detection, a version-drift warning, and `rate_limit_event` headroom in the UI | 4 |
 
-**One item remains, and it does not block Phase 2: whether a mid-session `set_model` re-bases the
-output-token limit and auto-compact window.** A bug in this area existed in the 2.1.2xx series.
+### Milestone 1 — crate, fixtures, output mapper
 
-It cannot be settled on a machine whose provider is host-managed, and the reason is specific rather
-than incidental: **such a machine serves one model whatever is selected**, so a per-model window and a
-stale window are indistinguishable. Launching `--model haiku` yields `get_settings.applied.model =
-claude-haiku-4-5-…` and `get_context_usage.maxTokens = 1000000` — but Haiku's real window is 200K, and
-`result.modelUsage` records `claude-sonnet-5-5`, whose window *is* 1M. So the 1M reading is correct
-for what actually ran and proves nothing about re-basing. Dropping
-`CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST` does not change it.
+The crate skeleton (`Cargo.toml`, workspace membership, `deny.toml` unchanged since `claude-codes` is
+Apache-2.0 with MSRV 1.85), a README that mirrors the Codex adapter's identifier and lifecycle
+contract for what exists so far, and the `AGENTS.md` / root README crate lists.
 
-Settling it needs a direct-provider machine and takes one session: start on a 200K model, read
-`get_context_usage.maxTokens`, `set_model` to a 1M model, and read it again. `set_model` itself, the
-`system/init` re-emit, and the `get_settings` read-back are already confirmed, so only the window
-arithmetic is in question — and §6 does not depend on it, because the gauge reads
-`autocompact_state` and `result.modelUsage[].contextWindow` rather than a per-session constant.
+**Fixtures are this milestone's first deliverable**, and they replace the old Phase 0. Each is a
+sanitized stream-json transcript recorded against a real CLI with the exact argv in its metadata
+file: the catalog probe, a plain text turn with partial messages, an allowed tool call, a denied one,
+a session-scoped `AcceptForSession`, a `Cancel` (deny with `interrupt`), a foreground delegation, an
+interrupted delegation, a `/compact`, a denied `ExitPlanMode`, a backgrounded shell command that
+outlives its turn, and a failed `--resume`. They live in the crate's `tests/fixtures/` and every
+mapper test reads one of them, so a test's input is a frame the CLI actually produced.
 
-**Fixtures are the real Phase 0 deliverable.** Each sanitized transcript becomes a mapper test input:
-the §9.2 ask payload, a denial, a session-scoped `AcceptForSession`, a compaction, a catalog probe
-response, **a denied `ExitPlanMode`** — whose `result.permission_denials[].tool_input.plan` and
-`planFilePath` are the shape a plan item would be built from if §8.2's decision ever changes —
-**a delegation**, **an interrupted delegation**, and **a backgrounded shell command that outlives its
-turn**. The delegation pair tests that a turn stays open until its agent task reaches a terminal
-`task_updated`; the backgrounded command tests the other half of the same rule — that a `local_bash`
-task does *not* gate completion, so a dev server cannot hold a turn open forever (§5.3).
+**The mapper** is a pure state machine like `CodexMapper`: one raw JSON line in, a list of outputs
+out, no I/O. It owns the turn state a single child needs (active turn, item ids keyed by tool-use id
+or message block, open agent tasks, the pending effective window) and produces `AgentEvent`s plus
+the control replies that need no user (a denied `ExitPlanMode`, a `control_response` correlation).
+It covers every frame in §3.2 and the `can_use_tool` and `AskUserQuestion` shapes in §9, including
+the two invariants that fail silently when wrong: the agent-task gate on turn completion (§5.3) and
+the three-summand input-token arithmetic (§6). Sub-agent frames with a `parent_tool_use_id` are
+routed to a child route when one is claimed and dropped with a debug log otherwise; milestone 5
+supplies the routes.
 
-### Phase 1 — preparatory work on the server
+**Deliberately not in it:** no process, no `AgentHarness` implementation, no kind registration. The
+remaining open verification (whether a mid-session `set_model` re-bases the auto-compact window) is
+not a milestone; it needs a direct-provider machine and §6 does not depend on it.
 
-Almost none is left. Stages 0–2 of `docs/multi-harness-design.md` shipped the multi-harness
-groundwork: named declarations, `HarnessKind` / `HarnessKindFactory`, per-declaration slots on
-`ProjectAuthority`, `ThreadFile.harness` with a constant default, per-harness bootstrap filtering,
-harness-scoped MCP routes, and capabilities on the wire.
+### Milestone 2 — child supervisor and thread lifecycle
 
-**Nothing blocks this adapter.** One hygiene item is open on `main`:
+`ClaudeHarness` as the façade over `HashMap<ThreadId, ChildSession>`, one supervisor task per
+child owning its stdin, its raw-line reader, its mapper and its retained `EventLog` (created at
+open, so `subscribe` answers before the first frame). Giskard owns argv: the full §3.1 invocation is
+built on `tokio::process::Command` directly, because `ClaudeCliBuilder` cannot emit
+`--setting-sources`, `--effort`, `--forward-subagent-text`, `--include-partial-messages` or
+`--replay-user-messages` (§3.7.1). The `initialize` handshake, `open_thread` for a fresh id and for
+`--resume`, the same-id respawn when resume fails (§5.2), `start_turn` with inline attachments and
+the encoded-size ceilings (§3.6), `interrupt`, `shutdown` that interrupts before it stops, and the
+three lifecycle methods that stop a child. `list_models` from the freshest `initialize` or the probe
+(§6), `list_providers` reporting `anthropic`. Capabilities as §4, except that `live_approvals`,
+`plan_build_modes`, `per_turn_model` and `reasoning_effort` are reported only from milestone 3.
 
-| # | Change | Status |
-| --- | --- | --- |
-| **P8** | **Harness-scoped native-id lookup** — hygiene, not a bug | One site: `resolve_reverse_subagent_target` (`registry.rs:1946`) finds a thread by `harness_thread_id` across the whole project graph with no harness filter. `ThreadFile.harness` is the missing predicate, and the correct idiom already exists in the same file — `graph.values().filter(\|thread\| thread.harness == harness)` at `registry.rs:830`. Two things keep it benign: a Codex rollout id, a Claude session UUID and a `task:` id cannot collide in practice, and the match is additionally constrained to the source thread's own parent, so a spurious hit would have to be that exact parent. Worth fixing while three id namespaces share one field, not a blocker. |
+Tested without a real CLI: a scripted fake `claude` (a small test binary in the crate that replays a
+milestone-1 fixture and answers control requests) drives the supervisor in CI, the way the Codex
+crate's `FakeCodexTransport` does.
 
-In particular the server does **not** need to soften `HarnessError::Unsupported` from
-`set_thread_name` / `set_thread_archived` / `delete_thread`,
-because this adapter implements all three (§5.2) — rename forwards to `rename_session`, and archive
-and delete are where the child process stops. No method returns `Unsupported`, so `registry.rs`
-propagating it is not a problem this adapter creates.
+### Milestone 3 — approvals, server requests, per-turn settings
 
-**Sequencing against Stage 3.** `docs/multi-harness-design.md`'s Stage 3 rewrites those same three
-registry methods (`registry.rs:1457`, `:1477`, `:1505`). **Stage 3 lands first**, and this adapter is
-written against the shape it leaves, rather than the two changes racing on the same call sites.
+`can_use_tool` → `ApprovalRequested` with the §9.3 decision mapping, including the
+session-destination rewrite and its regression test, `Cancel` as a deny with `interrupt`, and the
+degradation to a plain `Accept` when no rule suggestion is offered. `AskUserQuestion`,
+`request_user_dialog` and elicitation → `ServerRequestReceived` / `respond_server_request`. The
+permission mode per turn: `--permission-mode` at spawn, `set_permission_mode` at every turn start,
+`--disallowedTools EnterPlanMode ExitPlanMode` (§8.2), presets per §8.1. `set_model` and
+`apply_flag_settings{effortLevel}` with `get_settings` read-back (§3.3), which makes `TurnOverrides`
+fully honoured. `compact_thread` as a `/compact` user message, with the degenerate `result` not
+persisted as an assistant turn. `rate_limit_event` and `api_retry` → `Notice`.
 
-### Phase 2 — `giskard-harness-claude` MVP
+### Milestone 4 — registration and documentation
 
-**Depends on Stage 3 of `docs/multi-harness-design.md` landing first** (see Phase 1).
+`ClaudeCodeKind` beside `CodexKind` in `bin/giskard-server.rs` (§5.1), with the startup tests
+extended for a two-kind catalog; `config.example.toml` gains a `[harnesses.claude]` declaration;
+README's *Supported harnesses* entry changes; the spec gains a Claude Code mapping section beside
+§4.6 and the §9.1 / §9.2.1 amendments (§8.2, §9.3); `docs/api-endpoints.md` is unchanged because no
+route moves; the adapter README is completed. P8 (`resolve_reverse_subagent_target` filtered by
+`ThreadFile.harness`) lands here because it is the one server-side hygiene item. **Stage 3 of
+`docs/multi-harness-design.md` lands before this milestone**, since it rewrites the registry
+methods this adapter's lifecycle methods are called through. Checking that a second *kind* renders
+correctly in a picker built against two Codex declarations, and regenerating the screenshots if it
+does not, is part of this milestone.
 
-New crate + README, plus a `ClaudeCodeKind` beside `CodexKind` (§5.1) — a declaration is what makes
-the adapter reachable at all. **`claude-codes` as the protocol layer** (§3.7), child supervisor, mapper
-(`assistant`/`stream_event`/`user`/`result` → items and turns), `open_thread`/`start_turn`/
-`subscribe`/`interrupt`/`shutdown`, **`can_use_tool` ↔ `ApprovalRequested` with the §9 decision
-mapping**, user attachments as inline content blocks (§3.6), token usage, `ContextWindowUpdated`,
-the `anthropic` provider report, and **the model catalog including its probe** (§6): `list_models`
-answers from the freshest `initialize.models` of a live child, and spawns a probe child when none is
-live. The probe is MVP scope rather than a refinement, because the picker calls `list_models` before
-any thread exists and the first Claude thread of a project cannot otherwise be created. **Test that a
-probe against a throwaway `CLAUDE_CONFIG_DIR` leaves no file under `projects/`** — that property is
-what makes it safe to run on every picker load. Capability set from §4.
+### Milestone 5 — sub-agent child threads
 
-**The thread-lifecycle methods are part of the MVP, not a later nicety** (§5.2):
-`delete_thread` and `set_thread_archived(true)` stop the child, `set_thread_name` forwards to
-`rename_session`. Left at the trait default they return `Unsupported`, which `registry.rs` propagates
-— and archive and delete are the only things bounding process growth before Phase 5's reaper.
+`--forward-subagent-text` on every child, `SubagentLink` on the parent's `Agent` item,
+`claim_native_thread` for `task:<tool_use_id>` ids, `subscribe` on a claimed child handle yielding
+the frames whose `parent_tool_use_id` matches, sub-agent approvals routed by `tool_use_id`, and the
+`open_thread` refusal to ever `--resume` a `task:` id (§5.3). `docs/subagents.md` gains the
+no-native-session model. The two halves ship together, never one without the other.
 
-**Sub-agent child threads (§5.3) may be deferred to Phase 3, but only with `SubagentLink` deferred
-with them.** The two are not separable: emitting a `SubagentLink` on the parent's `Agent` item is what
-makes the forwarder raise a link, which makes admission call `claim_native_thread` — and at the trait
-default that fails and is re-queued forever (§5.3). So Phase 2 has exactly two safe shapes:
+### Milestones 6 to 8 — polish
 
-- **Defer both.** The `Agent` call is mapped as an ordinary tool call with **no `SubagentLink`**. The
-  transcript stays readable, the Sub-agents card is simply absent, and nothing is admitted.
-- **Ship both.** `SubagentLink` plus `claim_native_thread` plus `parent_tool_use_id` routing.
-
-What must never ship is the half: a `SubagentLink` without a claim implementation turns every
-delegation into an unbounded retry loop with a warning per driver event. Given how small the claim
-implementation is — bind the id in the façade, return a handle echoing it, filter `subscribe` by
-`parent_tool_use_id` — shipping both in Phase 2 is the better default, and deferral is the option
-that needs the care.
-
-Mapper unit tests off Phase-0 fixtures, including a denial that must not be reported as an
-executed-and-failed tool call.
-
-### Phase 3 — the rest of the control channel
-
-`set_model`, `set_permission_mode` and
-`apply_flag_settings{effortLevel}` — per-turn model, mode and reasoning effort with no respawn, which
-together make `TurnOverrides` fully supported — elicitation / `request_user_dialog` →
-`ServerRequestReceived`,
-`rate_limit_event` → `Notice`, `/compact`, `AcceptForSession` via session-destination
-`updatedPermissions`.
-
-The `session_name` output frame also belongs here — the CLI announces a name change the host did not
-make, and the mapper need only treat a repeated name as no change. (`rename_session` itself is Phase 2,
-because `set_thread_name` must not return `Unsupported`; see §5.2.)
-
-### Phase 4 — (folded into Phase 2)
-
-**There is no separate model-discovery phase.** The catalog is answered by the child over the control
-channel, so the work is a mapper from the `initialize` / `list_models` `models` array to
-`ModelDescriptor` — small enough to sit inside Phase 2 beside the rest of the handshake.
-
-The `models.rs` discovery extensions are still worth building eventually, for a catalog with **no live
-child** (a picker offered before any thread is open). That is a Giskard-wide question rather than this
-adapter's, and it has no dependency on Claude Code shipping.
-
-There is no cross-harness UX phase any more: the grouped picker, the harness on thread wire types,
-capability gating and harness-scoped MCP routes all landed with Stage 2. What remains is checking that
-a second *kind* renders correctly in a picker built and tested against two Codex declarations, and
-regenerating screenshots if it does not (`tests/e2e/screenshots.sh`).
-
-### Phase 5 — polish
-
-Idle reaping — now an adapter-level policy over child processes, and the open question
-`docs/multi-harness-design.md` leaves for whoever needs it first (§5.2 says why that is this
-adapter). Synthesized `FileChange`/`DiffUpdated`, and a version-drift warning surfaced in the UI.
+Idle reaping (§5.2, and the design doc's open question), synthesized structured diffs (§6.1), and
+surfacing `system/init.capabilities`, `claude_code_version` drift and subscription headroom in the
+UI (§12). Each is independent of the others and follows milestone 4.
 
 ### Later, as its own decision — the hook route (§9.4)
 
-Not scheduled here on purpose: it is a
-refactor of how an approval reaches the server (second inbound channel, approval routing that does not
-assume a `ThreadHandle`, ephemeral hook installation, cross-transport deduplication by `tool_use_id`),
-and it should be decided against a working harness rather than designed in advance.
+Not scheduled here on purpose: it is a refactor of how an approval reaches the server (second
+inbound channel, approval routing that does not assume a `ThreadHandle`, ephemeral hook
+installation, cross-transport deduplication by `tool_use_id`), and it should be decided against a
+working harness rather than designed in advance.
 
 ### Documentation to update
 
 Much less than before: Stage 0 already rewrote spec §4.7 and §6.4 around instances, and Stage 2 took
-the endpoint inventory. What this adapter still owns:
+the endpoint inventory. What this adapter still owns, by milestone:
 
-- `specs/giskard-specification.md`, four changes:
-  - a Claude Code mapping section beside the Codex one;
-  - **§9.1** — Plan/Build is not orthogonal to the preset for a harness without `plan_build_modes`
-    independence, because `plan` *is* a permission mode here (§8.2);
-  - **§9.2.1** — a wording generalisation, not a behaviour change: the definitional parenthetical
-    names *"the current harness process for that project (i.e. the `codex app-server` child spawned
-    for the project)"*, which is Codex's model. Reword it as the process that enforces the grant. The
-    section's rationale and its "scope follows what the harness scopes it to" rule already cover the
-    per-thread case, and the UI string needs no change (§9.3);
-  - **§8.2**'s auth-placement note, only if §6's discovery extensions land.
-- `README.md`: the *Supported harnesses* entry currently reads "Claude Code — not yet supported";
-  and `config.example.toml` gains a `[harnesses.claude]` declaration.
-- `docs/subagents.md`: sub-agent threads without native sessions (§5.3), beside the Codex model.
-- `AGENTS.md`: the crate list, once `giskard-harness-claude` exists.
-- New `crates/giskard-harness-claude/README.md`, mirroring the Codex adapter's identifier and
-  lifecycle contract — including that a `task:` native id is an item id and must never reach
+- Milestone 1: `AGENTS.md` and the root README crate lists; the new
+  `crates/giskard-harness-claude/README.md`, started with the identifier model and the mapper's
+  contract.
+- Milestone 4: `specs/giskard-specification.md` (a Claude Code mapping section beside §4.6; §9.1 and
+  §9.2.1 amended for a per-thread process and plan mode as a permission mode); `README.md`'s
+  *Supported harnesses* entry; `config.example.toml`'s `[harnesses.claude]` declaration; the adapter
+  README completed, including that a `task:` native id is an item id and must never reach
   `--resume`.
+- Milestone 5: `docs/subagents.md`, sub-agent threads without native sessions (§5.3), beside the
+  Codex model.
 
 ---
 
@@ -1632,13 +1612,13 @@ the endpoint inventory. What this adapter still owns:
 | --- | --- |
 | Protocol drift as Claude Code ships — **measured, not hypothetical** | Over ~50 patch releases the 2.1.2xx series moved a documented flag value to undocumented, added two permission modes, changed the headless default mode, and grew the control channel by roughly twenty subtypes. `claude-codes` (§3.7) helps — its version tracks the CLI and its enums tolerate unknown values — but enum tolerance does not protect a capability decided on a premise that has expired. **Read `system/init.capabilities` and feature-detect** rather than comparing version strings; log `claude_code_version` as diagnostics; **re-check §3 against the version the adapter ships against**. Drift cuts both ways: several of §3.3's subtypes *removed* planned work, so a re-check is as likely to simplify the plan as to complicate it |
 | `ask_first` does not ask about everything — **two independent causes, both verified** | User settings allow-rules pre-empt the callback (accepted by the §8.3 decision), *and* the CLI approves effect-free commands itself below the settings layer, with nothing configured (§9.2.1). Not mitigated by design: the UI wording must match what the preset actually promises, and the hook route (§9.4) is the only fix for either |
-| One process per loaded thread, **measured at 440–530 MB RSS** | `delete_thread` and `set_thread_archived(true)` release a child immediately (§5.2), which bounds the worst case but not the common one: a thread the user merely stops looking at keeps its process, because `retire_thread` / `forget_thread` are invisible to the harness. MVP logs the live-child count so growth is visible; reaping in Phase 5. At the spec's ~10-thread scale this is gigabytes, so it is a capacity question, not a detail |
-| **A `SubagentLink` without `claim_native_thread`** | Fails loudly but endlessly rather than silently: every delegation is re-queued by `defer_admission` with no attempt cap and warns once per driver event. Ship `SubagentLink` and the claim together, or neither (§5.3, Phase 2) |
+| One process per loaded thread, **measured at 440–530 MB RSS** | `delete_thread` and `set_thread_archived(true)` release a child immediately (§5.2), which bounds the worst case but not the common one: a thread the user merely stops looking at keeps its process, because `retire_thread` / `forget_thread` are invisible to the harness. MVP logs the live-child count so growth is visible; reaping in milestone 6. At the spec's ~10-thread scale this is gigabytes, so it is a capacity question, not a detail |
+| **A `SubagentLink` without `claim_native_thread`** | Fails loudly but endlessly rather than silently: every delegation is re-queued by `defer_admission` with no attempt cap and warns once per driver event. Ship `SubagentLink` and the claim together, or neither (§5.3, milestone 5) |
 | A stray `ANTHROPIC_API_KEY` in Giskard's own environment silently bills a subscriber to API credits | Not preventable *by Giskard*: `env` is an overlay and cannot unset an inherited variable (§7). Detect it — `initialize`'s `account:{subscriptionType, apiProvider}` at handshake, `system/init.apiKeySource` per turn. Prevention exists for the operator: the managed `allowedProviders` setting outranks every other scope (§7) |
 | Cost/quota semantics differ under a subscription | Treat euro cost as notional; surface `rate_limit_event` (§6) |
 | `full_access` fails to start when the server process runs as root (§8.1) | Outside the documented setup, but the raw failure is an opaque spawn error: detect the refusal and surface its cause |
 | A checkout carries permission rules Giskard would otherwise honour | `project` and `local` scopes stay excluded (§8.3); only the machine owner's user-scope file is loaded. The exclusion covers `.mcp.json` as well as `settings.json` — a separate surface that would otherwise start a checkout's MCP servers unprompted |
-| **A backgrounded delegation emits two `result` messages** (§5.3) | The highest-severity mapper hazard in this plan, because it fails silently: closing the turn on the first `result` persists "I have delegated this" and drops the work. Worse, whether a delegation backgrounds is decided per call, so a mapper that closes on the first `result` works intermittently. Keep the turn open until every **agent-type** task has a terminal `task_updated` — and no longer, since a backgrounded `local_bash` task legitimately outlives its turn. Cover both halves with the Phase 0 delegation and backgrounded-command fixtures |
+| **A backgrounded delegation emits two `result` messages** (§5.3) | The highest-severity mapper hazard in this plan, because it fails silently: closing the turn on the first `result` persists "I have delegated this" and drops the work. Worse, whether a delegation backgrounds is decided per call, so a mapper that closes on the first `result` works intermittently. Keep the turn open until every **agent-type** task has a terminal `task_updated` — and no longer, since a backgrounded `local_bash` task legitimately outlives its turn. Cover both halves with the milestone 1 delegation and backgrounded-command fixtures |
 
 ---
 

@@ -1,0 +1,1 @@
+{"type": "user", "message": {"role": "user", "content": [{"type": "text", "text": "Using the Bash tool with run_in_background set to true, start the command `sleep 15 && echo finished`. Do not wait for it. Reply with the single word started."}]}}

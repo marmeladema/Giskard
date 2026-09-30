@@ -1,0 +1,2 @@
+{"type": "user", "message": {"role": "user", "content": [{"type": "text", "text": "Run the shell command `python3 -c \"print(1)\"` three separate times, one Bash tool call each, one after the other. Then reply done."}]}}
+{"type": "control_response", "response": {"subtype": "success", "request_id": "45bac3aa-5c02-4a2c-b379-380177cbc1ab", "response": {"behavior": "allow", "updatedPermissions": [{"type": "addRules", "rules": [{"toolName": "Bash", "ruleContent": "python3 -c \"print(1)\""}], "behavior": "allow", "destination": "session"}]}}}
