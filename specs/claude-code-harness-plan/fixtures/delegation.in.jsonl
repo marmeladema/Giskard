@@ -1,0 +1,1 @@
+{"type": "user", "message": {"role": "user", "content": [{"type": "text", "text": "Use the Agent tool to delegate this: read data.txt in the current directory and report the magic number. Then tell me the number."}]}}

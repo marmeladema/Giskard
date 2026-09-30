@@ -1,0 +1,2 @@
+{"type": "user", "message": {"role": "user", "content": [{"type": "text", "text": "Create an empty file named probe.txt in the current directory with the Bash command `touch probe.txt`, then reply done."}]}}
+{"type": "control_response", "response": {"subtype": "success", "request_id": "a949f115-7a12-45df-a915-3d9522bc6856", "response": {"behavior": "deny", "message": "Cancelled", "interrupt": true}}}

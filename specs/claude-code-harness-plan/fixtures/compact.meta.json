@@ -1,0 +1,27 @@
+{
+ "scenario": "compact",
+ "argv": [
+  "claude",
+  "-p",
+  "--input-format",
+  "stream-json",
+  "--output-format",
+  "stream-json",
+  "--verbose",
+  "--permission-prompt-tool",
+  "stdio",
+  "--setting-sources",
+  "",
+  "--model",
+  "haiku",
+  "--permission-mode",
+  "manual",
+  "--session-id",
+  "14028f75-ccd9-4f57-b5db-232b6090f560"
+ ],
+ "cwd": "/work/project",
+ "exit": 0,
+ "results": 2,
+ "asks": 0,
+ "elapsed_s": 21.0
+}

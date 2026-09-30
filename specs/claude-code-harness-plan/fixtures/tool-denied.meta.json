@@ -1,0 +1,27 @@
+{
+ "scenario": "tool-denied",
+ "argv": [
+  "claude",
+  "-p",
+  "--input-format",
+  "stream-json",
+  "--output-format",
+  "stream-json",
+  "--verbose",
+  "--permission-prompt-tool",
+  "stdio",
+  "--setting-sources",
+  "",
+  "--model",
+  "haiku",
+  "--permission-mode",
+  "manual",
+  "--session-id",
+  "711f54ab-953e-4cb0-993e-8c3cc41f9635"
+ ],
+ "cwd": "/work/project",
+ "exit": 0,
+ "results": 1,
+ "asks": 1,
+ "elapsed_s": 4.3
+}

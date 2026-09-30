@@ -1,0 +1,2 @@
+{"type": "active_goal", "value": null, "uuid": "00000000-0000-4000-8000-000000000001", "session_id": "3c6a3f4a-0f1e-4d7d-9b2a-8e0c2f1d5a10"}
+{"type": "autocompact_state", "value": {"enabled": true, "effective_window": 180000, "threshold": 144000, "enforced": true, "source": "auto"}, "uuid": "00000000-0000-4000-8000-000000000002", "session_id": "3c6a3f4a-0f1e-4d7d-9b2a-8e0c2f1d5a10"}

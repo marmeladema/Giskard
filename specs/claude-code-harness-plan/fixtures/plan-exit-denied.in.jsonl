@@ -1,0 +1,2 @@
+{"type": "user", "message": {"role": "user", "content": [{"type": "text", "text": "Create a file named probe.txt containing the word hello in the current directory using the Write tool. Do not ask me anything."}]}}
+{"type": "control_response", "response": {"subtype": "success", "request_id": "5684537b-5f2b-4105-bb7a-f5a78ed75165", "response": {"behavior": "deny", "message": "Giskard chooses the mode per turn; present the plan as this turn's answer."}}}

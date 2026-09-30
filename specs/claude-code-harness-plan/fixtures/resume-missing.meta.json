@@ -1,0 +1,27 @@
+{
+ "scenario": "resume-missing",
+ "argv": [
+  "claude",
+  "-p",
+  "--input-format",
+  "stream-json",
+  "--output-format",
+  "stream-json",
+  "--verbose",
+  "--permission-prompt-tool",
+  "stdio",
+  "--setting-sources",
+  "",
+  "--model",
+  "haiku",
+  "--permission-mode",
+  "manual",
+  "--resume",
+  "d9bfe887-699b-4c3d-9d6f-b7001e75764b"
+ ],
+ "cwd": "/work/project",
+ "exit": 1,
+ "results": 1,
+ "asks": 0,
+ "elapsed_s": 0.9
+}

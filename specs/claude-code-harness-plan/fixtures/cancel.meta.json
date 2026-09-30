@@ -1,0 +1,27 @@
+{
+ "scenario": "cancel",
+ "argv": [
+  "claude",
+  "-p",
+  "--input-format",
+  "stream-json",
+  "--output-format",
+  "stream-json",
+  "--verbose",
+  "--permission-prompt-tool",
+  "stdio",
+  "--setting-sources",
+  "",
+  "--model",
+  "haiku",
+  "--permission-mode",
+  "manual",
+  "--session-id",
+  "25c29ab0-888d-4e03-889c-ff1f4f75d1ef"
+ ],
+ "cwd": "/work/project",
+ "exit": 1,
+ "results": 1,
+ "asks": 1,
+ "elapsed_s": 3.2
+}
