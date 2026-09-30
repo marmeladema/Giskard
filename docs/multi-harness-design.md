@@ -11,6 +11,8 @@ Stage 0 is implemented; see `multi-harness-design/stage-0-plan.md`.
 
 Stage 1 is implemented; see `multi-harness-design/stage-1-plan.md`.
 
+Stage 2 is implemented; see `multi-harness-design/stage-2-plan.md`.
+
 The spec (`specs/giskard-specification.md`) remains authoritative for the harness contract. Where
 this document proposes changes to the spec, they are called out explicitly under *Spec and
 documentation changes*.
@@ -281,11 +283,12 @@ record needs no harness field. Token ledger keys stay `provider/model`.
   the user's choice.
 - `known_thread_bindings(project)` becomes `known_thread_bindings(project, harness)` and filters
   the thread graph by the thread field. Native id uniqueness is checked within that filtered set.
-- `HarnessFactory::create` keeps its `&ProjectConfig` signature (Stage 1). The binary's
-  `HarnessKindFactory` owns the `HarnessCatalog`, resolves the project's `harness` name to a
-  declaration, and hands `HarnessKind::create` a `HarnessInstanceSpec { project_id,
-  workspace_root, name, declaration }`; nothing outside that factory reads a declaration. Stage 2's
-  per-thread resolution changes the `HarnessFactory::create` call when it needs to.
+- `HarnessFactory::create(config, harness: &str, bootstrap)` takes the declaration name beside the
+  `&ProjectConfig` (Stage 2). The factory already owns the catalog, so the name is enough and the
+  registry never holds a declaration: the binary's `HarnessKindFactory` resolves the name — a
+  thread's `harness`, or the project's default for a draft — to a declaration, and hands
+  `HarnessKind::create` a `HarnessInstanceSpec { project_id, workspace_root, name, declaration }`;
+  nothing outside that factory reads a declaration.
 - Project deletion and registry shutdown quiesce every driver of the project before taking owner
   sets or shutting harnesses down, in the same order as today, iterated over the map.
 - The harness transition gate stays root-wide and non-keyed.
@@ -295,12 +298,18 @@ record needs no harness field. Token ledger keys stay `provider/model`.
 There is no separate harness picker. The draft's model picker shows the models of every declared
 harness, and the harness is derived from the selection, the same way the provider already is.
 
-**Composition.** `GET /api/projects/{id}/models` returns one group per declared harness. Each
-group carries the harness name, that instance's composed catalog (config, discovery, harness
-catalog), and that instance's warnings. Composing every group means every instance for the project
-is created; for Codex that is one process per declaration, which is accepted. The picker renders
-group headers only when more than one harness is declared, so a single-harness setup looks exactly
-as it does today.
+**Composition.** `GET /api/projects/{id}/models` composes every declared harness, each from that
+instance's catalog (config, discovery, harness catalog). The response is one flat `models` list
+whose entries each carry `harness` beside the descriptor fields, `warnings` stamped with `harness`
+the same way, a `harnesses` index giving each composed declaration's name, kind, default flag, and
+capabilities (absent when the instance could not start), and `project_harness`, the project's
+default declaration that the draft preselects. A flat list rather than nested groups keeps the
+browser's model lookups and the existing response readers unchanged, and a single declaration
+yields exactly the list served before, plus the new fields. Composing every group means every
+instance for the project is created; for Codex that is one process per declaration, which is
+accepted. `?harness=<name>` composes that declaration alone (an undeclared name is `404`). The
+picker renders group headers only when more than one harness is declared, so a single-harness setup
+looks exactly as it does today.
 
 **Selection.** A picker entry is a triple `(harness, provider, model)`. `ModelRef` is unchanged
 because it is a persistence and ledger key and `provider/model` is the right cost identity; the
@@ -316,7 +325,8 @@ instance's entries, emitted only when more than one harness is declared, and the
 carries harness, provider, and model as separate data attributes rather than a joined key: model
 ids already contain slashes, so the current `provider/model` string is unambiguous only by luck.
 
-**Scoping.** Once a thread exists, its picker requests one group, its own harness's. Mid-thread
+**Scoping.** Once a thread exists, its picker requests one group, its own harness's, with
+`?harness=<name>`, so opening a thread on one declaration never spawns the others. Mid-thread
 model switching stays inside that harness for the same reason provider switching is rejected on a
 bound Codex thread.
 
@@ -439,18 +449,22 @@ real but benign, and moot for Giskard:
 
 ### Wire protocol and UI
 
-- `ProjectSummary` and the project detail carry the project's default harness name.
-- Thread summaries and the thread-open response carry the thread's harness name, so the UI can show
-  a badge and scope the picker.
-- The draft's open message carries `harness` beside `model`. `CreateProjectRequest` accepts an
-  optional default harness name (done in Stage 1, with `GET /api/harnesses` listing the
-  declarations for the new-project modal; `ProjectSummary` is left for Stage 2).
+- The project detail carries the project's default harness name. `ProjectSummary` does not: the
+  project list is built from `projects.json`, which has no harness column, and the draft learns the
+  project's default from the models response instead. Deferred.
+- Thread summaries and the thread-open response carry the thread's harness name, so the UI can
+  scope the picker and name it in the sidebar row's tooltip (done in Stage 2; no badge).
+- The draft's start request carries `harness` beside `model_ref`, sent only when the picker
+  offered a choice (done in Stage 2). `CreateProjectRequest` accepts an optional default harness
+  name (done in Stage 1, with `GET /api/harnesses` listing the declarations for the new-project
+  modal).
 - `HarnessCapabilities` is serialized in full on the project models response, which the draft and
   every thread open already load, and the UI gates Plan/Build, approvals, effort, model, and
   compaction on it as spec §13.5 describes. Per-harness groups in Stage 2 carry it per group.
 - The models route returns groups as described above. MCP routes gain a harness segment:
-  `/api/projects/{id}/harnesses/{name}/mcp` and `/mcp/reload`. `docs/api-endpoints.md` is updated
-  in the same change.
+  `/api/projects/{id}/harnesses/{name}/mcp`, `/mcp/reload`, and `/mcp/oauth-login`, and the
+  project-wide paths are removed (done in Stage 2). `docs/api-endpoints.md` is updated in the same
+  change.
 - Neutral wording replaces Codex wording in `WsError::from_harness`, `app.js`, and `index.html`.
   Where a message must name the harness, it names the declaration, which is what the user wrote in
   their config.

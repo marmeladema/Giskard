@@ -82,14 +82,16 @@ max_command_output_bytes = 134217728   # 128 MiB
 # had before this section existed.
 #
 # Declare harnesses to run more than one Codex side by side (a stable and a nightly build, or two
-# CODEX_HOMEs) and choose one per project in the new-project dialog. The rules:
+# CODEX_HOMEs). A project picks its default in the new-project dialog; each new thread picks its
+# harness from the model picker, which groups models by harness. The rules:
 #   * The table key (`codex-stable` below) is the harness's name. It is durable: each project
-#     stores the name it was created on in its project.json, so renaming or removing a declaration
-#     leaves those projects' threads read-only until a declaration of that name exists again.
+#     stores its default in project.json and each thread the name it runs on in its thread.json,
+#     so renaming or removing a declaration leaves the threads on it read-only until a declaration
+#     of that name exists again.
 #   * `default = true` may be set on at most one declaration. With none marked, the first declared
 #     one is the default. The default is what new projects get when no choice is made.
-#   * Declaring the table switches off the synthesized `codex`. Projects created before you
-#     declared it are stamped `codex`, so keep a declaration named `codex` for them to open.
+#   * Declaring the table switches off the synthesized `codex`. Projects and threads created before
+#     you declared it are stamped `codex`, so keep a declaration named `codex` for them to open.
 #   * `command` is the program to spawn (default: `codex` on PATH); `args` are appended after
 #     `app-server --listen stdio://`. A bare name is looked up on Giskard's own PATH, not on a
 #     PATH set in this declaration's `env`: use an absolute path for a binary that is not on

@@ -42,10 +42,10 @@ The agent harness is a replaceable component behind a neutral `AgentHarness` tra
 - **[Codex CLI](https://github.com/openai/codex) — supported, and required today.** Giskard drives
   Codex over its `app-server` JSON-RPC protocol. A working, authenticated Codex CLI must be installed
   on the machine (see [Prerequisites](#prerequisites)); without it you can create projects, but turns
-  fail. Giskard manages a harness *instance* per project; whether that is one process or one per
-  thread is the adapter's concern. Several Codex declarations (different binaries, profiles, or
-  `CODEX_HOME`s) can run side by side, chosen per project; see
-  [Configuration](#configuration).
+  fail. Giskard manages a harness *instance* per project and declaration; whether that is one
+  process or one per thread is the adapter's concern. Several Codex declarations (different
+  binaries, profiles, or `CODEX_HOME`s) can run side by side, chosen per thread from the model
+  picker; see [Configuration](#configuration).
 - **Claude Code — not yet supported.** The trait makes it addable without touching the rest of the
   app; it just hasn't been built yet. _(Anthropic, if you're reading this: a generous pile of Claude
   credits would move this up the roadmap_ 😁_.)_
@@ -60,8 +60,9 @@ The agent harness is a replaceable component behind a neutral `AgentHarness` tra
   it spawns the app-server. If Codex isn't configured, turns will fail with an "unauthenticated"
   message. See [§12.2 of the spec](specs/giskard-specification.md).
 
-Giskard runs one harness instance per project, which for Codex is one `codex app-server` process;
-each project is bound to a filesystem directory that becomes the agent's sandbox/workspace.
+Giskard runs one harness instance per project and harness declaration, which for Codex is one
+`codex app-server` process; each project is bound to a filesystem directory that becomes the agent's
+sandbox/workspace.
 
 ---
 
@@ -264,7 +265,7 @@ service does not silently run with an empty provider list.
 | `[history]` | `initial` / `page` | `5` / `5` | Turns fetched on open (topped up client-side to ~2 screens) / per scroll-up page. |
 | `[retention]` | `max_command_output_bytes` | `134217728` (128 MiB) | Maximum durable completed-command output. Must be at least `32768` (32 KiB); larger output retains a UTF-8-safe head and tail. |
 | `[harnesses.<name>]` | `kind` | — | **Optional.** A named harness declaration; the whole table defaults to one harness named `codex` of kind `codex`. `kind` is the adapter (`codex`). |
-| | `default` | first declared | At most one declaration may be `true`; new projects use it when no harness is chosen. |
+| | `default` | first declared | At most one declaration may be `true`; new projects use it when no harness is chosen, and a project's declaration is what a new thread preselects. |
 | | `command` | `codex` on `PATH` | Program to spawn. A bare name is resolved on Giskard's own `PATH`, not a `PATH` set in `env`, so use an absolute path for a binary that is not on Giskard's `PATH`; otherwise the `codex` on Giskard's `PATH` runs instead, silently. |
 | | `args` | `[]` | Extra arguments, appended after `app-server --listen stdio://`. |
 | | `env` | `{}` | `[harnesses.<name>.env]`: variables applied over Giskard's environment for the instance's processes and for discovery on its behalf. Values are never logged. |
@@ -274,12 +275,13 @@ service does not silently run with an empty provider list.
 Harness declarations are read once at startup and validated before the server listens: a blank
 name (`[harnesses.""]`), an unknown `kind`, two `default = true` entries, a blank `command` or
 `profile`, an invalid `env` variable name, or an unrecognised Codex key refuses startup with a
-message naming the `[harnesses.<name>]` key. A declaration's name is durable — each project stores the name it was
-created on — so the new-project dialog offers a choice only when more than one is declared, and
-renaming or removing a declaration leaves its projects' threads read-only (with the missing name
-and `[harnesses]` in the warning) until it is declared again. Declaring the table switches off the
-synthesized `codex`; projects created before you declared it are stamped `codex`, so keep a
-declaration named `codex` for them.
+message naming the `[harnesses.<name>]` key. A declaration's name is durable — each project stores
+the name it was created on as its default, and each thread stores the name it runs on — so the
+new-project dialog offers a choice only when more than one is declared, and renaming or removing a
+declaration leaves the threads on it read-only (with the missing name and `[harnesses]` in the
+warning) until it is declared again, while threads on other declarations keep working. Declaring
+the table switches off the synthesized `codex`; projects and threads created before you declared it
+are stamped `codex`, so keep a declaration named `codex` for them.
 
 Provider config governs the **picker** and optional `/v1/models` discovery only — Codex itself
 reads `~/.codex/config.toml` for real provider/auth, so any model you select must be one Codex can
@@ -351,6 +353,13 @@ no default model either — the model a new thread starts on is read from the pr
 picker list each time (Codex's default model when it marks one, otherwise the first entry), so it
 follows your provider and Codex configuration instead of remembering a choice that quietly stops
 matching it.
+
+With more than one `[harnesses.<name>]` declared, a new thread's picker lists the models of every
+declaration, grouped by harness; picking a model picks its harness, and the thread is created on
+that declaration's instance. A thread's harness is fixed at creation like its provider, so an
+existing thread's picker, MCP menu, and compaction control address only its own instance, and
+opening it never starts another declaration's app-server. With a single declaration the picker is
+not grouped.
 
 Models with `supports_reasoning_effort = true` expose a thread-header **Effort** selector next to
 the model picker. Choose `Default` to omit the effort parameter, or select one of the exact effort
@@ -433,7 +442,7 @@ $GISKARD_DATA_DIR/
 ├── projects/<project_id>/
 │   ├── project.json             # workspace root, harness declaration name
 │   ├── threads/<thread_id>/
-│   │   ├── thread.json           # thread metadata, permission preset, token cache
+│   │   ├── thread.json           # thread metadata, harness declaration, permission preset, token cache
 │   │   ├── history.jsonl         # turn index — a header line, then one bounded record per turn
 │   │   ├── turns/<turn_id>.jsonl # that turn's prompt, items and diffs — written atomically
 │   │   └── legacy/               # pre-migration originals, retained until you prune them
