@@ -1603,6 +1603,7 @@ async fn ensure_thread_open(
             .registry
             .open_thread(
                 &project_config,
+                &thread_file.harness,
                 &ws_root,
                 thread_id,
                 Some(thread_file.harness_thread_id.clone()),
@@ -1884,6 +1885,7 @@ async fn switch_provider_cold(
         .registry
         .open_thread(
             &project_config,
+            &thread_file.harness,
             &ws_root,
             thread_id,
             Some(thread_file.harness_thread_id.clone()),

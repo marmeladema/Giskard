@@ -63,7 +63,9 @@ pub use driver::{
 };
 pub use event_forwarder::ForwarderExitReason;
 use event_forwarder::forwarder_exit_reason_label;
-use project::{HarnessTransitions, LifecycleLock, ProjectAuthority, WeakLifecycleLock};
+use project::{
+    HarnessTransitions, LifecycleLock, NamedHarness, ProjectAuthority, WeakLifecycleLock,
+};
 pub(crate) use thread::ThreadAuthority;
 use thread::{
     ClassificationPhase, ExternalTurnDefaults, OwnerLock, ThreadBinding, ThreadCoordinator,
@@ -208,6 +210,8 @@ impl RegistryTaskTracker {
 #[derive(Clone)]
 pub struct LoadedThreadBinding {
     project_id: ProjectId,
+    /// The `[harnesses.<name>]` declaration whose instance holds this native thread.
+    harness: String,
     handle: ThreadHandle,
     turn_steering: bool,
     /// The model the harness reports this native thread is on. `None` when neither the caller nor
@@ -223,6 +227,10 @@ impl LoadedThreadBinding {
 
     pub fn handle(&self) -> &ThreadHandle {
         &self.handle
+    }
+
+    pub fn harness(&self) -> &str {
+        &self.harness
     }
 
     pub(crate) fn turn_steering(&self) -> bool {
@@ -340,16 +348,20 @@ struct RegistryShared {
 }
 
 impl RegistryShared {
-    async fn active_harness(&self, project_id: ProjectId) -> Option<Arc<dyn AgentHarness>> {
+    async fn active_harness(
+        &self,
+        project_id: ProjectId,
+        harness: &str,
+    ) -> Option<Arc<dyn AgentHarness>> {
         let authority = self.project_authority(project_id).await?;
         let mut transitions = self.harness_transitions.lock().await;
-        transitions.project(&authority).await.active()
+        transitions.project(&authority, harness).await.active()
     }
 
-    async fn event_driver(&self, project_id: ProjectId) -> Option<DriverHandle> {
+    async fn event_driver(&self, project_id: ProjectId, harness: &str) -> Option<DriverHandle> {
         let authority = self.project_authority(project_id).await?;
         let mut transitions = self.harness_transitions.lock().await;
-        transitions.project(&authority).await.driver()
+        transitions.project(&authority, harness).await.driver()
     }
 
     async fn project_authority(&self, project_id: ProjectId) -> Option<Arc<ProjectAuthority>> {
@@ -683,23 +695,25 @@ impl HarnessRegistry {
     pub(crate) async fn project_model_catalog(
         &self,
         project: &ProjectConfig,
+        harness: &str,
     ) -> Option<Vec<ModelDescriptor>> {
         self.shared
             .intern_project_authority(project.id)
             .await
-            .model_catalog()
+            .model_catalog(harness)
             .await
     }
 
     pub(crate) async fn replace_project_model_catalog(
         &self,
         project: &ProjectConfig,
+        harness: &str,
         models: Vec<ModelDescriptor>,
     ) {
         self.shared
             .intern_project_authority(project.id)
             .await
-            .replace_model_catalog(models)
+            .replace_model_catalog(harness, models)
             .await;
     }
 
@@ -735,6 +749,7 @@ impl HarnessRegistry {
         &self,
         project: ProjectId,
         config: &ProjectConfig,
+        harness: &str,
     ) -> Result<Arc<dyn AgentHarness>, HarnessError> {
         let authority = self.shared.intern_project_authority(project).await;
         // Fast path. This lock is a single global one guarding every project's harness and is
@@ -742,7 +757,7 @@ impl HarnessRegistry {
         // wait behind anything slower than a map lookup.
         {
             let mut transitions = self.shared.harness_transitions.lock().await;
-            let slot = transitions.project(&authority).await;
+            let slot = transitions.project(&authority, harness).await;
             if let Some(harness) = slot.active_or_creatable()? {
                 return Ok(harness);
             }
@@ -756,16 +771,16 @@ impl HarnessRegistry {
         // which case the re-check below returns theirs and this read is discarded — the cost of a
         // wasted scan on a path that runs once per project, against holding a global lock across
         // I/O on every path that does not.
-        let bootstrap = self.known_thread_bindings(project).await?;
+        let bootstrap = self.known_thread_bindings(project, harness).await?;
 
         let mut transitions = self.shared.harness_transitions.lock().await;
-        let mut slot = transitions.project(&authority).await;
+        let mut slot = transitions.project(&authority, harness).await;
         if let Some(harness) = slot.active_or_creatable()? {
             return Ok(harness);
         }
         let binding_count = bootstrap.known_threads.len();
         let h = self.factory.create(config, bootstrap).await?;
-        debug!(project_id = %project, bindings = binding_count,
+        debug!(project_id = %project, harness, bindings = binding_count,
             "created harness with durable thread bindings installed");
 
         let Some(driver_permit) = self.shared.background_tasks.register() else {
@@ -776,6 +791,7 @@ impl HarnessRegistry {
         };
         let driver = spawn_project_event_driver(
             project,
+            harness.to_string(),
             self.shared.clone(),
             &h,
             h.discoveries(),
@@ -785,15 +801,19 @@ impl HarnessRegistry {
         Ok(h)
     }
 
-    /// Every `(native id, ThreadId)` pair this project has already persisted.
+    /// Every `(native id, ThreadId)` pair this project has already persisted on one declaration.
     ///
     /// Read from the same thread files the thread graph is built from; nothing else is loaded, and
-    /// turn files are never touched. A failed/incomplete scan or a non-bijective identity table is
-    /// fatal: publishing a harness without every durable binding would reintroduce the startup
-    /// window this bootstrap exists to close.
+    /// turn files are never touched. Only the threads stamped with `harness` belong to its
+    /// instance, and uniqueness is checked over that set alone: two instances may legitimately
+    /// hold the same native id string, since each home numbers its own threads. A
+    /// failed/incomplete scan or a non-bijective identity table is fatal: publishing a harness
+    /// without every durable binding would reintroduce the startup window this bootstrap exists
+    /// to close.
     async fn known_thread_bindings(
         &self,
         project: ProjectId,
+        harness: &str,
     ) -> Result<HarnessBootstrap, HarnessError> {
         let graph = load_thread_graph(&self.shared.services.store, project)
             .await
@@ -805,7 +825,7 @@ impl HarnessRegistry {
         let mut native_ids = HashSet::new();
         let mut thread_ids = HashSet::new();
         let mut known_threads = Vec::with_capacity(graph.len());
-        for thread in graph.values() {
+        for thread in graph.values().filter(|thread| thread.harness == harness) {
             if thread.harness_thread_id.is_empty() {
                 return Err(HarnessError::Protocol(format!(
                     "thread {} has an empty native thread id",
@@ -844,7 +864,9 @@ impl HarnessRegistry {
                 thread.id
             )));
         }
-        let harness = self.get_or_create_harness(config.id, config).await?;
+        let harness = self
+            .get_or_create_harness(config.id, config, &thread.harness)
+            .await?;
         ensure_subagent_thread_open(
             config,
             thread,
@@ -858,6 +880,7 @@ impl HarnessRegistry {
     pub async fn open_thread(
         &self,
         config: &ProjectConfig,
+        harness_name: &str,
         workspace_root: &str,
         thread: ThreadId,
         resume: Option<String>,
@@ -866,6 +889,7 @@ impl HarnessRegistry {
         debug!(
             project_id = %config.id,
             thread_id = %thread,
+            harness = harness_name,
             resume = display_opt(resume.as_deref()),
             "opening harness thread"
         );
@@ -884,7 +908,9 @@ impl HarnessRegistry {
                 .await?;
             return Ok(existing.binding().await);
         }
-        let harness = self.get_or_create_harness(config.id, config).await?;
+        let harness = self
+            .get_or_create_harness(config.id, config, harness_name)
+            .await?;
         let (updates, update_stream) = thread_update_channel();
         let authority = self
             .shared
@@ -919,6 +945,7 @@ impl HarnessRegistry {
             .unwrap_or_else(|| initial_model.clone());
         let binding = LoadedThreadBinding {
             project_id: config.id,
+            harness: harness_name.to_string(),
             handle: handle.clone(),
             turn_steering: harness.capabilities().turn_steering,
             native_model: Some(native_model),
@@ -1006,7 +1033,7 @@ impl HarnessRegistry {
 
         let harness = self
             .shared
-            .active_harness(project_id)
+            .active_harness(project_id, &resolved.binding.harness)
             .await
             .ok_or(HarnessError::ThreadNotFound(thread_id))?;
 
@@ -1068,7 +1095,7 @@ impl HarnessRegistry {
 
         let harness = self
             .shared
-            .active_harness(project_id)
+            .active_harness(project_id, &resolved.binding.harness)
             .await
             .ok_or(HarnessError::ThreadNotFound(thread_id))?;
 
@@ -1190,7 +1217,7 @@ impl HarnessRegistry {
 
         let harness = self
             .shared
-            .active_harness(project_id)
+            .active_harness(project_id, &resolved.binding.harness)
             .await
             .ok_or(HarnessError::ThreadNotFound(thread_id))?;
         if !harness.capabilities().turn_steering {
@@ -1243,7 +1270,7 @@ impl HarnessRegistry {
         let handle = binding.handle;
         let harness = self
             .shared
-            .active_harness(project_id)
+            .active_harness(project_id, &binding.harness)
             .await
             .ok_or(HarnessError::ThreadNotFound(thread_id))?;
         let started = Instant::now();
@@ -1331,9 +1358,18 @@ impl HarnessRegistry {
             return Ok(Some(parent_target));
         }
 
+        // A child is admitted by the instance that ran its parent.
+        let parent = self
+            .shared
+            .services
+            .store
+            .load_thread(project_id, parent_thread_id)
+            .await
+            .map_err(|error| HarnessError::Protocol(error.to_string()))?
+            .ok_or(HarnessError::ThreadNotFound(parent_thread_id))?;
         let driver = self
             .shared
-            .event_driver(project_id)
+            .event_driver(project_id, &parent.harness)
             .await
             .ok_or_else(|| HarnessError::Protocol("project event driver is gone".into()))?;
         let (reply, response) = oneshot::channel();
@@ -1365,7 +1401,7 @@ impl HarnessRegistry {
         let handle = binding.handle;
         let harness = self
             .shared
-            .active_harness(project_id)
+            .active_harness(project_id, &binding.harness)
             .await
             .ok_or(HarnessError::ThreadNotFound(thread_id))?;
         let started = Instant::now();
@@ -1403,11 +1439,14 @@ impl HarnessRegistry {
         &self,
         config: &ProjectConfig,
         thread_id: ThreadId,
+        harness_name: &str,
         harness_thread_id: String,
         archived: bool,
     ) -> Result<(), HarnessError> {
         self.ensure_thread_writable(config.id, thread_id).await?;
-        let harness = self.get_or_create_harness(config.id, config).await?;
+        let harness = self
+            .get_or_create_harness(config.id, config, harness_name)
+            .await?;
         let handle = self
             .loaded_thread_binding(thread_id)
             .await
@@ -1420,11 +1459,14 @@ impl HarnessRegistry {
         &self,
         config: &ProjectConfig,
         thread_id: ThreadId,
+        harness_name: &str,
         harness_thread_id: String,
         name: String,
     ) -> Result<(), HarnessError> {
         self.ensure_thread_writable(config.id, thread_id).await?;
-        let harness = self.get_or_create_harness(config.id, config).await?;
+        let harness = self
+            .get_or_create_harness(config.id, config, harness_name)
+            .await?;
         let handle = self
             .loaded_thread_binding(thread_id)
             .await
@@ -1433,22 +1475,26 @@ impl HarnessRegistry {
         harness.set_thread_name(&handle, &name).await
     }
 
-    /// The project's harness instance, created on first use. This is the one way code outside the
-    /// registry reaches a harness; the trait is the API from here on.
+    /// The project's instance of one harness declaration, created on first use. This is the one
+    /// way code outside the registry reaches a harness; the trait is the API from here on.
     pub async fn harness(
         &self,
         config: &ProjectConfig,
+        harness: &str,
     ) -> Result<Arc<dyn AgentHarness>, HarnessError> {
-        self.get_or_create_harness(config.id, config).await
+        self.get_or_create_harness(config.id, config, harness).await
     }
 
     pub async fn delete_thread(
         &self,
         config: &ProjectConfig,
         thread_id: ThreadId,
+        harness: String,
         harness_thread_id: String,
     ) -> Result<(), HarnessError> {
-        let harness = self.get_or_create_harness(config.id, config).await?;
+        let harness = self
+            .get_or_create_harness(config.id, config, &harness)
+            .await?;
         let handle = self
             .loaded_thread_binding(thread_id)
             .await
@@ -1470,11 +1516,18 @@ impl HarnessRegistry {
         let Some(authority) = self.shared.thread_authority(thread_id).await else {
             return;
         };
-        if let Some(driver) = self.shared.event_driver(authority.project_id()).await {
-            driver.detach(thread_id).await;
-        } else if let Some(coordinator) = authority.coordinator().await
-            && coordinator.is_failed().await
+        // A thread with no coordinator has no owner to detach.
+        let Some(coordinator) = authority.coordinator().await else {
+            return;
+        };
+        let harness = coordinator.binding().await.harness;
+        if let Some(driver) = self
+            .shared
+            .event_driver(authority.project_id(), &harness)
+            .await
         {
+            driver.detach(thread_id).await;
+        } else if coordinator.is_failed().await {
             authority.clear_coordinator_if(&coordinator).await;
         }
     }
@@ -1509,9 +1562,9 @@ impl HarnessRegistry {
                 .collect::<Vec<_>>();
             let mut harnesses = HashMap::new();
             for authority in authorities {
-                let mut harness = transitions.project(&authority).await;
-                if let Some(harness_and_driver) = harness.take_for_shutdown() {
-                    harnesses.insert(authority.project_id(), harness_and_driver);
+                let mut slots = transitions.project_all(&authority).await;
+                for (name, harness_and_driver) in slots.take_all_for_shutdown() {
+                    harnesses.insert((authority.project_id(), name), harness_and_driver);
                 }
             }
             harnesses
@@ -1524,17 +1577,18 @@ impl HarnessRegistry {
                 "shutting down project harnesses"
             );
         }
-        for (project_id, (_, driver)) in &harnesses {
+        for ((project_id, harness), (_, driver)) in &harnesses {
             if let Err(error) = driver.quiesce().await {
                 debug!(
                     %project_id,
+                    harness,
                     %error,
                     "project event driver was already gone during registry shutdown"
                 );
             }
         }
         let results = join_all(harnesses.into_iter().map(
-            |(project_id, (harness, driver))| async move {
+            |((project_id, harness_name), (harness, driver))| async move {
                 let started = Instant::now();
                 let result = match timeout(HARNESS_SHUTDOWN_TIMEOUT, harness.shutdown()).await {
                     Ok(result) => result,
@@ -1546,27 +1600,29 @@ impl HarnessRegistry {
                 match &result {
                     Ok(()) => info!(
                         %project_id,
+                        harness = %harness_name,
                         elapsed_ms = started.elapsed().as_millis(),
                         "project harness shutdown completed"
                     ),
                     Err(error) => error!(
                         %project_id,
+                        harness = %harness_name,
                         %error,
                         elapsed_ms = started.elapsed().as_millis(),
                         "project harness shutdown failed"
                     ),
                 }
-                (project_id, result, driver)
+                (project_id, harness_name, result, driver)
             },
         ))
         .await;
 
         let mut failures = results
             .into_iter()
-            .filter_map(|(project_id, result, _driver)| {
-                result.err().map(|error| (project_id, error))
+            .filter_map(|(project_id, harness, result, _driver)| {
+                result.err().map(|error| (project_id, harness, error))
             })
-            .map(|(project_id, error)| format!("{project_id}: {error}"))
+            .map(|(project_id, harness, error)| format!("{project_id} ({harness}): {error}"))
             .collect::<Vec<_>>();
         if let Err(error) = self
             .shared
@@ -1605,72 +1661,96 @@ impl HarnessRegistry {
         }
     }
 
+    /// Stop every harness instance of a project and forget its loaded threads.
+    ///
+    /// Every declaration slot is marked deleting at once, then every driver is quiesced before
+    /// any harness is shut down, so no instance admits a native thread into a project whose other
+    /// instances are already gone. A failure before the first shutdown restores every instance; a
+    /// failed shutdown restores that instance and the ones not yet reached, while the ones already
+    /// stopped stay removed, since a stopped harness cannot serve again.
     pub async fn delete_project(&self, project_id: ProjectId) -> Result<(), HarnessError> {
         let mut thread_ids = HashSet::new();
         let authority = self.shared.project_authority(project_id).await;
-        let harness_and_driver = if let Some(authority) = authority.as_ref() {
+        let deleting = if let Some(authority) = authority.as_ref() {
             let mut transitions = self.shared.harness_transitions.lock().await;
-            transitions.project(authority).await.begin_delete()?
+            transitions
+                .project_all(authority)
+                .await
+                .begin_delete_all()?
         } else {
-            None
+            Vec::new()
         };
-        let mut retained_driver = None;
-        if let Some((harness, driver)) = harness_and_driver {
+
+        for (index, (name, (_, driver))) in deleting.iter().enumerate() {
             if let Err(error) = driver.quiesce().await {
-                let mut transitions = self.shared.harness_transitions.lock().await;
-                if let Some(authority) = authority.as_ref() {
-                    transitions
-                        .project(authority)
-                        .await
-                        .rollback_delete_if_running(harness);
+                warn!(%project_id, harness = %name, %error,
+                    "project event driver could not be quiesced for project deletion");
+                for (_, (_, quiesced)) in &deleting[..index] {
+                    if let Err(resume_error) = quiesced.resume().await {
+                        warn!(%project_id, %resume_error,
+                            "project event driver could not resume after a failed deletion");
+                    }
                 }
+                self.rollback_project_deletion(authority.as_deref(), &deleting)
+                    .await;
                 return Err(error);
             }
-            for (thread_id, coordinator) in self.shared.coordinator_snapshot().await {
-                if coordinator.binding().await.project_id == project_id {
-                    thread_ids.insert(thread_id);
-                }
+        }
+        for (thread_id, coordinator) in self.shared.coordinator_snapshot().await {
+            if coordinator.binding().await.project_id == project_id {
+                thread_ids.insert(thread_id);
             }
+        }
+
+        let mut retained_drivers = HashMap::new();
+        for (index, (name, (harness, driver))) in deleting.iter().enumerate() {
             if let Err(error) = harness.shutdown().await {
-                if let Err(resume_error) = driver.resume().await {
-                    return Err(HarnessError::Protocol(format!(
-                        "harness shutdown failed: {error}; project event driver could not resume: {resume_error}"
-                    )));
+                warn!(%project_id, harness = %name, %error,
+                    "project harness shutdown failed during project deletion");
+                let remaining = &deleting[index..];
+                for (_, (_, driver)) in remaining {
+                    if let Err(resume_error) = driver.resume().await {
+                        return Err(HarnessError::Protocol(format!(
+                            "harness {name} shutdown failed: {error}; project event driver could not resume: {resume_error}"
+                        )));
+                    }
                 }
-                let mut transitions = self.shared.harness_transitions.lock().await;
-                if let Some(authority) = authority.as_ref() {
-                    transitions
-                        .project(authority)
-                        .await
-                        .rollback_delete_if_running(harness);
-                }
+                self.rollback_project_deletion(authority.as_deref(), remaining)
+                    .await;
                 return Err(error);
             }
-            retained_driver = Some(driver);
+            retained_drivers.insert(name.clone(), driver.clone());
             let mut transitions = self.shared.harness_transitions.lock().await;
             if let Some(authority) = authority.as_ref() {
-                transitions.project(authority).await.finish_delete(&harness);
-            }
-        } else {
-            for (thread_id, coordinator) in self.shared.coordinator_snapshot().await {
-                if coordinator.binding().await.project_id == project_id {
-                    thread_ids.insert(thread_id);
-                }
+                transitions
+                    .project(authority, name)
+                    .await
+                    .finish_delete(harness);
             }
         }
 
         let mut thread_authorities = Vec::new();
         for thread_id in &thread_ids {
-            if let Some(authority) = self.shared.thread_authority(*thread_id).await {
-                thread_authorities.push(authority);
+            let thread_authority = self.shared.thread_authority(*thread_id).await;
+            let driver = match thread_authority.as_ref() {
+                Some(thread_authority) => match thread_authority.coordinator().await {
+                    Some(coordinator) => retained_drivers
+                        .get(&coordinator.binding().await.harness)
+                        .cloned(),
+                    None => None,
+                },
+                None => None,
+            };
+            if let Some(thread_authority) = thread_authority {
+                thread_authorities.push(thread_authority);
             }
-            if let Some(driver) = retained_driver.as_ref() {
+            if let Some(driver) = driver {
                 driver.detach(*thread_id).await;
             } else {
                 self.forget_thread(*thread_id).await;
             }
         }
-        drop(retained_driver);
+        drop(retained_drivers);
         self.shared
             .services
             .runtime
@@ -1678,6 +1758,24 @@ impl HarnessRegistry {
         self.shared.services.publish_runtime_overview().await;
 
         Ok(())
+    }
+
+    /// Restore the deleting slots of a failed project deletion to active use.
+    async fn rollback_project_deletion(
+        &self,
+        authority: Option<&ProjectAuthority>,
+        deleting: &[NamedHarness],
+    ) {
+        let Some(authority) = authority else {
+            return;
+        };
+        let mut transitions = self.shared.harness_transitions.lock().await;
+        for (name, (harness, _)) in deleting {
+            transitions
+                .project(authority, name)
+                .await
+                .rollback_delete_if_running(harness.clone());
+        }
     }
 }
 
@@ -1946,6 +2044,7 @@ async fn ensure_subagent_thread_open(
         .or_else(|| thread_file.current_model.as_known().cloned());
     let binding = LoadedThreadBinding {
         project_id: project_config.id,
+        harness: thread_file.harness.clone(),
         handle,
         turn_steering: harness.capabilities().turn_steering,
         native_model,
@@ -1962,9 +2061,15 @@ async fn install_event_owner(
 ) -> Result<bool, HarnessError> {
     let thread_id = binding.handle.thread;
     let project_id = binding.project_id;
-    let driver = shared.event_driver(project_id).await.ok_or_else(|| {
-        HarnessError::Protocol(format!("project {project_id} has no event driver"))
-    })?;
+    let harness = binding.harness.clone();
+    let driver = shared
+        .event_driver(project_id, &harness)
+        .await
+        .ok_or_else(|| {
+            HarnessError::Protocol(format!(
+                "project {project_id} has no event driver for harness {harness}"
+            ))
+        })?;
     match driver.attach(binding, classification).await? {
         AttachOutcome::Installed => Ok(true),
         AttachOutcome::Reused(handle) => {
@@ -2242,6 +2347,8 @@ mod tests {
 
     struct DiscoveryFactory {
         harness: StdMutex<Option<Arc<DiscoveryHarness>>>,
+        /// Every harness constructed, in construction order.
+        created: StdMutex<Vec<Arc<DiscoveryHarness>>>,
     }
 
     #[async_trait::async_trait]
@@ -2253,6 +2360,7 @@ mod tests {
         ) -> Result<Arc<dyn AgentHarness>, HarnessError> {
             let harness = Arc::new(DiscoveryHarness::new(bootstrap));
             *self.harness.lock().unwrap() = Some(harness.clone());
+            self.created.lock().unwrap().push(harness.clone());
             Ok(harness)
         }
     }
@@ -2537,6 +2645,7 @@ mod tests {
     ) {
         let factory = Arc::new(DiscoveryFactory {
             harness: StdMutex::new(None),
+            created: StdMutex::new(Vec::new()),
         });
         let sink = Arc::new(super::driver::probe::ProbeSink::default());
         let registry = Arc::new(super::HarnessRegistry::new_with_driver_events(
@@ -2607,11 +2716,16 @@ mod tests {
         thread: ThreadId,
         native: &str,
     ) {
-        let driver = registry.shared.event_driver(project).await.unwrap();
+        let driver = registry
+            .shared
+            .event_driver(project, "codex")
+            .await
+            .unwrap();
         driver
             .attach(
                 super::LoadedThreadBinding {
                     project_id: project,
+                    harness: "codex".into(),
                     handle: ThreadHandle::opened(thread, native.into(), PathBuf::from("/tmp/test")),
                     turn_steering: false,
                     native_model: None,
@@ -2627,7 +2741,11 @@ mod tests {
         project: ProjectId,
         parent: ThreadId,
     ) -> tokio::sync::oneshot::Receiver<Result<Option<ThreadId>, HarnessError>> {
-        let driver = registry.shared.event_driver(project).await.unwrap();
+        let driver = registry
+            .shared
+            .event_driver(project, "codex")
+            .await
+            .unwrap();
         let (reply, response) = tokio::sync::oneshot::channel();
         driver
             .link(super::Link {
@@ -2706,7 +2824,7 @@ mod tests {
             .unwrap();
         let (registry, factory, _sink) = discovery_registry(store).await;
         registry
-            .get_or_create_harness(project, &config)
+            .get_or_create_harness(project, &config, "codex")
             .await
             .unwrap();
         let harness = factory.harness.lock().unwrap().clone().unwrap();
@@ -2719,6 +2837,7 @@ mod tests {
                 registry
                     .open_thread(
                         &config,
+                        "codex",
                         "/tmp/test",
                         thread,
                         Some("native-primary".into()),
@@ -2772,7 +2891,7 @@ mod tests {
             .unwrap();
         let (registry, factory, _sink) = discovery_registry(store).await;
         registry
-            .get_or_create_harness(project, &config)
+            .get_or_create_harness(project, &config, "codex")
             .await
             .unwrap();
         let harness = factory.harness.lock().unwrap().clone().unwrap();
@@ -2786,6 +2905,7 @@ mod tests {
                 registry
                     .open_thread(
                         &config,
+                        "codex",
                         "/tmp/test",
                         thread,
                         Some("native-primary".into()),
@@ -2810,6 +2930,7 @@ mod tests {
         registry
             .open_thread(
                 &config,
+                "codex",
                 "/tmp/test",
                 thread,
                 Some("native-primary".into()),
@@ -2840,7 +2961,7 @@ mod tests {
             .unwrap();
         let (registry, factory, _sink) = discovery_registry(store).await;
         registry
-            .get_or_create_harness(project, &config)
+            .get_or_create_harness(project, &config, "codex")
             .await
             .unwrap();
         attach_test_primary(&registry, project, parent, "native-parent").await;
@@ -2863,6 +2984,240 @@ mod tests {
         assert!(!registry.thread_has_active_turn(child).await);
     }
 
+    /// Persist a primary thread file stamped with a harness declaration.
+    async fn save_thread_on(
+        store: &PersistStore,
+        project: ProjectId,
+        thread: ThreadId,
+        native: &str,
+        harness: &str,
+    ) {
+        let mut file = test_thread_file(project, thread, native, giskard_core::ThreadKind::Primary);
+        file.harness = harness.into();
+        store.save_thread(project, &file).await.unwrap();
+    }
+
+    fn bootstrapped_routes(harness: &DiscoveryHarness) -> HashMap<String, ThreadId> {
+        harness
+            .routes
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(native, handle)| (native.clone(), handle.thread))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn two_declarations_get_two_instances_and_two_drivers() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(PersistStore::new(tmp.path().to_path_buf()));
+        let (project, config) = create_test_project(&store, "two-declarations").await;
+        let stable_thread = ThreadId::new();
+        let nightly_thread = ThreadId::new();
+        save_thread_on(&store, project, stable_thread, "native-stable", "stable").await;
+        save_thread_on(&store, project, nightly_thread, "native-nightly", "nightly").await;
+        let (registry, factory, _sink) = discovery_registry(store).await;
+
+        let stable = registry
+            .get_or_create_harness(project, &config, "stable")
+            .await
+            .unwrap();
+        let nightly = registry
+            .get_or_create_harness(project, &config, "nightly")
+            .await
+            .unwrap();
+        assert!(!Arc::ptr_eq(&stable, &nightly));
+        let again = registry
+            .get_or_create_harness(project, &config, "stable")
+            .await
+            .unwrap();
+        assert!(Arc::ptr_eq(&stable, &again), "an instance is reused");
+
+        let created = factory.created.lock().unwrap().clone();
+        assert_eq!(created.len(), 2);
+        assert_eq!(
+            bootstrapped_routes(&created[0]),
+            HashMap::from([("native-stable".to_string(), stable_thread)]),
+            "each instance is bootstrapped with only its own threads"
+        );
+        assert_eq!(
+            bootstrapped_routes(&created[1]),
+            HashMap::from([("native-nightly".to_string(), nightly_thread)])
+        );
+        let stable_driver = registry.shared.event_driver(project, "stable").await;
+        let nightly_driver = registry.shared.event_driver(project, "nightly").await;
+        assert!(stable_driver.is_some() && nightly_driver.is_some());
+        assert!(
+            registry
+                .shared
+                .event_driver(project, "codex")
+                .await
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn the_same_native_id_on_two_harnesses_is_not_a_conflict() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(PersistStore::new(tmp.path().to_path_buf()));
+        let (project, config) = create_test_project(&store, "same-native-id").await;
+        let stable_thread = ThreadId::new();
+        let nightly_thread = ThreadId::new();
+        save_thread_on(&store, project, stable_thread, "native-same", "stable").await;
+        save_thread_on(&store, project, nightly_thread, "native-same", "nightly").await;
+        let (registry, factory, _sink) = discovery_registry(store).await;
+
+        registry
+            .get_or_create_harness(project, &config, "stable")
+            .await
+            .unwrap();
+        registry
+            .get_or_create_harness(project, &config, "nightly")
+            .await
+            .unwrap();
+
+        let created = factory.created.lock().unwrap().clone();
+        assert_eq!(
+            bootstrapped_routes(&created[0]),
+            HashMap::from([("native-same".to_string(), stable_thread)])
+        );
+        assert_eq!(
+            bootstrapped_routes(&created[1]),
+            HashMap::from([("native-same".to_string(), nightly_thread)])
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_project_shuts_down_every_instance() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(PersistStore::new(tmp.path().to_path_buf()));
+        let (project, config) = create_test_project(&store, "delete-every-instance").await;
+        let stable_thread = ThreadId::new();
+        let nightly_thread = ThreadId::new();
+        save_thread_on(&store, project, stable_thread, "native-stable", "stable").await;
+        save_thread_on(&store, project, nightly_thread, "native-nightly", "nightly").await;
+        let (registry, factory, _sink) = discovery_registry(store).await;
+        for harness in ["stable", "nightly"] {
+            registry
+                .get_or_create_harness(project, &config, harness)
+                .await
+                .unwrap();
+        }
+        let driver = registry.shared.event_driver(project, "nightly").await;
+        driver
+            .unwrap()
+            .attach(
+                super::LoadedThreadBinding {
+                    project_id: project,
+                    harness: "nightly".into(),
+                    handle: ThreadHandle::opened(
+                        nightly_thread,
+                        "native-nightly".into(),
+                        PathBuf::from("/tmp/test"),
+                    ),
+                    turn_steering: false,
+                    native_model: None,
+                },
+                super::ClassificationPhase::Primary,
+            )
+            .await
+            .unwrap();
+        assert!(registry.shared.coordinator(nightly_thread).await.is_some());
+
+        registry.delete_project(project).await.unwrap();
+
+        let created = factory.created.lock().unwrap().clone();
+        assert_eq!(created.len(), 2);
+        for harness in &created {
+            assert_eq!(harness.shutdown_calls.load(Ordering::SeqCst), 1);
+        }
+        let authority = registry.shared.project_authority(project).await.unwrap();
+        assert!(authority.harness_is_empty().await);
+        assert!(registry.shared.coordinator(nightly_thread).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_failed_instance_shutdown_keeps_it_and_its_successors_active() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(PersistStore::new(tmp.path().to_path_buf()));
+        let (project, config) = create_test_project(&store, "delete-partial-failure").await;
+        let (registry, factory, _sink) = discovery_registry(store).await;
+        for harness in ["stable", "nightly"] {
+            registry
+                .get_or_create_harness(project, &config, harness)
+                .await
+                .unwrap();
+        }
+        let created = factory.created.lock().unwrap().clone();
+        created[1].fail_next_shutdown();
+
+        let error = registry.delete_project(project).await.unwrap_err();
+        assert!(error.to_string().contains("injected"), "{error}");
+        assert!(
+            registry
+                .shared
+                .active_harness(project, "stable")
+                .await
+                .is_none(),
+            "a stopped instance cannot serve again"
+        );
+        let restored = registry
+            .shared
+            .active_harness(project, "nightly")
+            .await
+            .expect("the instance whose shutdown failed is restored");
+        let nightly: Arc<dyn AgentHarness> = created[1].clone();
+        assert!(Arc::ptr_eq(&restored, &nightly));
+    }
+
+    #[tokio::test]
+    async fn shutdown_drains_every_instance_of_a_project() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(PersistStore::new(tmp.path().to_path_buf()));
+        let (project, config) = create_test_project(&store, "shutdown-every-instance").await;
+        let (registry, factory, _sink) = discovery_registry(store).await;
+        for harness in ["stable", "nightly"] {
+            registry
+                .get_or_create_harness(project, &config, harness)
+                .await
+                .unwrap();
+        }
+
+        registry.shutdown().await.unwrap();
+
+        let created = factory.created.lock().unwrap().clone();
+        assert_eq!(created.len(), 2);
+        for harness in &created {
+            assert_eq!(harness.shutdown_calls.load(Ordering::SeqCst), 1);
+        }
+        let authority = registry.shared.project_authority(project).await.unwrap();
+        assert!(authority.harness_is_empty().await);
+    }
+
+    #[tokio::test]
+    async fn a_child_is_admitted_by_its_parents_instance() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(PersistStore::new(tmp.path().to_path_buf()));
+        let (project, config) = create_test_project(&store, "child-instance").await;
+        let (registry, factory, _sink) = discovery_registry(store.clone()).await;
+        registry
+            .get_or_create_harness(project, &config, "nightly")
+            .await
+            .unwrap();
+        let harness = factory.harness.lock().unwrap().clone().unwrap();
+        let thread = ThreadId::new();
+        harness.announce(ThreadDiscovered {
+            thread,
+            harness_thread_id: "native-child".into(),
+            parent_harness_thread_id: None,
+        });
+
+        let file = wait_for_thread(&store, project, thread).await;
+        assert_eq!(file.harness, "nightly");
+        let coordinator = wait_for_coordinator(&registry, thread).await;
+        assert_eq!(coordinator.binding().await.harness, "nightly");
+    }
+
     #[tokio::test]
     async fn registry_shutdown_quiesces_drivers_before_harness_shutdown() {
         let tmp = tempfile::tempdir().unwrap();
@@ -2883,7 +3238,7 @@ mod tests {
             .unwrap();
         let (registry, factory, _sink) = discovery_registry(store).await;
         registry
-            .get_or_create_harness(project, &config)
+            .get_or_create_harness(project, &config, "codex")
             .await
             .unwrap();
         attach_test_primary(&registry, project, parent, "native-parent").await;
@@ -2919,7 +3274,7 @@ mod tests {
         let (project, config) = create_test_project(&store, "discovered-orphan").await;
         let (registry, factory, _sink) = discovery_registry(store.clone()).await;
         registry
-            .get_or_create_harness(project, &config)
+            .get_or_create_harness(project, &config, "codex")
             .await
             .unwrap();
         let harness = factory.harness.lock().unwrap().clone().unwrap();
@@ -3030,7 +3385,7 @@ mod tests {
             .unwrap();
         let (registry, factory, sink) = discovery_registry(store.clone()).await;
         registry
-            .get_or_create_harness(project, &config)
+            .get_or_create_harness(project, &config, "codex")
             .await
             .unwrap();
         let mut probe = sink.probe();
@@ -3067,7 +3422,7 @@ mod tests {
         let (project, config) = create_test_project(&store, "discovery-recovery").await;
         let (registry, factory, sink) = discovery_registry(store.clone()).await;
         registry
-            .get_or_create_harness(project, &config)
+            .get_or_create_harness(project, &config, "codex")
             .await
             .unwrap();
         let mut probe = sink.probe();
@@ -3117,7 +3472,7 @@ mod tests {
         let (project, config) = create_test_project(&store, "discovery-shutdown").await;
         let (registry, _, _sink) = discovery_registry(store).await;
         registry
-            .get_or_create_harness(project, &config)
+            .get_or_create_harness(project, &config, "codex")
             .await
             .unwrap();
         tokio::time::timeout(std::time::Duration::from_secs(2), registry.shutdown())
@@ -3164,7 +3519,11 @@ mod tests {
         let creator = {
             let registry = registry.clone();
             let config = config.clone();
-            tokio::spawn(async move { registry.get_or_create_harness(project_id, &config).await })
+            tokio::spawn(async move {
+                registry
+                    .get_or_create_harness(project_id, &config, "codex")
+                    .await
+            })
         };
 
         // Others arrive while that binding is still in flight — the exact window in which a
@@ -3175,7 +3534,10 @@ mod tests {
             let config = config.clone();
             racers.push(tokio::spawn(async move {
                 tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                if let Ok(h) = registry.get_or_create_harness(project_id, &config).await {
+                if let Ok(h) = registry
+                    .get_or_create_harness(project_id, &config, "codex")
+                    .await
+                {
                     let (updates, _) = giskard_harness::thread_update_channel();
                     let _ = h
                         .open_thread(giskard_harness::OpenThreadOptions {
@@ -3234,6 +3596,7 @@ mod tests {
         let result = registry
             .open_thread(
                 &config,
+                "codex",
                 "/tmp/test",
                 thread_id,
                 None,
@@ -3292,19 +3655,39 @@ mod tests {
 
         let first_call = {
             let registry = registry.clone();
-            tokio::spawn(async move { registry.get_or_create_harness(first_id, &first).await })
+            tokio::spawn(async move {
+                registry
+                    .get_or_create_harness(first_id, &first, "codex")
+                    .await
+            })
         };
         let second_call = {
             let registry = registry.clone();
-            tokio::spawn(async move { registry.get_or_create_harness(second_id, &second).await })
+            tokio::spawn(async move {
+                registry
+                    .get_or_create_harness(second_id, &second, "codex")
+                    .await
+            })
         };
         first_call.await.unwrap().unwrap();
         second_call.await.unwrap().unwrap();
 
         assert_eq!(calls.load(Ordering::SeqCst), 2);
         assert_eq!(max_active.load(Ordering::SeqCst), 1);
-        assert!(registry.shared.active_harness(first_id).await.is_some());
-        assert!(registry.shared.active_harness(second_id).await.is_some());
+        assert!(
+            registry
+                .shared
+                .active_harness(first_id, "codex")
+                .await
+                .is_some()
+        );
+        assert!(
+            registry
+                .shared
+                .active_harness(second_id, "codex")
+                .await
+                .is_some()
+        );
     }
 
     #[tokio::test]
@@ -3331,7 +3714,11 @@ mod tests {
 
         let creating = {
             let registry = registry.clone();
-            tokio::spawn(async move { registry.get_or_create_harness(project_id, &config).await })
+            tokio::spawn(async move {
+                registry
+                    .get_or_create_harness(project_id, &config, "codex")
+                    .await
+            })
         };
         started.notified().await;
         let shutting_down = {
@@ -3401,7 +3788,10 @@ mod tests {
         );
         let config = store.load_project(project_id).await.unwrap().unwrap();
 
-        let error = match registry.get_or_create_harness(project_id, &config).await {
+        let error = match registry
+            .get_or_create_harness(project_id, &config, "codex")
+            .await
+        {
             Ok(_) => panic!("conflicting durable identities must prevent harness creation"),
             Err(error) => error,
         };
@@ -3436,13 +3826,16 @@ mod tests {
             .await;
         {
             let mut transitions = registry.shared.harness_transitions.lock().await;
-            transitions.project(&successful).await.publish_active(
-                Arc::new(ShutdownHarness {
-                    calls: successful_calls.clone(),
-                    fail: false,
-                }),
-                super::DriverHandle::disconnected(),
-            );
+            transitions
+                .project(&successful, "codex")
+                .await
+                .publish_active(
+                    Arc::new(ShutdownHarness {
+                        calls: successful_calls.clone(),
+                        fail: false,
+                    }),
+                    super::DriverHandle::disconnected(),
+                );
         }
         let failing = registry
             .shared
@@ -3450,7 +3843,7 @@ mod tests {
             .await;
         {
             let mut transitions = registry.shared.harness_transitions.lock().await;
-            transitions.project(&failing).await.publish_active(
+            transitions.project(&failing, "codex").await.publish_active(
                 Arc::new(ShutdownHarness {
                     calls: failing_calls.clone(),
                     fail: true,
@@ -3515,9 +3908,15 @@ mod tests {
         let authority = registry.shared.intern_project_authority(project_id).await;
         {
             let mut transitions = registry.shared.harness_transitions.lock().await;
-            let mut slot = transitions.project(&authority).await;
-            slot.publish_active(harness, super::DriverHandle::disconnected());
-            slot.begin_delete().unwrap();
+            transitions
+                .project(&authority, "codex")
+                .await
+                .publish_active(harness, super::DriverHandle::disconnected());
+            transitions
+                .project_all(&authority)
+                .await
+                .begin_delete_all()
+                .unwrap();
         }
         let config: ProjectConfig = serde_json::from_value(serde_json::json!({
             "version": 1,
@@ -3529,7 +3928,10 @@ mod tests {
             "updated_at": "2026-08-26T00:00:00Z"
         }))
         .unwrap();
-        let error = match registry.get_or_create_harness(project_id, &config).await {
+        let error = match registry
+            .get_or_create_harness(project_id, &config, "codex")
+            .await
+        {
             Ok(_) => panic!("deleting harness must not be replaced"),
             Err(error) => error,
         };
@@ -3555,7 +3957,7 @@ mod tests {
         {
             let mut transitions = registry.shared.harness_transitions.lock().await;
             transitions
-                .project(&authority)
+                .project(&authority, "codex")
                 .await
                 .publish_active(harness.clone(), super::DriverHandle::responsive_for_test());
         }
@@ -3564,7 +3966,7 @@ mod tests {
         assert!(error.to_string().contains("injected shutdown failure"));
         let mut transitions = registry.shared.harness_transitions.lock().await;
         let restored = transitions
-            .project(&authority)
+            .project(&authority, "codex")
             .await
             .active()
             .expect("failed deletion restores an active harness");
@@ -3591,7 +3993,7 @@ mod tests {
         {
             let mut transitions = registry.shared.harness_transitions.lock().await;
             transitions
-                .project(&authority)
+                .project(&authority, "codex")
                 .await
                 .publish_active(harness.clone(), super::DriverHandle::disconnected());
         }
@@ -3601,7 +4003,7 @@ mod tests {
         assert_eq!(calls.load(Ordering::SeqCst), 0);
         let mut transitions = registry.shared.harness_transitions.lock().await;
         let restored = transitions
-            .project(&authority)
+            .project(&authority, "codex")
             .await
             .active()
             .expect("failed quiesce restores the active harness");
@@ -3619,22 +4021,38 @@ mod tests {
             ledger::spawn(store.clone()),
         );
         let (project_id, config) = create_test_project(&store, "project").await;
-        assert!(registry.project_model_catalog(&config).await.is_none());
+        assert!(
+            registry
+                .project_model_catalog(&config, "codex")
+                .await
+                .is_none()
+        );
 
         let first = vec![ModelDescriptor::conservative("provider", "first")];
         registry
-            .replace_project_model_catalog(&config, first.clone())
+            .replace_project_model_catalog(&config, "codex", first.clone())
             .await;
-        assert_eq!(registry.project_model_catalog(&config).await, Some(first));
+        assert_eq!(
+            registry.project_model_catalog(&config, "codex").await,
+            Some(first)
+        );
 
         let second = vec![ModelDescriptor::conservative("provider", "second")];
         registry
-            .replace_project_model_catalog(&config, second.clone())
+            .replace_project_model_catalog(&config, "codex", second.clone())
             .await;
-        assert_eq!(registry.project_model_catalog(&config).await, Some(second));
+        assert_eq!(
+            registry.project_model_catalog(&config, "codex").await,
+            Some(second)
+        );
 
         registry.remove_project_model_catalog(project_id).await;
-        assert!(registry.project_model_catalog(&config).await.is_none());
+        assert!(
+            registry
+                .project_model_catalog(&config, "codex")
+                .await
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -3716,6 +4134,7 @@ mod tests {
         super::ThreadCoordinator::new(
             super::LoadedThreadBinding {
                 project_id: ProjectId::new(),
+                harness: "codex".into(),
                 handle: ThreadHandle::detached(ThreadId::new(), "native-test".into()),
                 turn_steering: false,
                 native_model: None,
@@ -3948,6 +4367,7 @@ mod tests {
         let coordinator_a = Arc::new(super::ThreadCoordinator::new(
             super::LoadedThreadBinding {
                 project_id,
+                harness: "codex".into(),
                 handle: ThreadHandle::detached(thread_id, "native-a".into()),
                 turn_steering: true,
                 native_model: Some(model_a.clone()),
@@ -3970,6 +4390,7 @@ mod tests {
         let coordinator_b = Arc::new(super::ThreadCoordinator::new(
             super::LoadedThreadBinding {
                 project_id,
+                harness: "codex".into(),
                 handle: ThreadHandle::detached(thread_id, "native-b".into()),
                 turn_steering: false,
                 native_model: Some(model_b.clone()),
@@ -4015,6 +4436,7 @@ mod tests {
         let unknown_coordinator = Arc::new(super::ThreadCoordinator::new(
             super::LoadedThreadBinding {
                 project_id,
+                harness: "codex".into(),
                 handle: ThreadHandle::detached(thread_id, "native-unknown".into()),
                 turn_steering: false,
                 native_model: None,
@@ -4038,6 +4460,7 @@ mod tests {
         let known = Arc::new(super::ThreadCoordinator::new(
             super::LoadedThreadBinding {
                 project_id,
+                harness: "codex".into(),
                 handle: ThreadHandle::detached(thread_id, "native-known".into()),
                 turn_steering: false,
                 native_model: Some(model.clone()),

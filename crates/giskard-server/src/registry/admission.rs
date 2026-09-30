@@ -39,6 +39,7 @@ pub(super) struct Admitted {
 
 fn admitted(
     project_id: giskard_core::ids::ProjectId,
+    harness: &str,
     handle: ThreadHandle,
     file: &ThreadFile,
     turn_steering: bool,
@@ -46,6 +47,7 @@ fn admitted(
     Admitted {
         binding: LoadedThreadBinding {
             project_id,
+            harness: harness.to_string(),
             native_model: handle
                 .resumed_model
                 .clone()
@@ -99,6 +101,7 @@ pub(super) async fn admit(
     shared: Arc<RegistryShared>,
     harness: Arc<dyn AgentHarness>,
     project_id: giskard_core::ids::ProjectId,
+    harness_name: &str,
     source: Admission,
 ) -> Result<Option<Admitted>, HarnessError> {
     let turn_steering = harness.capabilities().turn_steering;
@@ -123,7 +126,7 @@ pub(super) async fn admit(
                 project_id,
                 record.thread,
                 record.harness_thread_id.clone(),
-                project.harness.clone(),
+                harness_name.to_string(),
                 TurnModel::Unknown,
             );
             let root =
@@ -182,7 +185,7 @@ pub(super) async fn admit(
                 project_id,
                 handle.thread,
                 handle.harness_thread_id.clone(),
-                project.harness.clone(),
+                harness_name.to_string(),
                 current_model,
             );
             if let Some((link, parent)) = link.as_ref() {
@@ -226,7 +229,13 @@ pub(super) async fn admit(
                     .publish_created(project_id, &file)
                     .await;
             }
-            return Ok(Some(admitted(project_id, handle, &file, turn_steering)));
+            return Ok(Some(admitted(
+                project_id,
+                harness_name,
+                handle,
+                &file,
+                turn_steering,
+            )));
         }
     };
 
@@ -272,7 +281,13 @@ pub(super) async fn admit(
                 warn!(%project_id, parent_thread_id = %parent.id,
                     linked_harness_thread_id = %handle.harness_thread_id,
                     "refusing to materialize a sub-agent under an invalid parent chain");
-                return Ok(Some(admitted(project_id, handle, &file, turn_steering)));
+                return Ok(Some(admitted(
+                    project_id,
+                    harness_name,
+                    handle,
+                    &file,
+                    turn_steering,
+                )));
             }
             if let Some(native_parent) = handle.parent_harness_thread_id.as_deref()
                 && native_parent != parent.harness_thread_id
@@ -282,7 +297,13 @@ pub(super) async fn admit(
                     reported_parent_harness_thread_id = %native_parent,
                     linked_harness_thread_id = %handle.harness_thread_id,
                     "refusing to materialize a native thread under a mismatched parent");
-                return Ok(Some(admitted(project_id, handle, &file, turn_steering)));
+                return Ok(Some(admitted(
+                    project_id,
+                    harness_name,
+                    handle,
+                    &file,
+                    turn_steering,
+                )));
             }
             let desired_title = subagent_thread_title(&subagent_info_with_agent_name(
                 link.info.clone(),
@@ -352,5 +373,11 @@ pub(super) async fn admit(
         return Ok(None);
     }
 
-    Ok(Some(admitted(project_id, handle, &file, turn_steering)))
+    Ok(Some(admitted(
+        project_id,
+        harness_name,
+        handle,
+        &file,
+        turn_steering,
+    )))
 }

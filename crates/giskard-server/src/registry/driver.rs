@@ -115,13 +115,13 @@ pub enum OwnerExitDisposition {
 impl DriverEvent {
     /// The log line for this decision. Levels, messages, field names, field order, and field
     /// formatting are those of the sites the lines moved from.
-    pub fn log(&self, project_id: ProjectId) {
+    pub fn log(&self, project_id: ProjectId, harness: &str) {
         match self {
             Self::DiscoveryFinished {
                 native_thread_id,
                 attempts,
                 outcome: Err(error),
-            } => warn!(project_id = %project_id,
+            } => warn!(project_id = %project_id, harness,
                 native_thread_id = native_thread_id.as_str(), %error,
                 attempt = attempts.saturating_add(1),
                 "failed to admit discovered native thread"),
@@ -133,40 +133,50 @@ impl DriverEvent {
                 origin,
                 attempts,
                 outcome: Err(error),
-            } => warn!(project_id = %project_id, %parent_thread_id, %item_id, origin, %error,
+            } => {
+                warn!(project_id = %project_id, harness, %parent_thread_id, %item_id, origin, %error,
                 %native_thread_id, attempt = attempts.saturating_add(1),
-                "failed to admit linked native thread"),
+                "failed to admit linked native thread")
+            }
             Self::LinkFinished { outcome: Ok(_), .. } => {}
             Self::LinkDeferred {
                 native_thread_id,
                 parent_thread_id,
                 origin,
                 reason: DeferReason::Quiesced,
-            } => debug!(project_id = %project_id, %parent_thread_id, %native_thread_id, origin,
-                "deferring native identity link until the project resumes"),
+            } => {
+                debug!(project_id = %project_id, harness, %parent_thread_id, %native_thread_id, origin,
+                "deferring native identity link until the project resumes")
+            }
             Self::LinkDeferred {
                 native_thread_id,
                 parent_thread_id,
                 origin,
                 reason: DeferReason::ParentNotLive,
-            } => debug!(project_id = %project_id, %parent_thread_id, %native_thread_id, origin,
-                "deferring native identity link until its parent has a live owner"),
+            } => {
+                debug!(project_id = %project_id, harness, %parent_thread_id, %native_thread_id, origin,
+                "deferring native identity link until its parent has a live owner")
+            }
             Self::LinkDeferred {
                 native_thread_id,
                 parent_thread_id,
                 origin,
                 reason: DeferReason::ParentUnreadable(error),
-            } => warn!(project_id = %project_id, %parent_thread_id, %native_thread_id, origin,
-                %error, "keeping deferred native identity link; its parent thread could not be read"),
+            } => {
+                warn!(project_id = %project_id, harness, %parent_thread_id, %native_thread_id, origin,
+                %error, "keeping deferred native identity link; its parent thread could not be read")
+            }
             Self::LinkDropped {
                 native_thread_id,
                 parent_thread_id,
                 origin,
-            } => warn!(project_id = %project_id, %parent_thread_id, %native_thread_id, origin,
-                "dropping native identity link because its parent thread no longer exists"),
+            } => {
+                warn!(project_id = %project_id, harness, %parent_thread_id, %native_thread_id, origin,
+                "dropping native identity link because its parent thread no longer exists")
+            }
             Self::Refused {
                 subject: RefusedSubject::AttachWhileQuiesced { thread_id },
-            } => debug!(project_id = %project_id, %thread_id,
+            } => debug!(project_id = %project_id, harness, %thread_id,
                 "refusing attach because the project is being deleted"),
             Self::Refused {
                 subject:
@@ -175,28 +185,30 @@ impl DriverEvent {
                         parent_thread_id,
                         origin,
                     },
-            } => debug!(project_id = %project_id, %parent_thread_id, %native_thread_id, origin,
-                "refusing native identity link because the project is being deleted"),
+            } => {
+                debug!(project_id = %project_id, harness, %parent_thread_id, %native_thread_id, origin,
+                "refusing native identity link because the project is being deleted")
+            }
             Self::Refused {
                 subject:
                     RefusedSubject::LinkWithoutLiveParent {
                         parent_thread_id,
                         origin,
                     },
-            } => warn!(project_id = %project_id, %parent_thread_id, origin,
+            } => warn!(project_id = %project_id, harness, %parent_thread_id, origin,
                 "refusing native identity link from a parent without a live owner"),
             Self::OwnerExited {
                 thread_id,
                 reason,
                 disposition: OwnerExitDisposition::TeardownExit,
-            } => debug!(project_id = %project_id, %thread_id,
+            } => debug!(project_id = %project_id, harness, %thread_id,
                 exit_reason = forwarder_exit_reason_label(*reason),
                 "event owner ended during project teardown"),
             Self::OwnerExited {
                 thread_id,
                 reason,
                 disposition: OwnerExitDisposition::FailedRemoved,
-            } => warn!(project_id = %project_id, %thread_id,
+            } => warn!(project_id = %project_id, harness, %thread_id,
                 exit_reason = forwarder_exit_reason_label(*reason),
                 "removed failed event owner so the thread can be reopened"),
             Self::OwnerExited {
@@ -208,9 +220,10 @@ impl DriverEvent {
 }
 
 /// Receives every decision the project event driver reports. One sink serves every project
-/// driver in a registry, so `project_id` says which one decided.
+/// driver in a registry, so `project_id` and `harness` (the declaration name) say which one
+/// decided.
 pub trait DriverEventSink: Send + Sync + 'static {
-    fn observe(&self, project_id: ProjectId, event: &DriverEvent);
+    fn observe(&self, project_id: ProjectId, harness: &str, event: &DriverEvent);
 }
 
 /// The default sink: each decision becomes its log line (`DriverEvent::log`).
@@ -218,8 +231,8 @@ pub trait DriverEventSink: Send + Sync + 'static {
 pub struct LogDriverEventSink;
 
 impl DriverEventSink for LogDriverEventSink {
-    fn observe(&self, project_id: ProjectId, event: &DriverEvent) {
-        event.log(project_id);
+    fn observe(&self, project_id: ProjectId, harness: &str, event: &DriverEvent) {
+        event.log(project_id, harness);
     }
 }
 
@@ -307,6 +320,8 @@ struct OwnerExit {
 
 struct ProjectEventDriver {
     project_id: ProjectId,
+    /// The `[harnesses.<name>]` declaration whose instance this driver serves.
+    harness_name: String,
     rx: mpsc::Receiver<DriverCommand>,
     harness: Weak<dyn AgentHarness>,
     shared: Arc<RegistryShared>,
@@ -423,6 +438,7 @@ impl DriverHandle {
 
 pub(super) fn spawn_project_event_driver(
     project_id: ProjectId,
+    harness_name: String,
     shared: Arc<RegistryShared>,
     harness: &Arc<dyn AgentHarness>,
     discoveries: DiscoveryStream,
@@ -432,6 +448,7 @@ pub(super) fn spawn_project_event_driver(
     let weak_tx = tx.downgrade();
     let driver = ProjectEventDriver {
         project_id,
+        harness_name,
         rx,
         harness: Arc::downgrade(harness),
         shared,
@@ -466,7 +483,9 @@ fn is_teardown_exit(quiesced: bool, reason: ForwarderExitReason) -> bool {
 
 impl ProjectEventDriver {
     fn observe(&self, event: DriverEvent) {
-        self.shared.driver_events.observe(self.project_id, &event);
+        self.shared
+            .driver_events
+            .observe(self.project_id, &self.harness_name, &event);
     }
 
     async fn run(mut self) {
@@ -502,6 +521,7 @@ impl ProjectEventDriver {
                     Err(EventStreamError::Closed) => self.discoveries_closed = true,
                     Err(EventStreamError::Gap { dropped }) => error!(
                         project_id = %self.project_id,
+                        harness = %self.harness_name,
                         dropped,
                         "native thread discovery log dropped records"
                     ),
@@ -525,6 +545,7 @@ impl ProjectEventDriver {
                 if !self.deferred.is_empty() {
                     warn!(
                         project_id = %self.project_id,
+                        harness = %self.harness_name,
                         count = self.deferred.len(),
                         "project event driver dropped deferred admissions on exit"
                     );
@@ -551,6 +572,16 @@ impl ProjectEventDriver {
             let _ = attach.reply.send(Err(HarnessError::Protocol(format!(
                 "project {} event driver cannot attach thread {thread_id} from project {project_id}",
                 self.project_id
+            ))));
+            return;
+        }
+        if attach.binding.harness != self.harness_name {
+            warn!(%project_id, %thread_id, harness = %self.harness_name,
+                thread_harness = %attach.binding.harness,
+                "refusing to attach a thread bound to another harness instance");
+            let _ = attach.reply.send(Err(HarnessError::Protocol(format!(
+                "harness {} event driver cannot attach thread {thread_id} of harness {}",
+                self.harness_name, attach.binding.harness
             ))));
             return;
         }
@@ -637,7 +668,8 @@ impl ProjectEventDriver {
                 reason,
             }
         }));
-        debug!(%project_id, %thread_id, "installed long-lived native event owner");
+        debug!(%project_id, harness = %self.harness_name, %thread_id,
+            "installed long-lived native event owner");
         let _ = attach.reply.send(Ok(AttachOutcome::Installed));
     }
 
@@ -774,6 +806,7 @@ impl ProjectEventDriver {
             return;
         };
         let project_id = self.project_id;
+        let harness_name = self.harness_name.clone();
         self.admission = Some(InflightAdmission {
             work: Box::pin(async move {
                 AdmissionOutcome {
@@ -781,6 +814,7 @@ impl ProjectEventDriver {
                         shared,
                         harness,
                         project_id,
+                        &harness_name,
                         Admission::Link(Box::new(link)),
                     )
                     .await,
@@ -792,12 +826,14 @@ impl ProjectEventDriver {
 
     fn begin_discovery(&mut self, record: giskard_harness::ThreadDiscovered, attempts: u32) {
         let Some(harness) = self.harness.upgrade() else {
-            warn!(project_id = %self.project_id, thread_id = %record.thread,
+            warn!(project_id = %self.project_id,
+                        harness = %self.harness_name, thread_id = %record.thread,
                 "dropping native thread discovery because the project harness is gone");
             return;
         };
         let shared = self.shared.clone();
         let project_id = self.project_id;
+        let harness_name = self.harness_name.clone();
         let retry = Admission::Discovered(record.clone());
         self.admission = Some(InflightAdmission {
             work: Box::pin(async move {
@@ -806,6 +842,7 @@ impl ProjectEventDriver {
                         shared,
                         harness,
                         project_id,
+                        &harness_name,
                         Admission::Discovered(record),
                     )
                     .await,
@@ -924,7 +961,8 @@ impl ProjectEventDriver {
             attempts,
         });
         if self.deferred.len() == DEFERRED_ADMISSION_WARN_THRESHOLD {
-            warn!(project_id = %self.project_id, count = self.deferred.len(),
+            warn!(project_id = %self.project_id,
+                        harness = %self.harness_name, count = self.deferred.len(),
                 "deferred admissions are accumulating; native threads are not being persisted");
         }
     }
@@ -1051,8 +1089,8 @@ pub(super) mod probe {
     }
 
     impl DriverEventSink for ProbeSink {
-        fn observe(&self, project_id: ProjectId, event: &DriverEvent) {
-            event.log(project_id);
+        fn observe(&self, project_id: ProjectId, harness: &str, event: &DriverEvent) {
+            event.log(project_id, harness);
             if let Some(sender) = self.0.lock().unwrap().as_ref() {
                 let _ = sender.send(event.clone());
             }
@@ -1274,6 +1312,7 @@ mod tests {
     fn binding(project_id: ProjectId, thread_id: ThreadId, native: &str) -> LoadedThreadBinding {
         LoadedThreadBinding {
             project_id,
+            harness: "codex".into(),
             handle: ThreadHandle::opened(thread_id, native.into(), PathBuf::from("/tmp/test")),
             turn_steering: false,
             native_model: None,
@@ -1303,6 +1342,7 @@ mod tests {
         let trait_harness: Arc<dyn AgentHarness> = harness.clone();
         let driver = spawn_project_event_driver(
             project_id,
+            "codex".into(),
             shared.clone(),
             &trait_harness,
             trait_harness.discoveries(),
@@ -1672,6 +1712,7 @@ mod tests {
         let (tx, rx) = mpsc::channel(1);
         let mut driver = ProjectEventDriver {
             project_id,
+            harness_name: "codex".into(),
             rx,
             harness: Arc::downgrade(&trait_harness),
             shared: shared.clone(),
@@ -1736,8 +1777,14 @@ mod tests {
         let harness: Arc<dyn AgentHarness> = Arc::new(TestHarness::new());
         let project_id = ProjectId::new();
         let permit = shared.background_tasks.register().unwrap();
-        let driver =
-            spawn_project_event_driver(project_id, shared, &harness, harness.discoveries(), permit);
+        let driver = spawn_project_event_driver(
+            project_id,
+            "codex".into(),
+            shared,
+            &harness,
+            harness.discoveries(),
+            permit,
+        );
         driver.quiesce().await.unwrap();
 
         assert!(matches!(
@@ -1792,6 +1839,7 @@ mod tests {
         let (tx, rx) = mpsc::channel(1);
         let mut driver = ProjectEventDriver {
             project_id,
+            harness_name: "codex".into(),
             rx,
             harness: Arc::downgrade(&trait_harness),
             shared: shared.clone(),
@@ -2342,6 +2390,7 @@ mod tests {
         let trait_harness: Arc<dyn AgentHarness> = harness;
         let driver = ProjectEventDriver {
             project_id,
+            harness_name: "codex".into(),
             rx,
             harness: Arc::downgrade(&trait_harness),
             shared: shared.clone(),

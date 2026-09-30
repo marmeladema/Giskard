@@ -11,8 +11,8 @@ struct ProbeSink {
 }
 
 impl DriverEventSink for ProbeSink {
-    fn observe(&self, project_id: ProjectId, event: &DriverEvent) {
-        event.log(project_id);
+    fn observe(&self, project_id: ProjectId, harness: &str, event: &DriverEvent) {
+        event.log(project_id, harness);
         let _ = self.tx.send((project_id, event.clone()));
     }
 }
