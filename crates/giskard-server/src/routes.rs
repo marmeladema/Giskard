@@ -2177,6 +2177,7 @@ mod tests {
         async fn create(
             &self,
             _config: &ProjectConfig,
+            _harness: &str,
             _bootstrap: giskard_harness::HarnessBootstrap,
         ) -> Result<Arc<dyn AgentHarness>, giskard_core::HarnessError> {
             Err(giskard_core::HarnessError::Spawn("unused in test".into()))

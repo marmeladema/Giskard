@@ -711,6 +711,7 @@ impl<S: Script> HarnessFactory for FakeFactory<S> {
     async fn create(
         &self,
         _config: &ProjectConfig,
+        _harness: &str,
         bootstrap: HarnessBootstrap,
     ) -> Result<Arc<dyn AgentHarness>, HarnessError> {
         self.0.core.seed_routes(&bootstrap);

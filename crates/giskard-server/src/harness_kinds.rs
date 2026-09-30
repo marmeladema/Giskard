@@ -1,5 +1,6 @@
 //! Harness kinds a binary can construct, and the declarations (`[harnesses.<name>]`) that name
-//! them. A project names a declaration; the declaration names a kind.
+//! them. A thread runs on a declaration (a project names the default one); the declaration names
+//! a kind.
 
 use std::collections::HashSet;
 use std::path::PathBuf;
@@ -39,8 +40,9 @@ pub trait HarnessKind: Send + Sync {
     ) -> Result<Arc<dyn AgentHarness>, HarnessError>;
 }
 
-/// A `HarnessFactory` that resolves `ProjectConfig::harness` to a declaration in its catalog and
-/// dispatches on the declaration's kind. Nothing outside this factory reads a declaration.
+/// A `HarnessFactory` that resolves the declaration name the registry asks for (a thread's
+/// `harness`, or the project's default for a draft) to a declaration in its catalog and dispatches
+/// on the declaration's kind. Nothing outside this factory reads a declaration.
 pub struct HarnessKindFactory {
     // Insertion order is the order kinds are listed in errors; `indexmap` is already a dependency.
     kinds: IndexMap<String, Arc<dyn HarnessKind>>,
@@ -149,23 +151,24 @@ impl HarnessFactory for HarnessKindFactory {
     async fn create(
         &self,
         config: &ProjectConfig,
+        harness: &str,
         bootstrap: HarnessBootstrap,
     ) -> Result<Arc<dyn AgentHarness>, HarnessError> {
-        let Some(declaration) = self.catalog.get(&config.harness) else {
+        let Some(declaration) = self.catalog.get(harness) else {
             let declared = self.catalog.names().collect::<Vec<_>>().join(", ");
-            if self.first_report_of(&config.harness) {
+            if self.first_report_of(harness) {
                 warn!(
                     project_id = %config.id,
-                    harness = %config.harness,
+                    harness = %harness,
                     action = "create_harness",
                     declared = %declared,
-                    "project names a harness that config.toml does not declare"
+                    "a thread or project names a harness that config.toml does not declare"
                 );
             }
             return Err(HarnessError::Unsupported(format!(
                 "project {} names harness {:?}, which config.toml does not declare under \
                  [harnesses]; declared: {}",
-                config.id, config.harness, declared
+                config.id, harness, declared
             )));
         };
         // `validate` refuses boot for an unregistered kind, so this is unreachable in a server
@@ -174,7 +177,7 @@ impl HarnessFactory for HarnessKindFactory {
             let supported = self.kinds().collect::<Vec<_>>().join(", ");
             warn!(
                 project_id = %config.id,
-                harness = %config.harness,
+                harness = %harness,
                 kind = %declaration.kind,
                 action = "create_harness",
                 supported = %supported,
@@ -183,13 +186,13 @@ impl HarnessFactory for HarnessKindFactory {
             return Err(HarnessError::Unsupported(format!(
                 "project {} names harness {:?} of kind {:?}, which this server cannot construct; \
                  supported kinds: {}",
-                config.id, config.harness, declaration.kind, supported
+                config.id, harness, declaration.kind, supported
             )));
         };
         let spec = HarnessInstanceSpec {
             project_id: config.id,
             workspace_root: PathBuf::from(config.workspace_root.as_deref().unwrap_or(&config.dir)),
-            name: &config.harness,
+            name: harness,
             declaration,
         };
         kind.create(spec, bootstrap).await
@@ -281,7 +284,10 @@ command = "/opt/nightly/bin/codex"
     }
 
     async fn create_error(factory: &HarnessKindFactory, config: &ProjectConfig) -> HarnessError {
-        match factory.create(config, HarnessBootstrap::default()).await {
+        match factory
+            .create(config, &config.harness, HarnessBootstrap::default())
+            .await
+        {
             Err(error) => error,
             Ok(_) => panic!("expected an error, got a harness"),
         }
@@ -341,13 +347,30 @@ command = "/opt/nightly/bin/codex"
         let output = String::from_utf8(output.lock().unwrap().clone()).unwrap();
         assert_eq!(
             output
-                .matches("project names a harness that config.toml does not declare")
+                .matches("a thread or project names a harness that config.toml does not declare")
                 .count(),
             1,
             "{output}"
         );
         assert!(output.contains("harness=codex"), "{output}");
         assert!(output.contains("action=\"create_harness\""), "{output}");
+    }
+
+    /// The declaration comes from the name the registry passes, not from the project: a thread on
+    /// `nightly` in a project whose default is `stable` reaches `nightly`.
+    #[tokio::test]
+    async fn a_thread_on_another_declaration_reaches_that_declaration() {
+        let error = match factory()
+            .create(&project("stable"), "nightly", HarnessBootstrap::default())
+            .await
+        {
+            Err(error) => error,
+            Ok(_) => panic!("expected the stub's error, got a harness"),
+        };
+        assert!(
+            matches!(&error, HarnessError::Protocol(message) if message.starts_with("stub reached: other as nightly")),
+            "{error:?}"
+        );
     }
 
     #[test]

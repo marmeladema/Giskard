@@ -7,12 +7,13 @@ use giskard_harness_replay::{ReplayFixture, ReplayHarness};
 use giskard_persist::store::ProjectConfig;
 use giskard_server::HarnessFactory;
 
+/// A factory over a closure that also receives the requested `[harnesses.<name>]` declaration.
 struct FnFactory<F>(F);
 
 #[async_trait]
 impl<F> HarnessFactory for FnFactory<F>
 where
-    F: Fn(&ProjectConfig, HarnessBootstrap) -> Result<Arc<dyn AgentHarness>, HarnessError>
+    F: Fn(&ProjectConfig, &str, HarnessBootstrap) -> Result<Arc<dyn AgentHarness>, HarnessError>
         + Send
         + Sync
         + 'static,
@@ -20,15 +21,30 @@ where
     async fn create(
         &self,
         config: &ProjectConfig,
+        harness: &str,
         bootstrap: HarnessBootstrap,
     ) -> Result<Arc<dyn AgentHarness>, HarnessError> {
-        (self.0)(config, bootstrap)
+        (self.0)(config, harness, bootstrap)
     }
 }
 
+/// A factory that ignores the declaration name: every instance comes from `f`.
 pub fn from_fn<F>(f: F) -> Arc<dyn HarnessFactory>
 where
     F: Fn(&ProjectConfig, HarnessBootstrap) -> Result<Arc<dyn AgentHarness>, HarnessError>
+        + Send
+        + Sync
+        + 'static,
+{
+    Arc::new(FnFactory(
+        move |config: &ProjectConfig, _: &str, bootstrap| f(config, bootstrap),
+    ))
+}
+
+/// A factory that constructs a different instance per declaration name, for multi-harness tests.
+pub fn from_fn_by_harness<F>(f: F) -> Arc<dyn HarnessFactory>
+where
+    F: Fn(&ProjectConfig, &str, HarnessBootstrap) -> Result<Arc<dyn AgentHarness>, HarnessError>
         + Send
         + Sync
         + 'static,
@@ -71,7 +87,7 @@ mod tests {
     async fn failing_returns_the_given_error() {
         let factory = super::failing(HarnessError::Spawn("given".into()));
         let error = match factory
-            .create(&config().await, HarnessBootstrap::default())
+            .create(&config().await, "codex", HarnessBootstrap::default())
             .await
         {
             Ok(_) => panic!("failing factory created a harness"),
@@ -89,11 +105,11 @@ mod tests {
         let factory = super::shared(harness.clone());
         let config = config().await;
         let first = factory
-            .create(&config, HarnessBootstrap::default())
+            .create(&config, "codex", HarnessBootstrap::default())
             .await
             .unwrap();
         let second = factory
-            .create(&config, HarnessBootstrap::default())
+            .create(&config, "codex", HarnessBootstrap::default())
             .await
             .unwrap();
         assert!(Arc::ptr_eq(&harness, &first));
@@ -116,9 +132,24 @@ mod tests {
             known_threads: vec![binding],
         };
         factory
-            .create(&config().await, bootstrap.clone())
+            .create(&config().await, "codex", bootstrap.clone())
             .await
             .unwrap();
         assert_eq!(*received.lock().unwrap(), Some(bootstrap));
+    }
+
+    #[tokio::test]
+    async fn from_fn_by_harness_receives_the_declaration_name() {
+        let received = Arc::new(Mutex::new(None));
+        let recorded = received.clone();
+        let factory = super::from_fn_by_harness(move |_, harness, _| {
+            *recorded.lock().unwrap() = Some(harness.to_string());
+            Ok(Arc::new(ReplayHarness::new()))
+        });
+        factory
+            .create(&config().await, "nightly", HarnessBootstrap::default())
+            .await
+            .unwrap();
+        assert_eq!(received.lock().unwrap().as_deref(), Some("nightly"));
     }
 }
