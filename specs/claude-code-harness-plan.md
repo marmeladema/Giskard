@@ -37,7 +37,7 @@ Milestone 1 is implemented; see `claude-code-harness-plan/milestone-1-plan.md`.
 | --- | --- |
 | Harness binding granularity | **Per thread inside a project.** One project may hold Codex threads and Claude threads side by side. |
 | What selects the harness | **A declaration the user names.** A thread stores `harness` and is bound to it for life; the picker offers `(harness, provider, model)` and derives the harness from the selection. |
-| Child-process model | **One persistent `claude` child process per loaded thread**, alive across turns, spawned in `open_thread`, stopped by `delete_thread` / `set_thread_archived(true)` / `shutdown`. **No idle reaping in the MVP** (§5.2). |
+| Child-process model | **One persistent `claude` child process per loaded thread**, alive across turns, spawned in `open_thread`, stopped by `delete_thread` / `set_thread_archived(true)` / `shutdown`. **No idle reaping in the MVP** (§5.2); milestone 6 reaps an idle child and respawns it on the thread's next message. |
 | Who owns the permission mode | **Giskard.** Every child runs with `--disallowedTools EnterPlanMode ExitPlanMode`, and the adapter sets the mode at spawn and at the start of every turn (§8.2). Without the flag the model can switch modes mid-turn with no ask. |
 | Model catalog | **Answered by the harness, not discovered over HTTP.** The `initialize` response carries the session's `models` array and `list_models` refreshes it, so Giskard holds no Anthropic key and the `models.rs` discovery extensions leave the critical path (§3.3, §6). |
 | Structured diffs | **`structured_diffs: false` in v1.** Synthesize `FileChange`/`DiffUpdated` from `Edit`/`Write` tool calls + git in a later phase. |
@@ -596,9 +596,11 @@ releases its child immediately — but it does not close the gap: **a thread the
 looking at keeps its process**, so memory tracks threads *opened* rather than threads *open*. At the
 spec's ~10-thread scale (§1.4) that is gigabytes.
 
-The MVP should at minimum log the live-child count. Reaping is milestone 6;
-`docs/multi-harness-design.md` carries "idle shutdown" as an open question, and this adapter is the
-reason to answer it.
+The MVP should at minimum log the live-child count. Milestone 6 closes the gap: a child idle for
+`idle_shutdown_secs` (a key on the `claude-code` declaration, default 600 s, `0` never) is
+stopped while its thread stays bound and its stream open, and the thread's next message respawns
+it with `--resume`. Memory then tracks threads *in use*. This answers the Claude Code half of
+`docs/multi-harness-design.md`'s "idle shutdown" question; the Codex half stays open.
 
 ### 5.3 Sub-agent threads without native sessions
 
@@ -1648,6 +1650,16 @@ stopped with its thread's log open and its entry kept, and the next message resp
 (`local_bash` included), no outstanding control request, no in-flight hand-off and no pending
 ask. The server is not told and must not be: it reuses the binding and keeps reading the log.
 
+Milestone 6 is implemented: the supervisor is one `select!` loop over stdout, commands, the
+shutdown flag, the stage deadline and the idle timer, in a serving or a stopping phase; a
+`StartTurn`'s settings are a `TurnSetup` advanced by its responses and failed by its deadline
+(`await_control`, its polling and the deferred-command queue are gone); `stop_task` is a waiter; a
+stop refuses arriving commands at once and joins a second stop. A child idle (no hand-off, ask,
+route, open task, outstanding control request or turn) for `idle_shutdown_secs` is reaped: its
+façade entry (session id, log, model) is kept, its log stays open, and the next `start_turn`,
+`compact_thread` or `open_thread` respawns it through the open's own spawn path, a lost
+transcript surfacing as a `Notice` after the turn's `TurnStarted`. See the adapter README.
+
 ### After milestone 5, as its own change — MCP status per thread
 
 `list_mcp_servers` is instance-scoped (`AgentHarness::list_mcp_servers(&self)`, and the route
@@ -1700,7 +1712,7 @@ the endpoint inventory. What this adapter still owns, by milestone:
 | --- | --- |
 | Protocol drift as Claude Code ships — **measured, not hypothetical** | Over ~50 patch releases the 2.1.2xx series moved a documented flag value to undocumented, added two permission modes, changed the headless default mode, and grew the control channel by roughly twenty subtypes. `claude-codes` (§3.7) helps — its version tracks the CLI and its enums tolerate unknown values — but enum tolerance does not protect a capability decided on a premise that has expired. **Read `system/init.capabilities` and feature-detect** rather than comparing version strings; log `claude_code_version` as diagnostics; **re-check §3 against the version the adapter ships against**. Drift cuts both ways: several of §3.3's subtypes *removed* planned work, so a re-check is as likely to simplify the plan as to complicate it |
 | `ask_first` does not ask about everything — **two independent causes, both verified** | User settings allow-rules pre-empt the callback (accepted by the §8.3 decision), *and* the CLI approves effect-free commands itself below the settings layer, with nothing configured (§9.2.1). Not mitigated by design: the UI wording must match what the preset actually promises, and the hook route (§9.4) is the only fix for either |
-| One process per loaded thread, **measured at 440–530 MB RSS** | `delete_thread` and `set_thread_archived(true)` release a child immediately (§5.2), which bounds the worst case but not the common one: a thread the user merely stops looking at keeps its process, because `retire_thread` / `forget_thread` are invisible to the harness. MVP logs the live-child count so growth is visible; reaping in milestone 6. At the spec's ~10-thread scale this is gigabytes, so it is a capacity question, not a detail |
+| One process per loaded thread, **measured at 440–530 MB RSS** | `delete_thread` and `set_thread_archived(true)` release a child immediately (§5.2), which bounds the worst case but not the common one: a thread the user merely stops looking at keeps its process, because `retire_thread` / `forget_thread` are invisible to the harness. MVP logs the live-child count so growth is visible; since milestone 6 a child idle for `idle_shutdown_secs` (default 600 s) is reaped and respawned on the thread's next message. At the spec's ~10-thread scale this is gigabytes, so it is a capacity question, not a detail |
 | **A `SubagentLink` without `claim_native_thread`** | Fails loudly but endlessly rather than silently: every delegation is re-queued by `defer_admission` with no attempt cap and warns once per driver event. Ship `SubagentLink` and the claim together, or neither (§5.3, milestone 5) |
 | A stray `ANTHROPIC_API_KEY` in Giskard's own environment silently bills a subscriber to API credits | Not preventable *by Giskard*: `env` is an overlay and cannot unset an inherited variable (§7). Detect it — `initialize`'s `account:{subscriptionType, apiProvider}` at handshake, `system/init.apiKeySource` per turn. Prevention exists for the operator: the managed `allowedProviders` setting outranks every other scope (§7) |
 | Cost/quota semantics differ under a subscription | Treat euro cost as notional; surface `rate_limit_event` (§6) |
@@ -1712,9 +1724,9 @@ the endpoint inventory. What this adapter still owns, by milestone:
 
 ## 13. Open questions
 
-1. **Idle shutdown.** An adapter-level policy over child processes is this plan's problem (§5.2), but
-   whether the *declaration* should carry a timeout is `docs/multi-harness-design.md`'s open question.
-   One answer should serve both.
+1. **Idle shutdown.** Answered by milestone 6 for this adapter: the declaration carries the timeout
+   (`idle_shutdown_secs`), applied per process (§5.2). The Codex half of
+   `docs/multi-harness-design.md`'s question stays open.
 2. **Should a declaration be able to remove an inherited environment variable?** The `env` overlay can
    only add or overwrite (§7). For this harness that is the difference between "warn that the user is
    on API billing" and "make sure they are not".

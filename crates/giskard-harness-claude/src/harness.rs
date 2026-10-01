@@ -40,9 +40,9 @@ use crate::process::{
 };
 pub(crate) use crate::session::CONTROL_TIMEOUT;
 use crate::session::{
-    ChildCommand, ChildHandle, Children, Pending, PendingRequests, RouteHandle, Routes,
-    STOP_EXIT_GRACE, SupervisorParts, TurnSettings, control_line, control_outcome, lock,
-    new_request_id, spawn_supervisor,
+    ChildCommand, ChildHandle, Pending, PendingRequests, RouteHandle, Routes, STOP_EXIT_GRACE,
+    SupervisorParts, ThreadEntry, Threads, TurnSettings, control_line, control_outcome, lock,
+    new_request_id, spawn_supervisor, thread_counts,
 };
 
 /// How long the CLI has to answer `initialize`.
@@ -56,6 +56,9 @@ pub(crate) const STOP_TIMEOUT: Duration = Duration::from_secs(15);
 pub(crate) const PROBE_TIMEOUT: Duration = Duration::from_secs(30);
 /// Commands queued to one supervisor before a sender waits.
 const COMMAND_QUEUE: usize = 16;
+/// What the thread is told when its transcript was gone and a fresh session took its place.
+const RESUME_FAILED_MESSAGE: &str =
+    "Agent context was lost; started a fresh Claude Code session. History is intact.";
 
 /// Starts children. The production spawner runs `claude`; tests install a scripted one.
 #[async_trait]
@@ -85,19 +88,24 @@ impl ChildSpawner for ProcessSpawner {
     }
 }
 
-/// One Claude Code harness instance: one `claude` process per open primary thread.
+/// One Claude Code harness instance: one `claude` process per open primary thread in use.
 pub struct ClaudeHarness {
     workspace_root: PathBuf,
     launch: ClaudeLaunchOptions,
     // ENTITY-AUTHORITY-EXCEPTION:
-    // Role: Reach each live child's supervisor task and retained log from the trait methods.
-    // Source of truth: `open_thread` inserts an entry after the handshake; the supervisor removes
-    //   it when the child exits.
-    // Structural reason: The harness crate cannot depend on the server's thread authority.
+    // Role: Reach each primary thread's session id, retained log and model, and its live child's
+    //   supervisor task while it has one, from the trait methods.
+    // Source of truth: `open_thread` inserts an entry after the handshake and a respawn fills a
+    //   reaped entry's child; the supervisor's idle reap clears its own child, and its other exits
+    //   remove the entry.
+    // Structural reason: The harness crate cannot depend on the server's thread authority, and the
+    //   server never reopens a bound thread, so a reaped thread's session and log must outlive
+    //   its child here.
     // Synchronization: A std mutex guards insert, lookup and removal; nothing awaits under it.
-    // Invalidation/removal: Child exit, `delete_thread`, `set_thread_archived(true)` and
-    //   `shutdown` remove entries; dropping the harness drops the map.
-    children: Children,
+    // Invalidation/removal: `delete_thread`, `set_thread_archived(true)` and `shutdown` remove
+    //   entries and close their logs; an unexpected child exit removes its entry; dropping the
+    //   harness drops the map.
+    threads: Threads,
     // ENTITY-AUTHORITY-EXCEPTION:
     // Role: Remember which thread and CLI request id a published approval or server request
     //   belongs to, and what its answer must echo, for `respond_*`.
@@ -147,7 +155,7 @@ impl ClaudeHarness {
         Self {
             workspace_root,
             launch,
-            children: Arc::new(Mutex::new(HashMap::new())),
+            threads: Arc::new(Mutex::new(HashMap::new())),
             pending: Arc::new(Mutex::new(PendingRequests::default())),
             routes: Arc::new(Mutex::new(HashMap::new())),
             catalog: Arc::new(Mutex::new(None)),
@@ -193,8 +201,14 @@ impl ClaudeHarness {
         lock(&self.catalog).clone()
     }
 
-    fn live_children(&self) -> usize {
-        lock(&self.children).len()
+    /// Threads whose child runs.
+    pub(crate) fn live_children(&self) -> usize {
+        thread_counts(&lock(&self.threads)).0
+    }
+
+    /// Threads this instance holds, with or without a child.
+    pub(crate) fn loaded_threads(&self) -> usize {
+        lock(&self.threads).len()
     }
 
     /// Sub-agent routes the façade can reach, live and cold.
@@ -202,12 +216,28 @@ impl ClaudeHarness {
         lock(&self.routes).len()
     }
 
-    /// The command channel, open model and launch mode of a thread's live child.
+    /// The command channel, model, launch mode and generation of a thread's live child.
     fn live(&self, thread: ThreadId) -> Option<LiveChild> {
-        lock(&self.children).get(&thread).map(|handle| LiveChild {
-            commands: handle.commands.clone(),
-            model: handle.model.clone(),
-            launch_mode: handle.launch_mode,
+        let threads = lock(&self.threads);
+        let entry = threads.get(&thread)?;
+        let child = entry.child.as_ref()?;
+        Some(LiveChild {
+            commands: child.commands.clone(),
+            model: entry.model.clone(),
+            launch_mode: child.launch_mode,
+            generation: child.generation,
+        })
+    }
+
+    /// The hand-off sent to `generation` failed because its child was reaped meanwhile: the entry
+    /// is still there, with no child or a newer one. `false` when the entry is gone (a crash or a
+    /// delete), so the original error stands.
+    fn reaped_under(&self, thread: ThreadId, generation: u64) -> bool {
+        lock(&self.threads).get(&thread).is_some_and(|entry| {
+            entry
+                .child
+                .as_ref()
+                .is_none_or(|child| child.generation != generation)
         })
     }
 
@@ -215,19 +245,19 @@ impl ClaudeHarness {
     /// standard launch with the same session flag when it refuses now.
     async fn spawn_child_for(
         &self,
-        opts: &OpenThreadOptions,
+        target: &SpawnTarget,
         session: SessionFlag,
     ) -> Result<(Box<dyn ClaudeChild>, Handshake, LaunchMode), (HandshakeFailure, LaunchMode)> {
         let refused = lock(&self.bypass_refused).is_some();
         if refused {
             return self
-                .spawn_and_handshake(opts, session, LaunchMode::Standard)
+                .spawn_and_handshake(target, session, LaunchMode::Standard)
                 .await
                 .map(|(child, handshake)| (child, handshake, LaunchMode::Standard))
                 .map_err(|failure| (failure, LaunchMode::Standard));
         }
         match self
-            .spawn_and_handshake(opts, session.clone(), LaunchMode::Bypass)
+            .spawn_and_handshake(target, session.clone(), LaunchMode::Bypass)
             .await
         {
             Ok((child, handshake)) => Ok((child, handshake, LaunchMode::Bypass)),
@@ -249,7 +279,7 @@ impl ClaudeHarness {
                     warn!(
                         project_id = display_opt(self.launch.project_id),
                         harness = display_opt(self.launch.declaration.as_deref()),
-                        thread_id = %opts.thread,
+                        thread_id = %target.thread,
                         action = "bypass_refused",
                         exit_code = display_opt(exit.code),
                         sentence = %sentence,
@@ -258,12 +288,12 @@ impl ClaudeHarness {
                     );
                 } else {
                     debug!(
-                        thread_id = %opts.thread,
+                        thread_id = %target.thread,
                         action = "bypass_refused",
                         "Claude Code refused a bypassPermissions launch again"
                     );
                 }
-                self.spawn_and_handshake(opts, session, LaunchMode::Standard)
+                self.spawn_and_handshake(target, session, LaunchMode::Standard)
                     .await
                     .map(|(child, handshake)| (child, handshake, LaunchMode::Standard))
                     .map_err(|failure| (failure, LaunchMode::Standard))
@@ -276,7 +306,7 @@ impl ClaudeHarness {
     /// reaped before this returns.
     async fn spawn_and_handshake(
         &self,
-        opts: &OpenThreadOptions,
+        target: &SpawnTarget,
         session: SessionFlag,
         launch_mode: LaunchMode,
     ) -> Result<(Box<dyn ClaudeChild>, Handshake), HandshakeFailure> {
@@ -287,22 +317,22 @@ impl ClaudeHarness {
         let argv = session_argv(
             &self.launch,
             &SessionArgs {
-                model: opts.initial_model.clone(),
+                model: target.model.clone(),
                 session,
                 launch_mode,
             },
         );
-        let mut context = self.context(Some(opts.thread), Some(&session_id));
+        let mut context = self.context(Some(target.thread), Some(&session_id));
         context.resume = resume;
         let mut child = self
             .spawner
-            .spawn(&argv, &opts.workspace_root, &context)
+            .spawn(&argv, &target.workspace_root, &context)
             .await
             .map_err(HandshakeFailure::Error)?;
         let started = Instant::now();
         let handshake = handshake(child.as_mut(), &context, resume, launch_mode).await?;
         debug!(
-            thread_id = %opts.thread,
+            thread_id = %target.thread,
             harness_thread_id = %session_id,
             action = "handshake",
             resume,
@@ -331,11 +361,11 @@ impl ClaudeHarness {
     /// The model the CLI says it applied, compared with the one requested.
     fn resumed_model(
         &self,
-        opts: &OpenThreadOptions,
+        target: &SpawnTarget,
         session_id: &str,
         applied: Option<AppliedSettings>,
     ) -> Option<ModelRef> {
-        let requested = &opts.initial_model;
+        let requested = &target.model;
         let applied = applied?;
         let resolved = self
             .catalog_snapshot()
@@ -345,7 +375,7 @@ impl ClaudeHarness {
         }
         warn!(
             project_id = display_opt(self.launch.project_id),
-            thread_id = %opts.thread,
+            thread_id = %target.thread,
             harness_thread_id = %session_id,
             action = "model_not_applied",
             requested = %requested.model,
@@ -359,14 +389,17 @@ impl ClaudeHarness {
         })
     }
 
-    /// Stop one child that is no longer in `children`, bounded by `STOP_TIMEOUT`.
-    async fn stop_handle(thread: ThreadId, handle: ChildHandle, action: &'static str) {
+    /// Stop one child that is no longer in `threads`, bounded by `STOP_TIMEOUT`. Its exit closes
+    /// the thread's `log`; this closes it when the supervisor cannot.
+    async fn stop_handle(
+        thread: ThreadId,
+        handle: ChildHandle,
+        harness_thread_id: String,
+        log: Arc<EventLog>,
+        action: &'static str,
+    ) {
         let ChildHandle {
-            commands,
-            mut task,
-            harness_thread_id,
-            log,
-            ..
+            commands, mut task, ..
         } = handle;
         let started = Instant::now();
         let stopped = tokio::time::timeout(STOP_TIMEOUT, async {
@@ -418,8 +451,9 @@ impl ClaudeHarness {
         }
     }
 
-    /// Stop a thread's child if it has one (archive, delete). A sub-agent thread has none: its
-    /// route is removed and its log closed, which ends the thread's stream.
+    /// Forget a thread (archive, delete): stop its child if it has one, else close its log. A
+    /// sub-agent thread has no child: its route is removed and its log closed, which ends the
+    /// thread's stream.
     async fn stop_thread(&self, thread: &ThreadHandle, action: &'static str) {
         if is_task_native_id(&thread.harness_thread_id) {
             let route = lock(&self.routes).remove(&thread.thread);
@@ -439,7 +473,7 @@ impl ClaudeHarness {
             );
             return;
         }
-        let Some(handle) = lock(&self.children).remove(&thread.thread) else {
+        let Some(entry) = lock(&self.threads).remove(&thread.thread) else {
             debug!(
                 thread_id = %thread.thread,
                 harness_thread_id = %thread.harness_thread_id,
@@ -448,14 +482,35 @@ impl ClaudeHarness {
             );
             return;
         };
-        Self::stop_handle(thread.thread, handle, action).await;
+        let ThreadEntry {
+            harness_thread_id,
+            log,
+            child,
+            ..
+        } = entry;
+        match child {
+            Some(handle) => {
+                Self::stop_handle(thread.thread, handle, harness_thread_id, log, action).await;
+            }
+            None => {
+                // Reaped: no supervisor is left to close the log.
+                log.close();
+                debug!(
+                    thread_id = %thread.thread,
+                    harness_thread_id = %harness_thread_id,
+                    action,
+                    "no live claude child; the thread's log is closed"
+                );
+            }
+        }
         let dropped = lock(&self.pending).remove_thread(thread.thread);
         debug!(
             thread_id = %thread.thread,
             action,
             pending_dropped = dropped,
             live_children = self.live_children(),
-            "thread's claude child removed"
+            loaded_threads = self.loaded_threads(),
+            "thread removed"
         );
     }
 
@@ -463,18 +518,13 @@ impl ClaudeHarness {
     /// `None` when neither is live (a cold route, or a thread this instance does not hold). The
     /// two locks are taken one after the other, never nested.
     fn child_carrying(&self, thread: ThreadId) -> Option<(ThreadId, mpsc::Sender<ChildCommand>)> {
-        if let Some(commands) = lock(&self.children)
-            .get(&thread)
-            .map(|handle| handle.commands.clone())
-        {
-            return Some((thread, commands));
+        if let Some(live) = self.live(thread) {
+            return Some((thread, live.commands));
         }
         let owner = lock(&self.routes)
             .get(&thread)
             .and_then(|route| route.owner)?;
-        lock(&self.children)
-            .get(&owner)
-            .map(|handle| (owner, handle.commands.clone()))
+        self.live(owner).map(|live| (owner, live.commands))
     }
 
     /// `interrupt` on a sub-agent thread: `stop_task` through the child that carries its route.
@@ -555,6 +605,428 @@ impl ClaudeHarness {
                     "claude did not answer {what} within {} s",
                     limit.as_secs()
                 )))
+            }
+        }
+    }
+
+    /// One session child with the open's fallbacks: bypass → standard, and on resume a missing
+    /// transcript → a fresh session with the same id, reported as `notice`.
+    async fn spawn_session(
+        &self,
+        target: &SpawnTarget,
+        session: SessionFlag,
+    ) -> Result<Spawned, HarnessError> {
+        let (session_id, resuming) = match &session {
+            SessionFlag::Fresh(id) => (id.clone(), false),
+            SessionFlag::Resume(id) => (id.clone(), true),
+        };
+        let mut context = self.context(Some(target.thread), Some(&session_id));
+        context.resume = resuming;
+        match self.spawn_child_for(target, session).await {
+            Ok((child, handshake, launch_mode)) => Ok(Spawned {
+                child,
+                handshake,
+                launch_mode,
+                notice: None,
+                context,
+            }),
+            Err((
+                HandshakeFailure::Exited {
+                    exit,
+                    result_errors,
+                    ..
+                },
+                launch_mode,
+            )) if resuming && classify_exit(&exit, &result_errors) == ExitKind::ResumeMissing => {
+                let detail = resume_missing_sentence(&exit, &result_errors);
+                warn!(
+                    project_id = display_opt(self.launch.project_id),
+                    harness = display_opt(self.launch.declaration.as_deref()),
+                    thread_id = %target.thread,
+                    harness_thread_id = %session_id,
+                    action = "claude_resume_failed",
+                    exit_code = display_opt(exit.code),
+                    stderr_tail = ?exit.stderr_tail,
+                    "the Claude Code transcript is gone; starting a fresh session with the \
+                     same id"
+                );
+                let mut fresh_context = context;
+                fresh_context.resume = false;
+                // The same launch mode; a bypass refusal on the respawn still falls back.
+                let (child, handshake, launch_mode) = if launch_mode == LaunchMode::Bypass {
+                    self.spawn_child_for(target, SessionFlag::Fresh(session_id.clone()))
+                        .await
+                        .map_err(|(failure, _)| failure.into_error(&fresh_context))?
+                } else {
+                    self.spawn_and_handshake(
+                        target,
+                        SessionFlag::Fresh(session_id.clone()),
+                        launch_mode,
+                    )
+                    .await
+                    .map(|(child, handshake)| (child, handshake, launch_mode))
+                    .map_err(|failure| failure.into_error(&fresh_context))?
+                };
+                Ok(Spawned {
+                    child,
+                    handshake,
+                    launch_mode,
+                    notice: Some(HarnessNotice {
+                        code: "claude_resume_failed".into(),
+                        message: RESUME_FAILED_MESSAGE.into(),
+                        detail,
+                    }),
+                    // The supervisor's lines name the original open's resume.
+                    context: fresh_context,
+                })
+            }
+            Err((failure, _)) => Err(failure.into_error(&context)),
+        }
+    }
+
+    /// Register a handshaken child for `target.thread` under `session_id`: a new entry (a first
+    /// open, `respawn` false), or the reaped entry's empty slot (`respawn` true), whose log the
+    /// new supervisor appends to. Decided under the lock, so a concurrent `shutdown` either sees
+    /// the child or refuses it.
+    fn register_child(
+        &self,
+        target: &SpawnTarget,
+        session_id: &str,
+        spawned: Spawned,
+        mapper: ClaudeMapper,
+        model: ModelRef,
+        respawn: bool,
+    ) -> Result<LiveChild, Box<Refused>> {
+        let Spawned {
+            child,
+            handshake,
+            launch_mode,
+            context,
+            ..
+        } = spawned;
+        let mut threads = lock(&self.threads);
+        if *self.shutdown_tx.borrow() {
+            return Err(Box::new(Refused {
+                error: HarnessError::Transport("Claude Code harness is shut down".into()),
+                child,
+                existing: None,
+            }));
+        }
+        let log = match threads.get(&target.thread) {
+            None if respawn => {
+                return Err(Box::new(Refused {
+                    error: HarnessError::ThreadNotFound(target.thread),
+                    child,
+                    existing: None,
+                }));
+            }
+            None => Arc::new(EventLog::new()),
+            Some(entry) => match &entry.child {
+                Some(existing) => {
+                    let existing = LiveChild {
+                        commands: existing.commands.clone(),
+                        model: entry.model.clone(),
+                        launch_mode: existing.launch_mode,
+                        generation: existing.generation,
+                    };
+                    return Err(Box::new(Refused {
+                        error: HarnessError::Protocol(format!(
+                            "thread {} was opened concurrently",
+                            target.thread
+                        )),
+                        child,
+                        existing: Some(existing),
+                    }));
+                }
+                None if respawn => entry.log.clone(),
+                None => {
+                    return Err(Box::new(Refused {
+                        error: HarnessError::Protocol(format!(
+                            "thread {} was opened concurrently",
+                            target.thread
+                        )),
+                        child,
+                        existing: None,
+                    }));
+                }
+            },
+        };
+        let (commands, receiver) = mpsc::channel(COMMAND_QUEUE);
+        let generation = self.generations.fetch_add(1, Ordering::Relaxed);
+        let task = spawn_supervisor(SupervisorParts {
+            child,
+            mapper,
+            log: log.clone(),
+            commands: receiver,
+            shutdown: self.shutdown_tx.subscribe(),
+            threads: self.threads.clone(),
+            pending: self.pending.clone(),
+            routes: self.routes.clone(),
+            commands_sender: commands.downgrade(),
+            generation,
+            thread: target.thread,
+            context,
+            early_lines: handshake.early_lines,
+            abandoned_requests: handshake.abandoned_requests,
+            model: model.clone(),
+            idle_timeout: self.launch.idle_timeout,
+        });
+        let handle = ChildHandle {
+            commands: commands.clone(),
+            task,
+            launch_mode,
+            generation,
+        };
+        match threads.entry(target.thread) {
+            Entry::Occupied(mut slot) => {
+                let entry = slot.get_mut();
+                entry.child = Some(handle);
+                entry.model = model.clone();
+            }
+            Entry::Vacant(slot) => {
+                slot.insert(ThreadEntry {
+                    harness_thread_id: session_id.to_owned(),
+                    log,
+                    workspace_root: target.workspace_root.clone(),
+                    model: model.clone(),
+                    child: Some(handle),
+                });
+            }
+        }
+        Ok(LiveChild {
+            commands,
+            model,
+            launch_mode,
+            generation,
+        })
+    }
+
+    /// The thread's live child, respawned from its entry with `--resume` when it was reaped, under
+    /// the open's launch rules. A failed respawn leaves the entry as it was, so the next call
+    /// tries again.
+    async fn ensure_child(&self, thread: ThreadId) -> Result<Respawned, HarnessError> {
+        if let Some(live) = self.live(thread) {
+            return Ok(Respawned::already_live(live));
+        }
+        self.ensure_running()?;
+        let (session_id, target) = lock(&self.threads)
+            .get(&thread)
+            .map(|entry| {
+                (
+                    entry.harness_thread_id.clone(),
+                    SpawnTarget {
+                        thread,
+                        workspace_root: entry.workspace_root.clone(),
+                        model: entry.model.clone(),
+                    },
+                )
+            })
+            .ok_or(HarnessError::ThreadNotFound(thread))?;
+        let started = Instant::now();
+        let mut spawned = self
+            .spawn_session(&target, SessionFlag::Resume(session_id.clone()))
+            .await
+            .inspect_err(|error| {
+                warn!(
+                    project_id = display_opt(self.launch.project_id),
+                    harness = display_opt(self.launch.declaration.as_deref()),
+                    thread_id = %thread,
+                    harness_thread_id = %session_id,
+                    action = "respawn",
+                    error = %error,
+                    "could not respawn the thread's claude child; the thread stays open"
+                );
+            })?;
+        if let Some(models) = spawned.handshake.models.as_deref() {
+            self.store_catalog(models, "handshake");
+        }
+        let resumed_model =
+            self.resumed_model(&target, &session_id, spawned.handshake.applied.clone());
+        let mut mapper =
+            ClaudeMapper::new(thread, session_id.clone(), target.workspace_root.clone());
+        // The handshake set `default`; a `status` it emitted (mapped from `early_lines`) is not
+        // drift.
+        mapper.set_expected_mode("default");
+        let context_window = spawned.handshake.context_window;
+        // The window was persisted at the first resume; seeding the mapper makes the next turn's
+        // usage carry it.
+        if let Some(window) = context_window {
+            mapper.note_context_window(window);
+        }
+        let notice = spawned.notice.take();
+        let launch_mode = spawned.launch_mode;
+        let model = resumed_model
+            .clone()
+            .unwrap_or_else(|| target.model.clone());
+        let live = match self.register_child(&target, &session_id, spawned, mapper, model, true) {
+            Ok(live) => live,
+            Err(refused) => {
+                let Refused {
+                    error,
+                    mut child,
+                    existing,
+                } = *refused;
+                debug!(
+                    thread_id = %thread,
+                    harness_thread_id = %session_id,
+                    action = "respawn",
+                    error = %error,
+                    "discarding a freshly respawned claude child"
+                );
+                reap(child.as_mut()).await;
+                // Two callers raced to respawn: both get the winner.
+                return existing.map(Respawned::already_live).ok_or(error);
+            }
+        };
+        info!(
+            project_id = display_opt(self.launch.project_id),
+            harness = display_opt(self.launch.declaration.as_deref()),
+            thread_id = %thread,
+            harness_thread_id = %session_id,
+            action = "respawn",
+            resume_fallback = notice.is_some(),
+            launch_mode = launch_mode.as_str(),
+            live_children = self.live_children(),
+            loaded_threads = self.loaded_threads(),
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "respawned the reaped thread's claude child"
+        );
+        Ok(Respawned {
+            live,
+            notice,
+            context_window,
+            resumed_model,
+        })
+    }
+
+    /// `start_turn` on the thread's child, from `attempt`. A hand-off refused because the child
+    /// was reaped under it runs once more on a fresh child, under the same turn id.
+    async fn start_turn_on(
+        &self,
+        thread: &ThreadHandle,
+        mut attempt: Respawned,
+        line: String,
+        overrides: TurnOverrides,
+    ) -> Result<TurnId, HarnessError> {
+        let turn = TurnId::new();
+        let mode = turn_mode(&overrides);
+        let mut notice = attempt.notice.take();
+        let mut retried = false;
+        loop {
+            let live = attempt.live.clone();
+            if mode == "bypassPermissions" && live.launch_mode == LaunchMode::Standard {
+                // `bypassPermissions` is a launch-time capability: the CLI refuses to set it on a
+                // child launched without it.
+                let why = lock(&self.bypass_refused).clone().map_or_else(
+                    || "the child was not launched in that mode".to_owned(),
+                    |sentence| {
+                        format!(
+                            "Claude Code refused to start in bypassPermissions mode ({sentence})"
+                        )
+                    },
+                );
+                warn!(
+                    thread_id = %thread.thread,
+                    harness_thread_id = %thread.harness_thread_id,
+                    action = "start_turn",
+                    mode,
+                    launch_mode = live.launch_mode.as_str(),
+                    "refusing a full_access turn on a child that cannot bypass permissions"
+                );
+                return Err(HarnessError::Unsupported(format!(
+                    "full_access is not available: {why}"
+                )));
+            }
+            let model = overrides.model.clone().unwrap_or(live.model);
+            let resolved_model = self
+                .catalog_snapshot()
+                .and_then(|snapshot| snapshot.resolved_model(&model.model).map(str::to_owned));
+            let settings = TurnSettings {
+                mode: mode.to_owned(),
+                model: Some(model.model.clone()),
+                effort: model
+                    .reasoning_effort
+                    .as_ref()
+                    .map(|effort| effort.0.clone()),
+                resolved_model,
+            };
+            let message = notice.as_ref().map(|notice| notice.message.clone());
+            let line = line.clone();
+            let outcome = self
+                .call(
+                    thread.thread,
+                    live.commands,
+                    "start_turn",
+                    START_TURN_TIMEOUT,
+                    |reply| ChildCommand::StartTurn {
+                        line,
+                        turn,
+                        model,
+                        settings,
+                        notice: message,
+                        reply,
+                    },
+                )
+                .await;
+            match outcome {
+                Err(error) if !retried && self.reaped_under(thread.thread, live.generation) => {
+                    debug!(
+                        thread_id = %thread.thread,
+                        harness_thread_id = %thread.harness_thread_id,
+                        turn_id = %turn,
+                        action = "start_turn",
+                        error = %error,
+                        "reaped under the hand-off; respawning"
+                    );
+                    retried = true;
+                    attempt = self.ensure_child(thread.thread).await?;
+                    notice = notice.or(attempt.notice.take());
+                }
+                outcome => return outcome.map(|()| turn),
+            }
+        }
+    }
+
+    /// `compact_thread` on the thread's child, from `attempt`, retried once as `start_turn_on`.
+    async fn compact_on(
+        &self,
+        thread: &ThreadHandle,
+        mut attempt: Respawned,
+    ) -> Result<(), HarnessError> {
+        let turn = TurnId::new();
+        let mut notice = attempt.notice.take();
+        let mut retried = false;
+        loop {
+            let generation = attempt.live.generation;
+            let message = notice.as_ref().map(|notice| notice.message.clone());
+            let outcome = self
+                .call(
+                    thread.thread,
+                    attempt.live.commands.clone(),
+                    "compact",
+                    CONTROL_TIMEOUT,
+                    |reply| ChildCommand::Compact {
+                        turn,
+                        notice: message,
+                        reply,
+                    },
+                )
+                .await;
+            match outcome {
+                Err(error) if !retried && self.reaped_under(thread.thread, generation) => {
+                    debug!(
+                        thread_id = %thread.thread,
+                        harness_thread_id = %thread.harness_thread_id,
+                        turn_id = %turn,
+                        action = "compact",
+                        error = %error,
+                        "reaped under the hand-off; respawning"
+                    );
+                    retried = true;
+                    attempt = self.ensure_child(thread.thread).await?;
+                    notice = notice.or(attempt.notice.take());
+                }
+                outcome => return outcome,
             }
         }
     }
@@ -675,6 +1147,26 @@ async fn probe_request(
     }
 }
 
+/// Report a resumed thread's context window through the open's update sink.
+fn send_context_window(opts: &OpenThreadOptions, model: ModelRef, context_window: u32) {
+    let update = ThreadUpdate::ContextWindowRestored {
+        model,
+        context_window,
+    };
+    if let Err(error) = opts.updates.send(update) {
+        let why = match error {
+            ThreadUpdateSendError::Full(_) => "full",
+            ThreadUpdateSendError::Closed(_) => "closed",
+        };
+        debug!(
+            thread_id = %opts.thread,
+            action = "context_window_restored",
+            why,
+            "the thread update sink did not take the restored window"
+        );
+    }
+}
+
 /// The descriptors of a stored snapshot, noting where and when it came from.
 fn served(snapshot: &CatalogSnapshot) -> Vec<ModelDescriptor> {
     debug!(
@@ -692,10 +1184,58 @@ fn child_stopped() -> HarnessError {
 }
 
 /// What the trait methods need of a live child.
+#[derive(Clone)]
 struct LiveChild {
     commands: mpsc::Sender<ChildCommand>,
+    /// The thread's model: a turn without a model override runs on it.
     model: ModelRef,
     launch_mode: LaunchMode,
+    generation: u64,
+}
+
+/// Which thread a session child serves, where, and on which model it launches.
+struct SpawnTarget {
+    thread: ThreadId,
+    workspace_root: PathBuf,
+    model: ModelRef,
+}
+
+/// A handshaken session child, not yet registered.
+struct Spawned {
+    child: Box<dyn ClaudeChild>,
+    handshake: Handshake,
+    launch_mode: LaunchMode,
+    /// The resume found no transcript and a fresh session took its place.
+    notice: Option<HarnessNotice>,
+    /// The context the child was spawned with, for its supervisor's log lines.
+    context: ChildLogContext,
+}
+
+/// A registration that did not take: the fresh child to reap, and the thread's live child when
+/// another caller registered one first.
+struct Refused {
+    error: HarnessError,
+    child: Box<dyn ClaudeChild>,
+    existing: Option<LiveChild>,
+}
+
+/// The thread's live child, and what a respawn learned when one ran.
+struct Respawned {
+    live: LiveChild,
+    notice: Option<HarnessNotice>,
+    context_window: Option<u32>,
+    resumed_model: Option<ModelRef>,
+}
+
+impl Respawned {
+    fn already_live(live: LiveChild) -> Self {
+        Self {
+            live,
+            notice: None,
+            context_window: None,
+            resumed_model: None,
+        }
+    }
 }
 
 /// The CLI's name for a turn's permission mode (plan §8.2: Plan wins over the preset). `auto` and
@@ -1242,14 +1782,25 @@ impl AgentHarness for ClaudeHarness {
 
     async fn shutdown(&self) -> Result<(), HarnessError> {
         self.shutdown_tx.send_replace(true);
-        let handles: Vec<(ThreadId, ChildHandle)> = lock(&self.children).drain().collect();
-        let children_stopped = handles.len();
-        futures::future::join_all(
-            handles
-                .into_iter()
-                .map(|(thread, handle)| Self::stop_handle(thread, handle, "shutdown")),
-        )
-        .await;
+        let entries: Vec<(ThreadId, ThreadEntry)> = lock(&self.threads).drain().collect();
+        let threads_closed = entries.len();
+        let mut stops = Vec::new();
+        for (thread, entry) in entries {
+            match entry.child {
+                Some(handle) => stops.push(Self::stop_handle(
+                    thread,
+                    handle,
+                    entry.harness_thread_id,
+                    entry.log,
+                    "shutdown",
+                )),
+                // Reaped: no supervisor is left to close the log. A child still draining from its
+                // reap finishes on its own under the shutdown flag.
+                None => entry.log.close(),
+            }
+        }
+        let children_stopped = stops.len();
+        futures::future::join_all(stops).await;
         let pending_dropped = lock(&self.pending).clear();
         let routes: Vec<RouteHandle> = lock(&self.routes).drain().map(|(_, route)| route).collect();
         let routes_dropped = routes.len();
@@ -1261,6 +1812,7 @@ impl AgentHarness for ClaudeHarness {
             harness = display_opt(self.launch.declaration.as_deref()),
             action = "shutdown",
             children_stopped,
+            threads_closed,
             routes_dropped,
             pending_dropped,
             "Claude Code harness shut down"
@@ -1288,20 +1840,48 @@ impl AgentHarness for ClaudeHarness {
             None => None,
         };
 
-        if let Some(handle) = lock(&self.children).get(&opts.thread) {
-            debug!(
-                thread_id = %opts.thread,
-                harness_thread_id = %handle.harness_thread_id,
-                action = "open_thread",
-                "thread already has a live claude child; returning its handle"
-            );
-            let mut existing = ThreadHandle::opened(
-                opts.thread,
-                handle.harness_thread_id.clone(),
-                opts.workspace_root.clone(),
-            );
-            existing.resumed_model = Some(handle.model.clone());
-            return Ok(existing);
+        let existing = lock(&self.threads).get(&opts.thread).map(|entry| {
+            (
+                entry.harness_thread_id.clone(),
+                entry.child.is_some(),
+                entry.model.clone(),
+            )
+        });
+        if let Some((session_id, live, model)) = existing {
+            if let Some(asked) = resume.as_deref().filter(|asked| *asked != session_id) {
+                warn!(
+                    thread_id = %opts.thread,
+                    harness_thread_id = %session_id,
+                    requested = %asked,
+                    action = "open_thread",
+                    "open_thread named another session than the one this thread holds; keeping \
+                     the thread's"
+                );
+            }
+            let mut handle =
+                ThreadHandle::opened(opts.thread, session_id.clone(), opts.workspace_root.clone());
+            if live {
+                debug!(
+                    thread_id = %opts.thread,
+                    harness_thread_id = %session_id,
+                    action = "open_thread",
+                    "thread already has a live claude child; returning its handle"
+                );
+                handle.resumed_model = Some(model);
+                return Ok(handle);
+            }
+            // Reaped: respawn now, and report what a first open reports.
+            let respawned = self.ensure_child(opts.thread).await?;
+            if let Some(window) = respawned.context_window {
+                let model = respawned
+                    .resumed_model
+                    .clone()
+                    .unwrap_or_else(|| respawned.live.model.clone());
+                send_context_window(&opts, model, window);
+            }
+            handle.warning = respawned.notice;
+            handle.resumed_model = respawned.resumed_model;
+            return Ok(handle);
         }
 
         let (session_id, first) = match resume {
@@ -1312,163 +1892,52 @@ impl AgentHarness for ClaudeHarness {
             }
         };
         let resuming = matches!(first, SessionFlag::Resume(_));
-        let mut context = self.context(Some(opts.thread), Some(&session_id));
-        context.resume = resuming;
-
-        let (child, handshake, launch_mode, warning) = match self
-            .spawn_child_for(&opts, first)
-            .await
-        {
-            Ok((child, handshake, launch_mode)) => (child, handshake, launch_mode, None),
-            Err((
-                HandshakeFailure::Exited {
-                    exit,
-                    result_errors,
-                    ..
-                },
-                launch_mode,
-            )) if resuming && classify_exit(&exit, &result_errors) == ExitKind::ResumeMissing => {
-                let detail = resume_missing_sentence(&exit, &result_errors);
-                warn!(
-                    project_id = display_opt(self.launch.project_id),
-                    harness = display_opt(self.launch.declaration.as_deref()),
-                    thread_id = %opts.thread,
-                    harness_thread_id = %session_id,
-                    action = "claude_resume_failed",
-                    exit_code = display_opt(exit.code),
-                    stderr_tail = ?exit.stderr_tail,
-                    "the Claude Code transcript is gone; starting a fresh session with the \
-                     same id"
-                );
-                let mut fresh_context = context.clone();
-                fresh_context.resume = false;
-                // The same launch mode; a bypass refusal on the respawn still falls back.
-                let (child, handshake, launch_mode) = if launch_mode == LaunchMode::Bypass {
-                    self.spawn_child_for(&opts, SessionFlag::Fresh(session_id.clone()))
-                        .await
-                        .map_err(|(failure, _)| failure.into_error(&fresh_context))?
-                } else {
-                    self.spawn_and_handshake(
-                        &opts,
-                        SessionFlag::Fresh(session_id.clone()),
-                        launch_mode,
-                    )
-                    .await
-                    .map(|(child, handshake)| (child, handshake, launch_mode))
-                    .map_err(|failure| failure.into_error(&fresh_context))?
-                };
-                let notice = HarnessNotice {
-                    code: "claude_resume_failed".into(),
-                    message: "Agent context was lost; started a fresh Claude Code session. \
-                                  History is intact."
-                        .into(),
-                    detail,
-                };
-                (child, handshake, launch_mode, Some(notice))
-            }
-            Err((failure, _)) => return Err(failure.into_error(&context)),
+        let target = SpawnTarget {
+            thread: opts.thread,
+            workspace_root: opts.workspace_root.clone(),
+            model: opts.initial_model.clone(),
         };
+        let mut spawned = self.spawn_session(&target, first).await?;
+        let warning = spawned.notice.take();
+        let launch_mode = spawned.launch_mode;
 
-        if let Some(models) = handshake.models.as_deref() {
+        if let Some(models) = spawned.handshake.models.as_deref() {
             self.store_catalog(models, "handshake");
         }
-        let resumed_model = self.resumed_model(&opts, &session_id, handshake.applied.clone());
+        let resumed_model =
+            self.resumed_model(&target, &session_id, spawned.handshake.applied.clone());
         let mut mapper =
             ClaudeMapper::new(opts.thread, session_id.clone(), opts.workspace_root.clone());
         // The handshake set `default`; a `status` it emitted (mapped from `early_lines`) is not
         // drift.
         mapper.set_expected_mode("default");
-        if let Some(window) = handshake.context_window {
-            let update = ThreadUpdate::ContextWindowRestored {
-                model: resumed_model
-                    .clone()
-                    .unwrap_or_else(|| opts.initial_model.clone()),
-                context_window: window,
-            };
-            if let Err(error) = opts.updates.send(update) {
-                let why = match error {
-                    ThreadUpdateSendError::Full(_) => "full",
-                    ThreadUpdateSendError::Closed(_) => "closed",
-                };
-                debug!(
-                    thread_id = %opts.thread,
-                    action = "context_window_restored",
-                    why,
-                    "the thread update sink did not take the restored window"
-                );
-            }
+        if let Some(window) = spawned.handshake.context_window {
+            let model = resumed_model
+                .clone()
+                .unwrap_or_else(|| opts.initial_model.clone());
+            send_context_window(&opts, model, window);
             mapper.note_context_window(window);
         }
 
-        let log = Arc::new(EventLog::new());
-        let (commands, receiver) = mpsc::channel(COMMAND_QUEUE);
-        let generation = self.generations.fetch_add(1, Ordering::Relaxed);
         let open_model = resumed_model
             .clone()
             .unwrap_or_else(|| opts.initial_model.clone());
-        // Decided under the lock so a concurrent `shutdown` either sees this child or refuses it.
-        let registered: Result<usize, (HarnessError, Box<dyn ClaudeChild>)> = {
-            let mut children = lock(&self.children);
-            if *self.shutdown_tx.borrow() {
-                Err((
-                    HarnessError::Transport("Claude Code harness is shut down".into()),
-                    child,
-                ))
-            } else {
-                match children.entry(opts.thread) {
-                    Entry::Occupied(_) => Err((
-                        HarnessError::Protocol(format!(
-                            "thread {} was opened concurrently",
-                            opts.thread
-                        )),
-                        child,
-                    )),
-                    Entry::Vacant(slot) => {
-                        let task = spawn_supervisor(SupervisorParts {
-                            child,
-                            mapper,
-                            log: log.clone(),
-                            commands: receiver,
-                            shutdown: self.shutdown_tx.subscribe(),
-                            children: self.children.clone(),
-                            pending: self.pending.clone(),
-                            routes: self.routes.clone(),
-                            commands_sender: commands.downgrade(),
-                            generation,
-                            thread: opts.thread,
-                            context: context.clone(),
-                            early_lines: handshake.early_lines,
-                            abandoned_requests: handshake.abandoned_requests,
-                            model: open_model.clone(),
-                        });
-                        slot.insert(ChildHandle {
-                            harness_thread_id: session_id.clone(),
-                            log,
-                            commands,
-                            task,
-                            model: open_model,
-                            launch_mode,
-                            generation,
-                        });
-                        Ok(children.len())
-                    }
-                }
-            }
-        };
-        let live_children = match registered {
-            Ok(live_children) => live_children,
-            Err((error, mut child)) => {
-                warn!(
-                    thread_id = %opts.thread,
-                    harness_thread_id = %session_id,
-                    action = "thread_opened",
-                    error = %error,
-                    "discarding a freshly opened claude child"
-                );
-                reap(child.as_mut()).await;
-                return Err(error);
-            }
-        };
+        if let Err(refused) =
+            self.register_child(&target, &session_id, spawned, mapper, open_model, false)
+        {
+            let Refused {
+                error, mut child, ..
+            } = *refused;
+            warn!(
+                thread_id = %opts.thread,
+                harness_thread_id = %session_id,
+                action = "thread_opened",
+                error = %error,
+                "discarding a freshly opened claude child"
+            );
+            reap(child.as_mut()).await;
+            return Err(error);
+        }
         info!(
             project_id = display_opt(self.launch.project_id),
             harness = display_opt(self.launch.declaration.as_deref()),
@@ -1478,7 +1947,8 @@ impl AgentHarness for ClaudeHarness {
             resume = resuming,
             resume_fallback = warning.is_some(),
             launch_mode = launch_mode.as_str(),
-            live_children,
+            live_children = self.live_children(),
+            loaded_threads = self.loaded_threads(),
             "Claude Code thread opened"
         );
         let mut handle = ThreadHandle::opened(opts.thread, session_id, opts.workspace_root);
@@ -1567,8 +2037,11 @@ impl AgentHarness for ClaudeHarness {
     }
 
     fn subscribe(&self, thread: &ThreadHandle) -> AgentEventStream {
-        if let Some(handle) = lock(&self.children).get(&thread.thread) {
-            return AgentEventStream::new(handle.log.reader());
+        if let Some(log) = lock(&self.threads)
+            .get(&thread.thread)
+            .map(|entry| entry.log.clone())
+        {
+            return AgentEventStream::new(log.reader());
         }
         match lock(&self.routes).get(&thread.thread) {
             Some(route) => AgentEventStream::new(route.log.reader()),
@@ -1627,9 +2100,20 @@ impl AgentHarness for ClaudeHarness {
         if is_task_native_id(&thread.harness_thread_id) {
             return self.interrupt_route(thread).await;
         }
-        let LiveChild { commands, .. } = self
-            .live(thread.thread)
+        let child = lock(&self.threads)
+            .get(&thread.thread)
+            .map(|entry| entry.child.as_ref().map(|child| child.commands.clone()))
             .ok_or(HarnessError::ThreadNotFound(thread.thread))?;
+        let Some(commands) = child else {
+            // Reaped: the trait's contract is "interrupt the active turn", and there is none.
+            debug!(
+                thread_id = %thread.thread,
+                harness_thread_id = %thread.harness_thread_id,
+                action = "interrupt",
+                "no live claude child; nothing to interrupt"
+            );
+            return Ok(());
+        };
         self.call(
             thread.thread,
             commands,
@@ -1646,78 +2130,15 @@ impl AgentHarness for ClaudeHarness {
         input: UserInput,
         overrides: TurnOverrides,
     ) -> Result<TurnId, HarnessError> {
-        let live = self
-            .live(thread.thread)
-            .ok_or(HarnessError::ThreadNotFound(thread.thread))?;
-        let mode = turn_mode(&overrides);
-        if mode == "bypassPermissions" && live.launch_mode == LaunchMode::Standard {
-            // `bypassPermissions` is a launch-time capability: the CLI refuses to set it on a
-            // child launched without it.
-            let why = lock(&self.bypass_refused).clone().map_or_else(
-                || "the child was not launched in that mode".to_owned(),
-                |sentence| {
-                    format!("Claude Code refused to start in bypassPermissions mode ({sentence})")
-                },
-            );
-            warn!(
-                thread_id = %thread.thread,
-                harness_thread_id = %thread.harness_thread_id,
-                action = "start_turn",
-                mode,
-                launch_mode = live.launch_mode.as_str(),
-                "refusing a full_access turn on a child that cannot bypass permissions"
-            );
-            return Err(HarnessError::Unsupported(format!(
-                "full_access is not available: {why}"
-            )));
-        }
-        let model = overrides.model.clone().unwrap_or(live.model);
-        let resolved_model = self
-            .catalog_snapshot()
-            .and_then(|snapshot| snapshot.resolved_model(&model.model).map(str::to_owned));
-        let settings = TurnSettings {
-            mode: mode.to_owned(),
-            model: Some(model.model.clone()),
-            effort: model
-                .reasoning_effort
-                .as_ref()
-                .map(|effort| effort.0.clone()),
-            resolved_model,
-        };
         let UserInput::Text { text, attachments } = input;
         let line = user_message_line(&text, &attachments)?;
-        let turn = TurnId::new();
-        self.call(
-            thread.thread,
-            live.commands,
-            "start_turn",
-            START_TURN_TIMEOUT,
-            |reply| ChildCommand::StartTurn {
-                line,
-                turn,
-                model,
-                settings,
-                notice: None,
-                reply,
-            },
-        )
-        .await?;
-        Ok(turn)
+        let attempt = self.ensure_child(thread.thread).await?;
+        self.start_turn_on(thread, attempt, line, overrides).await
     }
 
     async fn compact_thread(&self, thread: &ThreadHandle) -> Result<(), HarnessError> {
-        let LiveChild { commands, .. } = self
-            .live(thread.thread)
-            .ok_or(HarnessError::ThreadNotFound(thread.thread))?;
-        let turn = TurnId::new();
-        self.call(
-            thread.thread,
-            commands,
-            "compact",
-            CONTROL_TIMEOUT,
-            |reply| ChildCommand::Compact { turn, reply },
-        )
-        .await
+        let attempt = self.ensure_child(thread.thread).await?;
+        self.compact_on(thread, attempt).await
     }
 
     async fn respond_approval(
@@ -1857,15 +2278,19 @@ mod tests {
     }
 
     fn harness(children: Vec<ScriptedChild>) -> (Arc<ClaudeHarness>, Arc<ScriptedSpawner>) {
+        harness_with(ClaudeLaunchOptions::default(), children)
+    }
+
+    fn harness_with(
+        launch: ClaudeLaunchOptions,
+        children: Vec<ScriptedChild>,
+    ) -> (Arc<ClaudeHarness>, Arc<ScriptedSpawner>) {
         let spawner = Arc::new(ScriptedSpawner {
             children: Mutex::new(children.into()),
             argv: Mutex::default(),
         });
-        let harness = ClaudeHarness::with_spawner(
-            PathBuf::from(WORKSPACE),
-            ClaudeLaunchOptions::default(),
-            spawner.clone(),
-        );
+        let harness =
+            ClaudeHarness::with_spawner(PathBuf::from(WORKSPACE), launch, spawner.clone());
         (harness, spawner)
     }
 
@@ -2543,7 +2968,7 @@ mod tests {
         let thread = ThreadId::new();
         let (options, _updates) = open_options(thread, None, "sonnet");
         let handle = harness.open_thread(options).await.unwrap();
-        lock(&harness.children).get(&thread).unwrap().log.close();
+        lock(&harness.threads).get(&thread).unwrap().log.close();
         harness
             .start_turn(&handle, text("go"), overrides())
             .await
@@ -3610,7 +4035,19 @@ mod tests {
         AgentEventStream,
         ApprovalId,
     ) {
-        let (harness, _) = harness(vec![child]);
+        ask_pending_with(ClaudeLaunchOptions::default(), child).await
+    }
+
+    async fn ask_pending_with(
+        launch: ClaudeLaunchOptions,
+        child: ScriptedChild,
+    ) -> (
+        Arc<ClaudeHarness>,
+        ThreadHandle,
+        AgentEventStream,
+        ApprovalId,
+    ) {
+        let (harness, _) = harness_with(launch, vec![child]);
         let (options, _updates) = open_options(ThreadId::new(), None, "sonnet");
         let handle = harness.open_thread(options).await.unwrap();
         let mut stream = harness.subscribe(&handle);
@@ -4722,11 +5159,7 @@ mod tests {
             .start_turn(&handle, text("go"), overrides())
             .await
             .unwrap();
-        let commands = lock(&harness.children)
-            .get(&handle.thread)
-            .unwrap()
-            .commands
-            .clone();
+        let commands = harness.live(handle.thread).unwrap().commands;
         let started = Instant::now();
         let (deleted, refused) = tokio::join!(harness.delete_thread(&handle), async {
             tokio::time::sleep(Duration::from_millis(100)).await;
@@ -4768,11 +5201,7 @@ mod tests {
         let (harness, _) = harness(vec![child.ignoring_eof()]);
         let (options, _updates) = open_options(ThreadId::new(), None, "sonnet");
         let handle = harness.open_thread(options).await.unwrap();
-        let commands = lock(&harness.children)
-            .get(&handle.thread)
-            .unwrap()
-            .commands
-            .clone();
+        let commands = harness.live(handle.thread).unwrap().commands;
         let (first, done_first) = oneshot::channel();
         let (second, done_second) = oneshot::channel();
         commands
@@ -5266,6 +5695,13 @@ mod tests {
     // ---- the real process path (tests/fake-claude.sh) ------------------------------------------
 
     fn real_harness(env: &[(&str, &str)]) -> (Arc<ClaudeHarness>, tempfile::TempDir) {
+        real_harness_with(env, None)
+    }
+
+    fn real_harness_with(
+        env: &[(&str, &str)],
+        idle_timeout: Option<Duration>,
+    ) -> (Arc<ClaudeHarness>, tempfile::TempDir) {
         let workspace = tempfile::tempdir().unwrap();
         let harness = ClaudeHarness::new(
             workspace.path().to_path_buf(),
@@ -5275,6 +5711,7 @@ mod tests {
                     env.iter()
                         .map(|(name, value)| ((*name).to_owned(), (*value).to_owned())),
                 ),
+                idle_timeout,
                 ..ClaudeLaunchOptions::default()
             },
         );
@@ -5538,6 +5975,22 @@ mod tests {
         Arc<Mutex<ScriptRecord>>,
         crate::session::tests::Injector,
     ) {
+        delegating_with(ClaudeLaunchOptions::default(), fixture, count, rest).await
+    }
+
+    async fn delegating_with(
+        launch: ClaudeLaunchOptions,
+        fixture: &'static str,
+        count: usize,
+        rest: Vec<Step>,
+    ) -> (
+        Arc<ClaudeHarness>,
+        ThreadHandle,
+        AgentEventStream,
+        ThreadHandle,
+        Arc<Mutex<ScriptRecord>>,
+        crate::session::tests::Injector,
+    ) {
         let mut steps = vec![Step::OnStdin(
             user(),
             vec![Action::EmitFixturePrefix {
@@ -5548,7 +6001,7 @@ mod tests {
         steps.extend(rest);
         let (child, record) = scripted(handshake_steps("sonnet"), steps);
         let injector = child.injector();
-        let (harness, _) = harness(vec![child]);
+        let (harness, _) = harness_with(launch, vec![child]);
         let (options, _updates) = open_options(ThreadId::new(), None, "sonnet");
         let handle = harness.open_thread(options).await.unwrap();
         let mut stream = harness.subscribe(&handle);
@@ -5926,5 +6379,631 @@ mod tests {
                 .await,
             Err(HarnessError::Transport(_))
         ));
+    }
+
+    // ---- milestone 6: idle reaping and lazy respawn --------------------------------------------
+
+    const IDLE: Duration = Duration::from_secs(60);
+
+    fn reaping() -> ClaudeLaunchOptions {
+        ClaudeLaunchOptions {
+            idle_timeout: Some(IDLE),
+            ..ClaudeLaunchOptions::default()
+        }
+    }
+
+    /// The handshake of a `--resume` child: the open's, then `get_context_usage`.
+    fn resume_steps(applied: &str) -> Vec<Step> {
+        let mut steps = handshake_steps(applied);
+        steps.push(Step::OnStdin(
+            control("get_context_usage"),
+            vec![Action::Respond(json!({
+                "totalTokens": 12000, "maxTokens": 200000, "rawMaxTokens": 200000,
+                "percentage": 6, "categories": []
+            }))],
+        ));
+        steps
+    }
+
+    /// A session child that answers its handshake and runs one text turn.
+    fn one_turn_child(steps: Vec<Step>) -> (ScriptedChild, Arc<Mutex<ScriptRecord>>) {
+        scripted(steps, vec![Step::OnStdin(user(), vec![text_turn()])])
+    }
+
+    /// Wait until the child's stdin closed and no thread has a child, then let the supervisor
+    /// finish its exit handling.
+    async fn reaped(harness: &ClaudeHarness, record: &Arc<Mutex<ScriptRecord>>) {
+        for _ in 0..1000 {
+            if lock(record).stdin_closed && harness.live_children() == 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        panic!("the child was never reaped");
+    }
+
+    fn thread_log(harness: &ClaudeHarness, thread: ThreadId) -> Arc<EventLog> {
+        lock(&harness.threads).get(&thread).unwrap().log.clone()
+    }
+
+    fn turns_started(events: &[AgentEvent]) -> Vec<TurnId> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                AgentEvent::TurnStarted { turn, .. } => Some(*turn),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn has_arg_pair(argv: &[String], flag: &str, value: &str) -> bool {
+        argv.windows(2)
+            .any(|pair| pair[0] == flag && pair[1] == value)
+    }
+
+    #[tokio::test(start_paused = true)]
+    #[traced_test]
+    async fn an_idle_child_is_reaped_after_the_timeout() {
+        let (child, record) = one_turn_child(handshake_steps("sonnet"));
+        let (harness, _) = harness_with(reaping(), vec![child]);
+        let thread = ThreadId::new();
+        let (options, _updates) = open_options(thread, None, "sonnet");
+        let handle = harness.open_thread(options).await.unwrap();
+        let mut stream = harness.subscribe(&handle);
+        harness
+            .start_turn(&handle, text("pong?"), overrides())
+            .await
+            .unwrap();
+        until_completed(&mut stream).await;
+
+        tokio::time::sleep(IDLE).await;
+        reaped(&harness, &record).await;
+        assert!(!lock(&record).killed, "the CLI exited 0 at EOF");
+        assert_eq!(harness.live_children(), 0);
+        assert_eq!(harness.loaded_threads(), 1);
+        assert!(!thread_log(&harness, thread).is_closed());
+        assert!(
+            stream.try_recv().is_none(),
+            "the stream stays open and silent"
+        );
+        logs_assert(a_line_with(&[
+            "action=\"idle\"",
+            "idle=true",
+            "timeout_ms=60000",
+        ]));
+        logs_assert(a_line_with(&[
+            "INFO",
+            "action=\"child_reaped\"",
+            "live_children=0",
+            "loaded_threads=1",
+        ]));
+        logs_assert(a_line_with(&[
+            "INFO",
+            "action=\"child_exited\"",
+            "reaped=true",
+            "requested=true",
+        ]));
+        harness.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_turn_resets_the_idle_clock() {
+        let (child, record) = scripted(
+            handshake_steps("sonnet"),
+            vec![Step::OnStdin(user(), vec![text_turn()])],
+        );
+        let (harness, _) = harness_with(reaping(), vec![child]);
+        let (options, _updates) = open_options(ThreadId::new(), None, "sonnet");
+        let handle = harness.open_thread(options).await.unwrap();
+        let mut stream = harness.subscribe(&handle);
+
+        tokio::time::sleep(IDLE - Duration::from_secs(1)).await;
+        assert_eq!(harness.live_children(), 1);
+        harness
+            .start_turn(&handle, text("pong?"), overrides())
+            .await
+            .unwrap();
+        until_completed(&mut stream).await;
+        tokio::time::sleep(IDLE - Duration::from_secs(1)).await;
+        assert_eq!(harness.live_children(), 1, "the turn restarted the clock");
+        assert!(!lock(&record).stdin_closed);
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        reaped(&harness, &record).await;
+        harness.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    #[traced_test]
+    async fn a_pending_ask_prevents_reaping() {
+        let (child, record) = asking("tool-allowed");
+        let (harness, _handle, mut stream, approval) = ask_pending_with(reaping(), child).await;
+        tokio::time::sleep(2 * IDLE).await;
+        assert_eq!(harness.live_children(), 1);
+        assert!(!lock(&record).stdin_closed);
+        logs_assert(a_line_with(&[
+            "action=\"idle\"",
+            "idle=false",
+            "reason=\"asks\"",
+        ]));
+
+        harness
+            .respond_approval(approval, ApprovalDecision::Accept)
+            .await
+            .unwrap();
+        until_completed(&mut stream).await;
+        tokio::time::sleep(IDLE).await;
+        reaped(&harness, &record).await;
+        harness.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    #[traced_test]
+    async fn an_open_background_task_prevents_reaping() {
+        let lines = fixture_lines("background-bash");
+        let result = lines
+            .iter()
+            .position(|line| line.contains("\"type\": \"result\""))
+            .unwrap();
+        let terminal = lines
+            .iter()
+            .position(|line| line.contains("\"subtype\": \"task_updated\""))
+            .unwrap();
+        assert!(terminal > result, "the shell outlives its turn");
+        let (child, record) = scripted(
+            handshake_steps("sonnet"),
+            vec![Step::OnStdin(
+                user(),
+                vec![Action::EmitFixturePrefix {
+                    name: "background-bash",
+                    count: result + 1,
+                }],
+            )],
+        );
+        let injector = child.injector();
+        let (harness, _) = harness_with(reaping(), vec![child]);
+        let (options, _updates) = open_options(ThreadId::new(), None, "sonnet");
+        let handle = harness.open_thread(options).await.unwrap();
+        let mut stream = harness.subscribe(&handle);
+        harness
+            .start_turn(&handle, text("sleep in the background"), overrides())
+            .await
+            .unwrap();
+        until_completed(&mut stream).await;
+
+        tokio::time::sleep(2 * IDLE).await;
+        assert_eq!(harness.live_children(), 1);
+        logs_assert(a_line_with(&[
+            "action=\"idle\"",
+            "idle=false",
+            "reason=\"tasks\"",
+            "open_tasks=1",
+        ]));
+
+        for line in &lines[result + 1..=terminal] {
+            injector.emit(line.clone());
+        }
+        tokio::time::sleep(IDLE).await;
+        reaped(&harness, &record).await;
+        harness.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_live_sub_agent_route_prevents_reaping() {
+        let lines = fixture_lines("delegation");
+        let terminal = lines
+            .iter()
+            .position(|line| line.contains("\"subtype\": \"task_updated\""))
+            .unwrap();
+        let (harness, _handle, mut stream, route, record, injector) =
+            delegating_with(reaping(), "delegation", terminal, Vec::new()).await;
+        tokio::time::sleep(2 * IDLE).await;
+        assert_eq!(harness.live_children(), 1);
+        assert!(!lock(&record).stdin_closed);
+
+        for line in &lines[terminal..] {
+            injector.emit(line.clone());
+        }
+        until_completed(&mut stream).await;
+        tokio::time::sleep(IDLE).await;
+        reaped(&harness, &record).await;
+        assert!(matches!(
+            harness.interrupt(&route).await,
+            Err(HarnessError::Unsupported(message)) if message.contains("no longer running")
+        ));
+        assert!(
+            !lock(&harness.routes)
+                .get(&route.thread)
+                .unwrap()
+                .log
+                .is_closed()
+        );
+        harness.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_reaped_thread_respawns_with_resume_on_the_next_turn() {
+        // The first child switches to opus on its turn; the respawn launches on opus.
+        let (first, first_record) = scripted(
+            handshake_steps("sonnet"),
+            vec![
+                Step::OnStdin(control("set_model"), vec![Action::Respond(Value::Null)]),
+                Step::OnStdin(
+                    control("get_settings"),
+                    vec![Action::Respond(settings("opus"))],
+                ),
+                Step::OnStdin(user(), vec![text_turn()]),
+            ],
+        );
+        let (second, second_record) = one_turn_child(resume_steps("opus"));
+        let (harness, spawner) = harness_with(reaping(), vec![first, second]);
+        let thread = ThreadId::new();
+        let (options, _updates) = open_options(thread, None, "sonnet");
+        let handle = harness.open_thread(options).await.unwrap();
+        let mut stream = harness.subscribe(&handle);
+        harness
+            .start_turn(&handle, text("pong?"), opus_turn())
+            .await
+            .unwrap();
+        until_completed(&mut stream).await;
+        tokio::time::sleep(IDLE).await;
+        reaped(&harness, &first_record).await;
+
+        let turn = harness
+            .start_turn(&handle, text("again"), overrides())
+            .await
+            .unwrap();
+        let spawns = spawner.spawns();
+        assert_eq!(spawns.len(), 2);
+        assert!(has_arg_pair(
+            &spawns[1],
+            "--resume",
+            &handle.harness_thread_id
+        ));
+        assert!(has_arg_pair(&spawns[1], "--model", "opus"));
+        assert!(subtypes_written(&second_record).contains(&"get_context_usage".to_owned()));
+        assert_eq!(harness.live_children(), 1);
+
+        // The same reader sees the second turn.
+        let events = until_completed(&mut stream).await;
+        assert_eq!(turns_started(&events), [turn]);
+        assert_eq!(completion(&events).1, TurnStatusKind::Completed);
+        let first_window = events.iter().find_map(|event| match event {
+            AgentEvent::TurnUsageUpdated { context_window, .. } => Some(*context_window),
+            _ => None,
+        });
+        assert_eq!(first_window, Some(Some(200_000)));
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, AgentEvent::Notice { .. }))
+        );
+        harness.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    #[traced_test]
+    async fn a_reaped_thread_whose_transcript_is_gone_starts_fresh_and_notices() {
+        let (first, first_record) = one_turn_child(handshake_steps("sonnet"));
+        let (missing, _) = ScriptedChild::new(vec![Step::OnStdin(
+            control("initialize"),
+            vec![
+                missing_transcript_exit(),
+                Action::Exit {
+                    code: 1,
+                    stderr: vec!["No conversation found with session ID: x".into()],
+                },
+            ],
+        )]);
+        let (fresh, _) = one_turn_child(handshake_steps("sonnet"));
+        let (harness, spawner) = harness_with(reaping(), vec![first, missing, fresh]);
+        let (options, _updates) = open_options(ThreadId::new(), None, "sonnet");
+        let handle = harness.open_thread(options).await.unwrap();
+        let mut stream = harness.subscribe(&handle);
+        tokio::time::sleep(IDLE).await;
+        reaped(&harness, &first_record).await;
+
+        let turn = harness
+            .start_turn(&handle, text("again"), overrides())
+            .await
+            .unwrap();
+        let spawns = spawner.spawns();
+        assert_eq!(spawns.len(), 3);
+        assert!(has_arg_pair(
+            &spawns[1],
+            "--resume",
+            &handle.harness_thread_id
+        ));
+        assert!(has_arg_pair(
+            &spawns[2],
+            "--session-id",
+            &handle.harness_thread_id
+        ));
+        let events = until_completed(&mut stream).await;
+        assert!(matches!(&events[0], AgentEvent::TurnStarted { turn: t, .. } if *t == turn));
+        assert!(
+            matches!(&events[1], AgentEvent::Notice { turn: Some(t), message, .. }
+                if *t == turn && message == RESUME_FAILED_MESSAGE),
+            "{:?}",
+            events[1]
+        );
+        logs_assert(a_line_with(&["WARN", "action=\"claude_resume_failed\""]));
+        logs_assert(a_line_with(&[
+            "INFO",
+            "action=\"respawn\"",
+            "resume_fallback=true",
+        ]));
+        harness.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_failed_respawn_fails_the_turn_and_keeps_the_thread() {
+        let (first, first_record) = one_turn_child(handshake_steps("sonnet"));
+        let (unauthenticated, _) = ScriptedChild::new(vec![Step::OnStdin(
+            control("initialize"),
+            vec![Action::Exit {
+                code: 1,
+                stderr: vec!["Invalid API key · Please run /login".into()],
+            }],
+        )]);
+        let (third, _) = one_turn_child(resume_steps("sonnet"));
+        let (harness, spawner) = harness_with(reaping(), vec![first, unauthenticated, third]);
+        let thread = ThreadId::new();
+        let (options, _updates) = open_options(thread, None, "sonnet");
+        let handle = harness.open_thread(options).await.unwrap();
+        let mut stream = harness.subscribe(&handle);
+        tokio::time::sleep(IDLE).await;
+        reaped(&harness, &first_record).await;
+
+        assert!(matches!(
+            harness
+                .start_turn(&handle, text("again"), overrides())
+                .await,
+            Err(HarnessError::Unauthenticated)
+        ));
+        assert_eq!(harness.loaded_threads(), 1);
+        assert!(!thread_log(&harness, thread).is_closed());
+        assert!(stream.try_recv().is_none());
+
+        let turn = harness
+            .start_turn(&handle, text("once more"), overrides())
+            .await
+            .unwrap();
+        assert_eq!(spawner.spawns().len(), 3);
+        let events = until_completed(&mut stream).await;
+        assert_eq!(completion(&events).0, turn);
+        harness.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    #[traced_test]
+    async fn a_turn_that_lands_in_the_reap_window_runs_on_a_fresh_child() {
+        // The first child ignores EOF, so its reap drains for the whole exit grace.
+        let (first, first_record) = scripted(handshake_steps("sonnet"), Vec::new());
+        let (second, _) = one_turn_child(resume_steps("sonnet"));
+        let (harness, _) = harness_with(reaping(), vec![first.ignoring_eof(), second]);
+        let thread = ThreadId::new();
+        let (options, _updates) = open_options(thread, None, "sonnet");
+        let handle = harness.open_thread(options).await.unwrap();
+        let mut stream = harness.subscribe(&handle);
+        // A caller that looked the child up before the reap took it.
+        let stale = harness.live(thread).unwrap();
+        tokio::time::sleep(IDLE).await;
+        reaped(&harness, &first_record).await;
+        assert!(!lock(&first_record).killed, "still draining");
+
+        let line = user_message_line("go", &[]).unwrap();
+        let turn = harness
+            .start_turn_on(&handle, Respawned::already_live(stale), line, overrides())
+            .await
+            .unwrap();
+        let events = until_completed(&mut stream).await;
+        assert_eq!(turns_started(&events), [turn]);
+        assert_eq!(completion(&events).1, TurnStatusKind::Completed);
+        tokio::time::sleep(STOP_EXIT_GRACE).await;
+        assert!(lock(&first_record).killed);
+        assert!(logs_contain("reaped under the hand-off; respawning"));
+        logs_assert(a_line_with(&["action=\"stop_kill\"", "reason=\"idle\""]));
+        logs_assert(a_line_with(&[
+            "action=\"stop_refused\"",
+            "command=\"start_turn\"",
+        ]));
+        harness.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_reaped_thread_is_interrupted_and_renamed_as_no_ops() {
+        let (child, record) = scripted(handshake_steps("sonnet"), Vec::new());
+        let (harness, spawner) = harness_with(reaping(), vec![child]);
+        let (options, _updates) = open_options(ThreadId::new(), None, "sonnet");
+        let handle = harness.open_thread(options).await.unwrap();
+        tokio::time::sleep(IDLE).await;
+        reaped(&harness, &record).await;
+        let before = lock(&record).written.len();
+        harness.interrupt(&handle).await.unwrap();
+        harness.set_thread_name(&handle, "named").await.unwrap();
+        assert_eq!(spawner.spawns().len(), 1, "nothing respawned");
+        assert_eq!(lock(&record).written.len(), before);
+        assert_eq!(harness.live_children(), 0);
+        harness.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    #[traced_test]
+    async fn deleting_or_archiving_a_reaped_thread_closes_its_stream() {
+        let (archived_child, archived_record) = scripted(handshake_steps("sonnet"), Vec::new());
+        let (deleted_child, deleted_record) = scripted(handshake_steps("sonnet"), Vec::new());
+        let (reopened, _) = scripted(resume_steps("sonnet"), Vec::new());
+        let (harness, spawner) =
+            harness_with(reaping(), vec![archived_child, deleted_child, reopened]);
+        let (options, _updates) = open_options(ThreadId::new(), None, "sonnet");
+        let archived = harness.open_thread(options).await.unwrap();
+        let (options, _updates) = open_options(ThreadId::new(), None, "sonnet");
+        let deleted = harness.open_thread(options).await.unwrap();
+        let mut archived_stream = harness.subscribe(&archived);
+        let mut deleted_stream = harness.subscribe(&deleted);
+        tokio::time::sleep(IDLE).await;
+        reaped(&harness, &archived_record).await;
+        reaped(&harness, &deleted_record).await;
+
+        harness.set_thread_archived(&archived, true).await.unwrap();
+        harness.delete_thread(&deleted).await.unwrap();
+        assert!(until_closed(&mut archived_stream).await.is_empty());
+        assert!(until_closed(&mut deleted_stream).await.is_empty());
+        assert_eq!(harness.loaded_threads(), 0);
+        assert_eq!(spawner.spawns().len(), 2, "nothing respawned");
+        logs_assert(lines_with(
+            2,
+            &["no live claude child; the thread's log is closed"],
+        ));
+
+        // The entry is gone: opening the thread again spawns anew.
+        let (options, _updates) =
+            open_options(deleted.thread, Some(&deleted.harness_thread_id), "sonnet");
+        harness.open_thread(options).await.unwrap();
+        assert_eq!(spawner.spawns().len(), 3);
+        harness.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    #[traced_test]
+    async fn shutdown_closes_reaped_threads() {
+        let (reaped_child, reaped_record) = scripted(handshake_steps("sonnet"), Vec::new());
+        let (live_child, _) = scripted(handshake_steps("sonnet"), Vec::new());
+        let (harness, _) = harness_with(reaping(), vec![reaped_child, live_child]);
+        let (options, _updates) = open_options(ThreadId::new(), None, "sonnet");
+        let first = harness.open_thread(options).await.unwrap();
+        let mut first_stream = harness.subscribe(&first);
+        tokio::time::sleep(IDLE).await;
+        reaped(&harness, &reaped_record).await;
+        let (options, _updates) = open_options(ThreadId::new(), None, "sonnet");
+        let second = harness.open_thread(options).await.unwrap();
+        let mut second_stream = harness.subscribe(&second);
+        assert_eq!(harness.live_children(), 1);
+        assert_eq!(harness.loaded_threads(), 2);
+
+        harness.shutdown().await.unwrap();
+        until_closed(&mut first_stream).await;
+        until_closed(&mut second_stream).await;
+        logs_assert(a_line_with(&[
+            "action=\"shutdown\"",
+            "children_stopped=1",
+            "threads_closed=2",
+        ]));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn open_thread_on_a_reaped_thread_respawns_eagerly() {
+        let (first, first_record) = scripted(handshake_steps("sonnet"), Vec::new());
+        let (second, _) = scripted(resume_steps("sonnet"), Vec::new());
+        let (harness, spawner) = harness_with(reaping(), vec![first, second]);
+        let thread = ThreadId::new();
+        let (options, _updates) = open_options(thread, None, "sonnet");
+        let handle = harness.open_thread(options).await.unwrap();
+        tokio::time::sleep(IDLE).await;
+        reaped(&harness, &first_record).await;
+
+        let (options, mut updates) =
+            open_options(thread, Some(&handle.harness_thread_id), "sonnet");
+        let again = harness.open_thread(options).await.unwrap();
+        assert_eq!(again.harness_thread_id, handle.harness_thread_id);
+        assert_eq!(again.resumed_model, Some(model("sonnet")));
+        assert!(again.warning.is_none());
+        assert_eq!(
+            updates.recv().await,
+            Some(ThreadUpdate::ContextWindowRestored {
+                model: model("sonnet"),
+                context_window: 200_000,
+            })
+        );
+        assert!(has_arg_pair(
+            &spawner.spawns()[1],
+            "--resume",
+            &handle.harness_thread_id
+        ));
+        assert_eq!(harness.live_children(), 1);
+        harness.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn idle_timeout_none_never_reaps() {
+        let (child, record) = scripted(handshake_steps("sonnet"), Vec::new());
+        let (harness, _) = harness(vec![child]);
+        let (options, _updates) = open_options(ThreadId::new(), None, "sonnet");
+        harness.open_thread(options).await.unwrap();
+        tokio::time::sleep(Duration::from_secs(24 * 3600)).await;
+        assert_eq!(harness.live_children(), 1);
+        assert!(!lock(&record).stdin_closed);
+        harness.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn list_mcp_servers_hinting_a_reaped_thread_probes() {
+        let (session, record) = scripted(handshake_steps("sonnet"), Vec::new());
+        let (probe, _) = mcp_probe_child(Action::Respond(json!({"mcpServers": []})));
+        let (harness, spawner) = harness_with(reaping(), vec![session, probe]);
+        let (options, _updates) = open_options(ThreadId::new(), None, "sonnet");
+        let handle = harness.open_thread(options).await.unwrap();
+        tokio::time::sleep(IDLE).await;
+        reaped(&harness, &record).await;
+
+        assert!(
+            harness
+                .list_mcp_servers(Some(&handle))
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let spawns = spawner.spawns();
+        assert_eq!(spawns.len(), 2);
+        assert_eq!(spawns[1], crate::process::probe_argv(&reaping()));
+        assert_eq!(harness.live_children(), 0, "no respawn for a status read");
+        harness.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    #[traced_test]
+    async fn an_idle_fake_claude_is_reaped_and_resumed() {
+        let (harness, workspace) = real_harness_with(
+            &[("FAKE_CLAUDE_RESUME_OK", "1")],
+            Some(Duration::from_secs(1)),
+        );
+        let (options, _updates) = real_options(&workspace, None);
+        let handle = harness.open_thread(options).await.unwrap();
+        let mut stream = harness.subscribe(&handle);
+        let first = harness
+            .start_turn(&handle, text("pong?"), overrides())
+            .await
+            .unwrap();
+        assert_eq!(completion(&until_completed(&mut stream).await).0, first);
+
+        until_no_children(&harness).await;
+        assert_eq!(harness.loaded_threads(), 1);
+        for _ in 0..500 {
+            if logs_contain("reaped=true") {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        logs_assert(a_line_with(&[
+            "INFO",
+            "action=\"child_exited\"",
+            "reaped=true",
+            "exit_code=0",
+        ]));
+
+        let second = harness
+            .start_turn(&handle, text("pong again?"), overrides())
+            .await
+            .unwrap();
+        let events = until_completed(&mut stream).await;
+        assert_eq!(turns_started(&events), [second]);
+        assert_eq!(completion(&events).1, TurnStatusKind::Completed);
+        logs_assert(a_line_with(&[
+            "action=\"respawn\"",
+            "resume_fallback=false",
+        ]));
+        harness.shutdown().await.unwrap();
+        assert!(matches!(stream.recv().await, Err(EventStreamError::Closed)));
     }
 }

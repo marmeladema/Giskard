@@ -32,6 +32,11 @@ pub(crate) const STDERR_LINE_PREVIEW: usize = 400;
 const STDERR_DRAIN_GRACE: Duration = Duration::from_secs(2);
 /// The binary run when the declaration names none.
 const DEFAULT_COMMAND: &str = "claude";
+/// How long a thread's child may sit idle before it is reaped, when the declaration does not say
+/// (`idle_shutdown_secs`). A judgment, not a measurement: long enough that a user reading an answer
+/// and replying does not pay a respawn, short enough that a dozen idle threads do not hold
+/// gigabytes for an hour.
+pub const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(600);
 
 /// How to launch this instance's children (the declaration's neutral keys plus logging context).
 #[derive(Debug, Clone, Default)]
@@ -46,6 +51,9 @@ pub struct ClaudeLaunchOptions {
     pub project_id: Option<ProjectId>,
     /// The `[harnesses.<name>]` key this instance comes from. Only reported on log lines.
     pub declaration: Option<String>,
+    /// Reap a thread's child idle this long; it is respawned with `--resume` on the thread's
+    /// next turn. `None` never reaps.
+    pub idle_timeout: Option<Duration>,
 }
 
 impl ClaudeLaunchOptions {

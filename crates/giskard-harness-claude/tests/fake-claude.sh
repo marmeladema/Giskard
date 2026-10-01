@@ -3,7 +3,8 @@
 # adapter's real-process tests. It replays the recorded fixtures next to it and needs only `sh`,
 # `sed`, `grep`, `cut` and `cat`. Behaviour by argv and environment:
 #
-# - `--resume <id>`: the missing-transcript failure (stderr sentence, the recorded result, exit 1).
+# - `--resume <id>`: the missing-transcript failure (stderr sentence, the recorded result, exit 1);
+#   with `FAKE_CLAUDE_RESUME_OK=1`, a successful resume that behaves as a fresh child.
 # - `--permission-mode bogus`: the commander usage error, exit 1.
 # - `--permission-mode bypassPermissions` with `FAKE_CLAUDE_REFUSE_BYPASS=1`: the root refusal
 #   sentence on stderr, exit 1.
@@ -63,7 +64,7 @@ ask_line=$(grep -n '"type": "control_request"' "$fixtures/tool-allowed.out.jsonl
 effort="null"
 asked=""
 
-if [ -n "$resume" ]; then
+if [ -n "$resume" ] && [ -z "$FAKE_CLAUDE_RESUME_OK" ]; then
     echo "No conversation found with session ID: $resume" >&2
     cat "$fixtures/resume-missing.out.jsonl"
     exit 1

@@ -2443,8 +2443,9 @@ structured diff (`DiffUpdated`), and no `item/tool/call` analogue.
 - **Codex** transport: **stdio** (newline-delimited JSON-RPC), the stable/production transport. The
   WebSocket transport is not used in v1 (it is for remote, which is out of scope).
 - **Lazy spawn:** the process starts on first interaction with the project, not at app boot.
-- **Idle shutdown:** not implemented. `docs/multi-harness-design.md` lists it as an open
-  question, as an instance policy an adapter may apply per process.
+- **Idle shutdown:** Codex: not implemented (`docs/multi-harness-design.md` keeps it as an open
+  question). Claude Code: per process, `idle_shutdown_secs` on the `claude-code` declaration
+  (default 600 s, `0` never); the thread stays open and resumes on its next message.
 - **Server shutdown:** SIGINT and SIGTERM stop HTTP acceptance, allow in-flight requests a bounded
   drain, then shut every project harness down concurrently. Harness shutdown is completion-based:
   the adapter closes its transport before returning, with a bounded timeout for a stuck provider.

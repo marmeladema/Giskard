@@ -560,6 +560,17 @@ impl ClaudeMapper {
         !self.session.routes.is_empty()
     }
 
+    /// Whether any Claude Code task (a sub-agent or a background shell) has started and not yet
+    /// reached a terminal `task_updated`. A `local_bash` task outlives its turn.
+    pub fn has_tasks(&self) -> bool {
+        !self.session.tasks.is_empty()
+    }
+
+    /// How many tasks are open.
+    pub fn open_tasks(&self) -> usize {
+        self.session.tasks.len()
+    }
+
     /// The active turn of `thread`: the primary's, or a sub-agent route's.
     pub fn active_turn_of(&self, thread: ThreadId) -> Option<TurnId> {
         let route = self.route_of_thread(thread)?;
@@ -4214,6 +4225,48 @@ mod tests {
         assert!(responses[0].1["response"]["models"].is_array());
         assert_eq!(responses[1].0, "6bf79889-ef4e-48ef-89e8-51f8d988d387");
         assert!(events(&outputs).is_empty());
+    }
+
+    #[test]
+    fn has_tasks_is_true_from_task_started_to_the_terminal_update() {
+        for (name, kind) in [
+            ("background-bash", "local_bash"),
+            ("delegation", "local_agent"),
+        ] {
+            let lines = out_lines(name);
+            let started = lines
+                .iter()
+                .position(|line| line.contains(r#""subtype": "task_started""#))
+                .unwrap();
+            let terminal = lines
+                .iter()
+                .rposition(|line| line.contains(r#""subtype": "task_updated""#))
+                .unwrap();
+            let mut mapper = new_mapper();
+            assert!(!mapper.has_tasks());
+            drive_lines(&mut mapper, &lines[..started], 1, TurnKind::User, false);
+            assert!(!mapper.has_tasks(), "{kind}: before task_started");
+            drive_lines(
+                &mut mapper,
+                &lines[started..terminal],
+                0,
+                TurnKind::User,
+                false,
+            );
+            assert!(mapper.has_tasks(), "{kind}: after task_started");
+            assert_eq!(mapper.open_tasks(), 1, "{kind}");
+            drive_lines(
+                &mut mapper,
+                &lines[terminal..=terminal],
+                0,
+                TurnKind::User,
+                false,
+            );
+            assert!(
+                !mapper.has_tasks(),
+                "{kind}: after the terminal task_updated"
+            );
+        }
     }
 
     #[test]
