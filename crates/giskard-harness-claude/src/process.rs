@@ -66,11 +66,31 @@ pub(crate) enum SessionFlag {
     Resume(String),
 }
 
+/// The permission mode a session child is launched with: the *ceiling* of what its turns may set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LaunchMode {
+    /// `--permission-mode bypassPermissions`: every preset, `full_access` included, can be set
+    /// per turn. The handshake sets `default` before anything else.
+    Bypass,
+    /// `--permission-mode manual`: the CLI refused a bypass launch; `full_access` is refused.
+    Standard,
+}
+
+impl LaunchMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            LaunchMode::Bypass => "bypass",
+            LaunchMode::Standard => "standard",
+        }
+    }
+}
+
 /// The per-thread part of a session child's argv.
 #[derive(Debug, Clone)]
 pub(crate) struct SessionArgs {
     pub model: ModelRef,
     pub session: SessionFlag,
+    pub launch_mode: LaunchMode,
 }
 
 /// The protocol flags every child carries, session or probe.
@@ -100,7 +120,11 @@ fn protocol_argv() -> Vec<String> {
 /// operator can append to, never override, the protocol flags.
 pub(crate) fn session_argv(options: &ClaudeLaunchOptions, session: &SessionArgs) -> Vec<String> {
     let mut argv = protocol_argv();
-    argv.extend(["--permission-mode".into(), "manual".into()]);
+    let mode = match session.launch_mode {
+        LaunchMode::Bypass => "bypassPermissions",
+        LaunchMode::Standard => "manual",
+    };
+    argv.extend(["--permission-mode".into(), mode.into()]);
     argv.extend(["--model".into(), session.model.model.clone()]);
     if let Some(effort) = &session.model.reasoning_effort {
         argv.extend(["--effort".into(), effort.0.clone()]);
@@ -508,6 +532,9 @@ fn exit_signal(_status: &std::process::ExitStatus) -> Option<i32> {
 pub(crate) enum ExitKind {
     /// `No conversation found with session ID` on stderr or in `result.errors`.
     ResumeMissing,
+    /// The CLI refused `--permission-mode bypassPermissions`: as root, or (best effort, the exact
+    /// sentence is unverified) when settings disable the mode.
+    BypassRefused,
     /// The best-effort authentication match: the unauthenticated shape could not be reproduced,
     /// so this is a substring match on the CLI's own words.
     Unauthenticated,
@@ -515,6 +542,7 @@ pub(crate) enum ExitKind {
 }
 
 const RESUME_MISSING_MARKER: &str = "No conversation found with session ID";
+const BYPASS_ROOT_MARKER: &str = "cannot be used with root/sudo privileges";
 const AUTHENTICATION_MARKERS: &[&str] = &[
     "not logged in",
     "invalid api key",
@@ -527,6 +555,9 @@ pub(crate) fn classify_exit(exit: &ChildExit, last_result_errors: &[String]) -> 
     if texts().any(|text| text.contains(RESUME_MISSING_MARKER)) {
         return ExitKind::ResumeMissing;
     }
+    if texts().any(|text| is_bypass_refusal(text)) {
+        return ExitKind::BypassRefused;
+    }
     if texts().any(|text| {
         let text = text.to_ascii_lowercase();
         AUTHENTICATION_MARKERS
@@ -536,6 +567,24 @@ pub(crate) fn classify_exit(exit: &ChildExit, last_result_errors: &[String]) -> 
         return ExitKind::Unauthenticated;
     }
     ExitKind::Other
+}
+
+fn is_bypass_refusal(text: &str) -> bool {
+    if text.contains(BYPASS_ROOT_MARKER) {
+        return true;
+    }
+    let lower = text.to_ascii_lowercase();
+    lower.contains("bypasspermissions") && lower.contains("disable")
+}
+
+/// The sentence in which the CLI refused a bypass launch, for the `full_access` refusal.
+pub(crate) fn bypass_refused_sentence(exit: &ChildExit, result_errors: &[String]) -> String {
+    exit.stderr_tail
+        .iter()
+        .chain(result_errors)
+        .find(|text| is_bypass_refusal(text))
+        .map(|text| text.trim().to_owned())
+        .unwrap_or_else(|| format!("claude exited with {}", exit.describe()))
 }
 
 /// The sentence that explains a missing transcript, for the resume-fallback notice.
@@ -620,12 +669,13 @@ pub(crate) mod tests {
             &SessionArgs {
                 model: model(None),
                 session: SessionFlag::Fresh("uuid-1".into()),
+                launch_mode: LaunchMode::Bypass,
             },
         );
         let mut expected = strings(PROTOCOL);
         expected.extend(strings(&[
             "--permission-mode",
-            "manual",
+            "bypassPermissions",
             "--model",
             "sonnet",
             "--session-id",
@@ -640,6 +690,7 @@ pub(crate) mod tests {
             &SessionArgs {
                 model: model(Some("high")),
                 session: SessionFlag::Resume("uuid-2".into()),
+                launch_mode: LaunchMode::Standard,
             },
         );
         let mut expected = strings(PROTOCOL);
@@ -685,6 +736,21 @@ pub(crate) mod tests {
         assert_eq!(
             classify_exit(&exit("Error: Session ID x is already in use."), &[]),
             ExitKind::Other
+        );
+        let root = "--dangerously-skip-permissions cannot be used with root/sudo privileges for \
+                    security reasons";
+        assert_eq!(classify_exit(&exit(root), &[]), ExitKind::BypassRefused);
+        assert_eq!(bypass_refused_sentence(&exit(root), &[]), root);
+        assert_eq!(
+            classify_exit(
+                &ChildExit::default(),
+                &["bypassPermissions mode is disabled by your settings".into()]
+            ),
+            ExitKind::BypassRefused
+        );
+        assert_eq!(
+            bypass_refused_sentence(&exit("something else"), &[]),
+            "claude exited with code 1"
         );
         assert_eq!(exit("").describe(), "code 1");
         assert_eq!(

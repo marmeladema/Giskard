@@ -73,15 +73,30 @@ pub enum MapperOutput {
         request_id: String,
         payload: Value,
     },
-    /// An approval the adapter must remember until `respond_approval` (milestone 3).
+    /// An approval the adapter must remember until `respond_approval` answers it.
     PendingApproval {
         id: ApprovalId,
         request_id: String,
         tool_use_id: Option<String>,
+        tool_name: String,
+        /// The ask's raw `permission_suggestions` (`[]` when absent or `null`), kept verbatim so
+        /// `AcceptForSession` can echo its `addRules` entries without retyping them.
+        suggestions: Vec<Value>,
     },
-    /// A server request the adapter must remember until `respond_server_request` (milestone 3).
+    /// A server request the adapter must remember until `respond_server_request` answers it.
     PendingServerRequest {
         id: ServerRequestId,
+        request_id: String,
+        /// `can_use_tool` for an `AskUserQuestion` ask, else the control request's own subtype;
+        /// it selects the answer's shape.
+        subtype: String,
+        /// The ask's `input` (an `AskUserQuestion`'s answer echoes its `questions`); `Null` for
+        /// every other control request.
+        input: Value,
+    },
+    /// The CLI withdrew one of its asks (`control_cancel_request`). The mapper holds no pending
+    /// state, so the adapter looks the request id up.
+    CancelRequest {
         request_id: String,
     },
 }
@@ -112,7 +127,7 @@ struct SessionState {
     model: Option<String>,
     /// The permission mode the CLI last reported, from `init` or `status`.
     permission_mode: Option<String>,
-    /// The permission mode the adapter last set (milestone 3), for drift detection.
+    /// The permission mode the adapter last set, for drift detection.
     expected_mode: Option<String>,
     /// `autocompact_state.value.effective_window`, when the session reported one.
     effective_window: Option<u32>,
@@ -339,7 +354,25 @@ impl ClaudeMapper {
         }
     }
 
-    /// The permission mode the adapter just set; a `status` reporting another one is drift.
+    /// The adapter answered this tool use's ask with a deny, so its `tool_result` completes the
+    /// item as `declined`.
+    pub fn note_denied(&mut self, tool_use_id: &str) {
+        match self.turn.as_mut() {
+            Some(turn) => {
+                turn.denied_tool_use_ids.insert(tool_use_id.to_owned());
+            }
+            None => warn!(
+                thread_id = %self.thread,
+                harness_thread_id = %self.harness_thread_id,
+                action = "note_denied",
+                native_item_id = %tool_use_id,
+                "a denial noted with no active turn"
+            ),
+        }
+    }
+
+    /// The permission mode the adapter just set; an `init` or `status` reporting another one is
+    /// drift.
     pub fn set_expected_mode(&mut self, mode: impl Into<String>) {
         self.session.expected_mode = Some(mode.into());
     }
@@ -486,6 +519,17 @@ impl ClaudeMapper {
                 subtype,
                 raw,
             } => self.on_control_request(request_id, &subtype, raw, &mut out),
+            Frame::ControlCancelRequest { request_id } => {
+                info!(
+                    thread_id = %self.thread,
+                    harness_thread_id = %self.harness_thread_id,
+                    turn_id = display_opt(self.active_turn()),
+                    action = "control_cancel_request",
+                    request_id = %request_id,
+                    "Claude Code withdrew one of its asks"
+                );
+                out.push(MapperOutput::CancelRequest { request_id });
+            }
             Frame::ControlResponse { request_id, raw } => {
                 let payload = match raw {
                     Value::Object(mut object) => object.remove("response").unwrap_or_default(),
@@ -522,17 +566,19 @@ impl ClaudeMapper {
 
     fn on_init(&mut self, init: &InitMessage, out: &mut Out) {
         self.session.model = init.model.clone();
-        if let Some(mode) = &init.permission_mode {
-            self.session.permission_mode = Some(mode.as_str().to_owned());
-        }
         debug!(
             thread_id = %self.thread,
             harness_thread_id = %self.harness_thread_id,
             model = display_opt(init.model.as_deref()),
-            permission_mode = display_opt(self.session.permission_mode.as_deref()),
+            permission_mode = display_opt(init.permission_mode.as_ref().map(|mode| mode.as_str())),
             claude_code_version = display_opt(init.claude_code_version.as_deref()),
             "session initialized"
         );
+        // A re-emitted `init` (after a backgrounded task, after `/compact`) is the frame most
+        // likely to show a mode Giskard did not set.
+        if let Some(mode) = &init.permission_mode {
+            self.check_mode(mode.as_str(), out);
+        }
         let Some(source) = init
             .api_key_source
             .as_ref()
@@ -571,10 +617,14 @@ impl ClaudeMapper {
             compact_result = display_opt(status.compact_result.as_deref()),
             "status"
         );
-        let Some(mode) = &status.permission_mode else {
-            return;
-        };
-        let mode = mode.as_str().to_owned();
+        if let Some(mode) = &status.permission_mode {
+            self.check_mode(mode.as_str(), out);
+        }
+    }
+
+    /// Record the mode the CLI reports and compare it with the one the adapter last set.
+    fn check_mode(&mut self, mode: &str, out: &mut Out) {
+        let mode = mode.to_owned();
         self.session.permission_mode = Some(mode.clone());
         let Some(expected) = self.session.expected_mode.clone() else {
             return;
@@ -1634,8 +1684,8 @@ impl ClaudeMapper {
     ) {
         let tool_name = request.tool_name.as_str();
         if matches!(tool_name, "ExitPlanMode" | "EnterPlanMode") {
-            // With `--disallowedTools EnterPlanMode ExitPlanMode` (milestone 3) this ask never
-            // appears; if it does, Giskard still owns the mode, so answer it without a user.
+            // With `--disallowedTools EnterPlanMode ExitPlanMode` this ask never appears; if it
+            // does, Giskard still owns the mode, so answer it without a user.
             warn!(
                 thread_id = %self.thread,
                 harness_thread_id = %self.harness_thread_id,
@@ -1679,11 +1729,16 @@ impl ClaudeMapper {
                 request: ServerRequest {
                     id: id.clone(),
                     method: "claude/ask_user_question".into(),
-                    params: request.input,
+                    params: ask_user_question_params(&request.input),
                     received_at: Utc::now(),
                 },
             }));
-            out.push(MapperOutput::PendingServerRequest { id, request_id });
+            out.push(MapperOutput::PendingServerRequest {
+                id,
+                request_id,
+                subtype: "can_use_tool".into(),
+                input: request.input,
+            });
             return;
         }
         let description = raw
@@ -1727,14 +1782,14 @@ impl ClaudeMapper {
                 source_link: false,
             });
         }
-        // Name each suggestion by its type and destination only; its rules stay in `raw` for
-        // milestone 3 to echo back.
-        let suggestions = raw
+        // Name each suggestion by its type and destination only; its rules are kept raw on the
+        // pending ask for `AcceptForSession` to echo back.
+        let suggestions: Vec<Value> = raw
             .get("permission_suggestions")
             .and_then(Value::as_array)
-            .map(Vec::as_slice)
+            .cloned()
             .unwrap_or_default();
-        for suggestion in suggestions {
+        for suggestion in &suggestions {
             let suggestion_type = suggestion.get("type").and_then(Value::as_str);
             let destination = suggestion.get("destination").and_then(Value::as_str);
             let value = match (suggestion_type, destination) {
@@ -1768,6 +1823,8 @@ impl ClaudeMapper {
             id,
             request_id,
             tool_use_id: request.tool_use_id,
+            tool_name: tool_name.to_owned(),
+            suggestions,
         });
     }
 
@@ -1792,12 +1849,39 @@ impl ClaudeMapper {
                 received_at: Utc::now(),
             },
         }));
-        out.push(MapperOutput::PendingServerRequest { id, request_id });
+        out.push(MapperOutput::PendingServerRequest {
+            id,
+            request_id,
+            subtype: subtype.to_owned(),
+            input: Value::Null,
+        });
     }
 
     fn event(&self, event: AgentEvent) -> MapperOutput {
         MapperOutput::Event(event)
     }
+}
+
+/// The `ServerRequestReceived` params of an `AskUserQuestion` ask: `{questions: [...]}` with each
+/// question the CLI's object plus `"id": "<index>"`. The browser's question card keys its answers
+/// by `id`, and the CLI's questions carry none; the answer maps each id back to its index.
+fn ask_user_question_params(input: &Value) -> Value {
+    let questions: Vec<Value> = input
+        .get("questions")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default()
+        .iter()
+        .enumerate()
+        .map(|(index, question)| {
+            let mut question = question.clone();
+            if let Some(object) = question.as_object_mut() {
+                object.insert("id".into(), Value::String(index.to_string()));
+            }
+            question
+        })
+        .collect();
+    json!({ "questions": questions })
 }
 
 /// Plan §6: Claude reports cached input separately, and all three summands are context.
@@ -2255,7 +2339,9 @@ mod tests {
                     id,
                     request_id,
                     tool_use_id,
-                } => Some((id, request_id, tool_use_id)),
+                    tool_name,
+                    suggestions,
+                } => Some((id, request_id, tool_use_id, tool_name, suggestions)),
                 _ => None,
             })
             .collect();
@@ -2266,6 +2352,12 @@ mod tests {
             pending[0].2.as_deref(),
             Some("toolu_01FZdtNSm7HPbRG2vZ6fknrF")
         );
+        assert_eq!(pending[0].3, "Bash");
+        // The raw suggestions, `directories` and the `localSettings` destination included.
+        let suggestions = pending[0].4;
+        assert_eq!(suggestions.len(), 3);
+        assert_eq!(suggestions[0]["destination"], "localSettings");
+        assert_eq!(suggestions[1]["directories"], json!(["/work/project"]));
 
         assert_eq!(
             command_statuses(&outputs),
@@ -2790,6 +2882,66 @@ mod tests {
     }
 
     #[test]
+    fn a_permission_mode_the_adapter_did_not_set_on_init_is_a_notice() {
+        let mut mapper = new_mapper();
+        mapper.set_expected_mode("acceptEdits");
+        let init = line_of("text-turn", "system");
+        let mut outputs = Vec::new();
+        let logs = capture_logs(tracing::Level::WARN, || {
+            outputs = mapper.map_line(&init);
+        });
+        assert_eq!(
+            notices(&outputs),
+            ["Claude Code switched its permission mode to default; Giskard set acceptEdits"]
+        );
+        assert!(logs.contains(r#"action="permission_mode_drift""#), "{logs}");
+
+        // No expectation yet (before the adapter set a mode): no drift.
+        let mut fresh = new_mapper();
+        assert!(notices(&fresh.map_line(&init)).is_empty());
+    }
+
+    #[test]
+    fn a_control_cancel_request_is_handed_to_the_adapter() {
+        let mut mapper = new_mapper();
+        let mut outputs = Vec::new();
+        let logs = capture_logs(tracing::Level::INFO, || {
+            outputs =
+                mapper.map_line(r#"{"type":"control_cancel_request","request_id":"a949f115"}"#);
+        });
+        assert!(matches!(
+            &outputs[..],
+            [MapperOutput::CancelRequest { request_id }] if request_id == "a949f115"
+        ));
+        assert!(
+            logs.contains(r#"action="control_cancel_request""#),
+            "{logs}"
+        );
+        assert!(!logs.contains("does not know"), "{logs}");
+    }
+
+    #[test]
+    fn a_denial_the_adapter_noted_completes_the_tool_declined() {
+        let mut mapper = new_mapper();
+        let lines = out_lines("tool-allowed");
+        let mut outputs = Vec::new();
+        outputs.extend(mapper.begin_turn(TurnId::new(), TurnKind::User));
+        for line in &lines {
+            outputs.extend(mapper.map_line(line));
+            if line.contains("\"control_request\"") {
+                mapper.note_denied("toolu_01FZdtNSm7HPbRG2vZ6fknrF");
+            }
+        }
+        assert_eq!(
+            command_statuses(&outputs),
+            vec![("touch probe.txt".into(), Some("declined".into()))]
+        );
+
+        let logs = capture_logs(tracing::Level::WARN, || new_mapper().note_denied("toolu_x"));
+        assert!(logs.contains(r#"action="note_denied""#), "{logs}");
+    }
+
+    #[test]
     fn an_orphan_tool_result_is_dropped_with_a_warning() {
         let mut mapper = new_mapper();
         mapper.begin_turn(TurnId::new(), TurnKind::User);
@@ -2900,7 +3052,8 @@ mod tests {
         ));
         assert!(outputs.iter().any(|output| matches!(
             output,
-            MapperOutput::PendingServerRequest { request_id, .. } if request_id == "r9"
+            MapperOutput::PendingServerRequest { request_id, subtype, input, .. }
+                if request_id == "r9" && subtype == "request_user_dialog" && input.is_null()
         )));
     }
 
@@ -2918,8 +3071,24 @@ mod tests {
         ));
         assert!(outputs.iter().any(|output| matches!(
             output,
-            MapperOutput::PendingServerRequest { request_id, .. } if request_id == "q1"
+            MapperOutput::PendingServerRequest { request_id, subtype, input, .. }
+                if request_id == "q1" && subtype == "can_use_tool" && input["questions"] == json!([])
         )));
+
+        // Each question gains its index as `id`, which the browser's card keys answers by.
+        let outputs = mapper.map_line(
+            r#"{"type":"control_request","request_id":"q2","request":{"subtype":"can_use_tool","tool_name":"AskUserQuestion","input":{"questions":[{"question":"A?","header":"a","options":[],"multiSelect":false},{"question":"B?","header":"b","options":[],"multiSelect":true}]},"requires_user_interaction":true,"tool_use_id":"toolu_q2"}}"#,
+        );
+        let AgentEvent::ServerRequestReceived { request, .. } = events(&outputs)[0] else {
+            panic!("no server request");
+        };
+        assert_eq!(request.params["questions"][0]["id"], "0");
+        assert_eq!(request.params["questions"][1]["id"], "1");
+        assert_eq!(request.params["questions"][1]["question"], "B?");
+        assert!(outputs.iter().any(|output| matches!(
+            output,
+            MapperOutput::PendingServerRequest { input, .. } if input["questions"][0].get("id").is_none()
+        )), "the pending input stays the CLI's own");
     }
 
     #[test]

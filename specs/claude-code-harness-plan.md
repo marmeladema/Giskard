@@ -1570,7 +1570,8 @@ permission mode per turn: `--permission-mode` at spawn, `set_permission_mode` at
 `--disallowedTools EnterPlanMode ExitPlanMode` (§8.2), presets per §8.1. `set_model` and
 `apply_flag_settings{effortLevel}` with `get_settings` read-back (§3.3), which makes `TurnOverrides`
 fully honoured. `compact_thread` as a `/compact` user message, with the degenerate `result` not
-persisted as an assistant turn. `rate_limit_event` and `api_retry` → `Notice`.
+persisted as an assistant turn. `rate_limit_event` and `api_retry` → `Notice`. Milestone 3 is
+implemented in `crates/giskard-harness-claude` and one dispatch line in `static/app.js`.
 
 ### Milestone 4 — registration and documentation
 
