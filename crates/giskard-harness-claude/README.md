@@ -10,10 +10,10 @@ semantics and invariants, and the
 behaves and the milestones that build this adapter. This document describes what the adapter does
 **today**, including the scope and lifetime of Claude Code-native identifiers.
 
-**Status: reachable (milestone 4).** A `[harnesses.<name>]` declaration of kind `claude-code`
-starts, and the server runs its projects and threads on `ClaudeHarness`, which implements
-`AgentHarness` over **one `claude` process per open primary thread**: `open_thread` spawns and
-handshakes it (fresh, `--resume`, or the same-id respawn when the transcript is gone),
+**Status: sub-agent threads (milestone 5).** A `[harnesses.<name>]` declaration of kind
+`claude-code` starts, and the server runs its projects and threads on `ClaudeHarness`, which
+implements `AgentHarness` over **one `claude` process per open primary thread**: `open_thread`
+spawns and handshakes it (fresh, `--resume`, or the same-id respawn when the transcript is gone),
 `start_turn` applies the turn's permission mode, model and effort and writes the user message with
 inline attachments, `respond_approval` and `respond_server_request` answer the CLI's asks,
 `compact_thread` runs `/compact`, `interrupt` and `set_thread_name` send control requests,
@@ -21,10 +21,12 @@ inline attachments, `respond_approval` and `respond_server_request` answer the C
 from the freshest handshake or a probe child, `list_mcp_servers` asks a live child or a probe for
 `mcp_status`, and `list_providers` reports `anthropic`. `capabilities()` reports the plan §4
 matrix, with `live_approvals`, `plan_build_modes`, `per_turn_model`, `reasoning_effort`,
-`context_compaction` and `mcp_status` true. Still to come: sub-agent threads and routing a
-sub-agent's asks to them (milestone 5), idle reaping of children and a supervisor state machine
-(milestone 6), synthesized diffs (milestone 7), and version-drift and headroom surfacing, including
-an MCP tool inventory from `init.tools` (milestone 8).
+`context_compaction` and `mcp_status` true. A delegation (an `Agent` tool call) is a **sub-agent
+thread**: the mapper mints a route for it, `claim_native_thread` binds it, its forwarded frames are
+its transcript, its asks are published on it, and `interrupt` on it is `stop_task` (see *Sub-agent
+routes*). Still to come: idle reaping of children and a supervisor state machine (milestone 6),
+synthesized diffs (milestone 7), and version-drift and headroom surfacing, including an MCP tool
+inventory from `init.tools` (milestone 8).
 
 ## Runtime ownership
 
@@ -32,7 +34,9 @@ an MCP tool inventory from `init.tools` (milestone 8).
   its `ClaudeMapper`, its pending control-request waiters and the thread's retained `EventLog`.
   Nothing else touches them, and none of them sits behind a lock: the façade reaches the task only
   through its bounded command channel (`StartTurn`, `Interrupt`, `Control`, `RespondApproval`,
-  `RespondServerRequest`, `Compact`, `Stop`). The task selects over the child's stdout lines
+  `RespondServerRequest`, `StopTask`, `Compact`, `Stop`). It also owns **one retained `EventLog` per
+  sub-agent route** of its child: each event goes to the log of the thread it names (the primary's
+  or a route's). The task selects over the child's stdout lines
   (first, so a frame already read is mapped before a new command is accepted), its commands, and
   the instance's shutdown signal. A command that needs a control *response* before it can go on
   (the per-turn settings) cannot await a waiter the same loop would resolve, so the supervisor
@@ -42,17 +46,25 @@ an MCP tool inventory from `init.tools` (milestone 8).
   and the stop sequence runs), and any other command arriving meanwhile is kept and handled after.
   A reply the mapper must write while pumping (an `ExitPlanMode` deny) that cannot be written
   breaks the child, as in the main loop.
-- **The façade** (`src/harness.rs`) holds two maps behind `std` mutexes that are never held across
-  an await: `children` (thread → live child: its session id, retained log, command sender, task,
-  open model, launch mode) and `pending` (approval / server-request id → thread, CLI
-  `request_id`, and what the answer needs: the tool-use id, the tool name and the raw
-  `permission_suggestions` of an approval, the subtype and `input` of a server request). The façade
+- **The façade** (`src/harness.rs`) holds three maps behind `std` mutexes that are never held
+  across an await: `children` (thread → live child: its session id, retained log, command sender,
+  task, open model, launch mode), `pending` (approval / server-request id → the thread the ask was
+  published on, its **owner** (the primary thread whose child answers it), CLI `request_id`, and
+  what the answer needs: the tool-use id, the tool name and the raw `permission_suggestions` of an
+  approval, the subtype and `input` of a server request) and `routes` (sub-agent thread → its
+  `task:` id, retained log, owning primary thread and command sender, parent native id, name and
+  model; a **cold** route has a fresh, open, silent log and no owner). The façade
   also remembers, once, the sentence in which the CLI refused a bypass launch (`bypass_refused`).
   `open_thread` inserts a child after its handshake; the supervisor removes its own entry when the
   child exits (a generation number keeps a stale supervisor from removing a reopened thread's
   entry); `delete_thread`, `set_thread_archived(true)` and `shutdown` take entries out before
-  stopping them. A supervisor drops its thread's `pending` entries when its child exits; an answer
-  or a `control_cancel_request` removes one entry.
+  stopping them. A supervisor drops every `pending` entry it owns (its routes' included) when its
+  child exits; an answer or a `control_cancel_request` removes one entry. A supervisor publishes a
+  route into `routes` on the mapper's `RouteOpened`, and at exit turns its own routes (guarded by
+  its generation) **cold**: owner and command sender cleared, log left open. `claim_native_thread`
+  inserts a cold route. Only the sub-agent thread's own `delete_thread` or
+  `set_thread_archived(true)`, and `shutdown`, remove a route and close its log, like a Codex
+  thread log that lives as long as its thread.
 - **The retained log is created at open**, so `subscribe` returns a live reader for any handle
   `open_thread` issued before the child has written a frame. Frames read during the handshake that
   were not its responses are mapped first, once the supervisor starts.
@@ -65,10 +77,11 @@ an MCP tool inventory from `init.tools` (milestone 8).
 | Giskard identity | Claude Code source |
 | --- | --- |
 | `harness_thread_id` of a primary thread | the session UUID Giskard mints and passes as `--session-id` |
-| `harness_thread_id` of a sub-agent thread | `task:<tool_use_id>` of the parent's `Agent` call (`ids::TASK_ID_PREFIX`); routes are claimed in milestone 5 |
+| `harness_thread_id` of a sub-agent thread | `task:<tool_use_id>` of the parent's `Agent` call (`ids::TASK_ID_PREFIX`): a sub-agent runs inside its parent's session and has no session of its own |
+| `ThreadId` of a sub-agent thread | minted by the mapper when the `Agent` block is mapped, and adopted by `claim_native_thread` whatever id the server proposed; a route whose session is gone is bound cold under the proposed id |
 | `TurnId` | minted by Giskard at `start_turn` (`begin_turn`), or by the mapper for a continuation turn the CLI started on its own |
 | `ItemId` | minted on first sight of a native key: a `tool_use` block's `id`, or `(message.id, block index)` for a text or thinking block; reused for the item's start, deltas and completion within the turn |
-| `Item.harness_item_id` | the tool-use id, `<message_id>:<index>`, `compact_boundary:<uuid>`, or `user:<uuid>:<index>` for a user-frame activity |
+| `Item.harness_item_id` | the tool-use id, `<message_id>:<index>`, `compact_boundary:<uuid>`, `user:<uuid>:<index>` for a user-frame activity or a sub-agent's delegated prompt, or `task_updated:<task_id>` for a backgrounded sub-agent's outcome |
 | `ApprovalId`, `ServerRequestId` | the `control_request`'s `request_id`, a UUID the CLI mints and the reply must carry; the trait's instance-wide uniqueness across children rests on the CLI minting UUIDs |
 
 `assistant` frames arrive **one content block per frame**, each repeating the whole message
@@ -83,7 +96,9 @@ so a block's index matches the `content_block_*.index` of the stream events for 
 | `thinking` block | only once a non-empty `thinking_delta` or a non-empty block arrives → `Reasoning` | `thinking_delta` → `Text` | `assistant` frame → `Reasoning { text }`; an empty thought emits nothing at all |
 | `tool_use` `Bash` | `assistant` frame → `CommandExecution` with `command`, `cwd` = workspace root, `status: in_progress` | none (Claude streams no command output) | the `tool_result` → `CommandExecution` with `output` = `tool_use_result.stdout` then `stderr`, else the result text; `exit_code: None` |
 | `tool_use` `Write`, `Edit`, `NotebookEdit` | `FileChange` | none | `FileChange { path: input.file_path, change }`, `Created` when `tool_use_result.type == "create"`, else `Modified`; no diff |
-| `tool_use` `Agent` | `ToolCall { name: "Agent" }`, no `SubagentLink` until milestone 5 | none | `ToolCall { output: the result content }` |
+| `tool_use` `Agent` | `ToolCall { name: "Agent", subagent }` with the route's link (`task:<id>`, `initial_prompt` = `input.prompt`, `Spawned`, `Pending`), preceded by `MapperOutput::RouteOpened` | none | `ToolCall { output: the result content, subagent }` with the link as the route stands: `Completed` (or `Interrupted`) for an ended route, `Started` / `Running` for one still running (a backgrounded delegation) |
+| a sub-agent's first `user` text block equal to its delegated prompt | on the route: `UserMessage` started and completed together, `text` = the prompt | | |
+| terminal `system/task_updated` of a route's `local_agent` task | | | on the route: open tool calls `interrupted`, then `TurnCompleted`; for a backgrounded delegation, on the spawning thread: `Activity { title: description, detail: completed / killed / failed, subagent: the link }` |
 | `tool_use` `mcp__<server>__<tool>` | `ToolCall { server: <server>, name: <tool> }` | none | `ToolCall` |
 | any other `tool_use` | `ToolCall { name, input }` | `input_json_delta` is ignored; the `assistant` frame has the final input | `ToolCall`, with `error` = the result text when `is_error` |
 | `user` frame with a text block and no `tool_result` | `Activity` started and completed together, `title` = the text (the `[Request interrupted by user for tool use]` marker) | | |
@@ -110,8 +125,9 @@ Session-level frames: `system/init` stores the model and emits a `Notice` once p
 `action = "permission_mode_drift"` (one check, `check_mode`, serves both: a re-emitted `init` after
 a backgrounded task is the frame most likely to show a mode Giskard did not set); a
 `rate_limit_event` is a `Notice` only when its status is not `allowed` or a window is at least 90%
-used; `api_retry` and `permission_denied` are `Notice`s. `note_denied(tool_use_id)` marks a tool
-use the adapter denied, so its `tool_result` completes the item as `declined`.
+used; `api_retry` and `permission_denied` are `Notice`s. `note_denied(thread, tool_use_id)` marks a
+tool use the adapter denied on the turn of `thread` (the primary's or a route's), so its
+`tool_result` completes the item as `declined`.
 
 ## Item lifecycle
 
@@ -121,8 +137,9 @@ block becomes an item only once it has text: the recordings ran with thinking di
 recorded thought is `thinking: ""` with a signature and produces no item. A tool call is started by
 its `assistant` frame and completed by the `tool_result` that names its id; a `tool_result` naming
 no open call is logged at `warn` with its id and dropped. Frames whose `parent_tool_use_id` is set
-belong to a sub-agent: no route is claimed for them in this milestone, so they are dropped with a
-`debug` log naming `parent_tool_use_id` and the frame type, never attributed to the primary thread.
+belong to a sub-agent: one naming a minted route is mapped onto that route's thread and turn by the
+same item functions (see *Sub-agent routes*); one naming no route is dropped with a `debug` log
+naming `parent_tool_use_id` and the frame type, never attributed to the primary thread.
 
 ## Turn completion
 
@@ -191,6 +208,7 @@ Each primary thread's child runs, in this order:
 | `--setting-sources user` | plan §8.3: the user's settings, not a cloned repository's |
 | `--disallowedTools EnterPlanMode ExitPlanMode` | Giskard chooses the mode per turn |
 | `--include-partial-messages` | `stream_event`s, so text streams as `ItemDelta`s |
+| `--forward-subagent-text` | a sub-agent's text and thinking reach stdout as `assistant` / `user` frames with `parent_tool_use_id`, its route's transcript |
 | `--permission-mode bypassPermissions`, or `manual` after a refused bypass launch | the launch mode is only the *ceiling* (see below); never `--permission-prompts none`, which would deny every ask silently |
 | `--model <ModelRef.model>` | an alias or a full id, verbatim |
 | `--effort <ModelRef.reasoning_effort>` | only when the model ref carries one; the CLI tolerates a level the model ignores |
@@ -214,15 +232,15 @@ session flag and `--permission-mode manual`; later opens launch standard childre
 standard child still sends `set_permission_mode default` in its handshake (a failure there is
 logged and ignored).
 
-No `--add-dir`, `--forward-subagent-text` (milestone 5) or `--replay-user-messages`. The child's
-working directory is `OpenThreadOptions.workspace_root`. The declaration's environment overlay is
-applied **over** the inherited environment, never in place of it, so an `ANTHROPIC_API_KEY`,
-`ANTHROPIC_BASE_URL` or other `ANTHROPIC_*` variable in Giskard's own environment reaches every
-child (plan §7); the mapper's `apiKeySource` notice is the mitigation. The spawn log line names the
-command, the working directory, the number of extra arguments and the overlay's variable **names**,
-never values. stdout lines are capped at 64 MiB (a longer one is fatal for that child); stderr is
-drained by its own task, logged at `debug` under the target `giskard_harness_claude::stderr`, and
-its last 8 lines (400 characters each) are what every spawn error and exit log line quotes.
+No `--add-dir` or `--replay-user-messages`. The child's working directory is
+`OpenThreadOptions.workspace_root`. The declaration's environment overlay is applied **over** the
+inherited environment, never in place of it, so an `ANTHROPIC_API_KEY`, `ANTHROPIC_BASE_URL` or
+other `ANTHROPIC_*` variable in Giskard's own environment reaches every child (plan §7); the
+mapper's `apiKeySource` notice is the mitigation. The spawn log line names the command, the working
+directory, the number of extra arguments and the overlay's variable **names**, never values. stdout
+lines are capped at 64 MiB (a longer one is fatal for that child); stderr is drained by its own
+task, logged at `debug` under the target `giskard_harness_claude::stderr`, and its last 8 lines (400
+characters each) are what every spawn error and exit log line quotes.
 
 ## Handshake, resume and respawn
 
@@ -275,7 +293,8 @@ A second `open_thread` for a thread with a live child returns that child's handl
   one 25 s budget (each request at most 10 s of it), so the supervisor's own timeout, naming the
   request left unanswered, ends a slow hand-off before the façade's 30 s `start_turn` limit.
 - **Interrupt** writes the `interrupt` control request and resolves on its response, within 10 s.
-  With no active turn the CLI answers at once and nothing else happens.
+  With no active turn the CLI answers at once and nothing else happens. On a sub-agent thread it is
+  `stop_task` instead (see *Sub-agent routes*).
 - **Rename.** `set_thread_name` sends `rename_session` (`source: "host"`) to a live child; a cold
   or `task:` thread is a no-op, since Giskard keeps its own name.
 - **Stop** (archive, delete, shutdown, or a dropped instance): if a turn is live, write `interrupt`
@@ -288,8 +307,9 @@ A second `open_thread` for a thread with a live child returns that child's handl
 - **Shutdown** is idempotent: it marks the instance shut down, stops every child concurrently,
   clears `pending`, and logs `children_stopped`. Afterwards `open_thread` and `list_models` fail.
 - **Child exit.** However a child ends, an active turn completes from `ClaudeMapper::child_exited`
-  (`Interrupted` after an interrupt, else `Failed`, naming the exit code or signal), the thread's
-  log closes (only that thread's stream ends), the child leaves `children`, waiters fail, and one
+  (`Interrupted` after an interrupt, else `Failed`, naming the exit code or signal), as does every
+  open sub-agent route turn; the thread's log closes (only that stream ends), its routes turn cold
+  with their logs left open, the child leaves `children`, waiters fail, and one
   `child_exited` line logs the exit code or signal, the stderr tail, whether the stop was requested
   and `live_children`: at `info` for a requested stop that exited 0 (or 1 after an interrupt), at
   `warn` otherwise. The spawn line logs `live_children` too. A closed log's refusal of an event is
@@ -396,7 +416,79 @@ for, until the next turn, and such an answer is not written, is logged at `info`
 fails with `Protocol("… was withdrawn by Claude Code")`, and for a server request emits the
 `ServerRequestResolved` the withdrawal could not.
 
-Until milestone 5, a sub-agent's asks attach to the primary thread's turn.
+**Sub-agent asks.** A sub-agent's `can_use_tool` carries `agent_id` (its task's id) and no
+`parent_tool_use_id`, and it can arrive **before** the forwarded frame carrying its `tool_use`
+block. It is routed by `agent_id` → task → route; else by its `tool_use_id` among the routes' open
+tool calls (logged at `debug`); else, with an unknown `agent_id`, it stays on the primary thread
+with a `warn` (`action = "ask_route_unknown"`) so it stays answerable. The ask is published on the
+route's thread and turn and recorded with the route's thread and the primary as its owner;
+`respond_approval` / `respond_server_request` reach the owner's child, and the answer is the same
+`control_response`: the CLI's `request_id` is all it needs.
+
+## Sub-agent routes
+
+- **Mint.** An `Agent` `tool_use` block mints a route keyed by its tool-use id, on whichever route
+  the block arrived (the primary, or an outer route for a nested delegation): a fresh `ThreadId`,
+  `task:<id>`, the parent's native id (the session id, or `task:<outer>`), the name
+  (`input.description`) and the prompt (`input.prompt`). `MapperOutput::RouteOpened` comes before
+  the block's `ItemStarted`, so the supervisor has created and published the route's retained log
+  before the server's forwarder sends the link, and every child frame is retained for the claim.
+  Logged at `info` with `action = "route_opened"`.
+- **Turn.** `system/task_started` of the `local_agent` task naming the route records its task id
+  and opens the route's turn (`TurnStarted` on the route's thread). A routed frame arriving with no
+  route turn opens one, at `info` with `action = "external_turn"`. The child's frames (forwarded
+  with `--forward-subagent-text`, `assistant` and `user` only, no stream events) map exactly as the
+  primary's, on the route's thread and turn; the delegated prompt is a `UserMessage`. Usage comes
+  from each child API message's `message.usage`, counted once per `message.id` though every
+  one-block frame repeats it.
+- **End.** A terminal `task_updated` of the route's task completes its turn **at once**: open tool
+  calls complete `interrupted` with no output, then `TurnCompleted`: `completed` → `Completed`;
+  `killed` → `Interrupted` when the adapter sent `stop_task` for the route or the spawning turn was
+  interrupted, else `Failed("agent task <id> was killed")`; `failed` / `stopped` → `Failed` with the
+  patch's `error`. A terminal update for a task already ended or unknown is ignored at `debug`
+  (`stop_task` on a completed task still emits `killed`). The primary turn's agent-task gate is
+  unchanged.
+- **Trailing frames.** A killed sub-agent's rejection `tool_result` and its `[Request interrupted by
+  user for tool use]` marker **trail** the terminal update. They are dropped at `debug` with
+  `action = "route_trailing_frame"`, the route and its thread: the `Interrupted` status says the
+  same, and holding the turn open for them would leave the sub-agent looking busy.
+- **Backgrounded.** A backgrounded delegation's `Agent` call completes at launch with its link still
+  `Started`; when its task ends, an `Activity` on the spawning thread's turn carries the outcome and
+  the link (`harness_item_id = task_updated:<task_id>`).
+- **Close.** When the turn that spawned a route ends, the mapper drops the route (`RouteClosed`: the
+  supervisor stops appending to its log and drops its asks; `info`, `action = "route_closed"`). The
+  log stays **open and published**: the sub-agent thread's owner keeps reading it (a closed stream
+  would end that owner as failed), and a claim that lands after the parent's turn ended still adopts
+  the route and reads its retained events. A route still running there (an agent task the gate let
+  through because the turn failed or was superseded) is first completed `Failed("parent turn
+  ended")` at `warn` (`action = "route_still_open"`). Nested routes are dropped with their parent
+  route. Child exit completes every open route turn (`Interrupted` after an interrupt or a
+  `stop_task`, else `Failed` naming the exit) and drops every route; the supervisor then turns its
+  published routes cold (logged as `routes_cooled` on the exit line). A route's mapper state never
+  outlives its child; its log lives until the sub-agent thread's own delete or archive, or shutdown.
+- **`stop_task`.** `interrupt` on a sub-agent thread sends `StopTask` to the owning child; the
+  supervisor writes `{"subtype":"stop_task","task_id":…}` through `await_control` (10 s) and logs
+  `stop_task` at `info`. The stop is noted on the route **before** the write, since the CLI emits
+  the task's `killed` update before it answers. A route whose task has not started yet is
+  `Protocol("the sub-agent has not started yet")`; one that already ended is `Ok` at `debug`; a
+  thread that is no route of the child is `Protocol`. The CLI withdraws the sub-agent's pending ask
+  with a `control_cancel_request` (the existing path), and the parent's turn continues.
+- **Claim.** `claim_native_thread` accepts only a `task:` id (anything else is `Protocol`). A live
+  route is **adopted**: the handle's thread is the mapper's, with `agent_name`, `resumed_model`
+  (the child's model) and `parent_harness_thread_id`. Otherwise the session that produced the
+  route is gone (a persisted sub-agent reopened after a restart), and a **cold route** is bound
+  under the proposed thread: an open, silent stream, no child. A route whose child exited is
+  already cold, and the claim adopts it with its retained history.
+  `interrupt` on it is `Unsupported("this Claude Code sub-agent is no longer running")`. The claim
+  never spawns, resumes or writes anything, is idempotent for the same id, and refuses a proposed
+  thread already bound to another native id. Logged at `info` with `action =
+  "claim_native_thread"`, `adopted` and `cold`. `subscribe` reads a child's log, else a route's.
+- **Cleanup.** `delete_thread` and `set_thread_archived(true)` on a `task:` thread remove its route,
+  close its log (ending the thread's stream) and drop its asks; `shutdown` closes and clears every
+  route. Archiving or deleting the *parent* stops its child, which only turns the routes cold.
+  `open_thread` still refuses to resume a `task:` id, and `set_thread_name` is a no-op for one. An
+  event for a route whose log is gone is counted and logged once per thread at `warn` (`action =
+  "route_log_missing"`).
 
 ## Server requests
 
@@ -495,7 +587,8 @@ error. `mcp_status` carries **no tool inventory**: tools reach the model as
   the per-turn mode, and the façade tests against a scripted child and against
   `tests/fake-claude.sh`.
 - `src/session.rs`: the per-child supervisor, `await_control` and the per-turn settings, the
-  approval and server-request answers, compaction, the stop sequence, the pending-ask map, and the
+  approval and server-request answers, `stop_task`, the route logs, compaction, the stop sequence,
+  the pending-ask map, and the
   in-process `ScriptedChild` the façade tests drive (it echoes every `set_permission_mode` the
   script does not handle itself).
 - `src/process.rs`: `ClaudeLaunchOptions`, argv and the launch mode, spawning, the capped stdout
@@ -504,7 +597,9 @@ error. `mcp_status` carries **no tool inventory**: tools reach the model as
 - `src/catalog.rs`: the `initialize.models` catalog, its descriptors and `ANTHROPIC_PROVIDER_ID`.
 - `src/mcp.rs`: the `mcp_status` answer to `McpServerStatus`.
 - `src/frame.rs`: one stdout line to a typed `Frame`, tolerant of everything the crate cannot type.
-- `src/mapper.rs`: `ClaudeMapper`, the frame-to-event state machine, and its fixture-driven tests.
+- `src/mapper.rs`: `ClaudeMapper`, the frame-to-event state machine and its sub-agent routes, and
+  its fixture-driven tests (the `delegation`, `delegation-interrupted`, `subagent-stop` and
+  `subagent-ask-withdrawn` recordings drive the route tests).
 - `src/ids.rs`: `NativeItemKey` and the `task:` sub-agent id prefix.
 - `src/log_fields.rs`: optional-field logging helper.
 - `src/log_checks.rs` (tests only): the line checks the `#[traced_test]` log assertions pass to
@@ -515,6 +610,7 @@ error. `mcp_status` carries **no tool inventory**: tools reach the model as
   process path (spawn, stderr tail, exit codes, kill) is tested without the CLI. It answers
   `set_permission_mode` (`bypass_not_launched` for `bypassPermissions` on a child not launched
   with it), `set_model` (`catalog_unknown` outside the `initialize` catalog), `apply_flag_settings`,
-  `get_settings` (echoing the model and effort it was told) and `mcp_status` (no servers), replays
+  `get_settings` (echoing the model and effort it was told), `stop_task` (`{}`) and `mcp_status`
+  (no servers), replays
   the `tool-allowed` ask on a message containing `touch` and the rest once answered, and with
   `FAKE_CLAUDE_REFUSE_BYPASS=1` refuses a bypass launch with the root sentence.

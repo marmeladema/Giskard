@@ -51,9 +51,10 @@ The agent harness is a replaceable component behind a neutral `AgentHarness` tra
   `[harnesses.<name>]` of kind `claude-code` (see [Configuration](#configuration)); its catalog
   appears under its own group in the model picker, beside any Codex declaration, and is chosen per
   thread. A working, logged-in Claude Code CLI must be installed (see
-  [Prerequisites](#prerequisites)). Sub-agent threads, idle-process reaping and structured diffs are
-  not there yet; see the [adapter README](crates/giskard-harness-claude/README.md) for what the
-  adapter does today.
+  [Prerequisites](#prerequisites)). Delegations appear as linked sub-agent threads, read-only and
+  never resumable (see [Sub-agent threads](docs/subagents.md)). Idle-process reaping and structured
+  diffs are not there yet; see the [adapter README](crates/giskard-harness-claude/README.md) for what
+  the adapter does today.
 
 ---
 

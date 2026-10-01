@@ -40,9 +40,9 @@ use crate::process::{
 };
 pub(crate) use crate::session::CONTROL_TIMEOUT;
 use crate::session::{
-    ChildCommand, ChildHandle, Children, Pending, PendingRequests, STOP_EXIT_GRACE,
-    SupervisorParts, TurnSettings, control_line, control_outcome, lock, new_request_id,
-    spawn_supervisor,
+    ChildCommand, ChildHandle, Children, Pending, PendingRequests, RouteHandle, Routes,
+    STOP_EXIT_GRACE, SupervisorParts, TurnSettings, control_line, control_outcome, lock,
+    new_request_id, spawn_supervisor,
 };
 
 /// How long the CLI has to answer `initialize`.
@@ -107,6 +107,17 @@ pub struct ClaudeHarness {
     // Invalidation/removal: An answer or a `control_cancel_request` removes one entry; the
     //   supervisor removes a thread's entries when its child exits; `shutdown` clears the map.
     pending: Pending,
+    // ENTITY-AUTHORITY-EXCEPTION:
+    // Role: Reach a sub-agent route's retained log and owning child from the trait methods.
+    // Source of truth: A supervisor inserts a live route on the mapper's `RouteOpened`;
+    //   `claim_native_thread` inserts a cold route for a route whose session is gone.
+    // Structural reason: The harness crate cannot depend on the server's thread authority, and a
+    //   sub-agent thread has no child of its own.
+    // Synchronization: A std mutex guards insert, lookup and removal; nothing awaits under it.
+    // Invalidation/removal: `delete_thread` and `set_thread_archived(true)` of the sub-agent thread
+    //   and `shutdown` remove entries and close their logs; child exit turns its live routes cold
+    //   (owner and command sender cleared, log left open).
+    routes: Routes,
     catalog: Arc<Mutex<Option<CatalogSnapshot>>>,
     /// Serializes probe children so concurrent `list_models` calls share one.
     probe: tokio::sync::Mutex<()>,
@@ -138,6 +149,7 @@ impl ClaudeHarness {
             launch,
             children: Arc::new(Mutex::new(HashMap::new())),
             pending: Arc::new(Mutex::new(PendingRequests::default())),
+            routes: Arc::new(Mutex::new(HashMap::new())),
             catalog: Arc::new(Mutex::new(None)),
             probe: tokio::sync::Mutex::new(()),
             bypass_refused: Mutex::new(None),
@@ -183,6 +195,11 @@ impl ClaudeHarness {
 
     fn live_children(&self) -> usize {
         lock(&self.children).len()
+    }
+
+    /// Sub-agent routes the façade can reach, live and cold.
+    pub(crate) fn live_routes(&self) -> usize {
+        lock(&self.routes).len()
     }
 
     /// The command channel, open model and launch mode of a thread's live child.
@@ -401,14 +418,24 @@ impl ClaudeHarness {
         }
     }
 
-    /// Stop a thread's child if it has one (archive, delete).
+    /// Stop a thread's child if it has one (archive, delete). A sub-agent thread has none: its
+    /// route is removed and its log closed, which ends the thread's stream.
     async fn stop_thread(&self, thread: &ThreadHandle, action: &'static str) {
         if is_task_native_id(&thread.harness_thread_id) {
+            let route = lock(&self.routes).remove(&thread.thread);
+            if let Some(route) = &route {
+                route.log.close();
+            }
+            let pending_dropped = lock(&self.pending).remove_thread(thread.thread);
             debug!(
                 thread_id = %thread.thread,
                 harness_thread_id = %thread.harness_thread_id,
                 action,
-                "a sub-agent thread has no child to stop"
+                had_route = route.is_some(),
+                cold = route.as_ref().is_some_and(|route| route.owner.is_none()),
+                pending_dropped,
+                live_routes = self.live_routes(),
+                "a sub-agent thread has no child to stop; its route is forgotten"
             );
             return;
         }
@@ -430,6 +457,53 @@ impl ClaudeHarness {
             live_children = self.live_children(),
             "thread's claude child removed"
         );
+    }
+
+    /// `interrupt` on a sub-agent thread: `stop_task` through the child that carries its route.
+    async fn interrupt_route(&self, thread: &ThreadHandle) -> Result<(), HarnessError> {
+        let route = lock(&self.routes)
+            .get(&thread.thread)
+            .map(|route| (route.owner, route.commands.clone()));
+        let (owner, commands) = match route {
+            Some((Some(owner), Some(commands))) => (owner, commands),
+            Some(_) => {
+                debug!(
+                    thread_id = %thread.thread,
+                    harness_thread_id = %thread.harness_thread_id,
+                    action = "stop_task",
+                    "interrupt on a cold sub-agent route"
+                );
+                return Err(HarnessError::Unsupported(
+                    "this Claude Code sub-agent is no longer running".into(),
+                ));
+            }
+            None => {
+                debug!(
+                    thread_id = %thread.thread,
+                    harness_thread_id = %thread.harness_thread_id,
+                    action = "stop_task",
+                    "interrupt on a sub-agent thread with no route"
+                );
+                return Err(HarnessError::Unsupported(
+                    "this Claude Code sub-agent is no longer running".into(),
+                ));
+            }
+        };
+        debug!(
+            thread_id = %thread.thread,
+            owner_thread_id = %owner,
+            harness_thread_id = %thread.harness_thread_id,
+            action = "stop_task",
+            "stopping a sub-agent through its parent's child"
+        );
+        let route_thread = thread.thread;
+        self.call(owner, commands, "stop_task", CONTROL_TIMEOUT, |reply| {
+            ChildCommand::StopTask {
+                thread: route_thread,
+                reply,
+            }
+        })
+        .await
     }
 
     /// Send one command to a live child and await its reply, both under `limit`.
@@ -1140,11 +1214,17 @@ impl AgentHarness for ClaudeHarness {
         )
         .await;
         let pending_dropped = lock(&self.pending).clear();
+        let routes: Vec<RouteHandle> = lock(&self.routes).drain().map(|(_, route)| route).collect();
+        let routes_dropped = routes.len();
+        for route in routes {
+            route.log.close();
+        }
         info!(
             project_id = display_opt(self.launch.project_id),
             harness = display_opt(self.launch.declaration.as_deref()),
             action = "shutdown",
             children_stopped,
+            routes_dropped,
             pending_dropped,
             "Claude Code harness shut down"
         );
@@ -1315,6 +1395,8 @@ impl AgentHarness for ClaudeHarness {
                             shutdown: self.shutdown_tx.subscribe(),
                             children: self.children.clone(),
                             pending: self.pending.clone(),
+                            routes: self.routes.clone(),
+                            commands_sender: commands.downgrade(),
                             generation,
                             thread: opts.thread,
                             context: context.clone(),
@@ -1368,9 +1450,91 @@ impl AgentHarness for ClaudeHarness {
         Ok(handle)
     }
 
+    /// Bind a sub-agent route (`task:<tool_use_id>`) the server learned of from a parent's link.
+    /// A live route adopts the thread its mapper minted; a route whose session is gone (reopened
+    /// after a restart, or its parent's child exited) is bound cold: an open, silent stream and no
+    /// child. Never spawns, resumes or writes anything; idempotent for the same id.
+    async fn claim_native_thread(
+        &self,
+        thread: ThreadId,
+        harness_thread_id: String,
+        workspace_root: PathBuf,
+    ) -> Result<ThreadHandle, HarnessError> {
+        self.ensure_running()?;
+        if !is_task_native_id(&harness_thread_id) {
+            warn!(
+                thread_id = %thread,
+                harness_thread_id = %harness_thread_id,
+                action = "claim_native_thread",
+                "refusing to claim a native id that is not a Claude Code sub-agent id"
+            );
+            return Err(HarnessError::Protocol(format!(
+                "{harness_thread_id:?} is not a Claude Code sub-agent id"
+            )));
+        }
+        let (bound, adopted, cold) = {
+            let mut routes = lock(&self.routes);
+            let existing = routes
+                .iter()
+                .find(|(_, route)| route.harness_thread_id == harness_thread_id)
+                .map(|(bound, _)| *bound);
+            match existing {
+                Some(bound) => (
+                    bound,
+                    true,
+                    routes.get(&bound).is_some_and(|r| r.owner.is_none()),
+                ),
+                None => {
+                    if let Some(other) = routes.get(&thread) {
+                        return Err(HarnessError::Protocol(format!(
+                            "thread {thread} is bound to native thread {}, not {harness_thread_id}",
+                            other.harness_thread_id
+                        )));
+                    }
+                    routes.insert(
+                        thread,
+                        RouteHandle {
+                            harness_thread_id: harness_thread_id.clone(),
+                            log: Arc::new(EventLog::new()),
+                            owner: None,
+                            commands: None,
+                            parent_harness_thread_id: None,
+                            agent_name: None,
+                            model: None,
+                            generation: None,
+                        },
+                    );
+                    (thread, false, true)
+                }
+            }
+        };
+        let mut handle = ThreadHandle::opened(bound, harness_thread_id.clone(), workspace_root);
+        if let Some(route) = lock(&self.routes).get(&bound) {
+            handle.resumed_model = route.model.clone();
+            handle.agent_name = route.agent_name.clone();
+            handle.parent_harness_thread_id = route.parent_harness_thread_id.clone();
+        }
+        info!(
+            project_id = display_opt(self.launch.project_id),
+            harness = display_opt(self.launch.declaration.as_deref()),
+            thread_id = %bound,
+            proposed_thread_id = %thread,
+            harness_thread_id = %harness_thread_id,
+            adopted,
+            cold,
+            live_routes = self.live_routes(),
+            action = "claim_native_thread",
+            "Claude Code sub-agent thread claimed"
+        );
+        Ok(handle)
+    }
+
     fn subscribe(&self, thread: &ThreadHandle) -> AgentEventStream {
-        match lock(&self.children).get(&thread.thread) {
-            Some(handle) => AgentEventStream::new(handle.log.reader()),
+        if let Some(handle) = lock(&self.children).get(&thread.thread) {
+            return AgentEventStream::new(handle.log.reader());
+        }
+        match lock(&self.routes).get(&thread.thread) {
+            Some(route) => AgentEventStream::new(route.log.reader()),
             None => AgentEventStream::closed(),
         }
     }
@@ -1423,6 +1587,9 @@ impl AgentHarness for ClaudeHarness {
     }
 
     async fn interrupt(&self, thread: &ThreadHandle) -> Result<(), HarnessError> {
+        if is_task_native_id(&thread.harness_thread_id) {
+            return self.interrupt_route(thread).await;
+        }
         let LiveChild { commands, .. } = self
             .live(thread.thread)
             .ok_or(HarnessError::ThreadNotFound(thread.thread))?;
@@ -1543,10 +1710,11 @@ impl AgentHarness for ClaudeHarness {
                 "Claude Code approvals offer no exec-policy amendment".into(),
             ));
         }
-        let thread = ask.thread;
+        // A sub-agent's ask is answered by the child that carries its route.
+        let thread = ask.owner;
         let LiveChild { commands, .. } = self
             .live(thread)
-            .ok_or(HarnessError::ThreadNotFound(thread))?;
+            .ok_or(HarnessError::ThreadNotFound(ask.thread))?;
         self.call(
             thread,
             commands,
@@ -1577,10 +1745,10 @@ impl AgentHarness for ClaudeHarness {
                 "server request {req} is not pending"
             )));
         };
-        let thread = ask.thread;
+        let thread = ask.owner;
         let LiveChild { commands, .. } = self
             .live(thread)
-            .ok_or(HarnessError::ThreadNotFound(thread))?;
+            .ok_or(HarnessError::ThreadNotFound(ask.thread))?;
         self.call(
             thread,
             commands,
@@ -1826,6 +1994,8 @@ mod tests {
         let argv = &spawner.spawns()[0];
         let at = argv.iter().position(|arg| arg == "--session-id").unwrap();
         assert_eq!(argv[at + 1], handle.harness_thread_id);
+        // Sub-agent text and thinking reach the mapper as forwarded frames.
+        assert!(argv.iter().any(|arg| arg == "--forward-subagent-text"));
 
         let subtypes: Vec<_> = written(&record)
             .iter()
@@ -3901,8 +4071,10 @@ mod tests {
     #[test]
     fn ask_user_question_answers_skip_unanswered_questions() {
         let (_, input) = ask_user_question("q");
+        let thread = ThreadId::new();
         let ask = crate::session::PendingAsk {
-            thread: ThreadId::new(),
+            thread,
+            owner: thread,
             request_id: "q".into(),
             tool_use_id: None,
             tool_name: None,
@@ -4884,5 +5056,422 @@ mod tests {
         assert!(elapsed >= crate::session::STOP_EXIT_GRACE, "{elapsed:?}");
         assert!(elapsed < STOP_TIMEOUT, "{elapsed:?}");
         assert_eq!(harness.live_children(), 0);
+    }
+
+    // ---- sub-agent routes ----------------------------------------------------------------------
+
+    /// The link the primary's `Agent` item starts with.
+    async fn spawned_link(stream: &mut AgentEventStream) -> giskard_core::item::SubagentLink {
+        next_matching(stream, |event| match event {
+            AgentEvent::ItemStarted { item, .. } => {
+                item.tool.as_ref().and_then(|tool| tool.subagent.clone())
+            }
+            _ => None,
+        })
+        .await
+    }
+
+    /// Open a thread whose child emits `count` lines of `fixture` on the user message (then
+    /// `rest`), start a turn, and claim the sub-agent route its `Agent` item links.
+    async fn delegating(
+        fixture: &'static str,
+        count: usize,
+        rest: Vec<Step>,
+    ) -> (
+        Arc<ClaudeHarness>,
+        ThreadHandle,
+        AgentEventStream,
+        ThreadHandle,
+        Arc<Mutex<ScriptRecord>>,
+        crate::session::tests::Injector,
+    ) {
+        let mut steps = vec![Step::OnStdin(
+            user(),
+            vec![Action::EmitFixturePrefix {
+                name: fixture,
+                count,
+            }],
+        )];
+        steps.extend(rest);
+        let (child, record) = scripted(handshake_steps("sonnet"), steps);
+        let injector = child.injector();
+        let (harness, _) = harness(vec![child]);
+        let (options, _updates) = open_options(ThreadId::new(), None, "sonnet");
+        let handle = harness.open_thread(options).await.unwrap();
+        let mut stream = harness.subscribe(&handle);
+        harness
+            .start_turn(&handle, text("delegate"), overrides())
+            .await
+            .unwrap();
+        let link = spawned_link(&mut stream).await;
+        let route = harness
+            .claim_native_thread(
+                ThreadId::new(),
+                link.harness_thread_id,
+                PathBuf::from(WORKSPACE),
+            )
+            .await
+            .unwrap();
+        (harness, handle, stream, route, record, injector)
+    }
+
+    #[tokio::test]
+    #[traced_test]
+    async fn claim_native_thread_adopts_the_minted_route() {
+        // Up to the delegated prompt: the route is live and its turn has started.
+        let (harness, handle, mut stream, route, _, injector) =
+            delegating("delegation", 7, Vec::new()).await;
+        assert_eq!(
+            route.harness_thread_id,
+            "task:toolu_01DSgcYLdZqTSvfAwdnE2njN"
+        );
+        assert_ne!(route.thread, handle.thread);
+        assert_eq!(
+            route.agent_name.as_deref(),
+            Some("Read and find magic number")
+        );
+        assert_eq!(route.resumed_model, Some(model("sonnet")));
+        assert_eq!(
+            route.parent_harness_thread_id.as_deref(),
+            Some(handle.harness_thread_id.as_str())
+        );
+        assert!(route.warning.is_none());
+
+        let mut child = harness.subscribe(&route);
+        let first = tokio::time::timeout(Duration::from_secs(10), child.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(matches!(first, AgentEvent::TurnStarted { thread, .. } if thread == route.thread));
+
+        // Idempotent, whatever thread is proposed.
+        let again = harness
+            .claim_native_thread(
+                ThreadId::new(),
+                route.harness_thread_id.clone(),
+                PathBuf::from(WORKSPACE),
+            )
+            .await
+            .unwrap();
+        assert_eq!(again.thread, route.thread);
+        // A proposed thread bound to another native id is refused.
+        assert!(matches!(
+            harness
+                .claim_native_thread(
+                    route.thread,
+                    "task:toolu_other".into(),
+                    PathBuf::from(WORKSPACE)
+                )
+                .await,
+            Err(HarnessError::Protocol(_))
+        ));
+
+        // The rest of the delegation: the child completes, then the parent, and the route closes.
+        for line in fixture_lines("delegation").into_iter().skip(7) {
+            injector.emit(line);
+        }
+        let events = until_completed(&mut child).await;
+        assert_eq!(completion(&events).1, TurnStatusKind::Completed);
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AgentEvent::ItemCompleted { item, .. }
+                if matches!(&item.payload, giskard_core::item::ItemPayload::UserMessage { .. })
+        )));
+        assert_eq!(
+            completion(&until_completed(&mut stream).await).1,
+            TurnStatusKind::Completed
+        );
+        // The parent's turn ended and the mapper dropped the route, but its log stays open and
+        // published: the sub-agent thread's owner keeps a live, silent stream.
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), child.recv())
+                .await
+                .is_err()
+        );
+        assert_eq!(harness.live_routes(), 1);
+        logs_assert(a_line_with(&[" INFO ", r#"action="route_closed""#]));
+        logs_assert(a_line_with(&[
+            r#"action="claim_native_thread""#,
+            "adopted=true",
+            "cold=false",
+        ]));
+        harness.shutdown().await.unwrap();
+        until_closed(&mut child).await;
+    }
+
+    #[tokio::test]
+    async fn a_claim_after_the_parent_turn_ended_adopts_the_route_and_its_history() {
+        // The whole delegation, parent `result` included, before the server claims the child.
+        let (child, _) = scripted(
+            handshake_steps("sonnet"),
+            vec![Step::OnStdin(
+                user(),
+                vec![Action::EmitFixture {
+                    name: "delegation",
+                    skip_types: &[],
+                }],
+            )],
+        );
+        let (harness, _) = harness(vec![child]);
+        let (options, _updates) = open_options(ThreadId::new(), None, "sonnet");
+        let handle = harness.open_thread(options).await.unwrap();
+        let mut stream = harness.subscribe(&handle);
+        harness
+            .start_turn(&handle, text("delegate"), overrides())
+            .await
+            .unwrap();
+        let link = spawned_link(&mut stream).await;
+        until_completed(&mut stream).await;
+
+        let proposed = ThreadId::new();
+        let route = harness
+            .claim_native_thread(proposed, link.harness_thread_id, PathBuf::from(WORKSPACE))
+            .await
+            .unwrap();
+        assert_ne!(
+            route.thread, proposed,
+            "a late claim must adopt, not bind cold"
+        );
+        assert_eq!(
+            route.agent_name.as_deref(),
+            Some("Read and find magic number")
+        );
+        let mut child = harness.subscribe(&route);
+        let events = until_completed(&mut child).await;
+        assert!(matches!(events[0], AgentEvent::TurnStarted { .. }));
+        assert_eq!(completion(&events).1, TurnStatusKind::Completed);
+        harness.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    #[traced_test]
+    async fn claim_native_thread_binds_a_cold_route_for_a_gone_session() {
+        let (harness, _) = harness(Vec::new());
+        let proposed = ThreadId::new();
+        let handle = harness
+            .claim_native_thread(proposed, "task:toolu_gone".into(), PathBuf::from(WORKSPACE))
+            .await
+            .unwrap();
+        assert_eq!(handle.thread, proposed);
+        assert_eq!(handle.harness_thread_id, "task:toolu_gone");
+        assert!(handle.agent_name.is_none() && handle.resumed_model.is_none());
+        assert_eq!(harness.live_routes(), 1);
+
+        // An open, silent stream: nothing in it, and not closed.
+        let mut stream = harness.subscribe(&handle);
+        assert!(stream.try_recv().is_none());
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), stream.recv())
+                .await
+                .is_err()
+        );
+        assert!(matches!(
+            harness.interrupt(&handle).await,
+            Err(HarnessError::Unsupported(message)) if message.contains("no longer running")
+        ));
+        let again = harness
+            .claim_native_thread(
+                ThreadId::new(),
+                "task:toolu_gone".into(),
+                PathBuf::from(WORKSPACE),
+            )
+            .await
+            .unwrap();
+        assert_eq!(again.thread, proposed);
+
+        harness.delete_thread(&handle).await.unwrap();
+        assert_eq!(harness.live_routes(), 0);
+        assert!(matches!(
+            harness
+                .claim_native_thread(ThreadId::new(), RESUME_ID.into(), PathBuf::from(WORKSPACE))
+                .await,
+            Err(HarnessError::Protocol(_))
+        ));
+        logs_assert(a_line_with(&[
+            r#"action="claim_native_thread""#,
+            "adopted=false",
+            "cold=true",
+        ]));
+    }
+
+    #[tokio::test]
+    #[traced_test]
+    async fn interrupt_on_a_sub_agent_writes_stop_task() {
+        let lines = fixture_lines("subagent-stop");
+        // Up to the sub-agent's `Bash` block, its ask pending; `stop_task` gets the recording's
+        // remainder, the CLI's answer between the task's updates and the trailing frames.
+        let (harness, handle, mut stream, route, record, _) = delegating(
+            "subagent-stop",
+            12,
+            vec![Step::OnStdin(
+                control("stop_task"),
+                vec![
+                    Action::Emit(lines[12..15].to_vec()),
+                    Action::Respond(json!({})),
+                    Action::EmitFixtureFrom {
+                        name: "subagent-stop",
+                        from: 15,
+                    },
+                ],
+            )],
+        )
+        .await;
+        let mut child = harness.subscribe(&route);
+        approval_requested(&mut child).await;
+
+        harness.interrupt(&route).await.unwrap();
+        let stop: Vec<Value> = written(&record)
+            .into_iter()
+            .filter(|line| line["request"]["subtype"] == "stop_task")
+            .map(|line| line["request"].clone())
+            .collect();
+        assert_eq!(
+            stop,
+            vec![json!({"subtype": "stop_task", "task_id": "ada9b7fee5c0a73e9"})]
+        );
+        let events = until_completed(&mut child).await;
+        assert_eq!(completion(&events).1, TurnStatusKind::Interrupted);
+        // The parent's turn is not ended by it.
+        assert_eq!(
+            completion(&until_completed(&mut stream).await).1,
+            TurnStatusKind::Completed
+        );
+        logs_assert(a_line_with(&[
+            " INFO ",
+            r#"action="stop_task""#,
+            "task_id=ada9b7fee5c0a73e9",
+        ]));
+        harness.shutdown().await.unwrap();
+        drop(handle);
+
+        // Before its `task_started` there is no task to stop.
+        let (harness, _, _, route, _, _) = delegating("subagent-stop", 5, Vec::new()).await;
+        assert!(matches!(
+            harness.interrupt(&route).await,
+            Err(HarnessError::Protocol(message)) if message.contains("not started")
+        ));
+        harness.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_sub_agent_approval_is_answered_through_its_owner() {
+        let (harness, handle, _stream, route, record, _) = delegating(
+            "subagent-stop",
+            12,
+            vec![Step::OnStdin(
+                answered(),
+                vec![Action::Exit {
+                    code: 0,
+                    stderr: Vec::new(),
+                }],
+            )],
+        )
+        .await;
+        let mut child = harness.subscribe(&route);
+        let approval = approval_requested(&mut child).await;
+        {
+            let pending = lock(&harness.pending);
+            let ask = pending.approval(&approval).unwrap();
+            assert_eq!(ask.thread, route.thread);
+            assert_eq!(ask.owner, handle.thread);
+        }
+
+        harness
+            .respond_approval(approval, ApprovalDecision::Accept)
+            .await
+            .unwrap();
+        let answer = written(&record)
+            .into_iter()
+            .find(|line| line["type"] == "control_response")
+            .unwrap();
+        assert_eq!(
+            answer["response"]["request_id"],
+            "fbf65ceb-dd0b-48ed-90eb-0b62eedd63c7"
+        );
+        assert_eq!(answer["response"]["response"]["behavior"], "allow");
+
+        until_no_children(&harness).await;
+        assert_eq!(lock(&harness.pending).len(), 0);
+        // The route outlives its child, cold.
+        assert_eq!(harness.live_routes(), 1);
+        assert!(matches!(
+            harness.interrupt(&route).await,
+            Err(HarnessError::Unsupported(_))
+        ));
+    }
+
+    #[tokio::test]
+    #[traced_test]
+    async fn child_exit_turns_live_routes_cold() {
+        let (harness, _handle, _stream, route, _, injector) =
+            delegating("subagent-stop", 12, Vec::new()).await;
+        let mut child = harness.subscribe(&route);
+        approval_requested(&mut child).await;
+        assert_eq!(harness.live_routes(), 1);
+
+        injector.eof();
+        let events = until_completed(&mut child).await;
+        assert_eq!(completion(&events).1, TurnStatusKind::Failed);
+        until_no_children(&harness).await;
+        // The route's stream stays open and silent; the route is cold now.
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), child.recv())
+                .await
+                .is_err()
+        );
+        assert_eq!(harness.live_routes(), 1);
+        assert!(matches!(
+            harness.interrupt(&route).await,
+            Err(HarnessError::Unsupported(message)) if message.contains("no longer running")
+        ));
+        let again = harness
+            .claim_native_thread(
+                ThreadId::new(),
+                route.harness_thread_id.clone(),
+                PathBuf::from(WORKSPACE),
+            )
+            .await
+            .unwrap();
+        assert_eq!(again.thread, route.thread);
+        assert_eq!(lock(&harness.pending).len(), 0);
+        logs_assert(a_line_with(&[
+            "claude child exited",
+            "pending_dropped=1",
+            "routes_cooled=1",
+        ]));
+
+        // Only the sub-agent thread's own delete ends its stream.
+        harness.delete_thread(&route).await.unwrap();
+        assert_eq!(harness.live_routes(), 0);
+        until_closed(&mut child).await;
+    }
+
+    #[tokio::test]
+    async fn shutdown_clears_routes() {
+        let (harness, _handle, _stream, route, _, _) =
+            delegating("delegation", 7, Vec::new()).await;
+        let cold = harness
+            .claim_native_thread(
+                ThreadId::new(),
+                "task:toolu_gone".into(),
+                PathBuf::from(WORKSPACE),
+            )
+            .await
+            .unwrap();
+        assert_eq!(harness.live_routes(), 2);
+        let mut cold_stream = harness.subscribe(&cold);
+        harness.shutdown().await.unwrap();
+        assert_eq!(harness.live_routes(), 0);
+        until_closed(&mut cold_stream).await;
+        assert!(matches!(
+            harness
+                .claim_native_thread(
+                    ThreadId::new(),
+                    route.harness_thread_id,
+                    PathBuf::from(WORKSPACE)
+                )
+                .await,
+            Err(HarnessError::Transport(_))
+        ));
     }
 }

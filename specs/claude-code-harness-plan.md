@@ -1610,6 +1610,8 @@ the mapper mints one route (a `ThreadId` and a retained log) per `Agent` call, t
 that id or binds a silent cold route for a session that is gone, and a killed sub-agent's trailing
 frames are dropped in favour of its `Interrupted` status. Two fixtures recorded for it
 (`subagent-stop`, `subagent-ask-withdrawn`) settled the ask ordering and the `stop_task` shape.
+Milestone 5 is implemented: the routes in the adapter's mapper and supervisor, `claim_native_thread`
+and `stop_task` in its façade, and no change to the server or `app.js`.
 
 ### Milestones 6 to 8 — polish
 

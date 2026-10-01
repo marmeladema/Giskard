@@ -23,7 +23,7 @@ use tokio::time::Instant;
 use tracing::{Instrument, debug, error, info, warn};
 
 use crate::log_fields::display_opt;
-use crate::mapper::{ClaudeMapper, MapperOutput, TurnKind};
+use crate::mapper::{ClaudeMapper, MapperOutput, RouteLookup, TurnKind};
 use crate::process::{ChildExit, ChildLogContext, ClaudeChild, LaunchMode};
 
 /// How long one control request the supervisor awaits itself may take (the per-turn settings).
@@ -91,6 +91,11 @@ pub(crate) enum ChildCommand {
         response: ServerRequestResponse,
         reply: oneshot::Sender<Result<(), HarnessError>>,
     },
+    /// Stop the sub-agent of route `thread` (`stop_task`): the sub-agent thread's `interrupt`.
+    StopTask {
+        thread: ThreadId,
+        reply: oneshot::Sender<Result<(), HarnessError>>,
+    },
     /// Run `/compact` as a compaction turn.
     Compact {
         turn: TurnId,
@@ -117,6 +122,26 @@ pub(crate) struct ChildHandle {
 }
 
 pub(crate) type Children = Arc<Mutex<HashMap<ThreadId, ChildHandle>>>;
+pub(crate) type Routes = Arc<Mutex<HashMap<ThreadId, RouteHandle>>>;
+
+/// The façade's view of one sub-agent route: a live one, published by its child's supervisor, or
+/// a cold one, bound by `claim_native_thread` for a route whose session is gone or left behind by
+/// its child's exit. Its log stays open until the sub-agent thread's delete or archive, or
+/// shutdown.
+pub(crate) struct RouteHandle {
+    /// `task:<tool_use_id>`.
+    pub harness_thread_id: String,
+    pub log: Arc<EventLog>,
+    /// The primary thread whose child carries this route; `None` for a cold route.
+    pub owner: Option<ThreadId>,
+    pub commands: Option<mpsc::Sender<ChildCommand>>,
+    pub parent_harness_thread_id: Option<String>,
+    pub agent_name: Option<String>,
+    pub model: Option<ModelRef>,
+    /// The publishing child's generation, so a supervisor never removes a route it did not
+    /// publish; `None` for a cold route.
+    pub generation: Option<u64>,
+}
 pub(crate) type Pending = Arc<Mutex<PendingRequests>>;
 
 /// Lock a std mutex whose guarded maps stay consistent even if a holder panicked.
@@ -127,7 +152,10 @@ pub(crate) fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 /// One ask the CLI published and nothing has answered yet.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct PendingAsk {
+    /// The thread the ask was published on: the primary's, or one of its sub-agent routes'.
     pub thread: ThreadId,
+    /// The primary thread whose child answers the ask.
+    pub owner: ThreadId,
     /// The CLI's `request_id` the answer must carry.
     pub request_id: String,
     pub tool_use_id: Option<String>,
@@ -204,16 +232,17 @@ impl PendingRequests {
         self.server_requests.remove(id)
     }
 
-    /// Remove the ask of `thread` whose CLI request id is `request_id`, whichever map holds it.
+    /// Remove the ask of `owner`'s child whose CLI request id is `request_id`, whichever map
+    /// holds it.
     pub fn remove_by_request_id(
         &mut self,
-        thread: ThreadId,
+        owner: ThreadId,
         request_id: &str,
     ) -> Option<(RequestKind, PendingAsk)> {
         let approval = self
             .approvals
             .iter()
-            .find(|(_, ask)| ask.thread == thread && ask.request_id == request_id)
+            .find(|(_, ask)| ask.owner == owner && ask.request_id == request_id)
             .map(|(id, _)| id.clone());
         if let Some(ask) = approval.and_then(|id| self.approvals.remove(&id)) {
             return Some((RequestKind::Approval, ask));
@@ -221,14 +250,22 @@ impl PendingRequests {
         let request = self
             .server_requests
             .iter()
-            .find(|(_, ask)| ask.thread == thread && ask.request_id == request_id)
+            .find(|(_, ask)| ask.owner == owner && ask.request_id == request_id)
             .map(|(id, _)| id.clone());
         request
             .and_then(|id| self.server_requests.remove(&id))
             .map(|ask| (RequestKind::ServerRequest, ask))
     }
 
-    /// Drop every ask of one thread; returns how many there were.
+    /// Drop every ask `owner`'s child published, its routes' included; returns how many.
+    pub fn remove_owner(&mut self, owner: ThreadId) -> usize {
+        let before = self.len();
+        self.approvals.retain(|_, ask| ask.owner != owner);
+        self.server_requests.retain(|_, ask| ask.owner != owner);
+        before - self.len()
+    }
+
+    /// Drop every ask published on one thread (a sub-agent route); returns how many.
     pub fn remove_thread(&mut self, thread: ThreadId) -> usize {
         let before = self.len();
         self.approvals.retain(|_, ask| ask.thread != thread);
@@ -245,6 +282,25 @@ impl PendingRequests {
 
     pub fn len(&self) -> usize {
         self.approvals.len() + self.server_requests.len()
+    }
+}
+
+/// The thread an event belongs to. `giskard-core` has no accessor for it.
+pub(crate) fn event_thread(event: &AgentEvent) -> ThreadId {
+    match event {
+        AgentEvent::ThreadOpened { thread, .. }
+        | AgentEvent::TurnStarted { thread, .. }
+        | AgentEvent::TurnUsageUpdated { thread, .. }
+        | AgentEvent::ItemStarted { thread, .. }
+        | AgentEvent::ItemDelta { thread, .. }
+        | AgentEvent::ItemCompleted { thread, .. }
+        | AgentEvent::DiffUpdated { thread, .. }
+        | AgentEvent::ApprovalRequested { thread, .. }
+        | AgentEvent::ServerRequestReceived { thread, .. }
+        | AgentEvent::ServerRequestResolved { thread, .. }
+        | AgentEvent::TurnCompleted { thread, .. }
+        | AgentEvent::Error { thread, .. }
+        | AgentEvent::Notice { thread, .. } => *thread,
     }
 }
 
@@ -484,6 +540,10 @@ pub(crate) struct SupervisorParts {
     pub shutdown: watch::Receiver<bool>,
     pub children: Children,
     pub pending: Pending,
+    /// The façade's sub-agent routes, where this supervisor publishes its own.
+    pub routes: Routes,
+    /// The sender half of `commands`, handed to the façade with each published route.
+    pub commands_sender: mpsc::WeakSender<ChildCommand>,
     pub generation: u64,
     pub thread: ThreadId,
     pub context: ChildLogContext,
@@ -505,6 +565,10 @@ pub(crate) fn spawn_supervisor(parts: SupervisorParts) -> JoinHandle<()> {
         shutdown: parts.shutdown,
         children: parts.children,
         pending: parts.pending,
+        routes: parts.routes,
+        commands_sender: parts.commands_sender,
+        route_logs: HashMap::new(),
+        route_logs_missing: HashSet::new(),
         generation: parts.generation,
         thread: parts.thread,
         context: parts.context,
@@ -549,6 +613,24 @@ struct Supervisor {
     shutdown: watch::Receiver<bool>,
     children: Children,
     pending: Pending,
+    routes: Routes,
+    commands_sender: mpsc::WeakSender<ChildCommand>,
+    // ENTITY-AUTHORITY-EXCEPTION:
+    // Role: The retained event log of each sub-agent route of this child.
+    // Source of truth: The mapper's `RouteOpened` creates the log.
+    // Structural reason: A route's events are its own thread's, read through the route's handle.
+    // Synchronization: Owned by this supervisor task alone.
+    // Invalidation/removal: The mapper's `RouteClosed` removes one and child exit the rest; the
+    //   log itself stays open, published in the façade's routes until the sub-agent thread's
+    //   delete or archive, or shutdown.
+    route_logs: HashMap<ThreadId, Arc<EventLog>>,
+    // ENTITY-AUTHORITY-EXCEPTION:
+    // Role: Report an event for a thread with no log once per thread, not once per event.
+    // Source of truth: `append` inserts the thread the first time it finds no log for it.
+    // Structural reason: A lost route log is an invariant breach worth one warning, not a flood.
+    // Synchronization: Owned by this supervisor task alone.
+    // Invalidation/removal: Drops with the task.
+    route_logs_missing: HashSet<ThreadId>,
     generation: u64,
     thread: ThreadId,
     context: ChildLogContext,
@@ -760,9 +842,11 @@ impl Supervisor {
                 tool_use_id,
                 tool_name,
                 suggestions,
+                thread,
             } => {
                 debug!(
-                    thread_id = %self.thread,
+                    thread_id = %thread,
+                    owner_thread_id = %self.thread,
                     request_id = %request_id,
                     tool_call_id = display_opt(tool_use_id.as_deref()),
                     tool_name = %tool_name,
@@ -773,7 +857,8 @@ impl Supervisor {
                 lock(&self.pending).insert_approval(
                     id,
                     PendingAsk {
-                        thread: self.thread,
+                        thread,
+                        owner: self.thread,
                         request_id,
                         tool_use_id,
                         tool_name: Some(tool_name),
@@ -785,12 +870,14 @@ impl Supervisor {
             }
             MapperOutput::PendingServerRequest {
                 id,
+                thread,
                 request_id,
                 subtype,
                 input,
             } => {
                 debug!(
-                    thread_id = %self.thread,
+                    thread_id = %thread,
+                    owner_thread_id = %self.thread,
                     request_id = %request_id,
                     subtype = %subtype,
                     action = "pending_server_request",
@@ -799,7 +886,8 @@ impl Supervisor {
                 lock(&self.pending).insert_server_request(
                     id,
                     PendingAsk {
-                        thread: self.thread,
+                        thread,
+                        owner: self.thread,
                         request_id,
                         tool_use_id: None,
                         tool_name: None,
@@ -810,8 +898,99 @@ impl Supervisor {
                 );
             }
             MapperOutput::CancelRequest { request_id } => self.on_cancel_request(&request_id),
+            MapperOutput::RouteOpened {
+                thread,
+                harness_thread_id,
+                parent_harness_thread_id,
+                agent_name,
+            } => self.open_route(
+                thread,
+                harness_thread_id,
+                parent_harness_thread_id,
+                agent_name,
+            ),
+            MapperOutput::RouteClosed { thread } => self.close_route(thread),
         }
         Ok(())
+    }
+
+    /// The mapper minted a route: give it a retained log and publish it to the façade, so the
+    /// server's claim adopts it and its reader starts at the route's first event.
+    fn open_route(
+        &mut self,
+        thread: ThreadId,
+        harness_thread_id: String,
+        parent_harness_thread_id: String,
+        agent_name: Option<String>,
+    ) {
+        let log = Arc::new(EventLog::new());
+        self.route_logs.insert(thread, log.clone());
+        let commands = self.commands_sender.upgrade();
+        let live_routes = {
+            let mut routes = lock(&self.routes);
+            routes.insert(
+                thread,
+                RouteHandle {
+                    harness_thread_id: harness_thread_id.clone(),
+                    log,
+                    owner: Some(self.thread),
+                    commands,
+                    parent_harness_thread_id: Some(parent_harness_thread_id.clone()),
+                    agent_name,
+                    model: Some(self.current_model.clone()),
+                    generation: Some(self.generation),
+                },
+            );
+            routes.len()
+        };
+        info!(
+            project_id = display_opt(self.context.project_id),
+            thread_id = %thread,
+            owner_thread_id = %self.thread,
+            harness_thread_id = display_opt(self.context.harness_thread_id.as_deref()),
+            route = %harness_thread_id,
+            parent_harness_thread_id = %parent_harness_thread_id,
+            live_routes,
+            action = "route_opened",
+            "sub-agent route published"
+        );
+    }
+
+    /// The mapper dropped a route: this supervisor stops appending to its log and drops its asks.
+    ///
+    /// The log stays **open and published**: the sub-agent thread's owner keeps reading it like
+    /// any thread's stream (a closed stream would end that owner as failed), and a claim that
+    /// lands after the parent's turn ended still adopts the route and reads its retained events.
+    /// The route ends only with the sub-agent thread's own delete or archive, or at shutdown.
+    fn close_route(&mut self, thread: ThreadId) {
+        let had_log = self.route_logs.remove(&thread).is_some();
+        let pending_dropped = lock(&self.pending).remove_thread(thread);
+        info!(
+            thread_id = %thread,
+            owner_thread_id = %self.thread,
+            harness_thread_id = display_opt(self.context.harness_thread_id.as_deref()),
+            had_log,
+            pending_dropped,
+            action = "route_closed",
+            "sub-agent route closed; its log stays open for the sub-agent thread"
+        );
+    }
+
+    /// The child exited: every route it published becomes a cold route (no owner, no command
+    /// sender), its log left open, so the sub-agent threads' owners keep their silent streams.
+    /// Returns how many routes were turned cold.
+    fn cool_routes(&self) -> usize {
+        let mut routes = lock(&self.routes);
+        let mut cooled = 0;
+        for route in routes.values_mut() {
+            if route.owner == Some(self.thread) && route.generation == Some(self.generation) {
+                route.owner = None;
+                route.commands = None;
+                route.generation = None;
+                cooled += 1;
+            }
+        }
+        cooled
     }
 
     /// The CLI withdrew an ask (`control_cancel_request`): drop it, so a late answer is refused.
@@ -820,9 +999,10 @@ impl Supervisor {
     fn on_cancel_request(&mut self, request_id: &str) {
         let removed = lock(&self.pending).remove_by_request_id(self.thread, request_id);
         match removed {
-            Some((kind, _)) => {
+            Some((kind, ask)) => {
                 debug!(
-                    thread_id = %self.thread,
+                    thread_id = %ask.thread,
+                    owner_thread_id = %self.thread,
                     turn_id = display_opt(self.mapper.active_turn()),
                     request_id = %request_id,
                     action = "control_cancel_request",
@@ -830,9 +1010,10 @@ impl Supervisor {
                     "dropped the ask Claude Code withdrew"
                 );
                 if kind == RequestKind::ServerRequest {
+                    let turn = self.mapper.active_turn_of(ask.thread);
                     self.append(AgentEvent::ServerRequestResolved {
-                        thread: self.thread,
-                        turn: self.mapper.active_turn(),
+                        thread: ask.thread,
+                        turn,
                         request_id: ServerRequestId::new(request_id.to_owned()),
                     });
                 }
@@ -852,8 +1033,30 @@ impl Supervisor {
         }
     }
 
-    /// Append to the retained log; a closed log is reported once and counted, never ignored.
+    /// Append to the retained log of the event's thread (the primary's or a route's); a closed or
+    /// missing log is reported once and counted, never ignored.
     fn append(&mut self, event: AgentEvent) {
+        let thread = event_thread(&event);
+        if thread != self.thread {
+            let appended = self
+                .route_logs
+                .get(&thread)
+                .is_some_and(|log| log.append(event));
+            if appended {
+                return;
+            }
+            self.dropped_events += 1;
+            if self.route_logs_missing.insert(thread) {
+                warn!(
+                    thread_id = %thread,
+                    owner_thread_id = %self.thread,
+                    harness_thread_id = display_opt(self.context.harness_thread_id.as_deref()),
+                    action = "route_log_missing",
+                    "no open event log for this sub-agent thread; dropping its events"
+                );
+            }
+            return;
+        }
         if self.log.append(event) {
             return;
         }
@@ -937,6 +1140,7 @@ impl Supervisor {
                 response,
                 reply,
             } => self.respond_server_request(id, ask, response, reply).await,
+            ChildCommand::StopTask { thread, reply } => self.stop_task(thread, reply).await,
             ChildCommand::Compact { turn, reply } => self.compact(turn, reply).await,
             ChildCommand::Stop { reply } => {
                 // The main loop intercepts `Stop`; reaching here would be a routing bug.
@@ -1424,19 +1628,19 @@ impl Supervisor {
                 "the ask carried no addRules suggestion; allowing this use only"
             );
         }
-        let turn = self.mapper.active_turn();
+        let turn = self.mapper.active_turn_of(ask.thread);
         if matches!(
             decision,
             ApprovalDecision::Decline | ApprovalDecision::Cancel
         ) && let Some(tool_use_id) = &ask.tool_use_id
         {
-            self.mapper.note_denied(tool_use_id);
+            self.mapper.note_denied(ask.thread, tool_use_id);
         }
         if matches!(decision, ApprovalDecision::Cancel) {
             // The deny carries `interrupt: true`: the turn ends `aborted_tools`, which must
             // persist as `Interrupted`, and the exit after it is expected.
             self.interrupt_sent = true;
-            if turn.is_some() {
+            if self.mapper.active_turn().is_some() {
                 self.mapper.note_interrupt_sent();
             }
         }
@@ -1450,7 +1654,8 @@ impl Supervisor {
         }
         info!(
             project_id = display_opt(self.context.project_id),
-            thread_id = %self.thread,
+            thread_id = %ask.thread,
+            owner_thread_id = %self.thread,
             turn_id = display_opt(turn),
             request_id = %ask.request_id,
             action = "respond_approval",
@@ -1480,9 +1685,10 @@ impl Supervisor {
                 "late answer to a server request Claude Code withdrew; not sent"
             );
             // The withdrawal found nothing pending, so its card is cleared here.
+            let turn = self.mapper.active_turn_of(ask.thread);
             self.append(AgentEvent::ServerRequestResolved {
-                thread: self.thread,
-                turn: self.mapper.active_turn(),
+                thread: ask.thread,
+                turn,
                 request_id: id.clone(),
             });
             let _ = reply.send(Err(HarnessError::Protocol(format!(
@@ -1520,10 +1726,11 @@ impl Supervisor {
             let _ = reply.send(Err(error.clone()));
             return Err(error);
         }
-        let turn = self.mapper.active_turn();
+        let turn = self.mapper.active_turn_of(ask.thread);
         info!(
             project_id = display_opt(self.context.project_id),
-            thread_id = %self.thread,
+            thread_id = %ask.thread,
+            owner_thread_id = %self.thread,
             turn_id = display_opt(turn),
             request_id = %ask.request_id,
             action = "respond_server_request",
@@ -1535,11 +1742,96 @@ impl Supervisor {
             "server request answered"
         );
         self.append(AgentEvent::ServerRequestResolved {
-            thread: self.thread,
+            thread: ask.thread,
             turn,
             request_id: id,
         });
         let _ = reply.send(Ok(()));
+        Ok(())
+    }
+
+    /// `stop_task` for the sub-agent of route `thread`: the sub-agent thread's interrupt. The
+    /// sub-agent is killed, its pending ask is withdrawn (`control_cancel_request`), and the
+    /// parent's turn continues. `Err` is a stdin write failure.
+    async fn stop_task(
+        &mut self,
+        thread: ThreadId,
+        reply: oneshot::Sender<Result<(), HarnessError>>,
+    ) -> Result<(), HarnessError> {
+        let task_id = match self.mapper.route_task_id(thread) {
+            Ok(Some(task_id)) => task_id,
+            Ok(None) => {
+                debug!(
+                    thread_id = %thread,
+                    owner_thread_id = %self.thread,
+                    action = "stop_task",
+                    "the sub-agent has not started yet; nothing to stop"
+                );
+                let _ = reply.send(Err(HarnessError::Protocol(
+                    "the sub-agent has not started yet".into(),
+                )));
+                return Ok(());
+            }
+            Err(RouteLookup::Ended) => {
+                debug!(
+                    thread_id = %thread,
+                    owner_thread_id = %self.thread,
+                    action = "stop_task",
+                    "the sub-agent already ended; nothing to stop"
+                );
+                let _ = reply.send(Ok(()));
+                return Ok(());
+            }
+            Err(RouteLookup::NotARoute) => {
+                warn!(
+                    thread_id = %thread,
+                    owner_thread_id = %self.thread,
+                    action = "stop_task",
+                    "stop_task for a thread that is no sub-agent of this child"
+                );
+                let _ = reply.send(Err(HarnessError::Protocol(format!(
+                    "thread {thread} is not a running sub-agent of this child"
+                ))));
+                return Ok(());
+            }
+        };
+        let harness_thread_id = lock(&self.routes)
+            .get(&thread)
+            .map(|route| route.harness_thread_id.clone());
+        // Noted before the write: the CLI emits the task's `killed` update before it answers, and
+        // that update must read as an interruption. A refused stop leaves the task running, and
+        // only another stop (or the parent's interrupt) can kill it later.
+        self.mapper.note_stop_sent(thread);
+        let request = json!({"subtype": "stop_task", "task_id": task_id});
+        let deadline = Instant::now() + CONTROL_TIMEOUT;
+        match self.await_control(&request, deadline).await {
+            Ok(_) => {
+                info!(
+                    project_id = display_opt(self.context.project_id),
+                    thread_id = %thread,
+                    owner_thread_id = %self.thread,
+                    harness_thread_id = display_opt(harness_thread_id.as_deref()),
+                    task_id = %task_id,
+                    action = "stop_task",
+                    "sub-agent stopped"
+                );
+                let _ = reply.send(Ok(()));
+            }
+            Err(failure) => {
+                warn!(
+                    project_id = display_opt(self.context.project_id),
+                    thread_id = %thread,
+                    owner_thread_id = %self.thread,
+                    harness_thread_id = display_opt(harness_thread_id.as_deref()),
+                    task_id = %task_id,
+                    action = "stop_task",
+                    error = %failure,
+                    "Claude Code did not stop the sub-agent"
+                );
+                let _ = reply.send(Err(failure.into_error()));
+            }
+        }
+        // A write failure inside `await_control` already marked the child broken.
         Ok(())
     }
 
@@ -1692,13 +1984,31 @@ impl Supervisor {
         if let Some(failure) = self.failure {
             described = format!("{described}, after {failure}");
         }
-        if self.mapper.active_turn().is_some() {
-            for output in self.mapper.child_exited(&described) {
-                if let MapperOutput::Event(event) = output {
-                    self.append(event);
-                }
+        // Counted before the routes close, so the exit line reports every ask of this child.
+        let pending_dropped = lock(&self.pending).remove_owner(self.thread);
+        let outputs = if self.mapper.active_turn().is_some() || self.mapper.has_routes() {
+            self.mapper.child_exited(&described)
+        } else {
+            Vec::new()
+        };
+        for output in outputs {
+            match output {
+                MapperOutput::Event(event) => self.append(event),
+                MapperOutput::RouteClosed { thread } => self.close_route(thread),
+                other => debug!(
+                    thread_id = %self.thread,
+                    action = "child_exited",
+                    output = ?other,
+                    "ignoring a mapper output produced at child exit"
+                ),
             }
         }
+        // Routes the mapper never closed (none, normally) end with the child.
+        let rest: Vec<ThreadId> = self.route_logs.keys().copied().collect();
+        for thread in rest {
+            self.close_route(thread);
+        }
+        let routes_cooled = self.cool_routes();
         self.log.close();
         for (request_id, waiter) in self.waiters.drain() {
             if !matches!(waiter, Waiter::Stop) {
@@ -1721,7 +2031,6 @@ impl Supervisor {
             }
             children.len()
         };
-        let pending_dropped = lock(&self.pending).remove_thread(self.thread);
         let expected =
             requested && (exit.code == Some(0) || (exit.code == Some(1) && self.interrupt_sent));
         macro_rules! exit_line {
@@ -1739,6 +2048,7 @@ impl Supervisor {
                     requested,
                     live_children,
                     pending_dropped,
+                    routes_cooled,
                     dropped_events = self.dropped_events,
                     $message
                 )
@@ -1804,6 +2114,11 @@ pub(crate) mod tests {
     impl Injector {
         pub(crate) fn emit(&self, line: String) {
             let _ = self.0.send(Out::Line(line));
+        }
+
+        /// Close stdout, as a child that exits on its own does.
+        pub(crate) fn eof(&self) {
+            let _ = self.0.send(Out::Eof);
         }
     }
 
