@@ -47,8 +47,8 @@ pub enum Frame {
     },
     /// A `control_request` with subtype `can_use_tool`. `raw` is the request object as the CLI
     /// sent it: `ToolPermissionRequest` has no `agent_id`, `display_name` or `description`, and its
-    /// typed `PermissionSuggestion` drops keys such as `directories` that milestone 3 must echo
-    /// back verbatim.
+    /// typed `PermissionSuggestion` drops keys such as `directories` that `AcceptForSession` must
+    /// echo back verbatim.
     CanUseTool {
         request_id: String,
         request: Box<ToolPermissionRequest>,
@@ -66,6 +66,11 @@ pub enum Frame {
     ControlResponse {
         request_id: String,
         raw: Value,
+    },
+    /// The top-level `{type: "control_cancel_request", request_id}` frame: the CLI withdrew one of
+    /// its own asks (it does so for every pending ask when the turn is interrupted).
+    ControlCancelRequest {
+        request_id: String,
     },
     Unknown {
         r#type: String,
@@ -123,6 +128,13 @@ impl Frame {
             "autocompact_state" => Self::parse_autocompact_state(&value),
             "control_request" => Self::parse_control_request(value),
             "control_response" => Self::parse_control_response(value),
+            "control_cancel_request" => {
+                typed::<CancelEnvelope>(value, "control_cancel_request", None).map(|envelope| {
+                    Frame::ControlCancelRequest {
+                        request_id: envelope.request_id,
+                    }
+                })
+            }
             _ => Ok(Frame::Unknown {
                 subtype: value
                     .get("subtype")
@@ -155,6 +167,7 @@ impl Frame {
             Frame::CanUseTool { .. } => ("control_request", Some("can_use_tool")),
             Frame::ControlRequest { subtype, .. } => ("control_request", Some(subtype)),
             Frame::ControlResponse { .. } => ("control_response", None),
+            Frame::ControlCancelRequest { .. } => ("control_cancel_request", None),
             Frame::Unknown { r#type, subtype } => (r#type, subtype.as_deref()),
         }
     }
@@ -282,6 +295,12 @@ impl Frame {
             raw: value,
         })
     }
+}
+
+/// The `control_cancel_request` frame's one field.
+#[derive(serde::Deserialize)]
+struct CancelEnvelope {
+    request_id: String,
 }
 
 /// A `stream_event` frame. `claude-codes` leaves `event` an untyped `Value`, so the event is this
@@ -606,6 +625,20 @@ mod tests {
             Frame::parse(line),
             Ok(Frame::ControlRequest { ref request_id, ref subtype, ref raw })
                 if request_id == "r2" && subtype == "rename_session" && raw["title"] == "x"
+        ));
+    }
+
+    #[test]
+    fn a_control_cancel_request_names_the_withdrawn_ask() {
+        let frame =
+            Frame::parse(r#"{"type":"control_cancel_request","request_id":"a949f115"}"#).unwrap();
+        assert!(
+            matches!(&frame, Frame::ControlCancelRequest { request_id } if request_id == "a949f115")
+        );
+        assert_eq!(frame.kind(), ("control_cancel_request", None));
+        assert!(matches!(
+            Frame::parse(r#"{"type":"control_cancel_request"}"#),
+            Err(FrameError::Untyped { r#type, .. }) if r#type == "control_cancel_request"
         ));
     }
 

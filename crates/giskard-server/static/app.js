@@ -5005,7 +5005,7 @@ function renderServerRequest(request) {
   }
 
   const method = String(request.method || "");
-  if (method === "item/tool/requestUserInput") renderToolUserInputRequest(body, id, request);
+  if (method === "item/tool/requestUserInput" || method === "claude/ask_user_question") renderToolUserInputRequest(body, id, request);
   else if (method === "mcpServer/elicitation/request") renderMcpElicitationRequest(body, id, request);
   else if (method === "item/tool/call") renderDynamicToolCallRequest(body, id, request);
   else if (method === "account/chatgptAuthTokens/refresh") {
@@ -5058,7 +5058,7 @@ function resetResolvingServerRequests() {
 function serverRequestTitle(request) {
   const method = String(request.method || "");
   if (method === "item/tool/call") return "Tool call needs a browser response";
-  if (method === "item/tool/requestUserInput") return "Agent needs your answer";
+  if (method === "item/tool/requestUserInput" || method === "claude/ask_user_question") return "Agent needs your answer";
   if (method === "mcpServer/elicitation/request") return "MCP server needs input";
   return "Harness server request";
 }
@@ -5074,7 +5074,7 @@ function serverRequestDetail(request) {
     const name = stringValue(p.tool) || "tool";
     return `${ns ? ns + ":" : ""}${name}`;
   }
-  if (method === "item/tool/requestUserInput") {
+  if (method === "item/tool/requestUserInput" || method === "claude/ask_user_question") {
     const n = Array.isArray(p.questions) ? p.questions.length : 0;
     return n ? `${n} question${n===1 ? "" : "s"}` : "";
   }

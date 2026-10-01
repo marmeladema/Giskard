@@ -13,7 +13,7 @@ use giskard_core::error::HarnessError;
 use giskard_core::ids::{ApprovalId, ServerRequestId, ThreadId, TurnId};
 use giskard_core::model::{Effort, ModelDescriptor, ModelRef};
 use giskard_core::server_request::ServerRequestResponse;
-use giskard_core::turn::TurnOverrides;
+use giskard_core::turn::{Mode, PermissionPreset, TurnOverrides};
 use giskard_core::user_input::UserInput;
 use giskard_harness::{
     AgentEventStream, AgentHarness, EventLog, HarnessCapabilities, HarnessNotice, HarnessProvider,
@@ -32,18 +32,22 @@ use crate::ids::is_task_native_id;
 use crate::log_fields::display_opt;
 use crate::mapper::ClaudeMapper;
 use crate::process::{
-    ChildExit, ChildLogContext, ClaudeChild, ClaudeLaunchOptions, ExitKind, SessionArgs,
-    SessionFlag, classify_exit, probe_argv, resume_missing_sentence, session_argv, spawn_child,
+    ChildExit, ChildLogContext, ClaudeChild, ClaudeLaunchOptions, ExitKind, LaunchMode,
+    SessionArgs, SessionFlag, bypass_refused_sentence, classify_exit, probe_argv,
+    resume_missing_sentence, session_argv, spawn_child,
 };
+pub(crate) use crate::session::CONTROL_TIMEOUT;
 use crate::session::{
     ChildCommand, ChildHandle, Children, Pending, PendingRequests, STOP_EXIT_GRACE,
-    SupervisorParts, control_line, control_outcome, lock, new_request_id, spawn_supervisor,
+    SupervisorParts, TurnSettings, control_line, control_outcome, lock, new_request_id,
+    spawn_supervisor,
 };
 
 /// How long the CLI has to answer `initialize`.
 pub(crate) const INITIALIZE_TIMEOUT: Duration = Duration::from_secs(30);
-/// How long a control request (and a `start_turn` hand-off) may take.
-pub(crate) const CONTROL_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long a `start_turn` hand-off may take: up to four control requests (mode, model, effort,
+/// read-back) plus the write.
+pub(crate) const START_TURN_TIMEOUT: Duration = Duration::from_secs(30);
 /// How long stopping one child may take; the registry's own shutdown budget is the same 15 s.
 pub(crate) const STOP_TIMEOUT: Duration = Duration::from_secs(15);
 /// How long the catalog probe has to answer `initialize`.
@@ -94,16 +98,19 @@ pub struct ClaudeHarness {
     children: Children,
     // ENTITY-AUTHORITY-EXCEPTION:
     // Role: Remember which thread and CLI request id a published approval or server request
-    //   belongs to, for milestone 3's `respond_*`.
+    //   belongs to, and what its answer must echo, for `respond_*`.
     // Source of truth: The supervisor records an entry when the mapper publishes the request.
     // Structural reason: The responses carry no thread (trait doc: ids are instance-unique).
     // Synchronization: A std mutex.
-    // Invalidation/removal: Milestone 3 removes an entry when it is answered; the supervisor
-    //   removes a thread's entries when its child exits; `shutdown` clears the map.
+    // Invalidation/removal: An answer or a `control_cancel_request` removes one entry; the
+    //   supervisor removes a thread's entries when its child exits; `shutdown` clears the map.
     pending: Pending,
     catalog: Arc<Mutex<Option<CatalogSnapshot>>>,
     /// Serializes probe children so concurrent `list_models` calls share one.
     probe: tokio::sync::Mutex<()>,
+    /// The sentence in which the CLI refused a `bypassPermissions` launch, once one was refused.
+    /// Later opens launch standard children directly, and `full_access` turns quote it.
+    bypass_refused: Mutex<Option<String>>,
     shutdown_tx: watch::Sender<bool>,
     spawner: Arc<dyn ChildSpawner>,
     generations: AtomicU64,
@@ -131,6 +138,7 @@ impl ClaudeHarness {
             pending: Arc::new(Mutex::new(PendingRequests::default())),
             catalog: Arc::new(Mutex::new(None)),
             probe: tokio::sync::Mutex::new(()),
+            bypass_refused: Mutex::new(None),
             shutdown_tx: watch::channel(false).0,
             spawner,
             generations: AtomicU64::new(0),
@@ -175,11 +183,74 @@ impl ClaudeHarness {
         lock(&self.children).len()
     }
 
-    /// The command channel and open model of a thread's live child.
-    fn live(&self, thread: ThreadId) -> Option<(mpsc::Sender<ChildCommand>, ModelRef)> {
-        lock(&self.children)
-            .get(&thread)
-            .map(|handle| (handle.commands.clone(), handle.model.clone()))
+    /// The command channel, open model and launch mode of a thread's live child.
+    fn live(&self, thread: ThreadId) -> Option<LiveChild> {
+        lock(&self.children).get(&thread).map(|handle| LiveChild {
+            commands: handle.commands.clone(),
+            model: handle.model.clone(),
+            launch_mode: handle.launch_mode,
+        })
+    }
+
+    /// Spawn a session child in bypass mode unless the CLI already refused one, falling back to a
+    /// standard launch with the same session flag when it refuses now.
+    async fn spawn_child_for(
+        &self,
+        opts: &OpenThreadOptions,
+        session: SessionFlag,
+    ) -> Result<(Box<dyn ClaudeChild>, Handshake, LaunchMode), (HandshakeFailure, LaunchMode)> {
+        let refused = lock(&self.bypass_refused).is_some();
+        if refused {
+            return self
+                .spawn_and_handshake(opts, session, LaunchMode::Standard)
+                .await
+                .map(|(child, handshake)| (child, handshake, LaunchMode::Standard))
+                .map_err(|failure| (failure, LaunchMode::Standard));
+        }
+        match self
+            .spawn_and_handshake(opts, session.clone(), LaunchMode::Bypass)
+            .await
+        {
+            Ok((child, handshake)) => Ok((child, handshake, LaunchMode::Bypass)),
+            Err(HandshakeFailure::Exited {
+                exit,
+                result_errors,
+                ..
+            }) if classify_exit(&exit, &result_errors) == ExitKind::BypassRefused => {
+                let sentence = bypass_refused_sentence(&exit, &result_errors);
+                let first = {
+                    let mut refused = lock(&self.bypass_refused);
+                    let first = refused.is_none();
+                    if first {
+                        *refused = Some(sentence.clone());
+                    }
+                    first
+                };
+                if first {
+                    warn!(
+                        project_id = display_opt(self.launch.project_id),
+                        harness = display_opt(self.launch.declaration.as_deref()),
+                        thread_id = %opts.thread,
+                        action = "bypass_refused",
+                        exit_code = display_opt(exit.code),
+                        sentence = %sentence,
+                        "Claude Code refused a bypassPermissions launch; children launch in \
+                         standard mode and full_access turns are refused"
+                    );
+                } else {
+                    debug!(
+                        thread_id = %opts.thread,
+                        action = "bypass_refused",
+                        "Claude Code refused a bypassPermissions launch again"
+                    );
+                }
+                self.spawn_and_handshake(opts, session, LaunchMode::Standard)
+                    .await
+                    .map(|(child, handshake)| (child, handshake, LaunchMode::Standard))
+                    .map_err(|failure| (failure, LaunchMode::Standard))
+            }
+            Err(failure) => Err((failure, LaunchMode::Bypass)),
+        }
     }
 
     /// Spawn one session child and run its handshake. A child that fails the handshake has been
@@ -188,6 +259,7 @@ impl ClaudeHarness {
         &self,
         opts: &OpenThreadOptions,
         session: SessionFlag,
+        launch_mode: LaunchMode,
     ) -> Result<(Box<dyn ClaudeChild>, Handshake), HandshakeFailure> {
         let resume = matches!(session, SessionFlag::Resume(_));
         let session_id = match &session {
@@ -198,6 +270,7 @@ impl ClaudeHarness {
             &SessionArgs {
                 model: opts.initial_model.clone(),
                 session,
+                launch_mode,
             },
         );
         let mut context = self.context(Some(opts.thread), Some(&session_id));
@@ -208,12 +281,13 @@ impl ClaudeHarness {
             .await
             .map_err(HandshakeFailure::Error)?;
         let started = Instant::now();
-        let handshake = handshake(child.as_mut(), &context, resume).await?;
+        let handshake = handshake(child.as_mut(), &context, resume, launch_mode).await?;
         debug!(
             thread_id = %opts.thread,
             harness_thread_id = %session_id,
             action = "handshake",
             resume,
+            launch_mode = launch_mode.as_str(),
             elapsed_ms = started.elapsed().as_millis() as u64,
             pid = display_opt(handshake.pid),
             permission_mode = display_opt(handshake.permission_mode.as_deref()),
@@ -467,6 +541,26 @@ fn child_stopped() -> HarnessError {
     HarnessError::Transport("claude child stopped".into())
 }
 
+/// What the trait methods need of a live child.
+struct LiveChild {
+    commands: mpsc::Sender<ChildCommand>,
+    model: ModelRef,
+    launch_mode: LaunchMode,
+}
+
+/// The CLI's name for a turn's permission mode (plan §8.2: Plan wins over the preset). `auto` and
+/// `dontAsk` are never sent (plan §8.1).
+pub(crate) fn turn_mode(overrides: &TurnOverrides) -> &'static str {
+    if overrides.mode == Mode::Plan {
+        return "plan";
+    }
+    match overrides.permission_preset {
+        PermissionPreset::AskFirst => "default",
+        PermissionPreset::AutoApprove => "acceptEdits",
+        PermissionPreset::FullAccess => "bypassPermissions",
+    }
+}
+
 /// Close stdin and wait for the exit, killing the child after `STOP_EXIT_GRACE`.
 async fn reap(child: &mut dyn ClaudeChild) -> ChildExit {
     child.close_stdin();
@@ -653,11 +747,13 @@ fn note_result_errors(line: &str, result_errors: &mut Vec<String>) {
     }
 }
 
-/// `initialize`, then `get_settings`, then on resume `get_context_usage`.
+/// `initialize`, then `set_permission_mode default`, then `get_settings`, then on resume
+/// `get_context_usage`.
 async fn handshake(
     child: &mut dyn ClaudeChild,
     context: &ChildLogContext,
     resume: bool,
+    launch_mode: LaunchMode,
 ) -> Result<Handshake, HandshakeFailure> {
     let mut early = Vec::new();
     let mut result_errors = Vec::new();
@@ -691,6 +787,77 @@ async fn handshake(
             ))));
         }
     };
+
+    // No turn runs before this: nothing reaches stdout before the first user message, and every
+    // turn sets its own mode. A bypass-launched child that cannot leave bypass is never used.
+    let mut permission_mode = reply.current_permission_mode;
+    let set_default = json!({"subtype": "set_permission_mode", "mode": "default"});
+    match launch_mode {
+        LaunchMode::Bypass => {
+            let answer = tokio::time::timeout(
+                CONTROL_TIMEOUT,
+                request(
+                    child,
+                    &new_request_id(),
+                    &set_default,
+                    &mut early,
+                    &mut result_errors,
+                ),
+            )
+            .await;
+            let why = match answer {
+                Ok(Ok(Ok(_))) => None,
+                Ok(Ok(Err(message))) => Some(message),
+                // The child is gone, so it cannot be used in bypass mode: report its exit like any
+                // other handshake exit (stderr tail, unanswered stage, authentication and bypass
+                // refusal classification).
+                Ok(Err(failure @ HandshakeFailure::Exited { .. })) => {
+                    debug!(
+                        thread_id = display_opt(context.thread_id),
+                        action = "set_permission_mode",
+                        launch_mode = launch_mode.as_str(),
+                        "a bypass-launched child exited before leaving bypassPermissions"
+                    );
+                    return Err(failure);
+                }
+                Ok(Err(HandshakeFailure::Error(error))) => Some(error.to_string()),
+                Err(_) => Some(format!("no answer within {} s", CONTROL_TIMEOUT.as_secs())),
+            };
+            if let Some(why) = why {
+                child.start_kill();
+                child.wait().await;
+                warn!(
+                    thread_id = display_opt(context.thread_id),
+                    harness_thread_id = display_opt(context.harness_thread_id.as_deref()),
+                    action = "set_permission_mode",
+                    mode = "default",
+                    launch_mode = launch_mode.as_str(),
+                    error = %why,
+                    "a bypass-launched child did not leave bypassPermissions; killed it"
+                );
+                return Err(HandshakeFailure::Error(HarnessError::Spawn(format!(
+                    "claude did not leave bypassPermissions: {why}"
+                ))));
+            }
+            permission_mode = Some("default".into());
+        }
+        LaunchMode::Standard => {
+            // `manual` already is `default`; the request makes it explicit and costs nothing.
+            if optional_request(
+                child,
+                context,
+                &set_default,
+                &mut early,
+                &mut result_errors,
+                &mut abandoned,
+            )
+            .await?
+            .is_some()
+            {
+                permission_mode = Some("default".into());
+            }
+        }
+    }
 
     let settings = optional_request(
         child,
@@ -755,7 +922,7 @@ async fn handshake(
 
     Ok(Handshake {
         models: reply.models,
-        permission_mode: reply.current_permission_mode,
+        permission_mode,
         pid: reply.pid,
         applied,
         context_window,
@@ -914,13 +1081,19 @@ impl AgentHarness for ClaudeHarness {
         let mut context = self.context(Some(opts.thread), Some(&session_id));
         context.resume = resuming;
 
-        let (child, handshake, warning) = match self.spawn_and_handshake(&opts, first).await {
-            Ok((child, handshake)) => (child, handshake, None),
-            Err(HandshakeFailure::Exited {
-                exit,
-                result_errors,
-                ..
-            }) if resuming && classify_exit(&exit, &result_errors) == ExitKind::ResumeMissing => {
+        let (child, handshake, launch_mode, warning) = match self
+            .spawn_child_for(&opts, first)
+            .await
+        {
+            Ok((child, handshake, launch_mode)) => (child, handshake, launch_mode, None),
+            Err((
+                HandshakeFailure::Exited {
+                    exit,
+                    result_errors,
+                    ..
+                },
+                launch_mode,
+            )) if resuming && classify_exit(&exit, &result_errors) == ExitKind::ResumeMissing => {
                 let detail = resume_missing_sentence(&exit, &result_errors);
                 warn!(
                     project_id = display_opt(self.launch.project_id),
@@ -935,10 +1108,21 @@ impl AgentHarness for ClaudeHarness {
                 );
                 let mut fresh_context = context.clone();
                 fresh_context.resume = false;
-                let (child, handshake) = self
-                    .spawn_and_handshake(&opts, SessionFlag::Fresh(session_id.clone()))
+                // The same launch mode; a bypass refusal on the respawn still falls back.
+                let (child, handshake, launch_mode) = if launch_mode == LaunchMode::Bypass {
+                    self.spawn_child_for(&opts, SessionFlag::Fresh(session_id.clone()))
+                        .await
+                        .map_err(|(failure, _)| failure.into_error(&fresh_context))?
+                } else {
+                    self.spawn_and_handshake(
+                        &opts,
+                        SessionFlag::Fresh(session_id.clone()),
+                        launch_mode,
+                    )
                     .await
-                    .map_err(|failure| failure.into_error(&fresh_context))?;
+                    .map(|(child, handshake)| (child, handshake, launch_mode))
+                    .map_err(|failure| failure.into_error(&fresh_context))?
+                };
                 let notice = HarnessNotice {
                     code: "claude_resume_failed".into(),
                     message: "Agent context was lost; started a fresh Claude Code session. \
@@ -946,9 +1130,9 @@ impl AgentHarness for ClaudeHarness {
                         .into(),
                     detail,
                 };
-                (child, handshake, Some(notice))
+                (child, handshake, launch_mode, Some(notice))
             }
-            Err(failure) => return Err(failure.into_error(&context)),
+            Err((failure, _)) => return Err(failure.into_error(&context)),
         };
 
         if let Some(models) = handshake.models.as_deref() {
@@ -957,6 +1141,9 @@ impl AgentHarness for ClaudeHarness {
         let resumed_model = self.resumed_model(&opts, &session_id, handshake.applied.clone());
         let mut mapper =
             ClaudeMapper::new(opts.thread, session_id.clone(), opts.workspace_root.clone());
+        // The handshake set `default`; a `status` it emitted (mapped from `early_lines`) is not
+        // drift.
+        mapper.set_expected_mode("default");
         if let Some(window) = handshake.context_window {
             let update = ThreadUpdate::ContextWindowRestored {
                 model: resumed_model
@@ -1016,6 +1203,7 @@ impl AgentHarness for ClaudeHarness {
                             context: context.clone(),
                             early_lines: handshake.early_lines,
                             abandoned_requests: handshake.abandoned_requests,
+                            model: open_model.clone(),
                         });
                         slot.insert(ChildHandle {
                             harness_thread_id: session_id.clone(),
@@ -1023,6 +1211,7 @@ impl AgentHarness for ClaudeHarness {
                             commands,
                             task,
                             model: open_model,
+                            launch_mode,
                             generation,
                         });
                         Ok(children.len())
@@ -1052,6 +1241,7 @@ impl AgentHarness for ClaudeHarness {
             action = "thread_opened",
             resume = resuming,
             resume_fallback = warning.is_some(),
+            launch_mode = launch_mode.as_str(),
             live_children,
             "Claude Code thread opened"
         );
@@ -1077,7 +1267,7 @@ impl AgentHarness for ClaudeHarness {
             );
             return Ok(());
         }
-        let Some((commands, _)) = self.live(thread.thread) else {
+        let Some(LiveChild { commands, .. }) = self.live(thread.thread) else {
             debug!(
                 thread_id = %thread.thread,
                 harness_thread_id = %thread.harness_thread_id,
@@ -1116,7 +1306,7 @@ impl AgentHarness for ClaudeHarness {
     }
 
     async fn interrupt(&self, thread: &ThreadHandle) -> Result<(), HarnessError> {
-        let (commands, _) = self
+        let LiveChild { commands, .. } = self
             .live(thread.thread)
             .ok_or(HarnessError::ThreadNotFound(thread.thread))?;
         self.call(
@@ -1135,45 +1325,57 @@ impl AgentHarness for ClaudeHarness {
         input: UserInput,
         overrides: TurnOverrides,
     ) -> Result<TurnId, HarnessError> {
-        let (commands, model) = self
+        let live = self
             .live(thread.thread)
             .ok_or(HarnessError::ThreadNotFound(thread.thread))?;
-        // Provider and model only: the same model at another effort is not a different model
-        // (per-turn effort is milestone 3's, with the rest of the overrides).
-        if let Some(requested) = overrides
-            .model
-            .as_ref()
-            .filter(|m| m.provider != model.provider || m.model != model.model)
-        {
+        let mode = turn_mode(&overrides);
+        if mode == "bypassPermissions" && live.launch_mode == LaunchMode::Standard {
+            // `bypassPermissions` is a launch-time capability: the CLI refuses to set it on a
+            // child launched without it.
+            let why = lock(&self.bypass_refused).clone().map_or_else(
+                || "the child was not launched in that mode".to_owned(),
+                |sentence| {
+                    format!("Claude Code refused to start in bypassPermissions mode ({sentence})")
+                },
+            );
             warn!(
                 thread_id = %thread.thread,
-                action = "turn_model_override_ignored",
-                requested_provider = %requested.provider,
-                requested = %requested.model,
-                open_provider = %model.provider,
-                open_model = %model.model,
-                "per-turn models arrive in milestone 3; the turn runs on the thread's model"
+                harness_thread_id = %thread.harness_thread_id,
+                action = "start_turn",
+                mode,
+                launch_mode = live.launch_mode.as_str(),
+                "refusing a full_access turn on a child that cannot bypass permissions"
             );
+            return Err(HarnessError::Unsupported(format!(
+                "full_access is not available: {why}"
+            )));
         }
-        debug!(
-            thread_id = %thread.thread,
-            action = "start_turn",
-            mode = ?overrides.mode,
-            permission_preset = ?overrides.permission_preset,
-            "per-turn mode and permission preset are not applied until milestone 3"
-        );
+        let model = overrides.model.clone().unwrap_or(live.model);
+        let resolved_model = self
+            .catalog_snapshot()
+            .and_then(|snapshot| snapshot.resolved_model(&model.model).map(str::to_owned));
+        let settings = TurnSettings {
+            mode: mode.to_owned(),
+            model: Some(model.model.clone()),
+            effort: model
+                .reasoning_effort
+                .as_ref()
+                .map(|effort| effort.0.clone()),
+            resolved_model,
+        };
         let UserInput::Text { text, attachments } = input;
         let line = user_message_line(&text, &attachments)?;
         let turn = TurnId::new();
         self.call(
             thread.thread,
-            commands,
+            live.commands,
             "start_turn",
-            CONTROL_TIMEOUT,
+            START_TURN_TIMEOUT,
             |reply| ChildCommand::StartTurn {
                 line,
                 turn,
                 model,
+                settings,
                 reply,
             },
         )
@@ -1181,22 +1383,66 @@ impl AgentHarness for ClaudeHarness {
         Ok(turn)
     }
 
+    async fn compact_thread(&self, thread: &ThreadHandle) -> Result<(), HarnessError> {
+        let LiveChild { commands, .. } = self
+            .live(thread.thread)
+            .ok_or(HarnessError::ThreadNotFound(thread.thread))?;
+        let turn = TurnId::new();
+        self.call(
+            thread.thread,
+            commands,
+            "compact",
+            CONTROL_TIMEOUT,
+            |reply| ChildCommand::Compact { turn, reply },
+        )
+        .await
+    }
+
     async fn respond_approval(
         &self,
         req: ApprovalId,
         decision: ApprovalDecision,
     ) -> Result<(), HarnessError> {
-        let known = lock(&self.pending).approval(&req).is_some();
-        debug!(
-            request_id = %req,
-            action = "respond_approval",
-            known,
-            decision = ?decision,
-            "approval answers arrive in milestone 3"
-        );
-        Err(HarnessError::Unsupported(
-            "Claude Code approvals are answered from milestone 3".into(),
-        ))
+        let Some(ask) = lock(&self.pending).remove_approval(&req) else {
+            warn!(
+                request_id = %req,
+                action = "respond_approval",
+                "approval is not pending: answered, withdrawn by an interrupt, or its child is gone"
+            );
+            return Err(HarnessError::Protocol(format!(
+                "approval {req} is not pending"
+            )));
+        };
+        if let ApprovalDecision::AcceptWithExecPolicyAmendment { .. } = decision {
+            // Not advertised (plan §9.3), so this is a client bug; the ask stays answerable.
+            warn!(
+                thread_id = %ask.thread,
+                request_id = %req,
+                action = "respond_approval",
+                "exec-policy amendments are not offered for Claude Code approvals"
+            );
+            lock(&self.pending).insert_approval(req, ask);
+            return Err(HarnessError::Unsupported(
+                "Claude Code approvals offer no exec-policy amendment".into(),
+            ));
+        }
+        let thread = ask.thread;
+        let LiveChild { commands, .. } = self
+            .live(thread)
+            .ok_or(HarnessError::ThreadNotFound(thread))?;
+        self.call(
+            thread,
+            commands,
+            "respond_approval",
+            CONTROL_TIMEOUT,
+            |reply| ChildCommand::RespondApproval {
+                id: req,
+                ask,
+                decision,
+                reply,
+            },
+        )
+        .await
     }
 
     async fn respond_server_request(
@@ -1204,17 +1450,33 @@ impl AgentHarness for ClaudeHarness {
         req: ServerRequestId,
         response: ServerRequestResponse,
     ) -> Result<(), HarnessError> {
-        let known = lock(&self.pending).server_request(&req).is_some();
-        let _ = response;
-        debug!(
-            request_id = %req,
-            action = "respond_server_request",
-            known,
-            "server request answers arrive in milestone 3"
-        );
-        Err(HarnessError::Unsupported(
-            "Claude Code approvals are answered from milestone 3".into(),
-        ))
+        let Some(ask) = lock(&self.pending).remove_server_request(&req) else {
+            warn!(
+                request_id = %req,
+                action = "respond_server_request",
+                "server request is not pending: answered, withdrawn, or its child is gone"
+            );
+            return Err(HarnessError::Protocol(format!(
+                "server request {req} is not pending"
+            )));
+        };
+        let thread = ask.thread;
+        let LiveChild { commands, .. } = self
+            .live(thread)
+            .ok_or(HarnessError::ThreadNotFound(thread))?;
+        self.call(
+            thread,
+            commands,
+            "respond_server_request",
+            CONTROL_TIMEOUT,
+            |reply| ChildCommand::RespondServerRequest {
+                id: req,
+                ask,
+                response,
+                reply,
+            },
+        )
+        .await
     }
 }
 
@@ -1481,7 +1743,10 @@ mod tests {
             .iter()
             .map(|line| line["request"]["subtype"].as_str().unwrap().to_owned())
             .collect();
-        assert_eq!(subtypes, ["initialize", "get_settings"]);
+        assert_eq!(
+            subtypes,
+            ["initialize", "set_permission_mode", "get_settings"]
+        );
 
         // A reader exists before the child wrote a frame, and nothing is in it yet.
         let mut stream = harness.subscribe(&handle);
@@ -1614,62 +1879,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn only_another_model_is_an_ignored_override() {
-        let (child, _) = scripted(
-            handshake_steps("sonnet"),
-            vec![
-                Step::OnStdin(
-                    user(),
-                    vec![Action::EmitFixture {
-                        name: "text-turn",
-                        skip_types: &[],
-                    }],
-                ),
-                Step::OnStdin(
-                    user(),
-                    vec![Action::EmitFixture {
-                        name: "text-turn",
-                        skip_types: &[],
-                    }],
-                ),
-            ],
-        );
-        let (harness, _) = harness(vec![child]);
-        let (output, _guard) = capture_logs();
-        let (options, _updates) = open_options(ThreadId::new(), None, "sonnet");
-        let handle = harness.open_thread(options).await.unwrap();
-        let mut stream = harness.subscribe(&handle);
-
-        let mut same_model = overrides();
-        same_model.model = Some(ModelRef {
-            reasoning_effort: Some(Effort("high".into())),
-            ..model("sonnet")
-        });
-        harness
-            .start_turn(&handle, text("one"), same_model)
-            .await
-            .unwrap();
-        until_completed(&mut stream).await;
-        assert!(!logs(&output).contains("turn_model_override_ignored"));
-
-        let mut other_model = overrides();
-        other_model.model = Some(model("opus"));
-        harness
-            .start_turn(&handle, text("two"), other_model)
-            .await
-            .unwrap();
-        until_completed(&mut stream).await;
-        let logs = logs(&output);
-        let line = logs
-            .lines()
-            .find(|line| line.contains("action=\"turn_model_override_ignored\""))
-            .unwrap_or_else(|| panic!("{logs}"));
-        assert!(line.contains("requested=opus"), "{line}");
-        assert!(line.contains("open_model=sonnet"), "{line}");
-        harness.shutdown().await.unwrap();
-    }
-
-    #[tokio::test]
     async fn interrupt_resolves_on_the_control_response_and_the_turn_ends_interrupted() {
         let (child, record) = scripted(
             handshake_steps("sonnet"),
@@ -1773,6 +1982,13 @@ mod tests {
                 .windows(2)
                 .any(|w| w == ["--session-id", RESUME_ID])
         );
+        for spawn in &spawns {
+            assert!(
+                spawn
+                    .windows(2)
+                    .any(|w| w == ["--permission-mode", "bypassPermissions"])
+            );
+        }
         assert!(!spawns[1].iter().any(|arg| arg == "--resume"));
         assert!(logs(&output).contains("action=\"claude_resume_failed\""));
         harness.shutdown().await.unwrap();
@@ -1932,7 +2148,12 @@ mod tests {
             .collect();
         assert_eq!(
             subtypes,
-            ["initialize", "get_settings", "get_context_usage"]
+            [
+                "initialize",
+                "set_permission_mode",
+                "get_settings",
+                "get_context_usage"
+            ]
         );
 
         let mut stream = harness.subscribe(&handle);
@@ -2074,7 +2295,7 @@ mod tests {
         harness.set_thread_name(&cold, "x").await.unwrap();
         let task = ThreadHandle::detached(ThreadId::new(), "task:toolu_1".into());
         harness.set_thread_name(&task, "x").await.unwrap();
-        assert_eq!(written(&record).len(), 3);
+        assert_eq!(written(&record).len(), 4);
         harness.shutdown().await.unwrap();
     }
 
@@ -2353,26 +2574,1455 @@ mod tests {
 
     // ---- asks ----------------------------------------------------------------------------------
 
-    #[tokio::test]
-    async fn a_pending_ask_is_recorded_and_respond_approval_is_unsupported() {
-        let ask_line = fixture_lines("tool-allowed")
-            .into_iter()
-            .position(|line| line.contains("\"control_request\""))
+    // ---- milestone 3: launch mode and handshake -------------------------------------------------
+
+    const ROOT_REFUSAL: &str = "--dangerously-skip-permissions cannot be used with root/sudo \
+                                privileges for security reasons";
+
+    fn root_refused_child() -> (ScriptedChild, Arc<Mutex<ScriptRecord>>) {
+        ScriptedChild::new(vec![Step::OnStdin(
+            control("initialize"),
+            vec![Action::Exit {
+                code: 1,
+                stderr: vec![ROOT_REFUSAL.into()],
+            }],
+        )])
+    }
+
+    fn launch_mode_of(argv: &[String]) -> &str {
+        let at = argv
+            .iter()
+            .position(|arg| arg == "--permission-mode")
             .unwrap();
-        let request_id: String = {
-            let line = &fixture_lines("tool-allowed")[ask_line];
-            serde_json::from_str::<Value>(line).unwrap()["request_id"]
-                .as_str()
-                .unwrap()
-                .to_owned()
+        &argv[at + 1]
+    }
+
+    fn turn_overrides(
+        preset: PermissionPreset,
+        mode: Mode,
+        model: Option<ModelRef>,
+    ) -> TurnOverrides {
+        TurnOverrides {
+            model,
+            mode,
+            permission_preset: preset,
+        }
+    }
+
+    fn with_effort(name: &str, effort: &str) -> ModelRef {
+        ModelRef {
+            reasoning_effort: Some(Effort(effort.into())),
+            ..model(name)
+        }
+    }
+
+    /// The modes of every `set_permission_mode` written, in order.
+    fn modes_written(record: &Arc<Mutex<ScriptRecord>>) -> Vec<String> {
+        written(record)
+            .iter()
+            .filter(|line| line["request"]["subtype"] == "set_permission_mode")
+            .map(|line| line["request"]["mode"].as_str().unwrap().to_owned())
+            .collect()
+    }
+
+    fn subtypes_written(record: &Arc<Mutex<ScriptRecord>>) -> Vec<String> {
+        written(record)
+            .iter()
+            .filter_map(|line| line["request"]["subtype"].as_str().map(str::to_owned))
+            .collect()
+    }
+
+    /// The control responses the adapter wrote, in order.
+    fn answers_written(record: &Arc<Mutex<ScriptRecord>>) -> Vec<Value> {
+        written(record)
+            .into_iter()
+            .filter(|line| line["type"] == "control_response")
+            .collect()
+    }
+
+    /// The text-turn frames with the `init` frame's `permissionMode` rewritten.
+    fn text_turn_reporting_mode(mode: &str) -> Vec<String> {
+        fixture_lines("text-turn")
+            .into_iter()
+            .map(|line| {
+                let mut frame: Value = serde_json::from_str(&line).unwrap();
+                if frame["type"] == "system" && frame["subtype"] == "init" {
+                    frame["permissionMode"] = json!(mode);
+                    return frame.to_string();
+                }
+                line
+            })
+            .collect()
+    }
+
+    fn text_turn() -> Action {
+        Action::EmitFixture {
+            name: "text-turn",
+            skip_types: &[],
+        }
+    }
+
+    /// The next event matching `select`, bounded so a broken test fails instead of hangs.
+    async fn next_matching<T>(
+        stream: &mut AgentEventStream,
+        mut select: impl FnMut(&AgentEvent) -> Option<T>,
+    ) -> T {
+        loop {
+            let event = tokio::time::timeout(Duration::from_secs(10), stream.recv())
+                .await
+                .expect("timed out waiting for an event")
+                .expect("stream ended");
+            if let Some(found) = select(&event) {
+                return found;
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_bypass_launch_sets_default_in_the_handshake() {
+        let (child, record) = scripted(handshake_steps("sonnet"), Vec::new());
+        let (harness, spawner) = harness(vec![child]);
+        let (options, _updates) = open_options(ThreadId::new(), None, "sonnet");
+        harness.open_thread(options).await.unwrap();
+        assert_eq!(launch_mode_of(&spawner.spawns()[0]), "bypassPermissions");
+        assert_eq!(
+            subtypes_written(&record),
+            ["initialize", "set_permission_mode", "get_settings"]
+        );
+        assert_eq!(modes_written(&record), ["default"]);
+        harness.shutdown().await.unwrap();
+
+        // The handshake reports `default` though the CLI said it was launched in bypass.
+        let mut payload = initialize_payload();
+        payload["current_permission_mode"] = json!("bypassPermissions");
+        let (mut child, _) = ScriptedChild::new(vec![
+            Step::OnStdin(control("initialize"), vec![Action::Respond(payload)]),
+            Step::OnStdin(
+                control("get_settings"),
+                vec![Action::Respond(settings("sonnet"))],
+            ),
+        ]);
+        let shaken = handshake(
+            &mut child,
+            &ChildLogContext::default(),
+            false,
+            LaunchMode::Bypass,
+        )
+        .await
+        .ok()
+        .unwrap();
+        assert_eq!(shaken.permission_mode.as_deref(), Some("default"));
+
+        // A standard launch reports `default` too, once its explicit request succeeded.
+        let (mut child, record) = ScriptedChild::new(vec![
+            Step::OnStdin(
+                control("initialize"),
+                vec![Action::Respond(initialize_payload())],
+            ),
+            Step::OnStdin(
+                control("get_settings"),
+                vec![Action::Respond(settings("sonnet"))],
+            ),
+        ]);
+        let shaken = handshake(
+            &mut child,
+            &ChildLogContext::default(),
+            false,
+            LaunchMode::Standard,
+        )
+        .await
+        .ok()
+        .unwrap();
+        assert_eq!(shaken.permission_mode.as_deref(), Some("default"));
+        assert_eq!(modes_written(&record), ["default"]);
+    }
+
+    #[tokio::test]
+    async fn a_refused_bypass_launch_falls_back_to_a_standard_launch() {
+        let (refused, _) = root_refused_child();
+        let (first, first_record) = scripted(handshake_steps("sonnet"), Vec::new());
+        let (second, _) = scripted(handshake_steps("sonnet"), Vec::new());
+        let (harness, spawner) = harness(vec![refused, first, second]);
+        let (output, _guard) = capture_logs();
+        for _ in 0..2 {
+            let (options, _updates) = open_options(ThreadId::new(), None, "sonnet");
+            harness.open_thread(options).await.unwrap();
+        }
+        let spawns = spawner.spawns();
+        let modes: Vec<&str> = spawns.iter().map(|argv| launch_mode_of(argv)).collect();
+        assert_eq!(modes, ["bypassPermissions", "manual", "manual"]);
+        // The same session flag on the fallback.
+        let session = |argv: &[String]| {
+            let at = argv.iter().position(|arg| arg == "--session-id").unwrap();
+            argv[at + 1].clone()
         };
+        assert_eq!(session(&spawns[0]), session(&spawns[1]));
+        assert_eq!(lock(&harness.bypass_refused).as_deref(), Some(ROOT_REFUSAL));
+        // A standard child still sets `default` explicitly.
+        assert_eq!(modes_written(&first_record), ["default"]);
+        let logs = logs(&output);
+        let warnings = logs
+            .lines()
+            .filter(|line| line.contains("WARN") && line.contains("action=\"bypass_refused\""))
+            .count();
+        assert_eq!(warnings, 1, "{logs}");
+        harness.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_handshake_that_cannot_leave_bypass_fails_the_open() {
+        let (child, record) = ScriptedChild::new(vec![
+            Step::OnStdin(
+                control("initialize"),
+                vec![Action::Respond(initialize_payload())],
+            ),
+            Step::OnStdin(
+                control("set_permission_mode"),
+                vec![Action::RespondError("Cannot set permission mode")],
+            ),
+        ]);
+        let (harness, _) = harness(vec![child.without_mode_echo()]);
+        let (options, _updates) = open_options(ThreadId::new(), None, "sonnet");
+        let error = harness.open_thread(options).await.unwrap_err();
+        assert!(
+            matches!(&error, HarnessError::Spawn(message)
+                if message == "claude did not leave bypassPermissions: Cannot set permission mode"),
+            "{error}"
+        );
+        assert!(lock(&record).killed);
+        assert_eq!(harness.live_children(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_resume_missing_fallback_keeps_the_launch_mode() {
+        // Bypass refused, then the transcript is missing: the fresh respawn stays standard.
+        let (refused, _) = root_refused_child();
+        let (missing, _) = ScriptedChild::new(vec![Step::OnStdin(
+            control("initialize"),
+            vec![
+                missing_transcript_exit(),
+                Action::Exit {
+                    code: 1,
+                    stderr: vec![format!(
+                        "No conversation found with session ID: {RESUME_ID}"
+                    )],
+                },
+            ],
+        )]);
+        let (fresh, _) = scripted(handshake_steps("sonnet"), Vec::new());
+        let (harness, spawner) = harness(vec![refused, missing, fresh]);
+        let (options, _updates) = open_options(ThreadId::new(), Some(RESUME_ID), "sonnet");
+        let handle = harness.open_thread(options).await.unwrap();
+        assert_eq!(handle.warning.unwrap().code, "claude_resume_failed");
+        let spawns = spawner.spawns();
+        let modes: Vec<&str> = spawns.iter().map(|argv| launch_mode_of(argv)).collect();
+        assert_eq!(modes, ["bypassPermissions", "manual", "manual"]);
+        assert!(spawns[0].windows(2).any(|w| w == ["--resume", RESUME_ID]));
+        assert!(spawns[1].windows(2).any(|w| w == ["--resume", RESUME_ID]));
+        assert!(
+            spawns[2]
+                .windows(2)
+                .any(|w| w == ["--session-id", RESUME_ID])
+        );
+        harness.shutdown().await.unwrap();
+    }
+
+    // ---- milestone 3: per-turn settings ---------------------------------------------------------
+
+    #[tokio::test]
+    async fn every_turn_sets_its_permission_mode() {
+        let turns = vec![
+            turn_overrides(PermissionPreset::AskFirst, Mode::Build, None),
+            turn_overrides(PermissionPreset::AskFirst, Mode::Build, None),
+            turn_overrides(PermissionPreset::AutoApprove, Mode::Build, None),
+            turn_overrides(PermissionPreset::FullAccess, Mode::Plan, None),
+            turn_overrides(PermissionPreset::AskFirst, Mode::Plan, None),
+        ];
+        let steps = turns
+            .iter()
+            .map(|_| Step::OnStdin(user(), vec![text_turn()]))
+            .collect();
+        let (child, record) = scripted(handshake_steps("sonnet"), steps);
+        let (harness, _) = harness(vec![child]);
+        let (options, _updates) = open_options(ThreadId::new(), None, "sonnet");
+        let handle = harness.open_thread(options).await.unwrap();
+        let mut stream = harness.subscribe(&handle);
+        for overrides in turns {
+            harness
+                .start_turn(&handle, text("go"), overrides)
+                .await
+                .unwrap();
+            until_completed(&mut stream).await;
+        }
+        assert_eq!(
+            modes_written(&record),
+            [
+                "default",
+                "default",
+                "default",
+                "acceptEdits",
+                "plan",
+                "plan"
+            ]
+        );
+        // Each mode is set before its turn's message.
+        let lines = written(&record);
+        for (index, line) in lines.iter().enumerate() {
+            if line["type"] == "user" {
+                assert_eq!(
+                    lines[index - 1]["request"]["subtype"],
+                    "set_permission_mode"
+                );
+            }
+        }
+        harness.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn full_access_needs_a_bypass_launch() {
+        let full_access = turn_overrides(PermissionPreset::FullAccess, Mode::Build, None);
+
+        // A standard child: refused with the CLI's sentence, nothing written.
+        let (refused, _) = root_refused_child();
+        let (standard, standard_record) = scripted(handshake_steps("sonnet"), Vec::new());
+        let (harness_standard, _) = harness(vec![refused, standard]);
+        let (options, _updates) = open_options(ThreadId::new(), None, "sonnet");
+        let handle = harness_standard.open_thread(options).await.unwrap();
+        let mut stream = harness_standard.subscribe(&handle);
+        let before = lock(&standard_record).written.len();
+        let error = harness_standard
+            .start_turn(&handle, text("go"), full_access.clone())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&error, HarnessError::Unsupported(message)
+                if message.starts_with("full_access is not available: Claude Code refused to \
+                                        start in bypassPermissions mode")
+                    && message.contains(ROOT_REFUSAL)),
+            "{error}"
+        );
+        assert_eq!(lock(&standard_record).written.len(), before);
+        assert!(stream.try_recv().is_none());
+        harness_standard.shutdown().await.unwrap();
+
+        // A bypass child: the mode is set and the turn runs.
+        let (child, record) = scripted(
+            handshake_steps("sonnet"),
+            vec![Step::OnStdin(user(), vec![text_turn()])],
+        );
+        let (harness, _) = harness(vec![child]);
+        let (options, _updates) = open_options(ThreadId::new(), None, "sonnet");
+        let handle = harness.open_thread(options).await.unwrap();
+        let mut stream = harness.subscribe(&handle);
+        harness
+            .start_turn(&handle, text("go"), full_access)
+            .await
+            .unwrap();
+        until_completed(&mut stream).await;
+        assert_eq!(modes_written(&record), ["default", "bypassPermissions"]);
+        harness.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_refused_mode_fails_the_turn_start() {
+        let (child, record) = scripted(
+            handshake_steps("sonnet"),
+            vec![Step::OnStdin(
+                control("set_permission_mode"),
+                vec![
+                    Action::RespondErrorCode {
+                        error: "Cannot set permission mode to bypassPermissions because the \
+                                session was not launched with --dangerously-skip-permissions",
+                        code: "bypass_not_launched",
+                    },
+                    // The CLI still holds `default`; reporting it is not drift.
+                    Action::Emit(vec![
+                        r#"{"type":"system","subtype":"status","status":null,"permissionMode":"default","session_id":"s"}"#.into(),
+                    ]),
+                ],
+            )],
+        );
+        let (harness, _) = harness(vec![child]);
+        let (output, _guard) = capture_logs();
+        let (options, _updates) = open_options(ThreadId::new(), None, "sonnet");
+        let handle = harness.open_thread(options).await.unwrap();
+        let mut stream = harness.subscribe(&handle);
+        let error = harness
+            .start_turn(
+                &handle,
+                text("go"),
+                turn_overrides(PermissionPreset::FullAccess, Mode::Build, None),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&error, HarnessError::Protocol(message) if message.contains("not launched")),
+            "{error}"
+        );
+        assert!(stream.try_recv().is_none(), "no TurnStarted");
+        assert!(written(&record).iter().all(|line| line["type"] != "user"));
+        // Shutdown reads stdout to EOF, so the status frame has been mapped once it returns.
+        harness.shutdown().await.unwrap();
+        let logs = logs(&output);
+        let line = logs
+            .lines()
+            .find(|line| line.contains("WARN") && line.contains("action=\"set_permission_mode\""))
+            .unwrap_or_else(|| panic!("{logs}"));
+        assert!(line.contains("error_code=bypass_not_launched"), "{line}");
+        assert!(line.contains("mode=bypassPermissions"), "{line}");
+        assert!(!logs.contains("permission_mode_drift"), "{logs}");
+        assert!(
+            !until_closed(&mut stream)
+                .await
+                .iter()
+                .any(|event| matches!(event, AgentEvent::Notice { .. })),
+            "no drift notice"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_mode_status_after_a_set_is_not_drift() {
+        let status = r#"{"type":"system","subtype":"status","status":null,"permissionMode":"acceptEdits","session_id":"f18693ff-2d11-4f87-9556-2b527e19e081"}"#;
+        let (child, _) = scripted(
+            handshake_steps("sonnet"),
+            vec![
+                Step::OnStdin(
+                    control("set_permission_mode"),
+                    vec![
+                        Action::Respond(json!({"mode": "acceptEdits"})),
+                        Action::Emit(vec![status.into()]),
+                    ],
+                ),
+                Step::OnStdin(
+                    user(),
+                    vec![Action::Emit(text_turn_reporting_mode("acceptEdits"))],
+                ),
+            ],
+        );
+        let (harness, _) = harness(vec![child]);
+        let (output, _guard) = capture_logs();
+        let (options, _updates) = open_options(ThreadId::new(), None, "sonnet");
+        let handle = harness.open_thread(options).await.unwrap();
+        let mut stream = harness.subscribe(&handle);
+        harness
+            .start_turn(
+                &handle,
+                text("go"),
+                turn_overrides(PermissionPreset::AutoApprove, Mode::Build, None),
+            )
+            .await
+            .unwrap();
+        let events = until_completed(&mut stream).await;
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, AgentEvent::Notice { .. }))
+        );
+        assert!(!logs(&output).contains("permission_mode_drift"));
+        harness.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_mode_the_adapter_did_not_set_is_drift_on_init_too() {
         let (child, _) = scripted(
             handshake_steps("sonnet"),
             vec![Step::OnStdin(
                 user(),
+                vec![Action::Emit(text_turn_reporting_mode("plan"))],
+            )],
+        );
+        let (harness, _) = harness(vec![child]);
+        let (output, _guard) = capture_logs();
+        let (options, _updates) = open_options(ThreadId::new(), None, "sonnet");
+        let handle = harness.open_thread(options).await.unwrap();
+        let mut stream = harness.subscribe(&handle);
+        harness
+            .start_turn(&handle, text("go"), overrides())
+            .await
+            .unwrap();
+        let events = until_completed(&mut stream).await;
+        let notices: Vec<&str> = events
+            .iter()
+            .filter_map(|event| match event {
+                AgentEvent::Notice { message, .. } => Some(message.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            notices,
+            ["Claude Code switched its permission mode to plan; Giskard set default"]
+        );
+        assert!(logs(&output).contains("action=\"permission_mode_drift\""));
+        harness.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_model_change_is_sent_and_read_back() {
+        let (child, record) = scripted(
+            handshake_steps("sonnet"),
+            vec![
+                Step::OnStdin(control("set_model"), vec![Action::Respond(Value::Null)]),
+                // The CLI answers with the catalog's resolved id for `opus`.
+                Step::OnStdin(
+                    control("get_settings"),
+                    vec![Action::Respond(settings("claude-opus-5-5"))],
+                ),
+                Step::OnStdin(user(), vec![text_turn()]),
+                Step::OnStdin(user(), vec![text_turn()]),
+            ],
+        );
+        let (harness, _) = harness(vec![child]);
+        let (output, _guard) = capture_logs();
+        let (options, _updates) = open_options(ThreadId::new(), None, "sonnet");
+        let handle = harness.open_thread(options).await.unwrap();
+        let mut stream = harness.subscribe(&handle);
+        let opus = turn_overrides(PermissionPreset::AskFirst, Mode::Build, Some(model("opus")));
+        harness
+            .start_turn(&handle, text("one"), opus.clone())
+            .await
+            .unwrap();
+        let events = until_completed(&mut stream).await;
+        let usage_models: Vec<_> = events
+            .iter()
+            .filter_map(|event| match event {
+                AgentEvent::TurnUsageUpdated { model, .. } => Some(model.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(!usage_models.is_empty());
+        assert!(usage_models.iter().all(|m| *m == Some(model("opus"))));
+        let set_model = written(&record)
+            .into_iter()
+            .find(|line| line["request"]["subtype"] == "set_model")
+            .unwrap();
+        assert_eq!(set_model["request"]["model"], "opus");
+        let logs_now = logs(&output);
+        let line = logs_now
+            .lines()
+            .find(|line| line.contains("action=\"turn_settings\""))
+            .unwrap_or_else(|| panic!("{logs_now}"));
+        assert!(
+            line.contains("model=opus") && line.contains("mode=default"),
+            "{line}"
+        );
+
+        // The same model on the next turn sends nothing but the mode.
+        let before = subtypes_written(&record).len();
+        harness
+            .start_turn(&handle, text("two"), opus)
+            .await
+            .unwrap();
+        until_completed(&mut stream).await;
+        assert_eq!(
+            &subtypes_written(&record)[before..],
+            ["set_permission_mode"]
+        );
+        harness.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_unknown_model_fails_the_turn_start() {
+        let (child, record) = scripted(
+            handshake_steps("sonnet"),
+            vec![Step::OnStdin(
+                control("set_model"),
+                vec![Action::RespondErrorCode {
+                    error: "Model 'gpt-5' not found",
+                    code: "catalog_unknown",
+                }],
+            )],
+        );
+        let (harness, _) = harness(vec![child]);
+        let (options, _updates) = open_options(ThreadId::new(), None, "sonnet");
+        let handle = harness.open_thread(options).await.unwrap();
+        let mut stream = harness.subscribe(&handle);
+        let error = harness
+            .start_turn(
+                &handle,
+                text("go"),
+                turn_overrides(
+                    PermissionPreset::AskFirst,
+                    Mode::Build,
+                    Some(model("gpt-5")),
+                ),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&error, HarnessError::Unsupported(message) if message == "Model 'gpt-5' not found"),
+            "{error}"
+        );
+        assert!(stream.try_recv().is_none(), "no TurnStarted");
+        let subtypes = subtypes_written(&record);
+        assert_eq!(subtypes.last().map(String::as_str), Some("set_model"));
+        assert!(written(&record).iter().all(|line| line["type"] != "user"));
+        harness.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_effort_change_is_sent_and_read_back() {
+        let applied = json!({"applied": {"model": "sonnet", "effort": "high"}, "effective": {}});
+        let (child, record) = scripted(
+            handshake_steps("sonnet"),
+            vec![
+                Step::OnStdin(
+                    control("apply_flag_settings"),
+                    vec![Action::Respond(Value::Null)],
+                ),
+                Step::OnStdin(control("get_settings"), vec![Action::Respond(applied)]),
+                Step::OnStdin(user(), vec![text_turn()]),
+                Step::OnStdin(user(), vec![text_turn()]),
+            ],
+        );
+        let (harness, _) = harness(vec![child]);
+        let (options, _updates) = open_options(ThreadId::new(), None, "sonnet");
+        let handle = harness.open_thread(options).await.unwrap();
+        let mut stream = harness.subscribe(&handle);
+        let high = turn_overrides(
+            PermissionPreset::AskFirst,
+            Mode::Build,
+            Some(with_effort("sonnet", "high")),
+        );
+        harness
+            .start_turn(&handle, text("one"), high.clone())
+            .await
+            .unwrap();
+        until_completed(&mut stream).await;
+        let apply = written(&record)
+            .into_iter()
+            .find(|line| line["request"]["subtype"] == "apply_flag_settings")
+            .unwrap();
+        assert_eq!(apply["request"]["settings"], json!({"effortLevel": "high"}));
+        assert!(
+            !subtypes_written(&record).contains(&"set_model".to_owned()),
+            "same model: no set_model"
+        );
+
+        // The CLI now holds `high`: nothing more is sent.
+        let before = subtypes_written(&record).len();
+        harness
+            .start_turn(&handle, text("two"), high)
+            .await
+            .unwrap();
+        until_completed(&mut stream).await;
+        assert_eq!(
+            &subtypes_written(&record)[before..],
+            ["set_permission_mode"]
+        );
+        harness.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_refused_effort_fails_the_turn_start() {
+        // An invalid level leaves the previous one in `applied.effort`.
+        let (child, _) = scripted(
+            handshake_steps("sonnet"),
+            vec![
+                Step::OnStdin(
+                    control("apply_flag_settings"),
+                    vec![Action::Respond(Value::Null)],
+                ),
+                Step::OnStdin(
+                    control("get_settings"),
+                    vec![Action::Respond(settings("sonnet"))],
+                ),
+            ],
+        );
+        let (harness, _) = harness(vec![child]);
+        let (options, _updates) = open_options(ThreadId::new(), None, "sonnet");
+        let handle = harness.open_thread(options).await.unwrap();
+        let mut stream = harness.subscribe(&handle);
+        let error = harness
+            .start_turn(
+                &handle,
+                text("go"),
+                turn_overrides(
+                    PermissionPreset::AskFirst,
+                    Mode::Build,
+                    Some(with_effort("sonnet", "banana")),
+                ),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&error, HarnessError::Unsupported(message)
+                if message == "Claude Code did not accept effort banana for sonnet"),
+            "{error}"
+        );
+        assert!(stream.try_recv().is_none(), "no TurnStarted");
+        harness.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_read_back_mismatch_is_a_protocol_error() {
+        let (child, record) = scripted(
+            handshake_steps("sonnet"),
+            vec![
+                Step::OnStdin(control("set_model"), vec![Action::Respond(Value::Null)]),
+                Step::OnStdin(
+                    control("get_settings"),
+                    vec![Action::Respond(settings("claude-fable-5-1"))],
+                ),
+            ],
+        );
+        let (harness, _) = harness(vec![child]);
+        let (options, _updates) = open_options(ThreadId::new(), None, "sonnet");
+        let handle = harness.open_thread(options).await.unwrap();
+        let mut stream = harness.subscribe(&handle);
+        let error = harness
+            .start_turn(
+                &handle,
+                text("go"),
+                turn_overrides(PermissionPreset::AskFirst, Mode::Build, Some(model("opus"))),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&error, HarnessError::Protocol(message)
+                if message == "Claude Code applied model claude-fable-5-1 instead of opus"),
+            "{error}"
+        );
+        assert!(stream.try_recv().is_none(), "no TurnStarted");
+        assert!(written(&record).iter().all(|line| line["type"] != "user"));
+        harness.shutdown().await.unwrap();
+    }
+
+    // ---- milestone 3: approvals -----------------------------------------------------------------
+
+    /// The index of a fixture's `can_use_tool` ask among `fixture_lines`, and its request id.
+    fn ask_of(name: &str) -> (usize, String) {
+        let lines = fixture_lines(name);
+        let index = lines
+            .iter()
+            .position(|line| line.contains("\"control_request\""))
+            .unwrap();
+        let value: Value = serde_json::from_str(&lines[index]).unwrap();
+        (index, value["request_id"].as_str().unwrap().to_owned())
+    }
+
+    /// A control response the adapter writes; the rest of the fixture follows it.
+    fn answered() -> crate::session::tests::Matcher {
+        Box::new(|value| value["type"] == "control_response")
+    }
+
+    /// A child that emits `name` up to its ask on the user message, and the rest once answered.
+    fn asking(name: &'static str) -> (ScriptedChild, Arc<Mutex<ScriptRecord>>) {
+        let (index, _) = ask_of(name);
+        scripted(
+            handshake_steps("sonnet"),
+            vec![
+                Step::OnStdin(
+                    user(),
+                    vec![Action::EmitFixturePrefix {
+                        name,
+                        count: index + 1,
+                    }],
+                ),
+                Step::OnStdin(
+                    answered(),
+                    vec![Action::EmitFixtureFrom {
+                        name,
+                        from: index + 1,
+                    }],
+                ),
+            ],
+        )
+    }
+
+    async fn approval_requested(stream: &mut AgentEventStream) -> ApprovalId {
+        next_matching(stream, |event| match event {
+            AgentEvent::ApprovalRequested { request, .. } => Some(request.id.clone()),
+            _ => None,
+        })
+        .await
+    }
+
+    /// Open a thread on `child`, start a turn, and wait for its ask.
+    async fn ask_pending(
+        child: ScriptedChild,
+    ) -> (
+        Arc<ClaudeHarness>,
+        ThreadHandle,
+        AgentEventStream,
+        ApprovalId,
+    ) {
+        let (harness, _) = harness(vec![child]);
+        let (options, _updates) = open_options(ThreadId::new(), None, "sonnet");
+        let handle = harness.open_thread(options).await.unwrap();
+        let mut stream = harness.subscribe(&handle);
+        harness
+            .start_turn(&handle, text("touch probe.txt"), overrides())
+            .await
+            .unwrap();
+        let approval = approval_requested(&mut stream).await;
+        (harness, handle, stream, approval)
+    }
+
+    fn command_status(events: &[AgentEvent]) -> Option<String> {
+        events.iter().find_map(|event| match event {
+            AgentEvent::ItemCompleted { item, .. } => match &item.payload {
+                giskard_core::item::ItemPayload::CommandExecution { status, .. } => status.clone(),
+                _ => None,
+            },
+            _ => None,
+        })
+    }
+
+    #[tokio::test]
+    async fn accept_writes_a_bare_allow() {
+        let (child, record) = asking("tool-allowed");
+        let (output, _guard) = capture_logs();
+        let (harness, _, mut stream, approval) = ask_pending(child).await;
+        let (_, request_id) = ask_of("tool-allowed");
+        assert_eq!(approval.0, request_id);
+        harness
+            .respond_approval(approval.clone(), ApprovalDecision::Accept)
+            .await
+            .unwrap();
+        let events = until_completed(&mut stream).await;
+        assert_eq!(completion(&events).1, TurnStatusKind::Completed);
+        assert_eq!(command_status(&events).as_deref(), Some("completed"));
+        assert_eq!(
+            answers_written(&record),
+            [json!({"type": "control_response", "response": {
+                "subtype": "success",
+                "request_id": request_id,
+                "response": {"behavior": "allow"},
+            }})]
+        );
+        assert!(lock(&harness.pending).approval(&approval).is_none());
+        let logs = logs(&output);
+        let line = logs
+            .lines()
+            .find(|line| line.contains("action=\"respond_approval\""))
+            .unwrap_or_else(|| panic!("{logs}"));
+        assert!(
+            line.contains("decision=\"accept\"") || line.contains("decision=accept"),
+            "{line}"
+        );
+        assert!(
+            line.contains("tool_name=\"Bash\"") || line.contains("tool_name=Bash"),
+            "{line}"
+        );
+        assert!(!logs.contains("touch probe.txt"), "{logs}");
+        harness.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn accept_for_session_echoes_the_rule_with_the_session_destination() {
+        let (child, record) = asking("accept-for-session");
+        let (harness, _, mut stream, approval) = ask_pending(child).await;
+        harness
+            .respond_approval(approval, ApprovalDecision::AcceptForSession)
+            .await
+            .unwrap();
+        let events = until_completed(&mut stream).await;
+        assert_eq!(completion(&events).1, TurnStatusKind::Completed);
+
+        let recorded = std::fs::read_to_string(format!(
+            "{}/tests/fixtures/accept-for-session.in.jsonl",
+            env!("CARGO_MANIFEST_DIR")
+        ))
+        .unwrap();
+        let recorded: Value = recorded
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .find(|line| line["type"] == "control_response")
+            .unwrap();
+        let answers = answers_written(&record);
+        assert_eq!(answers.len(), 1);
+        assert_eq!(
+            answers[0]["response"]["response"],
+            recorded["response"]["response"]
+        );
+        let rule = &answers[0]["response"]["response"]["updatedPermissions"][0];
+        assert_eq!(rule["destination"], "session");
+        assert_eq!(rule["rules"][0]["ruleContent"], "python3 -c \"print(1)\"");
+        let line = lock(&record)
+            .written
+            .iter()
+            .find(|line| line.contains("control_response"))
+            .unwrap()
+            .clone();
+        assert!(!line.contains("localSettings"), "{line}");
+        harness.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn accept_for_session_without_a_rule_suggestion_degrades_to_accept() {
+        let (index, request_id) = ask_of("tool-allowed");
+        let lines = fixture_lines("tool-allowed");
+        let mut ask: Value = serde_json::from_str(&lines[index]).unwrap();
+        ask["request"]["permission_suggestions"] = json!([
+            {"type": "addDirectories", "directories": ["/work/project"], "destination": "session"}
+        ]);
+        let mut prefix = lines[..index].to_vec();
+        prefix.push(ask.to_string());
+        let (child, record) = scripted(
+            handshake_steps("sonnet"),
+            vec![
+                Step::OnStdin(user(), vec![Action::Emit(prefix)]),
+                Step::OnStdin(
+                    answered(),
+                    vec![Action::EmitFixtureFrom {
+                        name: "tool-allowed",
+                        from: index + 1,
+                    }],
+                ),
+            ],
+        );
+        let (output, _guard) = capture_logs();
+        let (harness, _, mut stream, approval) = ask_pending(child).await;
+        harness
+            .respond_approval(approval, ApprovalDecision::AcceptForSession)
+            .await
+            .unwrap();
+        until_completed(&mut stream).await;
+        assert_eq!(
+            answers_written(&record)[0]["response"],
+            json!({"subtype": "success", "request_id": request_id, "response": {"behavior": "allow"}})
+        );
+        let logs = logs(&output);
+        let line = logs
+            .lines()
+            .find(|line| line.contains("action=\"accept_for_session_degraded\""))
+            .unwrap_or_else(|| panic!("{logs}"));
+        assert!(
+            line.contains("WARN") && line.contains("suggestions=1"),
+            "{line}"
+        );
+        harness.shutdown().await.unwrap();
+    }
+
+    /// A fixture's lines with `key` removed from every frame of `frame_type`.
+    fn fixture_without(name: &str, frame_type: &str, key: &str) -> Vec<String> {
+        fixture_lines(name)
+            .into_iter()
+            .map(|line| {
+                let mut frame: Value = serde_json::from_str(&line).unwrap();
+                if frame["type"] == frame_type
+                    && let Some(object) = frame.as_object_mut()
+                {
+                    object.remove(key);
+                    return frame.to_string();
+                }
+                line
+            })
+            .collect()
+    }
+
+    /// Like `asking`, from rewritten lines.
+    fn asking_lines(
+        name: &'static str,
+        lines: Vec<String>,
+    ) -> (ScriptedChild, Arc<Mutex<ScriptRecord>>) {
+        let (index, _) = ask_of(name);
+        scripted(
+            handshake_steps("sonnet"),
+            vec![
+                Step::OnStdin(user(), vec![Action::Emit(lines[..=index].to_vec())]),
+                Step::OnStdin(answered(), vec![Action::Emit(lines[index + 1..].to_vec())]),
+            ],
+        )
+    }
+
+    #[tokio::test]
+    async fn decline_blocks_the_tool_and_the_turn_completes() {
+        // Without `tool_result_meta`, only the adapter's own denial note makes the item
+        // `declined` (the result alone reads as a failed tool).
+        let (child, record) = asking_lines(
+            "tool-denied",
+            fixture_without("tool-denied", "user", "tool_result_meta"),
+        );
+        let (harness, _, mut stream, approval) = ask_pending(child).await;
+        harness
+            .respond_approval(approval, ApprovalDecision::Decline)
+            .await
+            .unwrap();
+        let events = until_completed(&mut stream).await;
+        assert_eq!(completion(&events).1, TurnStatusKind::Completed);
+        assert_eq!(command_status(&events).as_deref(), Some("declined"));
+        assert_eq!(
+            answers_written(&record)[0]["response"]["response"],
+            json!({"behavior": "deny", "message": "Declined by the user in Giskard"})
+        );
+        harness.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancel_interrupts_and_the_turn_is_interrupted() {
+        // Without `terminal_reason`, only the adapter's interrupt note makes the error result an
+        // interruption; the exit 1 after it must then read as expected.
+        let (child, record) = asking_lines(
+            "cancel",
+            fixture_without("cancel", "result", "terminal_reason"),
+        );
+        let (output, _guard) = capture_logs();
+        let (harness, handle, mut stream, approval) =
+            ask_pending(child.exiting_on_eof_with(1)).await;
+        harness
+            .respond_approval(approval, ApprovalDecision::Cancel)
+            .await
+            .unwrap();
+        let events = until_completed(&mut stream).await;
+        assert_eq!(completion(&events).1, TurnStatusKind::Interrupted);
+        assert_eq!(
+            answers_written(&record)[0]["response"]["response"],
+            json!({
+                "behavior": "deny",
+                "message": "Cancelled by the user in Giskard",
+                "interrupt": true,
+            })
+        );
+        harness.delete_thread(&handle).await.unwrap();
+        let logs = logs(&output);
+        let exit = logs
+            .lines()
+            .find(|line| line.contains("action=\"child_exited\""))
+            .unwrap_or_else(|| panic!("{logs}"));
+        assert!(
+            exit.contains("INFO") && exit.contains("exit_code=1"),
+            "{exit}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unknown_or_already_answered_approval_is_a_protocol_error() {
+        let (child, _) = asking("tool-allowed");
+        let (harness, _, mut stream, approval) = ask_pending(child).await;
+        assert!(matches!(
+            harness
+                .respond_approval(ApprovalId::new("nope"), ApprovalDecision::Accept)
+                .await,
+            Err(HarnessError::Protocol(message)) if message == "approval nope is not pending"
+        ));
+        harness
+            .respond_approval(approval.clone(), ApprovalDecision::Accept)
+            .await
+            .unwrap();
+        until_completed(&mut stream).await;
+        assert!(matches!(
+            harness
+                .respond_approval(approval, ApprovalDecision::Accept)
+                .await,
+            Err(HarnessError::Protocol(message)) if message.contains("is not pending")
+        ));
+        harness.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn exec_policy_amendments_are_unsupported() {
+        let (child, record) = asking("tool-allowed");
+        let (harness, handle, _stream, approval) = ask_pending(child).await;
+        assert!(matches!(
+            harness
+                .respond_approval(
+                    approval.clone(),
+                    ApprovalDecision::AcceptWithExecPolicyAmendment {
+                        amendment: vec!["touch".into()],
+                    },
+                )
+                .await,
+            Err(HarnessError::Unsupported(_))
+        ));
+        assert!(answers_written(&record).is_empty());
+        assert!(
+            lock(&harness.pending).approval(&approval).is_some(),
+            "the ask stays answerable"
+        );
+        harness.delete_thread(&handle).await.unwrap();
+        assert_eq!(lock(&harness.pending).len(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_ask_is_dropped_and_a_late_answer_is_refused() {
+        let (index, ask_id) = ask_of("cancel");
+        let dialog = json!({"type": "control_request", "request_id": "dialog-1", "request": {
+            "subtype": "request_user_dialog", "title": "t"
+        }})
+        .to_string();
+        let cancel =
+            |id: &str| json!({"type": "control_cancel_request", "request_id": id}).to_string();
+        let (child, record) = scripted(
+            handshake_steps("sonnet"),
+            vec![
+                Step::OnStdin(
+                    user(),
+                    vec![
+                        Action::EmitFixturePrefix {
+                            name: "cancel",
+                            count: index + 1,
+                        },
+                        Action::Emit(vec![dialog]),
+                    ],
+                ),
+                // The CLI withdraws its asks before it answers the interrupt.
+                Step::OnStdin(
+                    control("interrupt"),
+                    vec![
+                        Action::Emit(vec![cancel(&ask_id), cancel("dialog-1")]),
+                        Action::Respond(json!({"still_queued": []})),
+                        Action::EmitFixtureFrom {
+                            name: "cancel",
+                            from: index + 1,
+                        },
+                    ],
+                ),
+            ],
+        );
+        let (harness, _) = harness(vec![child]);
+        let (output, _guard) = capture_logs();
+        let (options, _updates) = open_options(ThreadId::new(), None, "sonnet");
+        let handle = harness.open_thread(options).await.unwrap();
+        let mut stream = harness.subscribe(&handle);
+        harness
+            .start_turn(&handle, text("touch probe.txt"), overrides())
+            .await
+            .unwrap();
+        let approval = approval_requested(&mut stream).await;
+        next_matching(&mut stream, |event| {
+            matches!(event, AgentEvent::ServerRequestReceived { .. }).then_some(())
+        })
+        .await;
+        harness.interrupt(&handle).await.unwrap();
+        let events = until_completed(&mut stream).await;
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AgentEvent::ServerRequestResolved { request_id, .. } if request_id.0 == "dialog-1"
+        )));
+        assert_eq!(completion(&events).1, TurnStatusKind::Interrupted);
+        assert!(matches!(
+            harness
+                .respond_approval(approval, ApprovalDecision::Accept)
+                .await,
+            Err(HarnessError::Protocol(_))
+        ));
+        assert!(matches!(
+            harness
+                .respond_server_request(
+                    ServerRequestId::new("dialog-1"),
+                    ServerRequestResponse::result(json!({}))
+                )
+                .await,
+            Err(HarnessError::Protocol(_))
+        ));
+        assert!(answers_written(&record).is_empty(), "nothing late is sent");
+        assert_eq!(lock(&harness.pending).len(), 0);
+        let logs = logs(&output);
+        assert_eq!(
+            logs.matches("action=\"control_cancel_request\"").count(),
+            4,
+            "the mapper's and the supervisor's line per withdrawn ask: {logs}"
+        );
+        harness.shutdown().await.unwrap();
+    }
+
+    // ---- milestone 3: server requests -----------------------------------------------------------
+
+    fn ask_user_question(request_id: &str) -> (String, Value) {
+        let input = json!({"questions": [
+            {
+                "question": "Do you prefer cats or dogs?",
+                "header": "Pet",
+                "options": [
+                    {"label": "Cats", "description": "Independent"},
+                    {"label": "Dogs", "description": "Loyal"},
+                ],
+                "multiSelect": false,
+            },
+            {
+                "question": "Which fruits do you like?",
+                "header": "Fruit",
+                "options": [
+                    {"label": "Apple", "description": "Crisp"},
+                    {"label": "Cherry", "description": "Sweet"},
+                ],
+                "multiSelect": true,
+            },
+        ]});
+        let line = json!({"type": "control_request", "request_id": request_id, "request": {
+            "subtype": "can_use_tool",
+            "tool_name": "AskUserQuestion",
+            "display_name": "AskUserQuestion",
+            "input": input,
+            "requires_user_interaction": true,
+            "tool_use_id": format!("toolu_{request_id}"),
+        }})
+        .to_string();
+        (line, input)
+    }
+
+    async fn server_request_received(
+        stream: &mut AgentEventStream,
+    ) -> (ServerRequestId, String, Value) {
+        next_matching(stream, |event| match event {
+            AgentEvent::ServerRequestReceived { request, .. } => Some((
+                request.id.clone(),
+                request.method.clone(),
+                request.params.clone(),
+            )),
+            _ => None,
+        })
+        .await
+    }
+
+    async fn server_request_resolved(stream: &mut AgentEventStream) -> ServerRequestId {
+        next_matching(stream, |event| match event {
+            AgentEvent::ServerRequestResolved { request_id, .. } => Some(request_id.clone()),
+            _ => None,
+        })
+        .await
+    }
+
+    #[tokio::test]
+    async fn ask_user_question_round_trips() {
+        let (first, input) = ask_user_question("q1");
+        let (second, _) = ask_user_question("q2");
+        let (child, record) = scripted(
+            handshake_steps("sonnet"),
+            vec![
+                Step::OnStdin(user(), vec![Action::Emit(vec![first])]),
+                Step::OnStdin(answered(), vec![Action::Emit(vec![second])]),
+                Step::OnStdin(answered(), vec![text_turn()]),
+            ],
+        );
+        let (harness, _) = harness(vec![child]);
+        let (output, _guard) = capture_logs();
+        let (options, _updates) = open_options(ThreadId::new(), None, "sonnet");
+        let handle = harness.open_thread(options).await.unwrap();
+        let mut stream = harness.subscribe(&handle);
+        harness
+            .start_turn(&handle, text("ask me"), overrides())
+            .await
+            .unwrap();
+
+        let (id, method, params) = server_request_received(&mut stream).await;
+        assert_eq!(id.0, "q1");
+        assert_eq!(method, "claude/ask_user_question");
+        assert_eq!(params["questions"][0]["id"], "0");
+        assert_eq!(params["questions"][1]["id"], "1");
+        assert_eq!(
+            params["questions"][0]["question"],
+            "Do you prefer cats or dogs?"
+        );
+        harness
+            .respond_server_request(
+                id.clone(),
+                ServerRequestResponse::result(json!({"answers": {
+                    "0": {"answers": ["Cats"]},
+                    "1": {"answers": ["Apple", "Cherry"]},
+                }})),
+            )
+            .await
+            .unwrap();
+        assert_eq!(server_request_resolved(&mut stream).await, id);
+        let answer = &answers_written(&record)[0];
+        assert_eq!(answer["response"]["request_id"], "q1");
+        assert_eq!(
+            answer["response"]["response"],
+            json!({"behavior": "allow", "updatedInput": {
+                "questions": input["questions"],
+                "answers": {
+                    "Do you prefer cats or dogs?": "Cats",
+                    "Which fruits do you like?": "Apple, Cherry",
+                },
+            }})
+        );
+
+        // A browser cancel is a deny with its message; an unanswered question is left out.
+        let (id, _, _) = server_request_received(&mut stream).await;
+        assert!(matches!(
+            harness
+                .respond_server_request(id.clone(), ServerRequestResponse::result(json!("x")))
+                .await,
+            Err(HarnessError::Protocol(_))
+        ));
+        assert!(
+            lock(&harness.pending).server_request(&id).is_some(),
+            "a malformed answer keeps the request pending"
+        );
+        harness
+            .respond_server_request(
+                id.clone(),
+                ServerRequestResponse::error(-32000, "User input request cancelled."),
+            )
+            .await
+            .unwrap();
+        assert_eq!(server_request_resolved(&mut stream).await, id);
+        assert_eq!(
+            answers_written(&record)[1]["response"]["response"],
+            json!({"behavior": "deny", "message": "User input request cancelled."})
+        );
+        until_completed(&mut stream).await;
+        let logs = logs(&output);
+        assert!(logs.contains("action=\"respond_server_request\""), "{logs}");
+        assert!(
+            !logs.contains("Cats") && !logs.contains("cats or dogs"),
+            "{logs}"
+        );
+        harness.shutdown().await.unwrap();
+    }
+
+    #[test]
+    fn ask_user_question_answers_skip_unanswered_questions() {
+        let (_, input) = ask_user_question("q");
+        let ask = crate::session::PendingAsk {
+            thread: ThreadId::new(),
+            request_id: "q".into(),
+            tool_use_id: None,
+            tool_name: None,
+            suggestions: Vec::new(),
+            subtype: "can_use_tool".into(),
+            input,
+        };
+        let line = crate::session::server_request_line(
+            &ask,
+            &ServerRequestResponse::result(json!({"answers": {
+                "0": {"answers": []},
+                "1": {"answers": ["Cherry"]},
+            }})),
+        )
+        .unwrap();
+        let line: Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(
+            line["response"]["response"]["updatedInput"]["answers"],
+            json!({"Which fruits do you like?": "Cherry"})
+        );
+        // An id that names no question is not that shape.
+        assert!(
+            crate::session::server_request_line(
+                &ask,
+                &ServerRequestResponse::result(json!({"answers": {"7": {"answers": ["x"]}}})),
+            )
+            .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn other_control_requests_round_trip() {
+        let request = |id: &str| {
+            json!({"type": "control_request", "request_id": id, "request": {
+                "subtype": "rename_session", "title": "From the CLI"
+            }})
+            .to_string()
+        };
+        let (child, record) = scripted(
+            handshake_steps("sonnet"),
+            vec![
+                Step::OnStdin(user(), vec![Action::Emit(vec![request("r7")])]),
+                Step::OnStdin(answered(), vec![Action::Emit(vec![request("r8")])]),
+                Step::OnStdin(answered(), vec![text_turn()]),
+            ],
+        );
+        let (harness, _) = harness(vec![child]);
+        let (options, _updates) = open_options(ThreadId::new(), None, "sonnet");
+        let handle = harness.open_thread(options).await.unwrap();
+        let mut stream = harness.subscribe(&handle);
+        harness
+            .start_turn(&handle, text("go"), overrides())
+            .await
+            .unwrap();
+
+        let (id, method, params) = server_request_received(&mut stream).await;
+        assert_eq!(method, "claude/rename_session");
+        assert_eq!(params["title"], "From the CLI");
+        harness
+            .respond_server_request(
+                id.clone(),
+                ServerRequestResponse::result(json!({"ok": true})),
+            )
+            .await
+            .unwrap();
+        assert_eq!(server_request_resolved(&mut stream).await, id);
+
+        let (id, _, _) = server_request_received(&mut stream).await;
+        harness
+            .respond_server_request(id.clone(), ServerRequestResponse::error(-32000, "nope"))
+            .await
+            .unwrap();
+        assert_eq!(server_request_resolved(&mut stream).await, id);
+        until_completed(&mut stream).await;
+
+        assert_eq!(
+            answers_written(&record),
+            [
+                json!({"type": "control_response", "response": {
+                    "subtype": "success", "request_id": "r7", "response": {"ok": true}
+                }}),
+                json!({"type": "control_response", "response": {
+                    "subtype": "error", "request_id": "r8", "error": "nope"
+                }}),
+            ]
+        );
+        harness.shutdown().await.unwrap();
+    }
+
+    // ---- milestone 3: compaction ----------------------------------------------------------------
+
+    #[tokio::test]
+    async fn compact_runs_a_compaction_turn() {
+        // The `compact` fixture's frames after its first turn's `result`.
+        let first_result = fixture_lines("compact")
+            .iter()
+            .position(|line| line.contains("\"type\": \"result\""))
+            .unwrap();
+        let (child, record) = scripted(
+            handshake_steps("sonnet"),
+            vec![Step::OnStdin(
+                user(),
+                vec![Action::EmitFixtureFrom {
+                    name: "compact",
+                    from: first_result + 1,
+                }],
+            )],
+        );
+        let (harness, _) = harness(vec![child]);
+        let (output, _guard) = capture_logs();
+        let (options, _updates) = open_options(ThreadId::new(), None, "sonnet");
+        let handle = harness.open_thread(options).await.unwrap();
+        let mut stream = harness.subscribe(&handle);
+        let before = subtypes_written(&record).len();
+        harness.compact_thread(&handle).await.unwrap();
+        let events = until_completed(&mut stream).await;
+
+        let turn = match events.first() {
+            Some(AgentEvent::TurnStarted { turn, .. }) => *turn,
+            other => panic!("expected TurnStarted, got {other:?}"),
+        };
+        let items: Vec<_> = events
+            .iter()
+            .filter_map(|event| match event {
+                AgentEvent::ItemCompleted { item, .. } => Some(item),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(items.len(), 1, "{items:?}");
+        assert!(matches!(
+            items[0].payload,
+            giskard_core::item::ItemPayload::Activity { .. }
+        ));
+        assert_eq!(completion(&events), (turn, TurnStatusKind::Completed, None));
+        assert!(!logs(&output).contains("permission_mode_drift"));
+        // No per-turn settings for a compaction turn: only the message.
+        assert_eq!(subtypes_written(&record).len(), before);
+        assert_eq!(
+            written(&record).pop().unwrap(),
+            json!({"type": "user", "message": {"role": "user", "content": [
+                {"type": "text", "text": "/compact"}
+            ]}})
+        );
+        harness.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn compact_during_a_turn_is_thread_busy() {
+        let (child, record) = scripted(
+            handshake_steps("sonnet"),
+            vec![Step::OnStdin(
+                user(),
                 vec![Action::EmitFixturePrefix {
-                    name: "tool-allowed",
-                    count: ask_line + 1,
+                    name: "text-turn",
+                    count: 3,
                 }],
             )],
         );
@@ -2380,39 +4030,283 @@ mod tests {
         let thread = ThreadId::new();
         let (options, _updates) = open_options(thread, None, "sonnet");
         let handle = harness.open_thread(options).await.unwrap();
-        let mut stream = harness.subscribe(&handle);
         harness
-            .start_turn(&handle, text("touch probe.txt"), overrides())
+            .start_turn(&handle, text("go"), overrides())
             .await
             .unwrap();
-        let approval = loop {
-            let event = tokio::time::timeout(Duration::from_secs(10), stream.recv())
-                .await
-                .unwrap()
-                .unwrap();
-            if let AgentEvent::ApprovalRequested { request, .. } = event {
-                break request.id;
-            }
-        };
-        assert_eq!(approval.0, request_id);
+        assert!(matches!(
+            harness.compact_thread(&handle).await,
+            Err(HarnessError::ThreadBusy { thread: t }) if t == thread
+        ));
         assert_eq!(
-            lock(&harness.pending)
-                .approval(&approval)
-                .map(|ask| ask.thread),
-            Some(thread)
+            written(&record)
+                .iter()
+                .filter(|line| line["type"] == "user")
+                .count(),
+            1
         );
+        let cold = ThreadHandle::detached(ThreadId::new(), RESUME_ID.into());
+        assert!(matches!(
+            harness.compact_thread(&cold).await,
+            Err(HarnessError::ThreadNotFound(_))
+        ));
+        harness.shutdown().await.unwrap();
+    }
+
+    // ---- review follow-ups ---------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn a_model_switch_sends_and_checks_the_requested_effort() {
+        // Open at `high`; switching to a model without effort must not pass silently.
+        let (child, record) = scripted(
+            handshake_steps("sonnet"),
+            vec![
+                Step::OnStdin(control("set_model"), vec![Action::Respond(Value::Null)]),
+                Step::OnStdin(
+                    control("apply_flag_settings"),
+                    vec![Action::Respond(Value::Null)],
+                ),
+                Step::OnStdin(
+                    control("get_settings"),
+                    vec![Action::Respond(settings("haiku"))],
+                ),
+            ],
+        );
+        let (harness, _) = harness(vec![child]);
+        let (mut options, _updates) = open_options(ThreadId::new(), None, "sonnet");
+        options.initial_model = with_effort("sonnet", "high");
+        let handle = harness.open_thread(options).await.unwrap();
+        let mut stream = harness.subscribe(&handle);
+        let error = harness
+            .start_turn(
+                &handle,
+                text("go"),
+                turn_overrides(
+                    PermissionPreset::AskFirst,
+                    Mode::Build,
+                    Some(with_effort("haiku", "high")),
+                ),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&error, HarnessError::Unsupported(message)
+                if message == "Claude Code did not accept effort high for haiku"),
+            "{error}"
+        );
+        let subtypes = subtypes_written(&record);
+        assert!(subtypes.contains(&"set_model".to_owned()), "{subtypes:?}");
+        assert!(
+            subtypes.contains(&"apply_flag_settings".to_owned()),
+            "{subtypes:?}"
+        );
+        assert!(stream.try_recv().is_none(), "no TurnStarted");
+        harness.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_reply_that_cannot_be_written_while_waiting_breaks_the_child() {
+        // While the turn's mode request is pending, the CLI asks for `ExitPlanMode` (which the
+        // mapper denies itself) and its stdin breaks: the deny cannot be written.
+        let exit_plan = json!({"type": "control_request", "request_id": "plan-1", "request": {
+            "subtype": "can_use_tool", "tool_name": "ExitPlanMode", "input": {},
+            "permission_suggestions": null, "tool_use_id": "toolu_plan"
+        }})
+        .to_string();
+        let (child, record) = scripted(
+            handshake_steps("sonnet"),
+            vec![Step::OnStdin(
+                control("set_permission_mode"),
+                vec![Action::BreakStdin, Action::Emit(vec![exit_plan])],
+            )],
+        );
+        let (harness, _) = harness(vec![child]);
+        let (output, _guard) = capture_logs();
+        let (options, _updates) = open_options(ThreadId::new(), None, "sonnet");
+        let handle = harness.open_thread(options).await.unwrap();
+        let error = harness
+            .start_turn(&handle, text("go"), overrides())
+            .await
+            .unwrap_err();
+        assert!(matches!(error, HarnessError::Transport(_)), "{error}");
+        assert!(lock(&record).killed);
+        until_no_children(&harness).await;
+        let logs = logs(&output);
+        assert!(
+            logs.lines()
+                .any(|line| line.contains("ERROR") && line.contains("action=\"write_stdin\"")),
+            "{logs}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_answer_overtaken_by_a_withdrawal_is_not_sent() {
+        let (index, ask_id) = ask_of("tool-allowed");
+        let dialog = json!({"type": "control_request", "request_id": "dialog-1", "request": {
+            "subtype": "request_user_dialog", "title": "t"
+        }})
+        .to_string();
+        let (child, record) = scripted(
+            handshake_steps("sonnet"),
+            vec![Step::OnStdin(
+                user(),
+                vec![
+                    Action::EmitFixturePrefix {
+                        name: "tool-allowed",
+                        count: index + 1,
+                    },
+                    Action::Emit(vec![dialog]),
+                ],
+            )],
+        );
+        let injector = child.injector();
+        let (output, _guard) = capture_logs();
+        let (harness, _handle, mut stream, approval) = ask_pending(child).await;
+        next_matching(&mut stream, |event| {
+            matches!(event, AgentEvent::ServerRequestReceived { .. }).then_some(())
+        })
+        .await;
+        let cancel =
+            |id: &str| json!({"type": "control_cancel_request", "request_id": id}).to_string();
+
+        // The withdrawal is already on stdout when the façade takes the ask: the supervisor reads
+        // it first (stdout wins its select), so the answer arrives for an ask no longer asked.
+        injector.emit(cancel(&ask_id));
+        assert!(matches!(
+            harness.respond_approval(approval, ApprovalDecision::Accept).await,
+            Err(HarnessError::Protocol(message)) if message.contains("withdrawn")
+        ));
+        injector.emit(cancel("dialog-1"));
         assert!(matches!(
             harness
-                .respond_approval(approval.clone(), ApprovalDecision::Accept)
+                .respond_server_request(
+                    ServerRequestId::new("dialog-1"),
+                    ServerRequestResponse::result(json!({}))
+                )
                 .await,
-            Err(HarnessError::Unsupported(_))
+            Err(HarnessError::Protocol(message)) if message.contains("withdrawn")
         ));
-        assert!(
-            lock(&harness.pending).approval(&approval).is_some(),
-            "kept for milestone 3"
+        assert_eq!(
+            server_request_resolved(&mut stream).await,
+            ServerRequestId::new("dialog-1")
         );
-        harness.delete_thread(&handle).await.unwrap();
+        assert!(answers_written(&record).is_empty(), "nothing late is sent");
         assert_eq!(lock(&harness.pending).len(), 0);
+        let logs = logs(&output);
+        assert!(
+            logs.contains("late answer to an approval Claude Code withdrew"),
+            "{logs}"
+        );
+        harness.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_turn_settings_share_one_budget() {
+        // Each answer comes after 9 s, under its own 10 s: after two of them only 7 s of the
+        // supervisor's 25 s budget are left for the third, which ends the hand-off before the
+        // façade's 30 s.
+        let late = |payload: Value| Action::RespondAfter {
+            delay: Duration::from_secs(9),
+            payload,
+        };
+        let (child, _) = scripted(
+            handshake_steps("sonnet"),
+            vec![
+                Step::OnStdin(
+                    control("set_permission_mode"),
+                    vec![late(json!({"mode": "default"}))],
+                ),
+                Step::OnStdin(control("set_model"), vec![late(Value::Null)]),
+                Step::OnStdin(control("apply_flag_settings"), vec![late(Value::Null)]),
+            ],
+        );
+        let (harness, _) = harness(vec![child]);
+        let (options, _updates) = open_options(ThreadId::new(), None, "sonnet");
+        let handle = harness.open_thread(options).await.unwrap();
+        let started = Instant::now();
+        let error = harness
+            .start_turn(
+                &handle,
+                text("go"),
+                turn_overrides(
+                    PermissionPreset::AskFirst,
+                    Mode::Build,
+                    Some(with_effort("opus", "high")),
+                ),
+            )
+            .await
+            .unwrap_err();
+        let elapsed = started.elapsed();
+        assert!(
+            matches!(&error, HarnessError::Timeout(message)
+                if message == "claude did not answer apply_flag_settings within 7.0 s"),
+            "{error}"
+        );
+        assert!(
+            elapsed >= crate::session::TURN_SETTINGS_BUDGET,
+            "{elapsed:?}"
+        );
+        assert!(elapsed < START_TURN_TIMEOUT, "{elapsed:?}");
+        harness.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_stop_during_the_turn_settings_is_not_delayed() {
+        // The mode request is never answered.
+        let (child, record) = scripted(
+            handshake_steps("sonnet"),
+            vec![Step::OnStdin(control("set_permission_mode"), Vec::new())],
+        );
+        let (harness, _) = harness(vec![child]);
+        let (options, _updates) = open_options(ThreadId::new(), None, "sonnet");
+        let handle = harness.open_thread(options).await.unwrap();
+        let started = Instant::now();
+        let (turn, ()) = tokio::join!(
+            harness.start_turn(&handle, text("go"), overrides()),
+            async {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                harness.delete_thread(&handle).await.unwrap();
+            }
+        );
+        assert!(
+            matches!(&turn, Err(HarnessError::Transport(message)) if message.contains("stopping")),
+            "{turn:?}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "{:?}",
+            started.elapsed()
+        );
+        assert!(lock(&record).stdin_closed);
+        assert!(written(&record).iter().all(|line| line["type"] != "user"));
+        assert_eq!(harness.live_children(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_bypass_child_that_exits_on_set_permission_mode_reports_its_exit() {
+        let (child, _) = ScriptedChild::new(vec![
+            Step::OnStdin(
+                control("initialize"),
+                vec![Action::Respond(initialize_payload())],
+            ),
+            Step::OnStdin(
+                control("set_permission_mode"),
+                vec![Action::Exit {
+                    code: 2,
+                    stderr: vec!["fatal: permissions unreadable".into()],
+                }],
+            ),
+        ]);
+        let (harness, _) = harness(vec![child.without_mode_echo()]);
+        let (options, _updates) = open_options(ThreadId::new(), None, "sonnet");
+        let error = harness.open_thread(options).await.unwrap_err();
+        assert!(
+            matches!(&error, HarnessError::Spawn(message)
+                if message == "claude exited with code 2 before answering set_permission_mode: \
+                               fatal: permissions unreadable"),
+            "{error}"
+        );
+        assert_eq!(harness.live_children(), 0);
     }
 
     // ---- isolation and timeouts ----------------------------------------------------------------
@@ -2671,6 +4565,135 @@ mod tests {
             matches!(&error, HarnessError::Spawn(message) if message.contains("'bogus' is invalid")),
             "{error}"
         );
+    }
+
+    #[tokio::test]
+    async fn a_real_child_sets_mode_model_and_effort_per_turn() {
+        // Asserted on events, not log lines: tracing's per-thread capture is not reliable across
+        // parallel real-process tests. The fake's `init` always reports `default`, so every turn
+        // set to another mode yields a drift notice naming the mode Giskard set.
+        let (harness, workspace) = real_harness(&[]);
+        let (options, _updates) = real_options(&workspace, None);
+        let handle = harness.open_thread(options).await.unwrap();
+        let mut stream = harness.subscribe(&handle);
+        for (overrides, mode) in [
+            (
+                turn_overrides(
+                    PermissionPreset::AutoApprove,
+                    Mode::Build,
+                    Some(with_effort("opus", "high")),
+                ),
+                "acceptEdits",
+            ),
+            (
+                turn_overrides(
+                    PermissionPreset::FullAccess,
+                    Mode::Build,
+                    Some(with_effort("opus", "high")),
+                ),
+                "bypassPermissions",
+            ),
+            (
+                turn_overrides(
+                    PermissionPreset::AskFirst,
+                    Mode::Plan,
+                    Some(model("sonnet")),
+                ),
+                "plan",
+            ),
+        ] {
+            let requested = overrides.model.clone();
+            harness
+                .start_turn(&handle, text("pong?"), overrides)
+                .await
+                .unwrap();
+            let events = until_completed(&mut stream).await;
+            assert_eq!(completion(&events).1, TurnStatusKind::Completed);
+            let notices: Vec<&str> = events
+                .iter()
+                .filter_map(|event| match event {
+                    AgentEvent::Notice { message, .. } => Some(message.as_str()),
+                    _ => None,
+                })
+                .collect();
+            assert_eq!(
+                notices,
+                [format!(
+                    "Claude Code switched its permission mode to default; Giskard set {mode}"
+                )]
+            );
+            assert!(events.iter().any(|event| matches!(
+                event,
+                AgentEvent::TurnUsageUpdated { model, .. } if *model == requested
+            )));
+        }
+        let error = harness
+            .start_turn(
+                &handle,
+                text("pong?"),
+                turn_overrides(
+                    PermissionPreset::AskFirst,
+                    Mode::Build,
+                    Some(model("gpt-5")),
+                ),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&error, HarnessError::Unsupported(message) if message == "Model 'gpt-5' not found"),
+            "{error}"
+        );
+        harness.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_real_child_answers_an_ask() {
+        let (harness, workspace) = real_harness(&[]);
+        let (options, _updates) = real_options(&workspace, None);
+        let handle = harness.open_thread(options).await.unwrap();
+        let mut stream = harness.subscribe(&handle);
+        harness
+            .start_turn(&handle, text("touch probe.txt"), overrides())
+            .await
+            .unwrap();
+        let approval = approval_requested(&mut stream).await;
+        harness
+            .respond_approval(approval, ApprovalDecision::Accept)
+            .await
+            .unwrap();
+        let events = until_completed(&mut stream).await;
+        assert_eq!(completion(&events).1, TurnStatusKind::Completed);
+        assert_eq!(command_status(&events).as_deref(), Some("completed"));
+        harness.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_real_refused_bypass_launch_refuses_full_access() {
+        let (harness, workspace) = real_harness(&[("FAKE_CLAUDE_REFUSE_BYPASS", "1")]);
+        let (options, _updates) = real_options(&workspace, None);
+        let handle = harness.open_thread(options).await.unwrap();
+        let error = harness
+            .start_turn(
+                &handle,
+                text("pong?"),
+                turn_overrides(PermissionPreset::FullAccess, Mode::Build, None),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&error, HarnessError::Unsupported(message) if message.contains(ROOT_REFUSAL)),
+            "{error}"
+        );
+        let mut stream = harness.subscribe(&handle);
+        harness
+            .start_turn(&handle, text("pong?"), overrides())
+            .await
+            .unwrap();
+        assert_eq!(
+            completion(&until_completed(&mut stream).await).1,
+            TurnStatusKind::Completed
+        );
+        harness.shutdown().await.unwrap();
     }
 
     #[tokio::test]
