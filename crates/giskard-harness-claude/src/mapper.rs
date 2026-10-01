@@ -348,6 +348,58 @@ impl ClaudeMapper {
         self.turn.as_ref().map(|turn| turn.id)
     }
 
+    /// The child process ended (`exit` reads `code 1` or `signal 9`) while a turn may be active.
+    ///
+    /// No `result` will ever arrive for that turn, so it completes here: `Interrupted` when the
+    /// adapter sent an interrupt, else `Failed`, with a message naming the exit. With no active
+    /// turn there is nothing to complete.
+    pub fn child_exited(&mut self, exit: &str) -> Vec<MapperOutput> {
+        let mut out = Vec::new();
+        let Some(turn) = self.turn.as_ref() else {
+            debug!(
+                thread_id = %self.thread,
+                harness_thread_id = %self.harness_thread_id,
+                action = "child_exited",
+                exit,
+                "Claude Code exited with no active turn"
+            );
+            return out;
+        };
+        let kind = if turn.interrupt_sent {
+            TurnStatusKind::Interrupted
+        } else {
+            TurnStatusKind::Failed
+        };
+        warn!(
+            thread_id = %self.thread,
+            harness_thread_id = %self.harness_thread_id,
+            turn_id = %turn.id,
+            action = "child_exited",
+            exit,
+            status = ?kind,
+            "Claude Code exited before the turn completed"
+        );
+        self.finish_turn(
+            TurnStatus {
+                kind,
+                message: Some(format!(
+                    "Claude Code exited ({exit}) before the turn completed"
+                )),
+            },
+            &mut out,
+        );
+        out
+    }
+
+    /// Seed the session's context window before any `result` reported one: a resumed thread's
+    /// `get_context_usage.maxTokens`. An `autocompact_state` window and a later
+    /// `result.modelUsage` window still take precedence.
+    pub fn note_context_window(&mut self, window: u32) {
+        if self.session.model_usage_window.is_none() {
+            self.session.model_usage_window = Some(window);
+        }
+    }
+
     /// Parse and map one stdout line. A line that is not a frame is logged and yields nothing.
     pub fn map_line(&mut self, line: &str) -> Vec<MapperOutput> {
         // The CLI writes stray blank lines between some frames; they carry nothing to diagnose.
@@ -2888,6 +2940,58 @@ mod tests {
         assert!(responses[0].1["response"]["models"].is_array());
         assert_eq!(responses[1].0, "6bf79889-ef4e-48ef-89e8-51f8d988d387");
         assert!(events(&outputs).is_empty());
+    }
+
+    #[test]
+    fn child_exited_and_note_context_window() {
+        // No turn: nothing to complete.
+        let mut mapper = new_mapper();
+        assert!(mapper.child_exited("code 0").is_empty());
+
+        // A turn cut short fails with the exit in its message.
+        let turn = TurnId::new();
+        mapper.begin_turn(turn, TurnKind::User);
+        let lines = out_lines("text-turn");
+        for line in &lines[..4] {
+            mapper.map_line(line);
+        }
+        let logs = capture_logs(tracing::Level::WARN, || {
+            let outputs = mapper.child_exited("code 3");
+            let completions = turn_completions(&outputs);
+            assert_eq!(completions.len(), 1);
+            assert_eq!(completions[0].0, turn);
+            assert_eq!(completions[0].2.kind, TurnStatusKind::Failed);
+            assert_eq!(
+                completions[0].2.message.as_deref(),
+                Some("Claude Code exited (code 3) before the turn completed")
+            );
+        });
+        assert!(logs.contains("action=\"child_exited\""), "{logs}");
+        assert!(mapper.active_turn().is_none());
+
+        // After an interrupt the same exit is an interruption.
+        mapper.begin_turn(TurnId::new(), TurnKind::User);
+        mapper.note_interrupt_sent();
+        let outputs = mapper.child_exited("signal 9");
+        assert_eq!(
+            turn_completions(&outputs)[0].2.kind,
+            TurnStatusKind::Interrupted
+        );
+
+        // A seeded window is reported until the session reports its own.
+        let mut mapper = new_mapper();
+        mapper.note_context_window(150_000);
+        mapper.begin_turn(TurnId::new(), TurnKind::User);
+        let outputs: Vec<MapperOutput> = lines.iter().flat_map(|l| mapper.map_line(l)).collect();
+        let updates = usage_updates(&outputs);
+        assert_eq!(updates.first().unwrap().1, Some(150_000));
+        assert_eq!(updates.last().unwrap().1, Some(200_000));
+
+        // A window a result already reported is not overwritten by a later seed.
+        mapper.note_context_window(1);
+        mapper.begin_turn(TurnId::new(), TurnKind::User);
+        let outputs: Vec<MapperOutput> = lines.iter().flat_map(|l| mapper.map_line(l)).collect();
+        assert_eq!(usage_updates(&outputs).first().unwrap().1, Some(200_000));
     }
 
     #[test]

@@ -10,15 +10,38 @@ semantics and invariants, and the
 behaves and the milestones that build this adapter. This document describes what the adapter does
 **today**, including the scope and lifetime of Claude Code-native identifiers.
 
-**Status: milestone 1.** The crate holds the pure mapper from stream-json frames to `AgentEvent`s
-and control replies, tested on recorded fixtures. Nothing spawns a process, nothing implements
-`AgentHarness`, and no `[harnesses.<name>]` declaration can name this kind yet. `capabilities()`
-already advertises the plan §4 matrix with `live_approvals`, `plan_build_modes`, `per_turn_model`
-and `reasoning_effort` false until milestone 3.
+**Status: milestone 2.** `ClaudeHarness` implements `AgentHarness` over **one `claude` process per
+open primary thread**: `open_thread` spawns and handshakes it (fresh, `--resume`, or the same-id
+respawn when the transcript is gone), `start_turn` writes the user message with inline attachments,
+`interrupt` and `set_thread_name` send control requests, `set_thread_archived(true)`,
+`delete_thread` and `shutdown` stop children, `list_models` answers from the freshest handshake or a
+probe child, and `list_providers` reports `anthropic`. Nothing is user-reachable yet: no
+`HarnessKind` names this adapter until milestone 4, which also wires `list_mcp_servers`. Milestone 3
+answers approvals and server requests and adds per-turn mode, model and effort and `/compact`.
+`capabilities()` reports the plan §4 matrix with `live_approvals`, `plan_build_modes`,
+`per_turn_model`, `reasoning_effort` and `context_compaction` false until milestone 3, and
+`mcp_status` false until milestone 4.
 
 ## Runtime ownership
 
-Milestone 2. Today `ClaudeMapper` is synchronous, owns all of its state, and does no I/O.
+- **One supervisor task per child** (`src/session.rs`) is the single owner of the child process,
+  its `ClaudeMapper`, its pending control-request waiters and the thread's retained `EventLog`.
+  Nothing else touches them, and none of them sits behind a lock: the façade reaches the task only
+  through its bounded command channel (`StartTurn`, `Interrupt`, `Control`, `Stop`). The task
+  selects over the child's stdout lines (first, so a frame already read is mapped before a new
+  command is accepted), its commands, and the instance's shutdown signal.
+- **The façade** (`src/harness.rs`) holds two maps behind `std` mutexes that are never held across
+  an await: `children` (thread → live child: its session id, retained log, command sender, task,
+  open model) and `pending` (approval / server-request id → thread and CLI `request_id`).
+  `open_thread` inserts a child after its handshake; the supervisor removes its own entry when the
+  child exits (a generation number keeps a stale supervisor from removing a reopened thread's
+  entry); `delete_thread`, `set_thread_archived(true)` and `shutdown` take entries out before
+  stopping them. A supervisor drops its thread's `pending` entries when its child exits.
+- **The retained log is created at open**, so `subscribe` returns a live reader for any handle
+  `open_thread` issued before the child has written a frame. Frames read during the handshake that
+  were not its responses are mapped first, once the supervisor starts.
+- **The probe child** that `list_models` spawns when no handshake has reported a catalog yet is
+  owned by the call: it is not in `children` and does not count as a live child.
 
 ## Identifier model
 
@@ -29,7 +52,7 @@ Milestone 2. Today `ClaudeMapper` is synchronous, owns all of its state, and doe
 | `TurnId` | minted by Giskard at `start_turn` (`begin_turn`), or by the mapper for a continuation turn the CLI started on its own |
 | `ItemId` | minted on first sight of a native key: a `tool_use` block's `id`, or `(message.id, block index)` for a text or thinking block; reused for the item's start, deltas and completion within the turn |
 | `Item.harness_item_id` | the tool-use id, `<message_id>:<index>`, `compact_boundary:<uuid>`, or `user:<uuid>:<index>` for a user-frame activity |
-| `ApprovalId`, `ServerRequestId` | the `control_request`'s `request_id`, a UUID the CLI mints and the reply must carry |
+| `ApprovalId`, `ServerRequestId` | the `control_request`'s `request_id`, a UUID the CLI mints and the reply must carry; the trait's instance-wide uniqueness across children rests on the CLI minting UUIDs |
 
 `assistant` frames arrive **one content block per frame**, each repeating the whole message
 envelope with the same `message.id`. The mapper numbers the blocks of one message across its frames,
@@ -139,17 +162,155 @@ pair is seen and at `debug` after; a known kind that fails to convert is `FrameE
 logged at `warn`; a non-JSON line is logged with its byte length. No log line carries frame
 content: serde errors have their quoted values redacted.
 
-## Process control, resume and approval responses
+## Launch
 
-Milestone 2 spawns and supervises the child and implements `AgentHarness`; milestone 3 answers
-approvals and server requests, sets the permission mode, and sends `/compact`.
+Each primary thread's child runs, in this order:
+
+| Arguments | Why |
+| --- | --- |
+| `-p --input-format stream-json --output-format stream-json --verbose` | the stdio protocol |
+| `--permission-prompt-tool stdio` | asks arrive as `can_use_tool` control requests |
+| `--setting-sources user` | plan §8.3: the user's settings, not a cloned repository's |
+| `--disallowedTools EnterPlanMode ExitPlanMode` | Giskard chooses the mode per turn |
+| `--include-partial-messages` | `stream_event`s, so text streams as `ItemDelta`s |
+| `--permission-mode manual` | fixed until milestone 3 sets it per turn; never `--permission-prompts none`, which would deny every ask silently |
+| `--model <ModelRef.model>` | an alias or a full id, verbatim |
+| `--effort <ModelRef.reasoning_effort>` | only when the model ref carries one; the CLI tolerates a level the model ignores |
+| `--session-id <uuid>` or `--resume <uuid>` | a fresh session (or the same-id respawn), or a resume |
+| the declaration's `args` | last, so an operator can append to, never override, the protocol flags |
+
+No `--add-dir`, `--forward-subagent-text` (milestone 5) or `--replay-user-messages`. The child's
+working directory is `OpenThreadOptions.workspace_root`. The declaration's environment overlay is
+applied **over** the inherited environment, never in place of it, so an `ANTHROPIC_API_KEY`,
+`ANTHROPIC_BASE_URL` or other `ANTHROPIC_*` variable in Giskard's own environment reaches every
+child (plan §7); the mapper's `apiKeySource` notice is the mitigation. The spawn log line names the
+command, the working directory, the number of extra arguments and the overlay's variable **names**,
+never values. stdout lines are capped at 64 MiB (a longer one is fatal for that child); stderr is
+drained by its own task, logged at `debug` under the target `giskard_harness_claude::stderr`, and
+its last 8 lines (400 characters each) are what every spawn error and exit log line quotes.
+
+## Handshake, resume and respawn
+
+Nothing reaches stdout at spawn: the CLI's first frame answers the first message. So the open
+handshake is a sequence of control requests:
+
+1. `initialize`, under a 30 s timeout. Its `models` replace the catalog snapshot. A child that exits
+   instead, times out (killed), or refuses fails the open.
+2. `get_settings`, under 10 s. `applied.model` equal to the requested model, or to the catalog's
+   `resolvedModel` for it, makes `ThreadHandle.resumed_model` the requested `ModelRef`; another id
+   makes it that id (with `applied.effort`) and logs `model_not_applied` at `warn`, so the server
+   unwinds a provider switch the CLI did not confirm. No answer is `None` and a `warn`, never a
+   failed open.
+3. On resume only, `get_context_usage`, under 10 s. A positive `maxTokens` is sent as
+   `ThreadUpdate::ContextWindowRestored` and seeds the mapper's window, so the first
+   `TurnUsageUpdated` carries it.
+
+The ids of `get_settings` or `get_context_usage` requests that timed out are handed to the
+supervisor, so the CLI's late answer is logged at `debug` rather than as an unexpected response.
+
+A `resume` id beginning with `task:` is refused as `Unsupported` (a sub-agent has no session; plan
+§5.3), and any other id must be a UUID. With `--resume`, a child that exits before answering
+`initialize` with `No conversation found with session ID` (on stderr or in the `result.errors` it
+wrote) means the transcript is gone: the adapter logs `claude_resume_failed` at `warn`, respawns
+with `--session-id <the same uuid>`, and opens the thread writable with the notice
+`claude_resume_failed` ("Agent context was lost; started a fresh Claude Code session. History is
+intact.", detail: the CLI's sentence). That respawn works only because the transcript is gone:
+any other resume failure (such as `Error: Session ID … is already in use.`) is an error and is
+never retried, and a failed respawn returns its own error. A handshake failure whose stderr or
+`result.errors` mentions `not logged in`, `Invalid API key`, `/login` or `authentication` is
+`HarnessError::Unauthenticated`; this is a best-effort substring match, since the unauthenticated
+shape could not be reproduced. Every other failure is `HarnessError::Spawn` quoting the exit status,
+the handshake request left unanswered (`initialize`, `get_settings` or `get_context_usage`) and the
+stderr tail, which is what the browser shows.
+
+A second `open_thread` for a thread with a live child returns that child's handle.
+
+## Process control
+
+- **Turns.** `start_turn` refuses a turn while the mapper has one active (`ThreadBusy`): the CLI
+  would queue the second message, and the adapter never queues. `TurnStarted` is in the log before
+  the line is written. A `start_turn` whose caller timed out (its reply channel closed) before the
+  supervisor reached it is dropped unwritten and logged at `warn`, so the user's message never runs
+  under a turn the server did not admit. A per-turn model whose provider or model differs from the
+  open model is logged at `warn` (`turn_model_override_ignored`) and ignored, as are the per-turn
+  effort, mode and preset, until milestone 3.
+- **Interrupt** writes the `interrupt` control request and resolves on its response, within 10 s.
+  With no active turn the CLI answers at once and nothing else happens.
+- **Rename.** `set_thread_name` sends `rename_session` (`source: "host"`) to a live child; a cold
+  or `task:` thread is a no-op, since Giskard keeps its own name.
+- **Stop** (archive, delete, shutdown, or a dropped instance): if a turn is live, write `interrupt`
+  and keep mapping frames for up to 5 s so the turn's `result` reaches the log; close stdin and
+  read to EOF for up to 5 s; then SIGKILL (`stop_kill` at `warn`). SIGTERM is not used: it leaves
+  the turn without a `result`. Each stop is bounded by 15 s, the registry's own shutdown budget;
+  a supervisor that overruns it is aborted (which kills the process) and the façade closes the
+  thread's event log itself, so the stream still ends.
+  `set_thread_archived(false)` does nothing; `delete_thread` does not touch `~/.claude`.
+- **Shutdown** is idempotent: it marks the instance shut down, stops every child concurrently,
+  clears `pending`, and logs `children_stopped`. Afterwards `open_thread` and `list_models` fail.
+- **Child exit.** However a child ends, an active turn completes from `ClaudeMapper::child_exited`
+  (`Interrupted` after an interrupt, else `Failed`, naming the exit code or signal), the thread's
+  log closes (only that thread's stream ends), the child leaves `children`, waiters fail, and one
+  `child_exited` line logs the exit code or signal, the stderr tail, whether the stop was requested
+  and `live_children`: at `info` for a requested stop that exited 0 (or 1 after an interrupt), at
+  `warn` otherwise. The spawn line logs `live_children` too. A closed log's refusal of an event is
+  logged once and counted on that line.
+- **Asks.** `can_use_tool` and other inbound control requests are published as events and recorded
+  in `pending`, but nothing answers them until milestone 3: `respond_approval` and
+  `respond_server_request` return `Unsupported` and leave the entry in place.
+
+## User attachments
+
+The user message is `{"type":"user","message":{"role":"user","content":[…]}}` with every
+attachment block before the text block:
+
+| `mime_type` | Block |
+| --- | --- |
+| `image/png`, `image/jpeg`, `image/gif`, `image/webp` | `image` with a `base64` source |
+| `application/pdf` | `document` with a `base64` source |
+| `text/*`, `application/json`, `application/xml`, `application/x-yaml`, `application/toml`, `application/javascript` | `document` with a `text` source holding the decoded UTF-8 |
+| anything else | `Unsupported`, naming the attachment |
+
+Whitespace is stripped from `data_base64` (the API rejects wrapped base64) and the data is decoded
+to validate it. The serialized line must fit the CLI's 10 MiB cap; a larger message is refused by
+size, never truncated. Empty text with attachments sends the attachments alone; an empty message is
+refused. The `attachment` log action records each attachment's kind, MIME type and size, never its
+content.
+
+## Model catalog (`initialize.models`)
+
+Every handshake replaces the catalog snapshot, so `list_models` answers from the freshest
+`initialize` a child reported. Before any thread is open, `list_models` spawns one probe child
+(serialized, so concurrent callers share it) with the protocol flags only (no mode, model, effort
+or session flag, so it leaves no transcript), reads `initialize` under 30 s, closes stdin and logs
+`catalog_probe`. Entries are parsed one at a time; an odd one is skipped with a `warn`. Each entry
+except the `default` alias becomes a descriptor with `model` = the entry's `value`, its display name
+and effort levels, and `is_default` on the first entry resolving to the same model as `default`
+(the user's configuration decides which). The catalog carries no context window, so descriptors use
+the conservative window until a turn's `TurnUsageUpdated` or a resume's `ContextWindowRestored`
+reports the runtime one.
+
+## Provider table
+
+`list_providers` reports one provider, `anthropic` ("Anthropic (Claude Code)"), with no base URL (so
+Giskard's own `/v1/models` discovery stays off), no auth source, and the instance's environment
+overlay.
 
 ## Code and tests
 
 - `src/lib.rs`: the public surface and `capabilities()`.
+- `src/harness.rs`: `ClaudeHarness`, the handshake, the resume fallback, the probe, and the façade
+  tests against a scripted child and against `tests/fake-claude.sh`.
+- `src/session.rs`: the per-child supervisor, the stop sequence, the pending-ask map, and the
+  in-process `ScriptedChild` the façade tests drive.
+- `src/process.rs`: `ClaudeLaunchOptions`, argv, spawning, the capped stdout reader, the stderr
+  tail and exit classification.
+- `src/attachments.rs`: the user message line and attachment blocks.
+- `src/catalog.rs`: the `initialize.models` catalog, its descriptors and `ANTHROPIC_PROVIDER_ID`.
 - `src/frame.rs`: one stdout line to a typed `Frame`, tolerant of everything the crate cannot type.
 - `src/mapper.rs`: `ClaudeMapper`, the frame-to-event state machine, and its fixture-driven tests.
 - `src/ids.rs`: `NativeItemKey` and the `task:` sub-agent id prefix.
 - `src/log_fields.rs`: optional-field logging helper.
 - [`tests/fixtures/README.md`](tests/fixtures/README.md): the recorded scenarios, the recorder's
   argv and the sanitization.
+- `tests/fake-claude.sh`: a POSIX `sh` stand-in for `claude` that replays the fixtures, so the real
+  process path (spawn, stderr tail, exit codes, kill) is tested without the CLI.

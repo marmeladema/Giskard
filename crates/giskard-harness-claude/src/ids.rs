@@ -5,8 +5,6 @@
 pub const TASK_ID_PREFIX: &str = "task:";
 
 /// Whether a native thread id names a sub-agent route rather than a Claude Code session.
-// Consumed by milestone 2's `open_thread` refusal and milestone 5's route claims.
-#[allow(dead_code)]
 pub fn is_task_native_id(native_id: &str) -> bool {
     native_id.starts_with(TASK_ID_PREFIX)
 }

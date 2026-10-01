@@ -1549,7 +1549,8 @@ from milestone 3, and `mcp_status` only from milestone 4, which wires `list_mcp_
 user message, so the open handshake is the `initialize` control response; a missing transcript
 makes `--resume` exit before answering it, so the fallback is decided at open; closing stdin lets
 a running turn finish and exits the idle CLI; `get_context_usage` answers `maxTokens` at open, which
-a resumed thread reports through `ThreadUpdate::ContextWindowRestored`.
+a resumed thread reports through `ThreadUpdate::ContextWindowRestored`. Milestone 2 is implemented
+in `crates/giskard-harness-claude` (`ClaudeHarness`, `ClaudeLaunchOptions`).
 
 Tested without a real CLI: a scripted fake `claude` (a small test binary in the crate that replays a
 milestone-1 fixture and answers control requests) drives the supervisor in CI, the way the Codex

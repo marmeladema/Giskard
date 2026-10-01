@@ -314,9 +314,10 @@ command is accepted:
    - `StartTurn` → if `mapper.active_turn().is_some()` reply `ThreadBusy` (the façade checks too,
      but the task is the authority and the check is cheap); else `mapper.begin_turn(turn,
      TurnKind::User)` and `mapper.note_turn_model(model)`, append the outputs, then
-     `write_line(line)`. A write failure fails the turn: `mapper.child_failed_turn(reason)`
-     (Step 7) is appended, the reply carries the error, and the child is treated as broken (kill,
-     wait, exit handling).
+     `write_line(line)`. A write failure fails the turn: the reply carries the error and the
+     child is treated as broken (kill, wait, exit handling), so `mapper.child_exited` (Step 7)
+     completes the turn with the exit described as `signal 9, after a stdin write failed`. There
+     is no separate `child_failed_turn`.
    - `Interrupt` → write the `interrupt` control request
      (`{"type":"control_request","request_id":<uuid>,"request":{"subtype":"interrupt"}}`),
      register the waiter, and only when `mapper.active_turn().is_some()` call
