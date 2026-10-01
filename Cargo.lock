@@ -745,15 +745,21 @@ dependencies = [
 name = "giskard-harness-claude"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
+ "base64 0.23.1",
  "chrono",
  "claude-codes",
+ "futures",
  "giskard-core",
  "giskard-harness",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror 2.0.20",
+ "tokio",
  "tracing",
  "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]
@@ -2650,7 +2656,9 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2ef6dac1e96601b4fb3acccccff2139741fcb757cb9a36089bf5be91cfb285ce"
 dependencies = [
  "getrandom 0.4.3",
+ "js-sys",
  "serde_core",
+ "wasm-bindgen",
 ]
 
 [[package]]

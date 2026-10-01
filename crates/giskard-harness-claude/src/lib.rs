@@ -1,19 +1,28 @@
 //! Claude Code CLI adapter (`claude -p --output-format stream-json`).
 //!
-//! Milestone 1 of `specs/claude-code-harness-plan.md`: the pure mapper from Claude Code's
-//! stream-json output to Giskard's [`AgentEvent`](giskard_core::event::AgentEvent)s, driven by the
-//! recorded fixtures under `tests/fixtures/`. Nothing here spawns a process or implements
-//! `AgentHarness` yet; see this crate's README for which milestone supplies what is missing.
+//! Milestone 2 of `specs/claude-code-harness-plan.md`: the pure mapper from Claude Code's
+//! stream-json output to Giskard's [`AgentEvent`](giskard_core::event::AgentEvent)s, plus
+//! [`ClaudeHarness`], an `AgentHarness` that supervises one `claude` child per primary thread.
+//! Approvals, server requests and per-turn settings arrive in milestone 3; see this crate's README
+//! for which milestone supplies what is missing.
 //!
 //! Every Claude Code-specific type stays inside this crate.
 
+mod attachments;
+mod catalog;
 mod frame;
+mod harness;
 mod ids;
 mod log_fields;
 mod mapper;
+mod process;
+mod session;
 
+pub use catalog::ANTHROPIC_PROVIDER_ID;
 pub use frame::{BlockStart, Delta, Frame, FrameError, StreamEvent, StreamEventKind};
+pub use harness::ClaudeHarness;
 pub use mapper::{ClaudeMapper, MapperOutput, Route, TurnKind};
+pub use process::ClaudeLaunchOptions;
 
 use giskard_harness::HarnessCapabilities;
 
@@ -31,8 +40,12 @@ pub fn capabilities() -> HarnessCapabilities {
         model_listing: true,
         provider_listing: true,
         token_usage: true,
-        mcp_status: true,
-        context_compaction: true,
+        // Milestone 4 wires `list_mcp_servers` (the `mcp_status` control request) beside
+        // registration; until then the trait default answers `Unsupported`.
+        mcp_status: false,
+        // Milestone 3 implements `compact_thread` (`/compact`); until then the trait default
+        // answers `Unsupported`.
+        context_compaction: false,
         // `structured_diffs`, `mcp_reload`, `mcp_oauth_login` and `turn_steering` are false per
         // plan §4: Claude Code offers no path behind them.
         ..HarnessCapabilities::default()
@@ -44,7 +57,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn capabilities_advertise_only_what_milestone_one_can_back() {
+    fn capabilities_advertise_only_what_milestone_two_can_back() {
         let capabilities = capabilities();
         assert!(!capabilities.live_approvals);
         assert!(!capabilities.plan_build_modes);
@@ -52,7 +65,10 @@ mod tests {
         assert!(!capabilities.reasoning_effort);
         assert!(capabilities.resumable_threads);
         assert!(capabilities.token_usage);
-        assert!(capabilities.context_compaction);
+        assert!(capabilities.model_listing);
+        assert!(capabilities.provider_listing);
+        assert!(!capabilities.mcp_status);
+        assert!(!capabilities.context_compaction);
         assert!(!capabilities.structured_diffs);
         assert!(!capabilities.mcp_reload);
         assert!(!capabilities.mcp_oauth_login);
