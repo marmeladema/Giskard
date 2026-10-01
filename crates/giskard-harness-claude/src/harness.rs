@@ -1697,6 +1697,7 @@ impl AgentHarness for ClaudeHarness {
                 turn,
                 model,
                 settings,
+                notice: None,
                 reply,
             },
         )
@@ -2808,9 +2809,7 @@ mod tests {
 
         // The rename's write releases the late `get_settings` answer ahead of its own.
         harness.set_thread_name(&handle, "named").await.unwrap();
-        assert!(logs_contain(
-            "late answer to a handshake request that timed out"
-        ));
+        assert!(logs_contain("late answer to a request that timed out"));
         logs_assert(no_line_with(
             "control response for a request nobody is waiting on",
         ));
@@ -4517,6 +4516,288 @@ mod tests {
         assert!(lock(&record).stdin_closed);
         assert!(written(&record).iter().all(|line| line["type"] != "user"));
         assert_eq!(harness.live_children(), 0);
+    }
+
+    // ---- milestone 6: the supervisor state machine ---------------------------------------------
+
+    fn opus_turn() -> TurnOverrides {
+        turn_overrides(PermissionPreset::AskFirst, Mode::Build, Some(model("opus")))
+    }
+
+    #[tokio::test(start_paused = true)]
+    #[traced_test]
+    async fn a_turn_setup_that_times_out_names_its_stage() {
+        // The mode is echoed; `set_model` is answered only when the next line is written.
+        let (child, record) = scripted(
+            handshake_steps("sonnet"),
+            vec![
+                Step::OnStdin(
+                    control("set_model"),
+                    vec![Action::RespondOnNextWrite(Value::Null)],
+                ),
+                Step::OnStdin(
+                    control("rename_session"),
+                    vec![Action::Respond(Value::Null)],
+                ),
+            ],
+        );
+        let (harness, _) = harness(vec![child]);
+        let (options, _updates) = open_options(ThreadId::new(), None, "sonnet");
+        let handle = harness.open_thread(options).await.unwrap();
+        let started = Instant::now();
+        let error = harness
+            .start_turn(&handle, text("go"), opus_turn())
+            .await
+            .unwrap_err();
+        let elapsed = started.elapsed();
+        assert!(
+            matches!(&error, HarnessError::Timeout(message)
+                if message == "claude did not answer set_model within 10.0 s"),
+            "{error}"
+        );
+        assert!(
+            elapsed < crate::session::TURN_SETTINGS_BUDGET,
+            "{elapsed:?}"
+        );
+        assert!(written(&record).iter().all(|line| line["type"] != "user"));
+
+        // The rename's write releases the late `set_model` answer ahead of its own.
+        harness.set_thread_name(&handle, "named").await.unwrap();
+        logs_assert(a_line_with(&[
+            "WARN",
+            "action=\"set_model\"",
+            "Claude Code did not answer a control request in time",
+        ]));
+        assert!(logs_contain("late answer to a request that timed out"));
+        logs_assert(no_line_with(
+            "control response for a request nobody is waiting on",
+        ));
+        harness.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_stop_during_a_turn_setup_fails_the_hand_off_at_once() {
+        // The mode is echoed; `set_model` is never answered.
+        let (child, record) = scripted(
+            handshake_steps("sonnet"),
+            vec![Step::OnStdin(control("set_model"), Vec::new())],
+        );
+        let (harness, _) = harness(vec![child]);
+        let (options, _updates) = open_options(ThreadId::new(), None, "sonnet");
+        let handle = harness.open_thread(options).await.unwrap();
+        let started = Instant::now();
+        let (turn, deleted) = tokio::join!(
+            harness.start_turn(&handle, text("go"), opus_turn()),
+            async {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                harness.delete_thread(&handle).await.unwrap();
+                started.elapsed()
+            }
+        );
+        assert!(
+            matches!(&turn, Err(HarnessError::Transport(message))
+                if message == "claude child is stopping"),
+            "{turn:?}"
+        );
+        assert!(deleted < CONTROL_TIMEOUT, "{deleted:?}");
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(lock(&record).stdin_closed);
+        assert!(written(&record).iter().all(|line| line["type"] != "user"));
+        assert_eq!(harness.live_children(), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_start_turn_during_a_turn_setup_is_thread_busy() {
+        let (child, record) = scripted(
+            handshake_steps("sonnet"),
+            vec![
+                Step::OnStdin(
+                    control("set_permission_mode"),
+                    vec![Action::RespondAfter {
+                        delay: Duration::from_secs(1),
+                        payload: json!({"mode": "default"}),
+                    }],
+                ),
+                Step::OnStdin(user(), vec![text_turn()]),
+            ],
+        );
+        let (harness, _) = harness(vec![child]);
+        let thread = ThreadId::new();
+        let (options, _updates) = open_options(thread, None, "sonnet");
+        let handle = harness.open_thread(options).await.unwrap();
+        let (first, (second, compact)) = tokio::join!(
+            harness.start_turn(&handle, text("first"), overrides()),
+            async {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                (
+                    harness
+                        .start_turn(&handle, text("second"), overrides())
+                        .await,
+                    harness.compact_thread(&handle).await,
+                )
+            }
+        );
+        first.unwrap();
+        assert!(matches!(second, Err(HarnessError::ThreadBusy { thread: t }) if t == thread));
+        assert!(matches!(compact, Err(HarnessError::ThreadBusy { thread: t }) if t == thread));
+        let users = written(&record)
+            .iter()
+            .filter(|line| line["type"] == "user")
+            .count();
+        assert_eq!(users, 1);
+        harness.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_rename_answered_during_a_turn_setup_resolves() {
+        let (child, record) = scripted(
+            handshake_steps("sonnet"),
+            vec![
+                Step::OnStdin(
+                    control("set_model"),
+                    vec![Action::RespondAfter {
+                        delay: Duration::from_secs(2),
+                        payload: Value::Null,
+                    }],
+                ),
+                Step::OnStdin(
+                    control("rename_session"),
+                    vec![Action::Respond(Value::Null)],
+                ),
+                Step::OnStdin(
+                    control("get_settings"),
+                    vec![Action::Respond(settings("opus"))],
+                ),
+                Step::OnStdin(user(), vec![text_turn()]),
+            ],
+        );
+        let (harness, _) = harness(vec![child]);
+        let (options, _updates) = open_options(ThreadId::new(), None, "sonnet");
+        let handle = harness.open_thread(options).await.unwrap();
+        let started = Instant::now();
+        let (turn, renamed) = tokio::join!(
+            harness.start_turn(&handle, text("go"), opus_turn()),
+            async {
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                harness.set_thread_name(&handle, "named").await.unwrap();
+                started.elapsed()
+            }
+        );
+        turn.unwrap();
+        assert!(renamed < Duration::from_secs(1), "{renamed:?}");
+        assert_eq!(
+            subtypes_written(&record)[3..],
+            [
+                "set_permission_mode",
+                "set_model",
+                "rename_session",
+                "get_settings"
+            ]
+        );
+        harness.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    #[traced_test]
+    async fn commands_during_the_stop_sequence_are_refused_at_once() {
+        // The interrupt is never answered and the turn never ends: the stop sequence waits out
+        // its interrupt grace.
+        let (child, record) = scripted(
+            handshake_steps("sonnet"),
+            vec![
+                Step::OnStdin(
+                    user(),
+                    vec![Action::EmitFixturePrefix {
+                        name: "text-turn",
+                        count: 3,
+                    }],
+                ),
+                Step::OnStdin(control("interrupt"), Vec::new()),
+            ],
+        );
+        let (harness, _) = harness(vec![child]);
+        let (options, _updates) = open_options(ThreadId::new(), None, "sonnet");
+        let handle = harness.open_thread(options).await.unwrap();
+        harness
+            .start_turn(&handle, text("go"), overrides())
+            .await
+            .unwrap();
+        let commands = lock(&harness.children)
+            .get(&handle.thread)
+            .unwrap()
+            .commands
+            .clone();
+        let started = Instant::now();
+        let (deleted, refused) = tokio::join!(harness.delete_thread(&handle), async {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            // The façade no longer reaches the child: send as a caller that looked it up before
+            // the delete did.
+            let (reply, answer) = oneshot::channel();
+            commands
+                .send(ChildCommand::Interrupt { reply })
+                .await
+                .unwrap();
+            let refused = answer.await.unwrap();
+            (refused, started.elapsed())
+        });
+        deleted.unwrap();
+        let (refused, at) = refused;
+        assert!(
+            matches!(&refused, Err(HarnessError::Transport(message)) if message == "claude child stopped"),
+            "{refused:?}"
+        );
+        assert!(at < Duration::from_secs(1), "{at:?}");
+        assert!(started.elapsed() >= crate::session::STOP_INTERRUPT_GRACE);
+        assert!(lock(&record).stdin_closed);
+        logs_assert(a_line_with(&[
+            "action=\"stop_refused\"",
+            "command=\"interrupt\"",
+            "reason=\"stop\"",
+        ]));
+        logs_assert(a_line_with(&[
+            "action=\"stop_interrupt\"",
+            "turn_closed=false",
+        ]));
+    }
+
+    #[tokio::test(start_paused = true)]
+    #[traced_test]
+    async fn two_stops_are_answered_together() {
+        // The child ignores EOF, so the first stop is still draining when the second arrives.
+        let (child, record) = scripted(handshake_steps("sonnet"), Vec::new());
+        let (harness, _) = harness(vec![child.ignoring_eof()]);
+        let (options, _updates) = open_options(ThreadId::new(), None, "sonnet");
+        let handle = harness.open_thread(options).await.unwrap();
+        let commands = lock(&harness.children)
+            .get(&handle.thread)
+            .unwrap()
+            .commands
+            .clone();
+        let (first, done_first) = oneshot::channel();
+        let (second, done_second) = oneshot::channel();
+        commands
+            .send(ChildCommand::Stop { reply: first })
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        commands
+            .send(ChildCommand::Stop { reply: second })
+            .await
+            .unwrap();
+        let (first, second) = tokio::join!(done_first, done_second);
+        first.unwrap();
+        second.unwrap();
+        // Racing archive and delete: both return; only one reaches the child.
+        let (archived, deleted) = tokio::join!(
+            harness.set_thread_archived(&handle, true),
+            harness.delete_thread(&handle)
+        );
+        archived.unwrap();
+        deleted.unwrap();
+        assert!(lock(&record).killed);
+        logs_assert(lines_with(1, &["a second stop joined the stop sequence"]));
+        logs_assert(lines_with(1, &["action=\"child_exited\""]));
+        logs_assert(lines_with(1, &["action=\"stop_kill\""]));
     }
 
     #[tokio::test]

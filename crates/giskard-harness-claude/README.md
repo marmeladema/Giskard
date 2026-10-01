@@ -36,16 +36,28 @@ inventory from `init.tools` (milestone 8).
   through its bounded command channel (`StartTurn`, `Interrupt`, `Control`, `RespondApproval`,
   `RespondServerRequest`, `StopTask`, `Compact`, `Stop`). It also owns **one retained `EventLog` per
   sub-agent route** of its child: each event goes to the log of the thread it names (the primary's
-  or a route's). The task selects over the child's stdout lines
-  (first, so a frame already read is mapped before a new command is accepted), its commands, and
-  the instance's shutdown signal. A command that needs a control *response* before it can go on
-  (the per-turn settings) cannot await a waiter the same loop would resolve, so the supervisor
-  writes the request and keeps reading and dispatching frames itself until the response or its
-  deadline (`await_control`); nothing read meanwhile is lost. It reads in 50 ms slices so that a
-  shutdown or a `Stop` ends the wait at once (the hand-off fails with "claude child is stopping"
-  and the stop sequence runs), and any other command arriving meanwhile is kept and handled after.
-  A reply the mapper must write while pumping (an `ExitPlanMode` deny) that cannot be written
-  breaks the child, as in the main loop.
+  or a route's). The task is an explicit state machine driven by **one** `select!` loop over the
+  child's stdout lines (first, so a frame already read is mapped before a new command is
+  accepted), its commands, the instance's shutdown signal, and the deadline of whatever it is
+  waiting on; every arm body runs to completion, so a write made from one is never cancelled. It
+  is in one of two phases:
+  - **serving**: frames are mapped and commands served. At most one **turn hand-off**
+    (`TurnSetup`) is in flight: a `StartTurn`'s settings requests are written one at a time, each
+    response (recognised by its `request_id`) advances the hand-off to its next stage (mode,
+    model, effort, read-back) and the last one writes the user message; the outstanding request's
+    deadline is a loop input that fails the hand-off. A second `StartTurn` or a `Compact`
+    meanwhile is `ThreadBusy`; every other command (a rename, an interrupt, an answer) is served
+    while the hand-off waits.
+  - **stopping**: the stop sequence (*Process control*), as an *interrupting* stage (waiting for
+    the interrupted turn's `result`) then a *draining* one (stdin closed, waiting for EOF), each
+    with its deadline. A hand-off in flight fails at once with "claude child is stopping"; every
+    command that arrives is refused at once with "claude child stopped" (`stop_refused` at
+    `debug`); a second `Stop` joins the sequence and is answered with the first when the child
+    has exited. The shutdown and command-channel arms are disabled once they fired, so the loop
+    never spins on a closed channel or a set flag.
+
+  A reply the mapper must write (an `ExitPlanMode` deny) that cannot be written breaks the child
+  wherever it happens.
 - **The façade** (`src/harness.rs`) holds three maps behind `std` mutexes that are never held
   across an await: `children` (thread → live child: its session id, retained log, command sender,
   task, open model, launch mode), `pending` (approval / server-request id → the thread the ask was
@@ -298,7 +310,9 @@ A second `open_thread` for a thread with a live child returns that child's handl
   under a turn the server did not admit. Before `TurnStarted`, the hand-off applies the turn's
   settings (below); any failure there fails `start_turn` with no turn started. The settings share
   one 25 s budget (each request at most 10 s of it), so the supervisor's own timeout, naming the
-  request left unanswered, ends a slow hand-off before the façade's 30 s `start_turn` limit.
+  request left unanswered, ends a slow hand-off before the façade's 30 s `start_turn` limit; that
+  deadline is an input of the supervisor's loop, and the CLI's late answer to a request that
+  timed out is logged at `debug` and ignored.
 - **Interrupt** writes the `interrupt` control request and resolves on its response, within 10 s.
   With no active turn the CLI answers at once and nothing else happens. On a sub-agent thread it is
   `stop_task` instead (see *Sub-agent routes*).
@@ -307,7 +321,8 @@ A second `open_thread` for a thread with a live child returns that child's handl
 - **Stop** (archive, delete, shutdown, or a dropped instance): if a turn is live, write `interrupt`
   and keep mapping frames for up to 5 s so the turn's `result` reaches the log; close stdin and
   read to EOF for up to 5 s; then SIGKILL (`stop_kill` at `warn`). SIGTERM is not used: it leaves
-  the turn without a `result`. Each stop is bounded by 15 s, the registry's own shutdown budget;
+  the turn without a `result`. A command arriving during the stop is refused at once, and a second
+  stop joins the first. Each stop is bounded by 15 s, the registry's own shutdown budget;
   a supervisor that overruns it is aborted (which kills the process) and the façade closes the
   thread's event log itself, so the stream still ends.
   `set_thread_archived(false)` does nothing; `delete_thread` does not touch `~/.claude`.
@@ -474,8 +489,8 @@ route's thread and turn and recorded with the route's thread and the primary as 
   published routes cold (logged as `routes_cooled` on the exit line). A route's mapper state never
   outlives its child; its log lives until the sub-agent thread's own delete or archive, or shutdown.
 - **`stop_task`.** `interrupt` on a sub-agent thread sends `StopTask` to the owning child; the
-  supervisor writes `{"subtype":"stop_task","task_id":…}` through `await_control` (10 s) and logs
-  `stop_task` at `info`. The stop is noted on the route **before** the write, since the CLI emits
+  supervisor writes `{"subtype":"stop_task","task_id":…}`, resolves the call when its answer
+  comes (the façade bounds it by 10 s), and logs `stop_task` at `info`. The stop is noted on the route **before** the write, since the CLI emits
   the task's `killed` update before it answers. A route whose task has not started yet is
   `Protocol("the sub-agent has not started yet")`; one that already ended is `Ok` at `debug`; a
   thread that is no route of the child is `Protocol`. The CLI withdraws the sub-agent's pending ask
@@ -601,8 +616,8 @@ error. `mcp_status` carries **no tool inventory**: tools reach the model as
 - `src/harness.rs`: `ClaudeHarness`, the handshake, the bypass and resume fallbacks, the probe,
   the per-turn mode, and the façade tests against a scripted child and against
   `tests/fake-claude.sh`.
-- `src/session.rs`: the per-child supervisor, `await_control` and the per-turn settings, the
-  approval and server-request answers, `stop_task`, the route logs, compaction, the stop sequence,
+- `src/session.rs`: the per-child supervisor's state machine (its serving and stopping phases
+  and the in-flight turn hand-off that applies the per-turn settings), the approval and server-request answers, `stop_task`, the route logs, compaction, the stop sequence,
   the pending-ask map, and the
   in-process `ScriptedChild` the façade tests drive (it echoes every `set_permission_mode` the
   script does not handle itself).
