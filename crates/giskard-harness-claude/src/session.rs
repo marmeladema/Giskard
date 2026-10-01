@@ -5,7 +5,7 @@
 //! façade reaches the task only through its command channel, so there is no lock around the
 //! mapper or the stdin handle (the `CodexInstance` rule of `AGENTS.md`, applied per child).
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
@@ -26,14 +26,12 @@ use crate::log_fields::display_opt;
 use crate::mapper::{ClaudeMapper, MapperOutput, RouteLookup, TurnKind};
 use crate::process::{ChildExit, ChildLogContext, ClaudeChild, LaunchMode};
 
-/// How long one control request the supervisor awaits itself may take (the per-turn settings).
+/// How long one request of a turn's settings may take (each stage of the hand-off).
 pub(crate) const CONTROL_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long a turn's settings (mode, model, effort, read-back) may take in all. It stays under the
 /// façade's 30 s `start_turn` budget, so the supervisor's own timeout, naming the request left
 /// unanswered, is what the caller sees.
 pub(crate) const TURN_SETTINGS_BUDGET: Duration = Duration::from_secs(25);
-/// How often `await_control` stops reading to look for a stop, a shutdown or another command.
-const AWAIT_POLL_SLICE: Duration = Duration::from_millis(50);
 /// What every deny the adapter writes for `Decline` says; the model and the transcript see it.
 pub(crate) const DECLINE_MESSAGE: &str = "Declined by the user in Giskard";
 /// What the deny the adapter writes for `Cancel` says.
@@ -66,6 +64,8 @@ pub(crate) enum ChildCommand {
         /// The model reported on the turn's usage events.
         model: ModelRef,
         settings: TurnSettings,
+        /// A sentence appended as `AgentEvent::Notice` right after `TurnStarted`.
+        notice: Option<String>,
         reply: oneshot::Sender<Result<(), HarnessError>>,
     },
     Interrupt {
@@ -104,6 +104,21 @@ pub(crate) enum ChildCommand {
     Stop {
         reply: oneshot::Sender<()>,
     },
+}
+
+impl ChildCommand {
+    fn name(&self) -> &'static str {
+        match self {
+            ChildCommand::StartTurn { .. } => "start_turn",
+            ChildCommand::Interrupt { .. } => "interrupt",
+            ChildCommand::Control { .. } => "control",
+            ChildCommand::RespondApproval { .. } => "respond_approval",
+            ChildCommand::RespondServerRequest { .. } => "respond_server_request",
+            ChildCommand::StopTask { .. } => "stop_task",
+            ChildCommand::Compact { .. } => "compact",
+            ChildCommand::Stop { .. } => "stop",
+        }
+    }
 }
 
 /// The façade's view of one live child.
@@ -465,11 +480,19 @@ fn ask_user_question_answers(questions: &Value, value: &Value) -> Option<Value> 
 enum Waiter {
     Unit(oneshot::Sender<Result<(), HarnessError>>),
     Value(oneshot::Sender<Result<Value, HarnessError>>),
-    /// The supervisor's own `await_control`: it wants the raw payload, refusals included, so it
-    /// can read the CLI's `error_code`.
-    Raw(oneshot::Sender<Result<Value, HarnessError>>),
+    /// A sub-agent's `stop_task`: its answer is logged, then replied.
+    StopTask(StopTaskWaiter),
     /// The stop sequence's own interrupt: nobody awaits the response.
     Stop,
+}
+
+/// What the answer to a `stop_task` is logged with and replied to.
+struct StopTaskWaiter {
+    /// The sub-agent thread.
+    thread: ThreadId,
+    task_id: String,
+    harness_thread_id: Option<String>,
+    reply: oneshot::Sender<Result<(), HarnessError>>,
 }
 
 impl Waiter {
@@ -487,15 +510,19 @@ impl Waiter {
             Waiter::Value(reply) => {
                 let _ = reply.send(payload.and_then(|payload| control_outcome(&payload)));
             }
-            Waiter::Raw(reply) => {
-                let _ = reply.send(payload);
+            Waiter::StopTask(stop) => {
+                let _ = stop.reply.send(
+                    payload
+                        .and_then(|payload| control_outcome(&payload))
+                        .map(|_| ()),
+                );
             }
             Waiter::Stop => {}
         }
     }
 }
 
-/// Why `await_control` returned no success payload.
+/// Why one stage of a turn's settings got no success payload.
 #[derive(Debug)]
 enum ControlFailure {
     /// The CLI answered with an error response.
@@ -521,6 +548,98 @@ impl ControlFailure {
             ControlFailure::Failed(_) => None,
         }
     }
+}
+
+/// One stage's response: its success payload, or the CLI's refusal with its `error_code`.
+fn setup_outcome(payload: &Value) -> Result<Value, ControlFailure> {
+    control_outcome(payload).map_err(|error| ControlFailure::Refused {
+        message: match error {
+            HarnessError::Protocol(message) => message,
+            other => other.to_string(),
+        },
+        code: payload
+            .get("error_code")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+    })
+}
+
+/// The `StartTurn` hand-off between its first settings request and the user line: the main loop
+/// advances it on each control response, fails it on its stage deadline, and runs its last step
+/// (the write) when the read-back is in. At most one is in flight; a second `StartTurn` or a
+/// `Compact` meanwhile is `ThreadBusy`.
+struct TurnSetup {
+    line: String,
+    turn: TurnId,
+    model: ModelRef,
+    settings: TurnSettings,
+    reply: oneshot::Sender<Result<(), HarnessError>>,
+    /// A sentence to append as `AgentEvent::Notice` right after `TurnStarted` (a respawn that
+    /// lost its transcript).
+    notice: Option<String>,
+    stage: SetupStage,
+    /// The outstanding request's id; checked before `waiters` when a response arrives.
+    request_id: String,
+    /// `started + TURN_SETTINGS_BUDGET`.
+    budget: Instant,
+    /// When the outstanding request was written.
+    sent: Instant,
+    /// The outstanding request's deadline: `min(sent + CONTROL_TIMEOUT, budget)`.
+    deadline: Instant,
+    /// Decided when the mode is in: the `set_model` to send, and the effort to send.
+    model_change: Option<String>,
+    effort_change: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SetupStage {
+    /// `set_permission_mode`, sent on every turn.
+    Mode,
+    /// `set_model`, when the requested model differs from the one the CLI holds.
+    Model,
+    /// `apply_flag_settings {effortLevel}`, when the effort differs or the model changed.
+    Effort,
+    /// `get_settings`, the read-back of `applied.model` and `applied.effort`.
+    ReadBack,
+}
+
+impl SetupStage {
+    fn subtype(self) -> &'static str {
+        match self {
+            SetupStage::Mode => "set_permission_mode",
+            SetupStage::Model => "set_model",
+            SetupStage::Effort => "apply_flag_settings",
+            SetupStage::ReadBack => "get_settings",
+        }
+    }
+}
+
+/// What the main loop is doing besides reading frames.
+enum Phase {
+    /// Reading frames and serving commands.
+    Serving,
+    /// The stop sequence. No command is served: each is refused at once with `child_stopped`.
+    Stopping(Stopping),
+}
+
+struct Stopping {
+    /// `stop`, `shutdown` or `harness_dropped`.
+    reason: &'static str,
+    /// Every `Stop` that arrived; all are answered when the child has exited.
+    replies: Vec<oneshot::Sender<()>>,
+    stage: StopStage,
+}
+
+enum StopStage {
+    /// `interrupt` was written for the live turn; waiting for its `result`.
+    Interrupting {
+        turn: TurnId,
+        request_id: String,
+        started: Instant,
+        deadline: Instant,
+    },
+    /// stdin is closed; waiting for EOF.
+    Draining { deadline: Instant },
 }
 
 impl std::fmt::Display for ControlFailure {
@@ -576,13 +695,14 @@ pub(crate) fn spawn_supervisor(parts: SupervisorParts) -> JoinHandle<()> {
         waiters: HashMap::new(),
         early_lines: parts.early_lines,
         abandoned: parts.abandoned_requests.into_iter().collect(),
-        eof: false,
         interrupt_sent: false,
         dropped_events: 0,
         failure: None,
         withdrawn: HashSet::new(),
-        deferred: VecDeque::new(),
-        stop_request: None,
+        turn_setup: None,
+        phase: Phase::Serving,
+        commands_closed: false,
+        ending: None,
         // The handshake set `default` on both launch modes.
         current_mode: "default".into(),
         current_effort: parts
@@ -603,7 +723,7 @@ enum Ending {
     /// A read or write failed; the child was killed.
     Broken,
     /// `Stop`, shutdown, or a dropped façade; the stop sequence ran.
-    Stopped(Option<oneshot::Sender<()>>),
+    Stopped { replies: Vec<oneshot::Sender<()>> },
 }
 
 struct Supervisor {
@@ -651,8 +771,6 @@ struct Supervisor {
     // Invalidation/removal: The late answer removes its entry; the rest drop with the task.
     abandoned: HashSet<String>,
     early_lines: Vec<String>,
-    /// stdout reached EOF.
-    eof: bool,
     /// An interrupt was written during this child's life (an exit 1 after it is expected).
     interrupt_sent: bool,
     /// Events the closed log refused.
@@ -667,10 +785,14 @@ struct Supervisor {
     // Synchronization: Owned by this supervisor task alone.
     // Invalidation/removal: The late answer removes its entry; the next turn clears the rest.
     withdrawn: HashSet<String>,
-    /// Commands received while `await_control` was reading; handled before the next `select!`.
-    deferred: VecDeque<ChildCommand>,
-    /// A stop (its reason and reply) that arrived while `await_control` was reading.
-    stop_request: Option<(&'static str, Option<oneshot::Sender<()>>)>,
+    /// The `StartTurn` hand-off whose settings are in flight. Not keyed: one at a time, cleared
+    /// when it replies.
+    turn_setup: Option<TurnSetup>,
+    phase: Phase,
+    /// The command channel closed (the façade dropped the child); its arm is disabled.
+    commands_closed: bool,
+    /// Set by a loop arm that ends the loop (the stop sequence's kill).
+    ending: Option<Ending>,
     /// The permission mode the CLI holds, by the CLI's name: `default` after the handshake, then
     /// whatever the last successful `set_permission_mode` set. The mapper's session mode stays
     /// what the CLI *reports*.
@@ -700,74 +822,82 @@ impl Supervisor {
             Some(ending) => ending,
             None => self.main_loop().await,
         };
-        let (requested, stop_reply) = match ending {
-            Ending::Eof | Ending::Broken => (false, None),
-            Ending::Stopped(reply) => (true, reply),
+        let (requested, replies) = match ending {
+            Ending::Eof | Ending::Broken => (false, Vec::new()),
+            Ending::Stopped { replies } => (true, replies),
         };
         let exit = self.child.wait().await;
         self.on_exit(&exit, requested);
-        if let Some(reply) = stop_reply {
+        for reply in replies {
             let _ = reply.send(());
         }
     }
 
+    /// One loop: every input the supervisor waits on (a frame, a command, the shutdown flag, the
+    /// in-flight stage's deadline) is an arm of one `select!`, and every arm body runs to
+    /// completion, so a write made from a body is never cancelled.
     async fn main_loop(&mut self) -> Ending {
         loop {
-            if let Some((reason, reply)) = self.stop_request.take() {
-                self.stop(reason).await;
-                return Ending::Stopped(reply);
-            }
-            if let Some(command) = self.deferred.pop_front() {
-                if let Err(error) = self.handle_command(command).await {
-                    self.broken("write_stdin", "a stdin write failed", &error);
-                    return Ending::Broken;
-                }
-                continue;
-            }
+            let stage_deadline = self.stage_deadline();
+            let stopping = self.stopping();
             tokio::select! {
                 biased;
                 line = self.child.next_line() => match line {
                     Ok(Some(line)) => {
                         if let Err(error) = self.dispatch_line(&line).await {
                             self.broken("write_stdin", "a stdin write failed", &error);
-                            return Ending::Broken;
+                            return self.end_broken();
                         }
+                        self.after_line();
                     }
-                    Ok(None) => {
-                        self.eof = true;
-                        return Ending::Eof;
-                    }
+                    Ok(None) => return self.end_at_eof(),
                     Err(error) => {
                         self.broken("read_stdout", "a stdout read failed", &error);
-                        return Ending::Broken;
+                        return self.end_broken();
                     }
                 },
-                command = self.commands.recv() => match command {
-                    Some(ChildCommand::Stop { reply }) => {
-                        self.stop("stop").await;
-                        return Ending::Stopped(Some(reply));
+                // A closed channel resolves on every poll: the arm is disabled once it fired.
+                command = self.commands.recv(), if !self.commands_closed => {
+                    if let Err(error) = self.on_command(command).await {
+                        self.broken("write_stdin", "a stdin write failed", &error);
+                        return self.end_broken();
                     }
-                    Some(command) => {
-                        if let Err(error) = self.handle_command(command).await {
-                            self.broken("write_stdin", "a stdin write failed", &error);
-                            return Ending::Broken;
-                        }
-                    }
-                    None => {
-                        debug!(
-                            thread_id = %self.thread,
-                            harness_thread_id = display_opt(self.context.harness_thread_id.as_deref()),
-                            action = "stop",
-                            "the harness dropped this child's command channel; stopping it"
-                        );
-                        self.stop("harness_dropped").await;
-                        return Ending::Stopped(None);
-                    }
-                },
-                () = shutdown_signal(&mut self.shutdown) => {
-                    self.stop("shutdown").await;
-                    return Ending::Stopped(None);
                 }
+                // So does a set flag: the arm is disabled while the stop sequence runs.
+                () = shutdown_signal(&mut self.shutdown), if !stopping => {
+                    self.enter_stopping("shutdown", None).await;
+                }
+                () = tokio::time::sleep_until(stage_deadline.unwrap_or_else(Instant::now)),
+                    if stage_deadline.is_some() => self.on_deadline(),
+            }
+            if let Some(ending) = self.ending.take() {
+                return ending;
+            }
+        }
+    }
+
+    /// One command, or the channel's end. `Err` is a stdin write failure: the child is broken.
+    async fn on_command(&mut self, command: Option<ChildCommand>) -> Result<(), HarnessError> {
+        match command {
+            Some(ChildCommand::Stop { reply }) => {
+                self.enter_stopping("stop", Some(reply)).await;
+                Ok(())
+            }
+            Some(command) if self.stopping() => {
+                self.refuse(command);
+                Ok(())
+            }
+            Some(command) => self.handle_command(command).await,
+            None => {
+                self.commands_closed = true;
+                debug!(
+                    thread_id = %self.thread,
+                    harness_thread_id = display_opt(self.context.harness_thread_id.as_deref()),
+                    action = "stop",
+                    "the harness dropped this child's command channel; stopping it"
+                );
+                self.enter_stopping("harness_dropped", None).await;
+                Ok(())
             }
         }
     }
@@ -808,6 +938,16 @@ impl Supervisor {
             MapperOutput::ControlResponse {
                 request_id,
                 payload,
+            } if self
+                .turn_setup
+                .as_ref()
+                .is_some_and(|setup| setup.request_id == request_id) =>
+            {
+                self.on_setup_response(payload).await?;
+            }
+            MapperOutput::ControlResponse {
+                request_id,
+                payload,
             } => {
                 let outcome = control_outcome(&payload);
                 match self.waiters.remove(&request_id) {
@@ -819,6 +959,9 @@ impl Supervisor {
                             success = outcome.is_ok(),
                             "control response received"
                         );
+                        if let Waiter::StopTask(stop) = &waiter {
+                            self.log_stop_task_answer(stop, &outcome);
+                        }
                         waiter.resolve(Ok(payload));
                     }
                     None if self.abandoned.remove(&request_id) => debug!(
@@ -826,7 +969,7 @@ impl Supervisor {
                         request_id = %request_id,
                         action = "control_response",
                         success = outcome.is_ok(),
-                        "late answer to a handshake request that timed out; ignored"
+                        "late answer to a request that timed out; ignored"
                     ),
                     None => warn!(
                         thread_id = %self.thread,
@@ -1081,8 +1224,12 @@ impl Supervisor {
                 turn,
                 model,
                 settings,
+                notice,
                 reply,
-            } => self.start_turn(line, turn, model, settings, reply).await,
+            } => {
+                self.begin_turn_setup(line, turn, model, settings, notice, reply)
+                    .await
+            }
             ChildCommand::Interrupt { reply } => {
                 let request_id = new_request_id();
                 if let Err(error) = self
@@ -1144,13 +1291,8 @@ impl Supervisor {
             ChildCommand::StopTask { thread, reply } => self.stop_task(thread, reply).await,
             ChildCommand::Compact { turn, reply } => self.compact(turn, reply).await,
             ChildCommand::Stop { reply } => {
-                // The main loop intercepts `Stop`; reaching here would be a routing bug.
-                warn!(
-                    thread_id = %self.thread,
-                    action = "stop",
-                    "a stop command reached the command handler"
-                );
-                let _ = reply.send(());
+                // `on_command` routes every `Stop` to the stop sequence.
+                self.enter_stopping("stop", Some(reply)).await;
                 Ok(())
             }
         }
@@ -1182,14 +1324,36 @@ impl Supervisor {
         })
     }
 
-    /// The `StartTurn` hand-off: the turn's settings, then `TurnStarted`, then the user message.
-    /// `Err` is a stdin write failure: the child is broken.
-    async fn start_turn(
+    /// `ThreadBusy` while another turn's settings are in flight.
+    fn setup_in_flight(&self, action: &'static str) -> Option<HarnessError> {
+        let setup = self.turn_setup.as_ref()?;
+        debug!(
+            thread_id = %self.thread,
+            turn_id = %setup.turn,
+            action,
+            "refusing a turn while another's settings are in flight"
+        );
+        Some(HarnessError::ThreadBusy {
+            thread: self.thread,
+        })
+    }
+
+    /// The `StartTurn` hand-off, first step: the turn's settings, then `TurnStarted`, then the
+    /// user message.
+    ///
+    /// Plan §8.2: the turn's permission mode is set on every turn, then its model and effort when
+    /// they differ from what the CLI holds, then both are read back, all within
+    /// `TURN_SETTINGS_BUDGET`. This writes the mode request and leaves the hand-off in
+    /// `turn_setup`; the main loop advances it on each response (`on_setup_response`) and fails
+    /// it on its stage deadline. Any failure fails the hand-off; a mode already set stays set
+    /// (the next turn sets its own). `Err` is a stdin write failure: the child is broken.
+    async fn begin_turn_setup(
         &mut self,
         line: String,
         turn: TurnId,
         model: ModelRef,
         settings: TurnSettings,
+        notice: Option<String>,
         reply: oneshot::Sender<Result<(), HarnessError>>,
     ) -> Result<(), HarnessError> {
         // The caller's receiver is dropped the moment its timeout fires. Starting the turn
@@ -1199,177 +1363,168 @@ impl Supervisor {
             self.log_caller_gave_up(turn, "start_turn");
             return Ok(());
         }
-        if let Some(busy) = self.busy("start_turn") {
+        if let Some(busy) = self
+            .busy("start_turn")
+            .or_else(|| self.setup_in_flight("start_turn"))
+        {
             let _ = reply.send(Err(busy));
             return Ok(());
         }
-        if let Err(error) = self.apply_turn_settings(turn, &model, &settings).await {
-            debug!(
-                thread_id = %self.thread,
-                turn_id = %turn,
-                action = "start_turn",
-                error = %error,
-                "the turn's settings were not applied; the turn does not start"
-            );
-            let _ = reply.send(Err(error));
-            return Ok(());
-        }
-        // Frames read while the settings were applied may have opened a turn of the CLI's own
-        // (a background task's continuation), and the caller may have given up meanwhile.
-        if reply.is_closed() {
-            self.log_caller_gave_up(turn, "start_turn");
-            return Ok(());
-        }
-        if let Some(busy) = self.busy("start_turn") {
-            let _ = reply.send(Err(busy));
-            return Ok(());
-        }
-        // Asks belong to a turn: a withdrawal of an earlier turn's ask can match nothing now.
-        self.withdrawn.clear();
-        // `TurnStarted` reaches the log before the line is written, so the server sees the turn
-        // before its first frame.
-        let outputs = self.mapper.begin_turn(turn, TurnKind::User);
-        self.mapper.note_turn_model(model);
-        for output in outputs {
-            if let MapperOutput::Event(event) = output {
-                self.append(event);
+        // Expected before the write, so the `status` the change emits is not drift.
+        self.mapper.set_expected_mode(settings.mode.clone());
+        let now = Instant::now();
+        let setup = TurnSetup {
+            line,
+            turn,
+            model,
+            settings,
+            reply,
+            notice,
+            stage: SetupStage::Mode,
+            request_id: String::new(),
+            budget: now + TURN_SETTINGS_BUDGET,
+            sent: now,
+            deadline: now,
+            model_change: None,
+            effort_change: None,
+        };
+        self.send_setup_request(setup, SetupStage::Mode).await
+    }
+
+    /// Write the request of `stage` and keep the hand-off in flight until its answer or its
+    /// deadline. `Err` is a stdin write failure: the hand-off fails with it and the child is
+    /// broken.
+    async fn send_setup_request(
+        &mut self,
+        mut setup: TurnSetup,
+        stage: SetupStage,
+    ) -> Result<(), HarnessError> {
+        let request = match stage {
+            SetupStage::Mode => {
+                json!({"subtype": "set_permission_mode", "mode": setup.settings.mode})
             }
+            SetupStage::Model => json!({"subtype": "set_model", "model": setup.model_change}),
+            SetupStage::Effort => {
+                json!({"subtype": "apply_flag_settings", "settings": {"effortLevel": setup.effort_change}})
+            }
+            SetupStage::ReadBack => json!({"subtype": "get_settings"}),
+        };
+        let request_id = new_request_id();
+        if let Err(error) = self
+            .child
+            .write_line(&control_line(&request_id, &request))
+            .await
+        {
+            let _ = setup.reply.send(Err(error.clone()));
+            return Err(error);
         }
-        info!(
-            project_id = display_opt(self.context.project_id),
+        debug!(
             thread_id = %self.thread,
-            harness_thread_id = display_opt(self.context.harness_thread_id.as_deref()),
-            turn_id = %turn,
-            pid = display_opt(self.pid),
-            action = "start_turn",
-            bytes = line.len(),
-            "writing a user message"
+            turn_id = %setup.turn,
+            request_id = %request_id,
+            action = "control_request",
+            subtype = stage.subtype(),
+            "control request sent; awaiting its response"
         );
-        match self.child.write_line(&line).await {
-            Ok(()) => {
-                let _ = reply.send(Ok(()));
-                Ok(())
-            }
+        let now = Instant::now();
+        setup.stage = stage;
+        setup.request_id = request_id;
+        setup.sent = now;
+        setup.deadline = (now + CONTROL_TIMEOUT).min(setup.budget);
+        self.turn_setup = Some(setup);
+        Ok(())
+    }
+
+    /// The CLI answered the in-flight hand-off's request: write the next one, start the turn, or
+    /// fail the hand-off. `Err` is a stdin write failure: the child is broken.
+    async fn on_setup_response(&mut self, payload: Value) -> Result<(), HarnessError> {
+        let Some(mut setup) = self.turn_setup.take() else {
+            return Ok(());
+        };
+        let outcome = setup_outcome(&payload);
+        debug!(
+            thread_id = %self.thread,
+            turn_id = %setup.turn,
+            request_id = %setup.request_id,
+            action = "control_response",
+            subtype = setup.stage.subtype(),
+            success = outcome.is_ok(),
+            "control response received"
+        );
+        let next = match outcome {
+            Ok(response) => self.setup_stage_done(&mut setup, &response),
+            Err(failure) => Err(self.setup_stage_failed(&setup, failure)),
+        };
+        match next {
+            Ok(Some(stage)) => self.send_setup_request(setup, stage).await,
+            Ok(None) => self.finish_turn_setup(setup).await,
             Err(error) => {
-                let _ = reply.send(Err(error.clone()));
-                Err(error)
+                self.fail_turn_setup(setup, error);
+                Ok(())
             }
         }
     }
 
-    /// Plan §8.2: set the turn's permission mode (every turn), then its model and effort when they
-    /// differ from what the CLI holds, then read them back, all within `TURN_SETTINGS_BUDGET`.
-    /// Any failure fails the hand-off; a mode already set stays set (the next turn sets its own).
-    async fn apply_turn_settings(
+    /// One stage succeeded: the next stage, `None` when the settings are applied, or the error
+    /// the read-back found.
+    fn setup_stage_done(
         &mut self,
-        turn: TurnId,
-        model: &ModelRef,
-        settings: &TurnSettings,
-    ) -> Result<(), HarnessError> {
-        let budget = Instant::now() + TURN_SETTINGS_BUDGET;
-        let deadline = || (Instant::now() + CONTROL_TIMEOUT).min(budget);
-        // Expected before the write, so the `status` the change emits is not drift.
-        self.mapper.set_expected_mode(settings.mode.clone());
-        let request = json!({"subtype": "set_permission_mode", "mode": settings.mode});
-        match self.await_control(&request, deadline()).await {
-            Ok(_) => {
+        setup: &mut TurnSetup,
+        response: &Value,
+    ) -> Result<Option<SetupStage>, HarnessError> {
+        let turn = setup.turn;
+        match setup.stage {
+            SetupStage::Mode => {
                 debug!(
                     thread_id = %self.thread,
                     turn_id = %turn,
                     action = "set_permission_mode",
-                    mode = %settings.mode,
+                    mode = %setup.settings.mode,
                     previous_mode = %self.current_mode,
                     "permission mode set for the turn"
                 );
-                self.current_mode = settings.mode.clone();
-            }
-            Err(failure) => {
-                // The CLI kept its mode: a later frame reporting it is not drift.
-                self.mapper.set_expected_mode(self.current_mode.clone());
-                warn!(
-                    project_id = display_opt(self.context.project_id),
-                    thread_id = %self.thread,
-                    harness_thread_id = display_opt(self.context.harness_thread_id.as_deref()),
-                    turn_id = %turn,
-                    action = "set_permission_mode",
-                    mode = %settings.mode,
-                    error_code = display_opt(failure.code()),
-                    error = %failure,
-                    "Claude Code did not set the turn's permission mode"
-                );
-                return Err(failure.into_error());
-            }
-        }
-
-        let model_change = settings
-            .model
-            .as_deref()
-            .filter(|requested| *requested != self.current_model.model);
-        // A model switch can change the effort the CLI holds (a model without effort reports
-        // none), so a requested level is sent and checked again whenever the model changes.
-        let effort_change = settings.effort.as_deref().filter(|requested| {
-            model_change.is_some() || Some(*requested) != self.current_effort.as_deref()
-        });
-        if model_change.is_none() && effort_change.is_none() {
-            self.log_turn_settings(turn, false);
-            return Ok(());
-        }
-        if let Some(requested) = model_change {
-            let request = json!({"subtype": "set_model", "model": requested});
-            if let Err(failure) = self.await_control(&request, deadline()).await {
-                warn!(
-                    thread_id = %self.thread,
-                    turn_id = %turn,
-                    action = "set_model",
-                    model = %requested,
-                    error_code = display_opt(failure.code()),
-                    error = %failure,
-                    "Claude Code did not switch the model"
-                );
-                // The picker offered a model the CLI does not know: surface its sentence.
-                return Err(match failure {
-                    ControlFailure::Refused { message, code }
-                        if code.as_deref() == Some("catalog_unknown") =>
-                    {
-                        HarnessError::Unsupported(message)
-                    }
-                    other => other.into_error(),
+                self.current_mode = setup.settings.mode.clone();
+                setup.model_change = setup
+                    .settings
+                    .model
+                    .clone()
+                    .filter(|requested| *requested != self.current_model.model);
+                // A model switch can change the effort the CLI holds (a model without effort
+                // reports none), so a requested level is sent and checked again whenever the
+                // model changes.
+                let model_changes = setup.model_change.is_some();
+                setup.effort_change = setup.settings.effort.clone().filter(|requested| {
+                    model_changes || Some(requested.as_str()) != self.current_effort.as_deref()
                 });
+                if !model_changes && setup.effort_change.is_none() {
+                    self.log_turn_settings(turn, false);
+                    return Ok(None);
+                }
+                Ok(Some(if model_changes {
+                    SetupStage::Model
+                } else {
+                    SetupStage::Effort
+                }))
             }
+            SetupStage::Model => Ok(Some(if setup.effort_change.is_some() {
+                SetupStage::Effort
+            } else {
+                SetupStage::ReadBack
+            })),
+            SetupStage::Effort => Ok(Some(SetupStage::ReadBack)),
+            SetupStage::ReadBack => self.check_read_back(setup, response).map(|()| None),
         }
-        if let Some(level) = effort_change {
-            let request =
-                json!({"subtype": "apply_flag_settings", "settings": {"effortLevel": level}});
-            if let Err(failure) = self.await_control(&request, deadline()).await {
-                warn!(
-                    thread_id = %self.thread,
-                    turn_id = %turn,
-                    action = "apply_flag_settings",
-                    effort = %level,
-                    error_code = display_opt(failure.code()),
-                    error = %failure,
-                    "Claude Code did not take the effort level"
-                );
-                return Err(failure.into_error());
-            }
-        }
+    }
 
-        let settings_now = match self
-            .await_control(&json!({"subtype": "get_settings"}), deadline())
-            .await
-        {
-            Ok(payload) => payload,
-            Err(failure) => {
-                warn!(
-                    thread_id = %self.thread,
-                    turn_id = %turn,
-                    action = "get_settings",
-                    error = %failure,
-                    "could not read back the turn's model and effort"
-                );
-                return Err(failure.into_error());
-            }
-        };
+    /// The read-back: the CLI must hold the requested model (or its catalog resolution) and
+    /// effort.
+    fn check_read_back(
+        &mut self,
+        setup: &TurnSetup,
+        settings_now: &Value,
+    ) -> Result<(), HarnessError> {
+        let turn = setup.turn;
+        let settings = &setup.settings;
         let applied = settings_now.get("applied");
         let applied_model = applied
             .and_then(|applied| applied.get("model"))
@@ -1401,15 +1556,15 @@ impl Supervisor {
                 "Claude Code applied model {applied} instead of {wanted_model}"
             )));
         }
-        if model_change.is_some() {
+        if setup.model_change.is_some() {
             // The switch went through, whatever happens to the effort below.
-            self.current_model = model.clone();
+            self.current_model = setup.model.clone();
         }
         // What the CLI holds now, refused or not, so the next turn compares against the truth.
         self.current_effort = applied_effort.clone();
         self.current_model.reasoning_effort =
             applied_effort.clone().map(giskard_core::model::Effort);
-        if let Some(level) = effort_change
+        if let Some(level) = setup.effort_change.as_deref()
             && applied_effort.as_deref() != Some(level)
         {
             warn!(
@@ -1429,6 +1584,173 @@ impl Supervisor {
         Ok(())
     }
 
+    /// One stage failed (refused, timed out, or the child is stopping): its log line, and the
+    /// error the hand-off fails with.
+    fn setup_stage_failed(&mut self, setup: &TurnSetup, failure: ControlFailure) -> HarnessError {
+        let turn = setup.turn;
+        match setup.stage {
+            SetupStage::Mode => {
+                // The CLI kept its mode: a later frame reporting it is not drift.
+                self.mapper.set_expected_mode(self.current_mode.clone());
+                warn!(
+                    project_id = display_opt(self.context.project_id),
+                    thread_id = %self.thread,
+                    harness_thread_id = display_opt(self.context.harness_thread_id.as_deref()),
+                    turn_id = %turn,
+                    action = "set_permission_mode",
+                    mode = %setup.settings.mode,
+                    error_code = display_opt(failure.code()),
+                    error = %failure,
+                    "Claude Code did not set the turn's permission mode"
+                );
+                failure.into_error()
+            }
+            SetupStage::Model => {
+                warn!(
+                    thread_id = %self.thread,
+                    turn_id = %turn,
+                    action = "set_model",
+                    model = display_opt(setup.model_change.as_deref()),
+                    error_code = display_opt(failure.code()),
+                    error = %failure,
+                    "Claude Code did not switch the model"
+                );
+                // The picker offered a model the CLI does not know: surface its sentence.
+                match failure {
+                    ControlFailure::Refused { message, code }
+                        if code.as_deref() == Some("catalog_unknown") =>
+                    {
+                        HarnessError::Unsupported(message)
+                    }
+                    other => other.into_error(),
+                }
+            }
+            SetupStage::Effort => {
+                warn!(
+                    thread_id = %self.thread,
+                    turn_id = %turn,
+                    action = "apply_flag_settings",
+                    effort = display_opt(setup.effort_change.as_deref()),
+                    error_code = display_opt(failure.code()),
+                    error = %failure,
+                    "Claude Code did not take the effort level"
+                );
+                failure.into_error()
+            }
+            SetupStage::ReadBack => {
+                warn!(
+                    thread_id = %self.thread,
+                    turn_id = %turn,
+                    action = "get_settings",
+                    error = %failure,
+                    "could not read back the turn's model and effort"
+                );
+                failure.into_error()
+            }
+        }
+    }
+
+    /// The in-flight request's deadline passed. The CLI may still answer it: its late answer is
+    /// expected.
+    fn on_setup_deadline(&mut self) {
+        let Some(setup) = self.turn_setup.take() else {
+            return;
+        };
+        let subtype = setup.stage.subtype();
+        let waited = setup.deadline.saturating_duration_since(setup.sent);
+        warn!(
+            thread_id = %self.thread,
+            harness_thread_id = display_opt(self.context.harness_thread_id.as_deref()),
+            turn_id = %setup.turn,
+            request_id = %setup.request_id,
+            action = subtype,
+            timeout_ms = waited.as_millis() as u64,
+            "Claude Code did not answer a control request in time"
+        );
+        self.abandoned.insert(setup.request_id.clone());
+        let error = self.setup_stage_failed(
+            &setup,
+            ControlFailure::Failed(HarnessError::Timeout(format!(
+                "claude did not answer {subtype} within {:.1} s",
+                waited.as_secs_f64()
+            ))),
+        );
+        self.fail_turn_setup(setup, error);
+    }
+
+    /// The hand-off failed: the turn does not start.
+    fn fail_turn_setup(&self, setup: TurnSetup, error: HarnessError) {
+        debug!(
+            thread_id = %self.thread,
+            turn_id = %setup.turn,
+            action = "start_turn",
+            error = %error,
+            "the turn's settings were not applied; the turn does not start"
+        );
+        let _ = setup.reply.send(Err(error));
+    }
+
+    /// The settings are applied: `TurnStarted`, then the user message. `Err` is a stdin write
+    /// failure: the child is broken.
+    async fn finish_turn_setup(&mut self, setup: TurnSetup) -> Result<(), HarnessError> {
+        let TurnSetup {
+            line,
+            turn,
+            model,
+            reply,
+            notice,
+            ..
+        } = setup;
+        // Frames read while the settings were applied may have opened a turn of the CLI's own
+        // (a background task's continuation), and the caller may have given up meanwhile.
+        if reply.is_closed() {
+            self.log_caller_gave_up(turn, "start_turn");
+            return Ok(());
+        }
+        if let Some(busy) = self.busy("start_turn") {
+            let _ = reply.send(Err(busy));
+            return Ok(());
+        }
+        // Asks belong to a turn: a withdrawal of an earlier turn's ask can match nothing now.
+        self.withdrawn.clear();
+        // `TurnStarted` reaches the log before the line is written, so the server sees the turn
+        // before its first frame.
+        let outputs = self.mapper.begin_turn(turn, TurnKind::User);
+        self.mapper.note_turn_model(model);
+        for output in outputs {
+            if let MapperOutput::Event(event) = output {
+                self.append(event);
+            }
+        }
+        if let Some(message) = notice {
+            self.append(AgentEvent::Notice {
+                thread: self.thread,
+                turn: Some(turn),
+                message,
+            });
+        }
+        info!(
+            project_id = display_opt(self.context.project_id),
+            thread_id = %self.thread,
+            harness_thread_id = display_opt(self.context.harness_thread_id.as_deref()),
+            turn_id = %turn,
+            pid = display_opt(self.pid),
+            action = "start_turn",
+            bytes = line.len(),
+            "writing a user message"
+        );
+        match self.child.write_line(&line).await {
+            Ok(()) => {
+                let _ = reply.send(Ok(()));
+                Ok(())
+            }
+            Err(error) => {
+                let _ = reply.send(Err(error.clone()));
+                Err(error)
+            }
+        }
+    }
+
     /// One `turn_settings` line per started turn: the mode, model and effort the CLI holds.
     fn log_turn_settings(&self, turn: TurnId, changed: bool) {
         info!(
@@ -1443,130 +1765,6 @@ impl Supervisor {
             model_or_effort_changed = changed,
             "the turn's settings are applied"
         );
-    }
-
-    /// Write one control request and pump frames until its response or `deadline`. Every frame
-    /// read meanwhile is dispatched normally (the way the stop sequence pumps), so a `status` or a
-    /// late answer is never lost. On a timeout the waiter is dropped; a write failure breaks the
-    /// child.
-    ///
-    /// The response is checked between pumps rather than raced against them in a `select!`: a
-    /// pump that resolves the waiter may still be writing a mapper reply, and dropping that
-    /// future would lose the write. Reads are cut into `AWAIT_POLL_SLICE`s (`next_line` is
-    /// cancel-safe) so a shutdown or a `Stop` ends the wait at once, and any other command is
-    /// kept for the main loop.
-    async fn await_control(
-        &mut self,
-        request: &Value,
-        deadline: Instant,
-    ) -> Result<Value, ControlFailure> {
-        let started = Instant::now();
-        let subtype = request
-            .get("subtype")
-            .and_then(Value::as_str)
-            .unwrap_or("control_request");
-        let request_id = new_request_id();
-        if let Err(error) = self
-            .child
-            .write_line(&control_line(&request_id, request))
-            .await
-        {
-            self.broken("write_stdin", "a stdin write failed", &error);
-            return Err(ControlFailure::Failed(error));
-        }
-        let (tx, mut rx) = oneshot::channel();
-        self.waiters.insert(request_id.clone(), Waiter::Raw(tx));
-        debug!(
-            thread_id = %self.thread,
-            request_id = %request_id,
-            action = "control_request",
-            subtype,
-            "control request sent; awaiting its response"
-        );
-        loop {
-            match rx.try_recv() {
-                Ok(Ok(payload)) => {
-                    return match control_outcome(&payload) {
-                        Ok(response) => Ok(response),
-                        Err(error) => Err(ControlFailure::Refused {
-                            message: match error {
-                                HarnessError::Protocol(message) => message,
-                                other => other.to_string(),
-                            },
-                            code: payload
-                                .get("error_code")
-                                .and_then(Value::as_str)
-                                .map(str::to_owned),
-                        }),
-                    };
-                }
-                Ok(Err(error)) => return Err(ControlFailure::Failed(error)),
-                Err(oneshot::error::TryRecvError::Closed) => {
-                    return Err(ControlFailure::Failed(child_stopped()));
-                }
-                Err(oneshot::error::TryRecvError::Empty) => {}
-            }
-            if self.eof {
-                self.waiters.remove(&request_id);
-                return Err(ControlFailure::Failed(child_stopped()));
-            }
-            if self.stop_requested_while_waiting() {
-                self.waiters.remove(&request_id);
-                debug!(
-                    thread_id = %self.thread,
-                    request_id = %request_id,
-                    action = subtype,
-                    "stopping the child; no longer waiting for this control request"
-                );
-                return Err(ControlFailure::Failed(HarnessError::Transport(
-                    "claude child is stopping".into(),
-                )));
-            }
-            if Instant::now() >= deadline {
-                self.waiters.remove(&request_id);
-                let waited = deadline.saturating_duration_since(started);
-                warn!(
-                    thread_id = %self.thread,
-                    harness_thread_id = display_opt(self.context.harness_thread_id.as_deref()),
-                    request_id = %request_id,
-                    action = subtype,
-                    timeout_ms = waited.as_millis() as u64,
-                    "Claude Code did not answer a control request in time"
-                );
-                return Err(ControlFailure::Failed(HarnessError::Timeout(format!(
-                    "claude did not answer {subtype} within {:.1} s",
-                    waited.as_secs_f64()
-                ))));
-            }
-            let slice = (Instant::now() + AWAIT_POLL_SLICE).min(deadline);
-            self.pump_until(slice, "await_control").await;
-        }
-    }
-
-    /// While `await_control` waits: take a shutdown or a `Stop` as a stop request for the main
-    /// loop (`true`), and keep any other command for after the wait.
-    fn stop_requested_while_waiting(&mut self) -> bool {
-        if self.stop_request.is_some() {
-            return true;
-        }
-        if *self.shutdown.borrow() {
-            self.stop_request = Some(("shutdown", None));
-            return true;
-        }
-        loop {
-            match self.commands.try_recv() {
-                Ok(ChildCommand::Stop { reply }) => {
-                    self.stop_request = Some(("stop", Some(reply)));
-                    return true;
-                }
-                Ok(command) => self.deferred.push_back(command),
-                Err(mpsc::error::TryRecvError::Empty) => return false,
-                Err(mpsc::error::TryRecvError::Disconnected) => {
-                    self.stop_request = Some(("harness_dropped", None));
-                    return true;
-                }
-            }
-        }
     }
 
     /// Answer a `can_use_tool` ask (plan §9.3). `Err` is a stdin write failure.
@@ -1753,7 +1951,8 @@ impl Supervisor {
 
     /// `stop_task` for the sub-agent of route `thread`: the sub-agent thread's interrupt. The
     /// sub-agent is killed, its pending ask is withdrawn (`control_cancel_request`), and the
-    /// parent's turn continues. `Err` is a stdin write failure.
+    /// parent's turn continues. The answer is a waiter the main loop resolves; the façade bounds
+    /// the call. `Err` is a stdin write failure.
     async fn stop_task(
         &mut self,
         thread: ThreadId,
@@ -1803,37 +2002,60 @@ impl Supervisor {
         // that update must read as an interruption. A refused stop leaves the task running, and
         // only another stop (or the parent's interrupt) can kill it later.
         self.mapper.note_stop_sent(thread);
+        let request_id = new_request_id();
         let request = json!({"subtype": "stop_task", "task_id": task_id});
-        let deadline = Instant::now() + CONTROL_TIMEOUT;
-        match self.await_control(&request, deadline).await {
-            Ok(_) => {
-                info!(
-                    project_id = display_opt(self.context.project_id),
-                    thread_id = %thread,
-                    owner_thread_id = %self.thread,
-                    harness_thread_id = display_opt(harness_thread_id.as_deref()),
-                    task_id = %task_id,
-                    action = "stop_task",
-                    "sub-agent stopped"
-                );
-                let _ = reply.send(Ok(()));
-            }
-            Err(failure) => {
-                warn!(
-                    project_id = display_opt(self.context.project_id),
-                    thread_id = %thread,
-                    owner_thread_id = %self.thread,
-                    harness_thread_id = display_opt(harness_thread_id.as_deref()),
-                    task_id = %task_id,
-                    action = "stop_task",
-                    error = %failure,
-                    "Claude Code did not stop the sub-agent"
-                );
-                let _ = reply.send(Err(failure.into_error()));
-            }
+        if let Err(error) = self
+            .child
+            .write_line(&control_line(&request_id, &request))
+            .await
+        {
+            let _ = reply.send(Err(error.clone()));
+            return Err(error);
         }
-        // A write failure inside `await_control` already marked the child broken.
+        debug!(
+            thread_id = %thread,
+            owner_thread_id = %self.thread,
+            request_id = %request_id,
+            task_id = %task_id,
+            action = "control_request",
+            subtype = "stop_task",
+            "control request sent; awaiting its response"
+        );
+        self.waiters.insert(
+            request_id,
+            Waiter::StopTask(StopTaskWaiter {
+                thread,
+                task_id,
+                harness_thread_id,
+                reply,
+            }),
+        );
         Ok(())
+    }
+
+    /// The CLI answered a `stop_task`.
+    fn log_stop_task_answer(&self, stop: &StopTaskWaiter, outcome: &Result<Value, HarnessError>) {
+        match outcome {
+            Ok(_) => info!(
+                project_id = display_opt(self.context.project_id),
+                thread_id = %stop.thread,
+                owner_thread_id = %self.thread,
+                harness_thread_id = display_opt(stop.harness_thread_id.as_deref()),
+                task_id = %stop.task_id,
+                action = "stop_task",
+                "sub-agent stopped"
+            ),
+            Err(error) => warn!(
+                project_id = display_opt(self.context.project_id),
+                thread_id = %stop.thread,
+                owner_thread_id = %self.thread,
+                harness_thread_id = display_opt(stop.harness_thread_id.as_deref()),
+                task_id = %stop.task_id,
+                action = "stop_task",
+                error = %error,
+                "Claude Code did not stop the sub-agent"
+            ),
+        }
     }
 
     /// `/compact` as a compaction turn. No per-turn settings are sent: compaction runs no tool,
@@ -1847,7 +2069,10 @@ impl Supervisor {
             self.log_caller_gave_up(turn, "compact");
             return Ok(());
         }
-        if let Some(busy) = self.busy("compact") {
+        if let Some(busy) = self
+            .busy("compact")
+            .or_else(|| self.setup_in_flight("compact"))
+        {
             let _ = reply.send(Err(busy));
             return Ok(());
         }
@@ -1883,98 +2108,243 @@ impl Supervisor {
         }
     }
 
-    /// Read and dispatch one line before `deadline`. `false` when the deadline passed first.
-    async fn pump_until(&mut self, deadline: Instant, action: &'static str) -> bool {
-        match tokio::time::timeout_at(deadline, self.child.next_line()).await {
-            Err(_) => false,
-            Ok(Ok(Some(line))) => {
-                if let Err(error) = self.dispatch_line(&line).await {
-                    debug!(
-                        thread_id = %self.thread,
-                        action,
-                        "a reply could not be written while pumping frames"
-                    );
-                    self.broken("write_stdin", "a stdin write failed", &error);
+    fn stopping(&self) -> bool {
+        matches!(self.phase, Phase::Stopping(_))
+    }
+
+    /// The deadline the main loop waits on besides frames and commands: the in-flight turn
+    /// hand-off's while serving, the stop stage's while stopping.
+    fn stage_deadline(&self) -> Option<Instant> {
+        match &self.phase {
+            Phase::Serving => self.turn_setup.as_ref().map(|setup| setup.deadline),
+            Phase::Stopping(stopping) => Some(match &stopping.stage {
+                StopStage::Interrupting { deadline, .. } | StopStage::Draining { deadline } => {
+                    *deadline
                 }
-                true
-            }
-            Ok(Ok(None)) => {
-                self.eof = true;
-                true
-            }
-            Ok(Err(error)) => {
-                self.broken("read_stdout", "a stdout read failed", &error);
-                self.eof = true;
-                true
-            }
+            }),
         }
     }
 
-    /// The stop sequence: interrupt a live turn, close stdin, kill on the grace timeout.
+    /// Enter the stop sequence: interrupt a live turn, then close stdin and wait for EOF, killing
+    /// the child on the grace timeout. A stop that arrives while one runs joins it.
     ///
     /// SIGTERM is deliberately not used: it leaves the turn without a `result`.
-    async fn stop(&mut self, reason: &'static str) {
-        if self.eof {
+    async fn enter_stopping(&mut self, reason: &'static str, reply: Option<oneshot::Sender<()>>) {
+        if let Phase::Stopping(stopping) = &mut self.phase {
+            stopping.replies.extend(reply);
+            debug!(
+                thread_id = %self.thread,
+                harness_thread_id = display_opt(self.context.harness_thread_id.as_deref()),
+                action = "stop",
+                reason,
+                running = stopping.reason,
+                "a second stop joined the stop sequence"
+            );
             return;
         }
-        if let Some(turn) = self.mapper.active_turn() {
-            let started = Instant::now();
-            let request_id = new_request_id();
-            match self
-                .child
-                .write_line(&control_line(&request_id, &json!({"subtype": "interrupt"})))
-                .await
-            {
-                Ok(()) => {
-                    self.waiters.insert(request_id.clone(), Waiter::Stop);
-                    self.interrupt_sent = true;
-                    self.mapper.note_interrupt_sent();
-                    let deadline = started + STOP_INTERRUPT_GRACE;
-                    while self.mapper.active_turn().is_some() && !self.eof {
-                        if !self.pump_until(deadline, "stop").await {
-                            break;
+        if let Some(setup) = self.turn_setup.take() {
+            debug!(
+                thread_id = %self.thread,
+                turn_id = %setup.turn,
+                request_id = %setup.request_id,
+                action = setup.stage.subtype(),
+                "stopping the child; no longer waiting for this control request"
+            );
+            // The CLI may still answer it while it drains.
+            self.abandoned.insert(setup.request_id.clone());
+            let error = self.setup_stage_failed(
+                &setup,
+                ControlFailure::Failed(HarnessError::Transport("claude child is stopping".into())),
+            );
+            self.fail_turn_setup(setup, error);
+        }
+        let stage = match self.mapper.active_turn() {
+            Some(turn) => {
+                let started = Instant::now();
+                let request_id = new_request_id();
+                match self
+                    .child
+                    .write_line(&control_line(&request_id, &json!({"subtype": "interrupt"})))
+                    .await
+                {
+                    Ok(()) => {
+                        self.waiters.insert(request_id.clone(), Waiter::Stop);
+                        self.interrupt_sent = true;
+                        self.mapper.note_interrupt_sent();
+                        StopStage::Interrupting {
+                            turn,
+                            request_id,
+                            started,
+                            deadline: started + STOP_INTERRUPT_GRACE,
                         }
                     }
-                    info!(
-                        thread_id = %self.thread,
-                        turn_id = %turn,
-                        request_id = %request_id,
-                        action = "stop_interrupt",
-                        reason,
-                        elapsed_ms = started.elapsed().as_millis() as u64,
-                        turn_closed = self.mapper.active_turn().is_none(),
-                        "interrupted the live turn before stopping"
-                    );
+                    Err(error) => {
+                        warn!(
+                            thread_id = %self.thread,
+                            turn_id = %turn,
+                            action = "stop_interrupt",
+                            reason,
+                            error = %error,
+                            "could not interrupt the live turn before stopping"
+                        );
+                        self.begin_draining()
+                    }
                 }
-                Err(error) => warn!(
-                    thread_id = %self.thread,
-                    turn_id = %turn,
-                    action = "stop_interrupt",
-                    reason,
-                    error = %error,
-                    "could not interrupt the live turn before stopping"
-                ),
             }
-        }
-        if self.eof {
-            return;
-        }
+            None => self.begin_draining(),
+        };
+        self.phase = Phase::Stopping(Stopping {
+            reason,
+            replies: reply.into_iter().collect(),
+            stage,
+        });
+    }
+
+    /// Close stdin: an idle CLI exits 0 at EOF.
+    fn begin_draining(&mut self) -> StopStage {
         self.child.close_stdin();
-        let deadline = Instant::now() + STOP_EXIT_GRACE;
-        while !self.eof {
-            if !self.pump_until(deadline, "stop").await {
+        StopStage::Draining {
+            deadline: Instant::now() + STOP_EXIT_GRACE,
+        }
+    }
+
+    /// Run after every dispatched line: an interrupted turn whose `result` came in moves the stop
+    /// sequence on to draining.
+    fn after_line(&mut self) {
+        let interrupting = matches!(
+            &self.phase,
+            Phase::Stopping(Stopping {
+                stage: StopStage::Interrupting { .. },
+                ..
+            })
+        );
+        if interrupting && self.mapper.active_turn().is_none() {
+            self.finish_interrupting(true);
+        }
+    }
+
+    /// The interrupt stage is over, its turn closed or its grace spent: close stdin.
+    fn finish_interrupting(&mut self, turn_closed: bool) {
+        let Phase::Stopping(stopping) = &self.phase else {
+            return;
+        };
+        let StopStage::Interrupting {
+            turn,
+            request_id,
+            started,
+            ..
+        } = &stopping.stage
+        else {
+            return;
+        };
+        info!(
+            thread_id = %self.thread,
+            turn_id = %turn,
+            request_id = %request_id,
+            action = "stop_interrupt",
+            reason = stopping.reason,
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            turn_closed,
+            "interrupted the live turn before stopping"
+        );
+        let stage = self.begin_draining();
+        if let Phase::Stopping(stopping) = &mut self.phase {
+            stopping.stage = stage;
+        }
+    }
+
+    /// The stage deadline passed: the turn hand-off's request timed out, the interrupted turn
+    /// never closed, or the child ignored EOF.
+    fn on_deadline(&mut self) {
+        match &self.phase {
+            Phase::Serving => self.on_setup_deadline(),
+            Phase::Stopping(Stopping {
+                stage: StopStage::Interrupting { .. },
+                ..
+            }) => self.finish_interrupting(false),
+            Phase::Stopping(Stopping {
+                stage: StopStage::Draining { .. },
+                reason,
+                ..
+            }) => {
                 warn!(
                     project_id = display_opt(self.context.project_id),
                     thread_id = %self.thread,
                     harness_thread_id = display_opt(self.context.harness_thread_id.as_deref()),
                     pid = display_opt(self.pid),
                     action = "stop_kill",
-                    reason,
+                    reason = *reason,
                     grace_ms = STOP_EXIT_GRACE.as_millis() as u64,
                     "claude did not exit after stdin closed; killing it"
                 );
                 self.child.start_kill();
-                break;
+                self.ending = Some(self.stopped());
+            }
+        }
+    }
+
+    /// The ending of a stop sequence, with every reply it collected.
+    fn stopped(&mut self) -> Ending {
+        match std::mem::replace(&mut self.phase, Phase::Serving) {
+            Phase::Stopping(stopping) => Ending::Stopped {
+                replies: stopping.replies,
+            },
+            Phase::Serving => Ending::Stopped {
+                replies: Vec::new(),
+            },
+        }
+    }
+
+    /// stdout reached EOF: the end of a stop sequence, or a child that exited on its own.
+    fn end_at_eof(&mut self) -> Ending {
+        if self.stopping() {
+            self.stopped()
+        } else {
+            Ending::Eof
+        }
+    }
+
+    /// A read or write failed and the child was killed. During a stop sequence the stop still
+    /// answers its callers.
+    fn end_broken(&mut self) -> Ending {
+        if self.stopping() {
+            self.stopped()
+        } else {
+            Ending::Broken
+        }
+    }
+
+    /// A command that arrived during the stop sequence is answered at once: the child will not
+    /// serve it. A `Stop` joins the sequence.
+    fn refuse(&mut self, command: ChildCommand) {
+        let reason = match &self.phase {
+            Phase::Stopping(stopping) => stopping.reason,
+            Phase::Serving => "serving",
+        };
+        debug!(
+            thread_id = %self.thread,
+            harness_thread_id = display_opt(self.context.harness_thread_id.as_deref()),
+            action = "stop_refused",
+            command = command.name(),
+            reason,
+            "the child is stopping; refusing the command"
+        );
+        match command {
+            ChildCommand::StartTurn { reply, .. }
+            | ChildCommand::Interrupt { reply }
+            | ChildCommand::RespondApproval { reply, .. }
+            | ChildCommand::RespondServerRequest { reply, .. }
+            | ChildCommand::StopTask { reply, .. }
+            | ChildCommand::Compact { reply, .. } => {
+                let _ = reply.send(Err(child_stopped()));
+            }
+            ChildCommand::Control { reply, .. } => {
+                let _ = reply.send(Err(child_stopped()));
+            }
+            ChildCommand::Stop { reply } => {
+                if let Phase::Stopping(stopping) = &mut self.phase {
+                    stopping.replies.push(reply);
+                }
             }
         }
     }
@@ -1984,6 +2354,10 @@ impl Supervisor {
         let mut described = exit.describe();
         if let Some(failure) = self.failure {
             described = format!("{described}, after {failure}");
+        }
+        // A hand-off whose answer never came (the child exited or broke meanwhile).
+        if let Some(setup) = self.turn_setup.take() {
+            self.fail_turn_setup(setup, child_stopped());
         }
         // Counted before the routes close, so the exit line reports every ask of this child.
         let pending_dropped = lock(&self.pending).remove_owner(self.thread);
