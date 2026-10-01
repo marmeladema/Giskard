@@ -133,6 +133,7 @@ pub(crate) struct RouteHandle {
     pub harness_thread_id: String,
     pub log: Arc<EventLog>,
     /// The primary thread whose child carries this route; `None` for a cold route.
+    /// It is also the child `list_mcp_servers` asks for a sub-agent hint.
     pub owner: Option<ThreadId>,
     pub commands: Option<mpsc::Sender<ChildCommand>>,
     pub parent_harness_thread_id: Option<String>,

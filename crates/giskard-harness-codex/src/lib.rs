@@ -1040,7 +1040,10 @@ impl AgentHarness for CodexHarness {
         Ok(providers)
     }
 
-    async fn list_mcp_servers(&self) -> Result<Vec<McpServerStatus>, HarnessError> {
+    async fn list_mcp_servers(
+        &self,
+        _thread: Option<&ThreadHandle>,
+    ) -> Result<Vec<McpServerStatus>, HarnessError> {
         let (tx, rx) = oneshot::channel();
         self.enqueue_control(
             "list_mcp_servers",

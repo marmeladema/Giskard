@@ -4396,11 +4396,46 @@ async fn declared_project_harness(
         .map_err(harness_api_error)
 }
 
+#[derive(Deserialize)]
+struct McpStatusQuery {
+    /// The open thread whose process the status should describe, when the harness runs one
+    /// process per thread. Optional: the instance's own view otherwise.
+    thread: Option<ThreadId>,
+}
+
 async fn list_mcp_servers(
     State(state): State<AppState>,
     AxumPath((project_id, harness_name)): AxumPath<(ProjectId, String)>,
+    Query(q): Query<McpStatusQuery>,
 ) -> Result<Json<ListMcpServersResponse>, ApiError> {
     let harness = declared_project_harness(&state, project_id, &harness_name).await?;
+    let binding = match q.thread {
+        None => None,
+        Some(thread_id) => match state.registry.loaded_thread_binding(thread_id).await {
+            None => {
+                // Closed between the browser's render and this request, or never opened: the
+                // menu must still open, so the instance answers.
+                debug!(
+                    %project_id,
+                    %thread_id,
+                    harness = %harness_name,
+                    action = "mcp_status",
+                    "hinted thread is not open; answering for the instance"
+                );
+                None
+            }
+            // A thread of another project is not addressable through this project's path.
+            Some(binding) if binding.project_id() != project_id => return Err(ApiError::NotFound),
+            Some(binding) if binding.harness() != harness_name => {
+                return Err(ApiError::BadRequest(format!(
+                    "thread {thread_id} runs on harness {}, not {harness_name}",
+                    binding.harness()
+                )));
+            }
+            Some(binding) => Some(binding),
+        },
+    };
+    let hint = binding.as_ref().map(|binding| binding.handle());
     let capabilities = harness.capabilities();
     if !capabilities.mcp_status {
         warn!(
@@ -4411,7 +4446,7 @@ async fn list_mcp_servers(
     }
     let servers = if capabilities.mcp_status {
         harness
-            .list_mcp_servers()
+            .list_mcp_servers(hint)
             .await
             .map_err(harness_api_error)?
     } else {
@@ -4424,6 +4459,8 @@ async fn list_mcp_servers(
         mcp_reload_supported = capabilities.mcp_reload,
         mcp_oauth_login_supported = capabilities.mcp_oauth_login,
         server_count = servers.len(),
+        thread_id = display_opt(hint.map(|handle| handle.thread)),
+        hinted = hint.is_some(),
         "MCP server status loaded"
     );
     Ok(Json(ListMcpServersResponse {

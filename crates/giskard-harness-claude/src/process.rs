@@ -718,6 +718,19 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn a_probe_never_becomes_a_session() {
+        // The probe rule (AGENTS.md): no flag that names, resumes or shapes a session.
+        let options = ClaudeLaunchOptions {
+            args: strings(&["--debug", "api"]),
+            ..ClaudeLaunchOptions::default()
+        };
+        let argv = probe_argv(&options);
+        for flag in ["--session-id", "--resume", "--model", "--permission-mode"] {
+            assert!(!argv.iter().any(|arg| arg == flag), "{flag} in {argv:?}");
+        }
+    }
+
+    #[test]
     fn exits_are_classified_by_the_cli_s_own_words() {
         let exit = |line: &str| ChildExit {
             code: Some(1),

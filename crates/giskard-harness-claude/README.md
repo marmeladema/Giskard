@@ -18,9 +18,9 @@ spawns and handshakes it (fresh, `--resume`, or the same-id respawn when the tra
 inline attachments, `respond_approval` and `respond_server_request` answer the CLI's asks,
 `compact_thread` runs `/compact`, `interrupt` and `set_thread_name` send control requests,
 `set_thread_archived(true)`, `delete_thread` and `shutdown` stop children, `list_models` answers
-from the freshest handshake or a probe child, `list_mcp_servers` asks a live child or a probe for
-`mcp_status`, and `list_providers` reports `anthropic`. `capabilities()` reports the plan §4
-matrix, with `live_approvals`, `plan_build_modes`, `per_turn_model`, `reasoning_effort`,
+from the freshest handshake or a probe child, `list_mcp_servers` asks the hinted thread's child or
+a probe for `mcp_status`, and `list_providers` reports `anthropic`. `capabilities()` reports the
+plan §4 matrix, with `live_approvals`, `plan_build_modes`, `per_turn_model`, `reasoning_effort`,
 `context_compaction` and `mcp_status` true. A delegation (an `Agent` tool call) is a **sub-agent
 thread**: the mapper mints a route for it, `claim_native_thread` binds it, its forwarded frames are
 its transcript, its asks are published on it, and `interrupt` on it is `stop_task` (see *Sub-agent
@@ -69,8 +69,15 @@ inventory from `init.tools` (milestone 8).
   `open_thread` issued before the child has written a frame. Frames read during the handshake that
   were not its responses are mapped first, once the supervisor starts.
 - **The probe child** that `list_models` spawns when no handshake has reported a catalog yet, or
-  `list_mcp_servers` when no child is live, is owned by the call: it is not in `children` and does
-  not count as a live child.
+  `list_mcp_servers` when the call names no thread with a live child, is owned by the call: it is
+  not in `children` and does not count as a live child. It must never become a Claude Code session
+  (`AGENTS.md`): it is launched with the protocol flags only (no `--session-id`, `--resume`,
+  `--model`, `--permission-mode`), it is written only control requests through `control_line`,
+  never a `user` line, and its stdin is closed after the last answer. Verified on 2.1.287:
+  `initialize` alone, or `initialize` then `mcp_status`, on a probe leaves no `projects/<cwd>/`
+  directory, no session `.jsonl`, no `sessions/` entry and no project entry in `.claude.json`;
+  only cache files change (`cache/model-catalog/*`, growth-book features, `policy-limits.json`,
+  `remote-settings.json`). The probe does start the user's configured MCP servers while it lives.
 
 ## Identifier model
 
@@ -558,12 +565,20 @@ overlay.
 
 ## MCP servers
 
-`list_mcp_servers` sends the `mcp_status` control request. When a child is live it asks that child
-(under the 10 s control timeout), since its answer reflects the servers that session connected,
-which is what the user is looking at; the line logs `mcp_status`. Otherwise it spawns a probe
-child exactly as the catalog probe does (protocol flags only, serialized with it), sends
-`initialize` and then `mcp_status` under 30 s each, stores the catalog from `initialize` as the
-catalog probe would, closes stdin and logs `mcp_probe` with `elapsed_ms` and `servers`. A refused
+`list_mcp_servers` sends the `mcp_status` control request. The configured server set is the same in
+every child (`--setting-sources user`), but `pending` and `failed` are per process, so the call
+takes the thread the user is looking at as a hint. When the hinted thread has a live child, or the
+hint is a sub-agent route whose owner's child is live (the `RouteHandle`'s `owner`), it asks that
+child (under the 10 s control timeout); the line logs `mcp_status` with `thread_id` (the hinted
+thread), `owner_thread_id` (the child's thread) and `hinted=true`. A live child's failure is
+returned, never probed around: a timeout from a running child says the CLI is unresponsive, and a
+probe would not describe that thread. With no hint, or a hint without a live child (a thread this
+instance does not hold, a cold route, a child that just exited, logged at `debug` as "the hinted
+thread has no live child; probing"), it never picks an arbitrary child: it spawns a probe child
+exactly as the catalog probe does (protocol flags only, serialized with it), sends `initialize` and
+then `mcp_status` under 30 s each, stores the catalog from `initialize` as the catalog probe would,
+closes stdin and logs `mcp_probe` with `thread_id` (the hint, if any), `hinted`, `elapsed_ms` and
+`servers`. A refused
 `mcp_status` is `HarnessError::Protocol` with the CLI's message; a probe that exits before
 answering is the handshake error (`claude exited with … before answering mcp_status: …`).
 

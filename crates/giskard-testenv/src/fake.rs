@@ -8,6 +8,7 @@ use async_trait::async_trait;
 use giskard_core::approval::ApprovalDecision;
 use giskard_core::event::AgentEvent;
 use giskard_core::ids::{ApprovalId, ServerRequestId, ThreadId, TurnId};
+use giskard_core::mcp::McpServerStatus;
 use giskard_core::model::{ModelDescriptor, ModelRef};
 use giskard_core::server_request::ServerRequestResponse;
 use giskard_core::turn::{TurnOverrides, TurnStatus, TurnStatusKind};
@@ -385,6 +386,16 @@ pub trait Script: Send + Sync + 'static {
             "provider listing is not supported by this harness".into(),
         ))
     }
+    async fn list_mcp_servers(
+        &self,
+        _core: &FakeCore,
+        thread: Option<&ThreadHandle>,
+    ) -> Result<Vec<McpServerStatus>, HarnessError> {
+        let _ = thread;
+        Err(HarnessError::Unsupported(
+            "MCP server status is not supported by this harness".into(),
+        ))
+    }
     async fn shutdown(&self, _core: &FakeCore) -> Result<(), HarnessError> {
         Ok(())
     }
@@ -417,6 +428,12 @@ impl<S: Script> AgentHarness for FakeHarness<S> {
     }
     async fn list_providers(&self) -> Result<Vec<HarnessProvider>, HarnessError> {
         self.script.list_providers().await
+    }
+    async fn list_mcp_servers(
+        &self,
+        thread: Option<&ThreadHandle>,
+    ) -> Result<Vec<McpServerStatus>, HarnessError> {
+        self.script.list_mcp_servers(&self.core, thread).await
     }
     async fn open_thread(&self, opts: OpenThreadOptions) -> Result<ThreadHandle, HarnessError> {
         self.core.record(Call::Open {

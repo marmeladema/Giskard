@@ -578,8 +578,8 @@ impl DiscoveryStream {
 ///
 /// Methods are grouped by scope, in this order:
 /// - instance: `capabilities`, `client_version`, `list_models`, `list_providers`,
-///   `list_mcp_servers`, `reload_mcp_servers`, `start_mcp_oauth_login`, `discoveries`,
-///   `shutdown`;
+///   `list_mcp_servers` (with an optional thread hint), `reload_mcp_servers`,
+///   `start_mcp_oauth_login`, `discoveries`, `shutdown`;
 /// - thread, taking a `ThreadHandle`: `open_thread`, `claim_native_thread`, `subscribe`,
 ///   `set_thread_name`, `set_thread_archived`, `delete_thread`, `compact_thread`, `interrupt`;
 /// - turn: `start_turn`, `steer_turn`, `respond_approval`, `respond_server_request`,
@@ -626,7 +626,17 @@ pub trait AgentHarness: Send + Sync {
     }
 
     /// List configured MCP servers and their visible tools/resources.
-    async fn list_mcp_servers(&self) -> Result<Vec<McpServerStatus>, HarnessError> {
+    ///
+    /// `thread` is a hint, not a scope: the thread the user is looking at, when it is open on this
+    /// instance. An adapter that runs one process per thread answers from that thread's process
+    /// (for a sub-agent, the process that carries it); an adapter with one process per instance
+    /// ignores it. With no hint, or a hint for a thread this instance does not hold, the answer is
+    /// the instance's own view. The method stays instance-scoped: it never opens or resumes a thread.
+    async fn list_mcp_servers(
+        &self,
+        thread: Option<&ThreadHandle>,
+    ) -> Result<Vec<McpServerStatus>, HarnessError> {
+        let _ = thread;
         Err(HarnessError::Unsupported(
             "MCP server status is not supported by this harness".into(),
         ))
