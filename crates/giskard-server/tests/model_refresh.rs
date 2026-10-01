@@ -453,8 +453,9 @@ model_listing = true
 }
 
 /// A configured provider id the harness has never heard of is reported as a warning against that
-/// provider, while its models stay in the picker (§8.2). Catching the mismatch here is the whole
-/// point: the alternative is a provider-side `model_not_found` in the middle of a turn.
+/// provider, and its models leave this harness's picker group, since they cannot be routed (§8.2).
+/// Catching the mismatch here is the whole point: the alternative is a provider-side
+/// `model_not_found` in the middle of a turn.
 #[tokio::test]
 async fn unknown_provider_id_is_reported_against_the_harness_table() {
     let extra_config = r#"[providers.typoed]
@@ -517,8 +518,8 @@ async fn unknown_provider_id_is_reported_against_the_harness_table() {
         .map(|m| m["model"].as_str().unwrap())
         .collect();
     assert!(
-        ids.contains(&"some-model"),
-        "flagged, not hidden: the user still sees what they declared: {ids:?}"
+        !ids.contains(&"some-model"),
+        "an unroutable model is not offered; the warning explains why: {ids:?}"
     );
 }
 
@@ -1055,7 +1056,7 @@ async fn providers_are_queried_concurrently() {
 
     let config: giskard_persist::Config = toml::from_str("").unwrap();
     let started = std::time::Instant::now();
-    let discovery = giskard_server::models::discover_models(&config, &table, None).await;
+    let discovery = giskard_server::models::discover_models(&config, &table, true, None).await;
     let elapsed = started.elapsed();
 
     assert_eq!(

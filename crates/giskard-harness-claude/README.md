@@ -10,18 +10,21 @@ semantics and invariants, and the
 behaves and the milestones that build this adapter. This document describes what the adapter does
 **today**, including the scope and lifetime of Claude Code-native identifiers.
 
-**Status: milestone 3.** `ClaudeHarness` implements `AgentHarness` over **one `claude` process per
-open primary thread**: `open_thread` spawns and handshakes it (fresh, `--resume`, or the same-id
-respawn when the transcript is gone), `start_turn` applies the turn's permission mode, model and
-effort and writes the user message with inline attachments, `respond_approval` and
-`respond_server_request` answer the CLI's asks, `compact_thread` runs `/compact`, `interrupt` and
-`set_thread_name` send control requests, `set_thread_archived(true)`, `delete_thread` and
-`shutdown` stop children, `list_models` answers from the freshest handshake or a probe child, and
-`list_providers` reports `anthropic`. `capabilities()` reports the plan §4 matrix, with
-`live_approvals`, `plan_build_modes`, `per_turn_model`, `reasoning_effort` and
-`context_compaction` true. Nothing is user-reachable yet: no `HarnessKind` names this adapter until
-milestone 4, which also wires `list_mcp_servers` (`mcp_status` stays false until then). Sub-agent
-threads, and routing a sub-agent's asks to them, are milestone 5's.
+**Status: reachable (milestone 4).** A `[harnesses.<name>]` declaration of kind `claude-code`
+starts, and the server runs its projects and threads on `ClaudeHarness`, which implements
+`AgentHarness` over **one `claude` process per open primary thread**: `open_thread` spawns and
+handshakes it (fresh, `--resume`, or the same-id respawn when the transcript is gone),
+`start_turn` applies the turn's permission mode, model and effort and writes the user message with
+inline attachments, `respond_approval` and `respond_server_request` answer the CLI's asks,
+`compact_thread` runs `/compact`, `interrupt` and `set_thread_name` send control requests,
+`set_thread_archived(true)`, `delete_thread` and `shutdown` stop children, `list_models` answers
+from the freshest handshake or a probe child, `list_mcp_servers` asks a live child or a probe for
+`mcp_status`, and `list_providers` reports `anthropic`. `capabilities()` reports the plan §4
+matrix, with `live_approvals`, `plan_build_modes`, `per_turn_model`, `reasoning_effort`,
+`context_compaction` and `mcp_status` true. Still to come: sub-agent threads and routing a
+sub-agent's asks to them (milestone 5), idle reaping of children and a supervisor state machine
+(milestone 6), synthesized diffs (milestone 7), and version-drift and headroom surfacing, including
+an MCP tool inventory from `init.tools` (milestone 8).
 
 ## Runtime ownership
 
@@ -53,8 +56,9 @@ threads, and routing a sub-agent's asks to them, are milestone 5's.
 - **The retained log is created at open**, so `subscribe` returns a live reader for any handle
   `open_thread` issued before the child has written a frame. Frames read during the handshake that
   were not its responses are mapped first, once the supervisor starts.
-- **The probe child** that `list_models` spawns when no handshake has reported a catalog yet is
-  owned by the call: it is not in `children` and does not count as a live child.
+- **The probe child** that `list_models` spawns when no handshake has reported a catalog yet, or
+  `list_mcp_servers` when no child is live, is owned by the call: it is not in `children` and does
+  not count as a live child.
 
 ## Identifier model
 
@@ -243,15 +247,15 @@ The ids of `get_settings` or `get_context_usage` requests that timed out are han
 supervisor, so the CLI's late answer is logged at `debug` rather than as an unexpected response.
 
 A `resume` id beginning with `task:` is refused as `Unsupported` (a sub-agent has no session; plan
-§5.3), and any other id must be a UUID. With `--resume`, a child that exits before answering
-`initialize` with `No conversation found with session ID` (on stderr or in the `result.errors` it
-wrote) means the transcript is gone: the adapter logs `claude_resume_failed` at `warn`, respawns
-with `--session-id <the same uuid>` and the same launch mode (a bypass refusal on that respawn
-still falls back), and opens the thread writable with the notice
+§5.3): it is an item id, never a session. Any other id must be a UUID. With `--resume`, a child that
+exits before answering `initialize` with `No conversation found with session ID` (on stderr or in
+the `result.errors` it wrote) means the transcript is gone: the adapter logs `claude_resume_failed`
+at `warn`, respawns with `--session-id <the same uuid>` and the same launch mode (a bypass refusal
+on that respawn still falls back), and opens the thread writable with the notice
 `claude_resume_failed` ("Agent context was lost; started a fresh Claude Code session. History is
-intact.", detail: the CLI's sentence). That respawn works only because the transcript is gone:
-any other resume failure (such as `Error: Session ID … is already in use.`) is an error and is
-never retried, and a failed respawn returns its own error. A handshake failure whose stderr or
+intact.", detail: the CLI's sentence). That respawn works only because the transcript is gone: any
+other resume failure (such as `Error: Session ID … is already in use.`) is an error and is never
+retried, and a failed respawn returns its own error. A handshake failure whose stderr or
 `result.errors` mentions `not logged in`, `Invalid API key`, `/login` or `authentication` is
 `HarnessError::Unauthenticated`; this is a best-effort substring match, since the unauthenticated
 shape could not be reproduced. Every other failure is `HarnessError::Spawn` quoting the exit status,
@@ -447,18 +451,42 @@ Every handshake replaces the catalog snapshot, so `list_models` answers from the
 `initialize` a child reported. Before any thread is open, `list_models` spawns one probe child
 (serialized, so concurrent callers share it) with the protocol flags only (no mode, model, effort
 or session flag, so it leaves no transcript), reads `initialize` under 30 s, closes stdin and logs
-`catalog_probe`. Entries are parsed one at a time; an odd one is skipped with a `warn`. Each entry
-except the `default` alias becomes a descriptor with `model` = the entry's `value`, its display name
-and effort levels, and `is_default` on the first entry resolving to the same model as `default`
-(the user's configuration decides which). The catalog carries no context window, so descriptors use
-the conservative window until a turn's `TurnUsageUpdated` or a resume's `ContextWindowRestored`
-reports the runtime one.
+`catalog_probe`; `list_mcp_servers`' probe stores the catalog the same way. Entries are parsed one
+at a time; an odd one is skipped with a `warn`. Each entry except the `default` alias becomes a
+descriptor with `model` = the entry's `value`, its display name and effort levels, and
+`is_default` on the first entry resolving to the same model as `default` (the user's configuration
+decides which). The catalog carries no context window, so descriptors use the conservative window
+until a turn's `TurnUsageUpdated` or a resume's `ContextWindowRestored` reports the runtime one.
 
 ## Provider table
 
 `list_providers` reports one provider, `anthropic` ("Anthropic (Claude Code)"), with no base URL (so
 Giskard's own `/v1/models` discovery stays off), no auth source, and the instance's environment
 overlay.
+
+## MCP servers
+
+`list_mcp_servers` sends the `mcp_status` control request. When a child is live it asks that child
+(under the 10 s control timeout), since its answer reflects the servers that session connected,
+which is what the user is looking at; the line logs `mcp_status`. Otherwise it spawns a probe
+child exactly as the catalog probe does (protocol flags only, serialized with it), sends
+`initialize` and then `mcp_status` under 30 s each, stores the catalog from `initialize` as the
+catalog probe would, closes stdin and logs `mcp_probe` with `elapsed_ms` and `servers`. A refused
+`mcp_status` is `HarnessError::Protocol` with the CLI's message; a probe that exits before
+answering is the handshake error (`claude exited with … before answering mcp_status: …`).
+
+The answer is `{"mcpServers": [{name, status, error?, config, scope, source}]}` (`src/mcp.rs`).
+Each entry becomes one `McpServerStatus`: `name` verbatim; `auth_status` `NotLoggedIn` when
+`status` is `needs-auth` or `needs_auth` (the CLI's `/mcp` screen names an
+authentication-required state whose wire spelling was not observed, so both are matched) and
+`Unknown` otherwise; `server_info.description` the status, or `<status>: <error>` when the CLI
+gave an error, so the panel shows `failed: ENOENT …` for a server that did not start and `pending`
+for one still connecting (the panel's refresh asks again). An entry that does not parse is skipped
+with a `warn` naming its index; each server is logged at `debug` with its name, status, source and
+error. `mcp_status` carries **no tool inventory**: tools reach the model as
+`mcp__<server>__<tool>` names in `system/init.tools`, so `tools`, `resources` and
+`resource_templates` stay empty; listing them in the panel is milestone 8's `init.tools` work.
+`mcp_reload` and `mcp_oauth_login` stay unadvertised.
 
 ## Code and tests
 
@@ -474,6 +502,7 @@ overlay.
   reader, the stderr tail and exit classification.
 - `src/attachments.rs`: the user message line and attachment blocks.
 - `src/catalog.rs`: the `initialize.models` catalog, its descriptors and `ANTHROPIC_PROVIDER_ID`.
+- `src/mcp.rs`: the `mcp_status` answer to `McpServerStatus`.
 - `src/frame.rs`: one stdout line to a typed `Frame`, tolerant of everything the crate cannot type.
 - `src/mapper.rs`: `ClaudeMapper`, the frame-to-event state machine, and its fixture-driven tests.
 - `src/ids.rs`: `NativeItemKey` and the `task:` sub-agent id prefix.
@@ -485,7 +514,7 @@ overlay.
 - `tests/fake-claude.sh`: a POSIX `sh` stand-in for `claude` that replays the fixtures, so the real
   process path (spawn, stderr tail, exit codes, kill) is tested without the CLI. It answers
   `set_permission_mode` (`bypass_not_launched` for `bypassPermissions` on a child not launched
-  with it), `set_model` (`catalog_unknown` outside the `initialize` catalog), `apply_flag_settings`
-  and `get_settings` (echoing the model and effort it was told), replays the `tool-allowed` ask on
-  a message containing `touch` and the rest once answered, and with `FAKE_CLAUDE_REFUSE_BYPASS=1`
-  refuses a bypass launch with the root sentence.
+  with it), `set_model` (`catalog_unknown` outside the `initialize` catalog), `apply_flag_settings`,
+  `get_settings` (echoing the model and effort it was told) and `mcp_status` (no servers), replays
+  the `tool-allowed` ask on a message containing `touch` and the rest once answered, and with
+  `FAKE_CLAUDE_REFUSE_BYPASS=1` refuses a bypass launch with the root sentence.

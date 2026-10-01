@@ -2396,6 +2396,31 @@ Plan vs build maps to Codex collaboration mode only: **Plan → `plan`**, **Buil
 The thread permission preset maps to Codex's built-in `permissions` profile and approval
 configuration (§9).
 
+### 4.6a Claude Code mapping (informative)
+
+The `ClaudeHarness` maps Claude Code's stream-json protocol (`claude -p --input-format stream-json
+--output-format stream-json`) onto the above. Its identifier model, launch flags and failure
+handling are described in
+[`crates/giskard-harness-claude/README.md`](../crates/giskard-harness-claude/README.md); the
+verified protocol is recorded in [`claude-code-harness-plan.md`](claude-code-harness-plan.md).
+
+| Claude Code | Giskard |
+|-------------|---------|
+| `initialize` control request | **once per process**, in the handshake at `open_thread`: one `claude` process per open thread (§4.7) |
+| `--session-id <uuid>` / `--resume <uuid>` | `open_thread`; a resume whose transcript is gone respawns with `--session-id` and the same id (the C5 fallback) |
+| `set_permission_mode`, `set_model`, `apply_flag_settings` and a `get_settings` read-back, then a `user` stdin line | `start_turn` + `TurnOverrides` |
+| `stream_event`, `assistant`, `user` tool results | `ItemStarted` / `ItemDelta` / `ItemCompleted` |
+| `can_use_tool` control request | `ApprovalRequested`, answered with the decision shapes of the harness plan §9.3 |
+| `AskUserQuestion` and other inbound control requests | `ServerRequestReceived` / `ServerRequestResolved` |
+| `result` (held while the CLI's agent tasks still run) | `TurnCompleted` |
+| `interrupt` control request | `interrupt` |
+| `/compact` user line | `compact_thread` |
+| `mcp_status` control request | `list_mcp_servers` |
+
+Plan maps to the CLI's `plan` permission mode and wins over the preset; in Build the preset maps to
+`default` / `acceptEdits` / `bypassPermissions` (§9.1). There is no steering (`steer_turn`), no
+structured diff (`DiffUpdated`), and no `item/tool/call` analogue.
+
 ### 4.7 Harness instances and processes
 
 - **One harness instance per working context.** An instance is one `AgentHarness` value:
@@ -3126,11 +3151,12 @@ header; without a bearer source, a custom `Authorization` header remains effecti
 **Id validation.** A `[providers.<id>]` key is the routing id sent to the harness, so an id the
 harness does not know cannot route. Giskard checks the configured ids against the harness's
 provider table whenever it composes a project's model list, and reports each unknown id as a
-warning (§8.3) naming the provider. The models stay in the picker — the harness may be
-misconfigured rather than the id being wrong — but the mismatch is surfaced at picker time
+warning (§8.3) naming the provider. Its declared models are left out of that harness's picker
+group, since they cannot be routed there (with several declarations, another harness that reports
+the id still offers them); the warning names the id, so the mismatch is surfaced at picker time
 instead of arriving as a provider-side `model_not_found` in the middle of a turn. An unanswered
-table (no capability, or a failed query) validates nothing: silence is not evidence that the ids
-are wrong.
+table (no capability, or a failed query) validates and filters nothing: silence is not evidence
+that the ids are wrong.
 
 > Note: Codex itself reads its own `~/.codex/config.toml` for provider/auth (Codex is
 > "already configured", §12.2). Giskard's provider config governs (a) what the UI offers in
@@ -3386,12 +3412,17 @@ presets:
 
 - **`ask_first`** — starts from Codex's built-in `:read-only` permissions profile and `on-request`
   permission preset. Reads can proceed; writes, commands, network, and other escalations require
-  approval.
+  approval. Claude Code: the `default` permission mode.
 - **`auto_approve`** — uses Codex's built-in `:workspace` permissions profile and `on-request`
   permission preset. Workspace work can proceed automatically; outside-workspace or other escalations
-  still require approval.
+  still require approval. Claude Code: the `acceptEdits` permission mode.
 - **`full_access`** — uses Codex's built-in `:danger-full-access` permissions profile and `never`
-  permission preset. The UI labels it with a warning marker.
+  permission preset. The UI labels it with a warning marker. Claude Code: the `bypassPermissions`
+  permission mode, which the CLI refuses as root, so `full_access` on Claude Code needs a server
+  running as an ordinary user (otherwise its turns are refused, quoting the CLI's sentence).
+
+Claude Code approves its built-in read-only command set without asking in every mode, `default`
+included; calls with an effect reach the approval card.
 
 The preset is a **thread-level** setting, **not** a per-project or per-turn override (P3/AP1). Project
 creation does not ask for it. New thread drafts default to `ask_first`, and the selected draft preset
@@ -3403,6 +3434,9 @@ initiator — the same durable-switch pattern as `SwitchMode`/`SelectModel` (P2)
 **Interaction with Plan mode.** Mode (Plan/Build) and permission preset are **orthogonal
 settings**. Plan mode changes Codex collaboration behavior (`plan` vs `default`) but does not force
 read-only sandboxing. The selected permission preset controls what the agent may do without asking.
+For a harness without that independence, Plan is itself a permission mode: Claude Code runs a Plan
+turn in its `plan` mode, which overrides the preset for that turn and makes file edits ask even
+under `auto_approve`; the preset applies again in Build.
 
 ### 9.2 Live approval flow (requires `capabilities.live_approvals`)
 
@@ -3446,8 +3480,10 @@ in an active turn with no remaining user action that can complete it.
 
 #### 9.2.1 Definition of "session" for `accept_for_session`
 
-"Session" = **the lifetime of the current harness process for that project** (i.e. the
-`codex app-server` child spawned for the project, §4.7). Rationale: the approval memory is a
+"Session" = **the lifetime of the harness process that enforces the grant**: for Codex the
+project's `codex app-server` child (§4.7), for Claude Code the thread's own `claude` child, so a
+Claude grant covers one thread and ends when that child stops (archive, delete, shutdown, crash).
+Rationale: the approval memory is a
 property of the running agent process, which is what actually enforces it, so the boundary
 must match that process.
 
@@ -3683,12 +3719,21 @@ alongside raw token counts. Off by default; raw token counts are the primary met
 - TLS is terminated upstream (Nginx). Giskard assumes HTTPS in production; the `Secure`
   cookie flag is on by default and can be disabled via config for local HTTP dev.
 
-### 12.2 Harness (Codex) auth
+### 12.2 Harness auth
 
 Codex is **already configured** on the machine (its own `~/.codex` credentials — ChatGPT
 login or API key / custom provider). Giskard does **not** manage Codex's auth; it inherits the
 environment when spawning the child process. Document the assumption clearly and fail with a
 helpful message if the spawned app-server reports it is unauthenticated.
+
+Claude Code must likewise be **logged in already**: interactively through `claude`, or with a
+`claude setup-token` token exported as `CLAUDE_CODE_OAUTH_TOKEN`. Giskard inherits the
+environment and does not manage the login; a child that reports it is unauthenticated fails the
+thread open with a message naming the fix. An `apiKeySource` other than `none` in the CLI's
+`system/init` is surfaced as a notice, because it means usage is billed to the API rather than the
+subscription (for example a stray `ANTHROPIC_API_KEY`, which a declaration's `env` overlay cannot
+unset). The operator's prevention is the managed `allowedProviders` setting, which Giskard does not
+write (harness plan §7).
 
 
 ---

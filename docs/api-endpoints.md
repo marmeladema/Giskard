@@ -45,9 +45,9 @@ when no `[harnesses]` table exists). A name the config does not declare is a `40
 lists the declared names, and nothing is created. The chosen name is stored in `project.json` as
 `harness` and is the project's default declaration: what a new thread runs on unless its draft
 picks a model of another declaration; `GET /api/projects/{id}` returns it.
-`GET /api/harnesses` lists the declarations in declaration order as
-`{"harnesses": [{"name", "kind", "default"}]}`, with exactly one entry marked `default`; the
-new-project modal shows its harness select only when more than one is listed. A project whose
+`GET /api/harnesses` lists the declarations in declaration order as `{"harnesses": [{"name", "kind",
+"default"}]}`, where `kind` is `codex` or `claude-code`, with exactly one entry marked `default`;
+the new-project modal shows its harness select only when more than one is listed. A project whose
 stored name is no longer declared opens its threads on that name read-only with a warning whose
 `detail` names the missing declaration and `[harnesses]`, and `POST
 /api/projects/{id}/threads/start` on it without a `harness` is a `400` with the same message.

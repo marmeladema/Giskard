@@ -1589,7 +1589,8 @@ offered with a warning that they cannot be routed). Stage 3 of `docs/multi-harne
 harness from the thread file's name and passes a detached handle for a cold thread, which the
 adapter handles, so Stage 3 remains desirable plumbing. The picker already groups by declaration
 name and `GET /api/harnesses` already carries `kind`, so no browser change and no screenshot
-regeneration is expected.
+regeneration is expected. Milestone 4 is implemented: `ClaudeCodeKind` in `bin/giskard-server.rs`,
+`list_mcp_servers` in the adapter, P8 and the per-harness model filter in the server.
 
 ### Milestone 5 — sub-agent child threads
 

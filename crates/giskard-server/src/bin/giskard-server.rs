@@ -4,12 +4,13 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use giskard_core::error::{HarnessError, PersistError};
 use giskard_harness::EnvOverlay;
+use giskard_harness_claude::{ClaudeHarness, ClaudeLaunchOptions};
 use giskard_harness_codex::{CodexDeclarationOptions, CodexHarness, CodexLaunchOptions};
 use giskard_persist::{Config, HarnessCatalog, HarnessDeclaration};
 use giskard_server::{
     AppState, HarnessInstanceSpec, HarnessKind, HarnessKindFactory, LogDriverEventSink, build_app,
 };
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 use tracing_subscriber::prelude::*;
 
 mod common;
@@ -61,6 +62,66 @@ impl HarnessKind for CodexKind {
             declaration: Some(spec.name.to_owned()),
         };
         Ok(CodexHarness::launch(spec.workspace_root, launch, bootstrap).await?)
+    }
+}
+
+struct ClaudeCodeKind;
+
+/// A `claude-code` declaration has no kind-specific keys (plan §5.1): everything the adapter
+/// needs from the environment is the neutral `env` overlay. Typing the empty table keeps a
+/// misspelt or misplaced key a startup error, as it is for Codex.
+#[derive(Default, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ClaudeDeclarationOptions {}
+
+/// Type-check a `claude-code` declaration's kind-specific keys (there are none).
+fn claude_options(declaration: &HarnessDeclaration) -> Result<ClaudeDeclarationOptions, String> {
+    toml::Value::Table(declaration.options.clone())
+        .try_into()
+        .map_err(|error: toml::de::Error| error.message().to_owned())
+}
+
+#[async_trait]
+impl HarnessKind for ClaudeCodeKind {
+    fn name(&self) -> &str {
+        "claude-code"
+    }
+
+    fn validate(&self, declaration: &HarnessDeclaration) -> Result<(), String> {
+        claude_options(declaration).map(|_| ())
+    }
+
+    async fn create(
+        &self,
+        spec: HarnessInstanceSpec<'_>,
+        bootstrap: giskard_harness::HarnessBootstrap,
+    ) -> Result<Arc<dyn giskard_harness::AgentHarness>, HarnessError> {
+        let declaration = spec.declaration;
+        // Validated at boot; re-checked rather than trusted so a failure is an error, not a panic.
+        claude_options(declaration).map_err(|message| {
+            HarnessError::Unsupported(format!("[harnesses.{}] {message}", spec.name))
+        })?;
+        let launch = ClaudeLaunchOptions {
+            command: declaration.command.as_ref().map(std::path::PathBuf::from),
+            args: declaration.args.clone(),
+            env: EnvOverlay::new(
+                declaration
+                    .env
+                    .iter()
+                    .map(|(name, value)| (name.to_owned(), value.to_owned())),
+            ),
+            project_id: Some(spec.project_id),
+            declaration: Some(spec.name.to_owned()),
+        };
+        // A per-thread-process adapter needs no bootstrap: each thread's child is spawned from
+        // its own stored session id at `open_thread`. Logged so a surprising count is visible.
+        debug!(
+            project_id = %spec.project_id,
+            harness = spec.name,
+            known_threads = bootstrap.known_threads.len(),
+            "claude-code instance created"
+        );
+        Ok(ClaudeHarness::new(spec.workspace_root, launch))
     }
 }
 
@@ -317,10 +378,13 @@ fn harness_catalog(config: &Config) -> Result<HarnessCatalog, String> {
     HarnessCatalog::resolve(config).map_err(|error| format!("invalid config.toml: {error}"))
 }
 
-/// The production factory: the `codex` kind over the given catalog, every declaration validated.
-fn codex_factory(catalog: HarnessCatalog) -> Result<HarnessKindFactory, String> {
+/// The production factory: the `codex` and `claude-code` kinds over the given catalog, every
+/// declaration validated.
+fn production_factory(catalog: HarnessCatalog) -> Result<HarnessKindFactory, String> {
     let factory = HarnessKindFactory::new()
         .register(Arc::new(CodexKind))
+        .map_err(|error| error.to_string())?
+        .register(Arc::new(ClaudeCodeKind))
         .map_err(|error| error.to_string())?
         .with_catalog(catalog);
     factory
@@ -355,7 +419,7 @@ async fn run(
     // Declarations are read once, from the startup config, and every one is checked before the
     // listener binds, so a typo refuses startup instead of surfacing on the first project open.
     let catalog = harness_catalog(&startup.config)?;
-    let factory = Arc::new(codex_factory(catalog)?);
+    let factory = Arc::new(production_factory(catalog)?);
 
     let state = AppState::new_with_config(
         startup.store,
@@ -437,7 +501,7 @@ mod tests {
 
     fn startup_factory(src: &str) -> Result<HarnessKindFactory, String> {
         let config: Config = toml::from_str(src).expect("config parses");
-        harness_catalog(&config).and_then(codex_factory)
+        harness_catalog(&config).and_then(production_factory)
     }
 
     #[test]
@@ -461,6 +525,28 @@ CODEX_HOME = "/home/you/.codex-nightly"
         )
         .expect("the README example is valid");
         assert_eq!(factory.catalog().default_name(), "codex-stable");
+
+        let factory = startup_factory(
+            r#"
+[harnesses.codex]
+kind = "codex"
+default = true
+
+[harnesses.claude]
+kind = "claude-code"
+[harnesses.claude.env]
+CLAUDE_CONFIG_DIR = "/home/you/.claude"
+"#,
+        )
+        .expect("the README Claude Code example is valid");
+        assert_eq!(factory.catalog().default_name(), "codex");
+        assert_eq!(
+            factory
+                .catalog()
+                .get("claude")
+                .map(|declaration| declaration.kind.as_str()),
+            Some("claude-code")
+        );
     }
 
     #[test]
@@ -469,6 +555,15 @@ CODEX_HOME = "/home/you/.codex-nightly"
             (
                 "[harnesses.x]\nkind = \"nope\"\n",
                 "invalid config.toml: [harnesses.x] names kind \"nope\"",
+            ),
+            (
+                "[harnesses.x]\nkind = \"claude\"\n",
+                "invalid config.toml: [harnesses.x] names kind \"claude\", which this server \
+                 cannot construct; supported kinds: codex, claude-code",
+            ),
+            (
+                "[harnesses.x]\nkind = \"claude-code\"\nprofile = \"x\"\n",
+                "invalid config.toml: [harnesses.x] unknown field `profile`",
             ),
             (
                 "[harnesses.x]\nkind = \"codex\"\nprofile = \"\"\n",

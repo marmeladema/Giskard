@@ -10,7 +10,7 @@ use std::collections::{HashMap, HashSet};
 use indexmap::IndexMap;
 
 use serde::Deserialize;
-use tracing::warn;
+use tracing::{debug, warn};
 
 use giskard_core::model::{ModelDescriptor, ModelRef};
 use giskard_harness::{HarnessProvider, ProviderAuth};
@@ -810,12 +810,18 @@ pub fn will_query_any_provider(config: &Config, harness_providers: &[HarnessProv
 /// the static list. Each such failure is logged **and** returned as a [`ModelListingWarning`] so
 /// it can be surfaced to the user rather than silently yielding no models (e.g. a 401 from a proxy
 /// whose key is missing or wrong).
+///
+/// `restrict_to_known` is set when the harness answered its provider table: the static list then
+/// keeps only models of providers the harness reports, since any other cannot be routed (the
+/// `validate_provider_ids` warning names each one left out). Without a table nothing is filtered:
+/// absence of evidence is not evidence that a provider is unknown.
 pub async fn discover_models(
     config: &Config,
     harness_providers: &[HarnessProvider],
+    restrict_to_known: bool,
     client_version: Option<&str>,
 ) -> Discovery {
-    let base = list_descriptors(config);
+    let base = static_base(config, harness_providers, restrict_to_known);
     let mut warnings: Vec<ModelListingWarning> = Vec::new();
 
     let client = match reqwest::Client::builder()
@@ -868,6 +874,36 @@ pub async fn discover_models(
         warnings,
         efforts_from_discovery,
     }
+}
+
+/// The config-declared models a harness can route: every one when `restrict_to_known` is unset,
+/// else only those of a provider in `harness_providers`.
+fn static_base(
+    config: &Config,
+    harness_providers: &[HarnessProvider],
+    restrict_to_known: bool,
+) -> Vec<ModelDescriptor> {
+    let base = list_descriptors(config);
+    if !restrict_to_known {
+        return base;
+    }
+    let (kept, dropped): (Vec<_>, Vec<_>) = base.into_iter().partition(|descriptor| {
+        harness_providers
+            .iter()
+            .any(|known| known.id == descriptor.provider)
+    });
+    if !dropped.is_empty() {
+        debug!(
+            action = "static_models",
+            dropped = dropped.len(),
+            providers = ?dropped
+                .iter()
+                .map(|descriptor| descriptor.provider.as_str())
+                .collect::<std::collections::BTreeSet<_>>(),
+            "left out declared models of providers the harness does not report"
+        );
+    }
+    kept
 }
 
 /// Query one provider's `/models`, returning what it offered and anything worth telling the user.
@@ -1281,6 +1317,47 @@ mod tests {
             ["zeta", "alpha", "beta", "mid"],
             "declared providers keep config's order; undeclared ones sort by id"
         );
+    }
+
+    fn two_provider_config() -> Config {
+        toml::from_str(
+            "[providers.openai]\nmodel_listing = false\n  [[providers.openai.models]]\n  \
+             id = \"gpt-5.5\"\n  context_window = 1000\n\
+             [providers.anthropic]\nmodel_listing = false\n  [[providers.anthropic.models]]\n  \
+             id = \"claude-sonnet-5-5\"\n  context_window = 2000\n",
+        )
+        .unwrap()
+    }
+
+    fn providers_of(discovery: &Discovery) -> Vec<&str> {
+        let mut providers: Vec<&str> = discovery
+            .models
+            .iter()
+            .map(|model| model.provider.as_str())
+            .collect();
+        providers.sort_unstable();
+        providers
+    }
+
+    /// A declared model of a provider the harness does not report cannot be routed, so it stays
+    /// out of that harness's picker group; without a table nothing is known, so nothing is cut.
+    #[tokio::test]
+    async fn declared_models_stay_with_the_providers_a_harness_reports() {
+        let config = two_provider_config();
+
+        let claude = vec![harness_provider("anthropic", None)];
+        let discovery = discover_models(&config, &claude, true, None).await;
+        assert_eq!(providers_of(&discovery), ["anthropic"]);
+
+        let both = vec![
+            harness_provider("openai", None),
+            harness_provider("anthropic", None),
+        ];
+        let discovery = discover_models(&config, &both, true, None).await;
+        assert_eq!(providers_of(&discovery), ["anthropic", "openai"]);
+
+        let discovery = discover_models(&config, &[], false, None).await;
+        assert_eq!(providers_of(&discovery), ["anthropic", "openai"]);
     }
 
     /// A config entry naming a provider the harness has never heard of cannot be queried, and must

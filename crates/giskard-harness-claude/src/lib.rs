@@ -1,11 +1,12 @@
 //! Claude Code CLI adapter (`claude -p --output-format stream-json`).
 //!
-//! Milestone 3 of `specs/claude-code-harness-plan.md`: the pure mapper from Claude Code's
+//! Milestones 3 and 4 of `specs/claude-code-harness-plan.md`: the pure mapper from Claude Code's
 //! stream-json output to Giskard's [`AgentEvent`](giskard_core::event::AgentEvent)s, plus
 //! [`ClaudeHarness`], an `AgentHarness` that supervises one `claude` child per primary thread and
 //! answers its approvals and server requests, applies per-turn permission mode, model and effort,
-//! and runs manual compaction. The kind is registered in milestone 4; see this crate's README for
-//! which milestone supplies what is missing.
+//! runs manual compaction, and lists the CLI's MCP servers. The server registers it as the
+//! `claude-code` kind (milestone 4); see this crate's README for which milestone supplies what is
+//! missing.
 //!
 //! Every Claude Code-specific type stays inside this crate.
 
@@ -18,6 +19,7 @@ mod ids;
 mod log_checks;
 mod log_fields;
 mod mapper;
+mod mcp;
 mod process;
 mod session;
 
@@ -40,9 +42,7 @@ pub fn capabilities() -> HarnessCapabilities {
         model_listing: true,
         provider_listing: true,
         token_usage: true,
-        // Milestone 4 wires `list_mcp_servers` (the `mcp_status` control request) beside
-        // registration; until then the trait default answers `Unsupported`.
-        mcp_status: false,
+        mcp_status: true,
         // `compact_thread` writes `/compact` as a compaction turn.
         context_compaction: true,
         // `structured_diffs`, `mcp_reload`, `mcp_oauth_login` and `turn_steering` are false per
@@ -56,7 +56,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn capabilities_advertise_milestone_three() {
+    fn capabilities_advertise_milestone_four() {
         let capabilities = capabilities();
         assert!(capabilities.live_approvals);
         assert!(capabilities.plan_build_modes);
@@ -66,7 +66,7 @@ mod tests {
         assert!(capabilities.token_usage);
         assert!(capabilities.model_listing);
         assert!(capabilities.provider_listing);
-        assert!(!capabilities.mcp_status);
+        assert!(capabilities.mcp_status);
         assert!(capabilities.context_compaction);
         assert!(!capabilities.structured_diffs);
         assert!(!capabilities.mcp_reload);

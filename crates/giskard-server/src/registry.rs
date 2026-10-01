@@ -1941,9 +1941,11 @@ async fn resolve_reverse_subagent_target(
     let Some(source) = graph.get(&source_thread_id) else {
         return Err(HarnessError::ThreadNotFound(source_thread_id));
     };
-    let target = graph
-        .values()
-        .find(|thread| thread.harness_thread_id == native_thread_id);
+    // Native ids are namespaced by the harness that minted them: with two declarations in one
+    // project, a thread of another declaration carrying the same id is not this source's parent.
+    let target = graph.values().find(|thread| {
+        thread.harness_thread_id == native_thread_id && thread.harness == source.harness
+    });
     Ok(target
         .filter(|target| source.parent_thread_id == Some(target.id))
         .map(|target| target.id))
@@ -3047,6 +3049,56 @@ mod tests {
             .iter()
             .map(|(native, handle)| (native.clone(), handle.thread))
             .collect()
+    }
+
+    #[tokio::test]
+    async fn a_reverse_subagent_lookup_stays_within_the_source_harness() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(PersistStore::new(tmp.path().to_path_buf()));
+        let (project, _) = create_test_project(&store, "reverse-lookup").await;
+        let (registry, _, _) = discovery_registry(store.clone()).await;
+
+        let other_parent = ThreadId::new();
+        save_thread_on(&store, project, other_parent, "native-shared", "b").await;
+        let source = ThreadId::new();
+        let mut child = test_thread_file(
+            project,
+            source,
+            "native-child",
+            giskard_core::ThreadKind::Subagent,
+        );
+        child.harness = "a".into();
+        child.parent_thread_id = Some(other_parent);
+        store.save_thread(project, &child).await.unwrap();
+
+        // Only a `b` thread carries the id: no target, even though it is the recorded parent.
+        assert_eq!(
+            super::resolve_reverse_subagent_target(
+                &registry.shared,
+                project,
+                source,
+                "native-shared"
+            )
+            .await
+            .unwrap(),
+            None
+        );
+
+        let parent = ThreadId::new();
+        save_thread_on(&store, project, parent, "native-shared", "a").await;
+        child.parent_thread_id = Some(parent);
+        store.save_thread(project, &child).await.unwrap();
+        assert_eq!(
+            super::resolve_reverse_subagent_target(
+                &registry.shared,
+                project,
+                source,
+                "native-shared"
+            )
+            .await
+            .unwrap(),
+            Some(parent)
+        );
     }
 
     #[tokio::test]

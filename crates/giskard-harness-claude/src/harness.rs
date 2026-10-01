@@ -11,6 +11,7 @@ use async_trait::async_trait;
 use giskard_core::approval::ApprovalDecision;
 use giskard_core::error::HarnessError;
 use giskard_core::ids::{ApprovalId, ServerRequestId, ThreadId, TurnId};
+use giskard_core::mcp::McpServerStatus;
 use giskard_core::model::{Effort, ModelDescriptor, ModelRef};
 use giskard_core::server_request::ServerRequestResponse;
 use giskard_core::turn::{Mode, PermissionPreset, TurnOverrides};
@@ -31,6 +32,7 @@ use crate::frame::Frame;
 use crate::ids::is_task_native_id;
 use crate::log_fields::display_opt;
 use crate::mapper::ClaudeMapper;
+use crate::mcp::mcp_servers;
 use crate::process::{
     ChildExit, ChildLogContext, ClaudeChild, ClaudeLaunchOptions, ExitKind, LaunchMode,
     SessionArgs, SessionFlag, bypass_refused_sentence, classify_exit, probe_argv,
@@ -468,51 +470,7 @@ impl ClaudeHarness {
     /// Spawn a probe child, read its catalog, and let it exit. Leaves no transcript.
     async fn probe_catalog(&self) -> Result<CatalogSnapshot, HarnessError> {
         let started = Instant::now();
-        let context = self.context(None, None);
-        let argv = probe_argv(&self.launch);
-        let mut child = self
-            .spawner
-            .spawn(&argv, &self.workspace_root, &context)
-            .await?;
-        let mut early = Vec::new();
-        let mut result_errors = Vec::new();
-        let reply = tokio::time::timeout(
-            PROBE_TIMEOUT,
-            request(
-                child.as_mut(),
-                &new_request_id(),
-                &json!({"subtype": "initialize"}),
-                &mut early,
-                &mut result_errors,
-            ),
-        )
-        .await;
-        let models = match reply {
-            Ok(Ok(Ok(reply))) => reply,
-            Ok(Ok(Err(message))) => {
-                reap(child.as_mut()).await;
-                return Err(HarnessError::Spawn(format!(
-                    "claude refused initialize: {message}"
-                )));
-            }
-            Ok(Err(failure)) => return Err(failure.into_error(&context)),
-            Err(_) => {
-                child.start_kill();
-                child.wait().await;
-                warn!(
-                    action = "catalog_probe",
-                    timeout_ms = PROBE_TIMEOUT.as_millis() as u64,
-                    "the catalog probe did not answer initialize; killed it"
-                );
-                return Err(HarnessError::Timeout(format!(
-                    "claude did not answer initialize within {} s",
-                    PROBE_TIMEOUT.as_secs()
-                )));
-            }
-        };
-        let reply = InitializeReply::from_value(&models);
-        reap(child.as_mut()).await;
-        let snapshot = self.store_catalog(reply.models.as_deref().unwrap_or_default(), "probe");
+        let (snapshot, _) = self.probe(None).await?;
         info!(
             project_id = display_opt(self.launch.project_id),
             harness = display_opt(self.launch.declaration.as_deref()),
@@ -522,6 +480,104 @@ impl ClaudeHarness {
             "read the Claude Code model catalog from a probe child"
         );
         Ok(snapshot)
+    }
+
+    /// Spawn a probe child, run `initialize` and then `follow_up` when given, and let it exit.
+    /// The catalog snapshot is stored from `initialize` either way; the second value is
+    /// `follow_up`'s success payload. Leaves no transcript.
+    async fn probe(
+        &self,
+        follow_up: Option<&Value>,
+    ) -> Result<(CatalogSnapshot, Option<Value>), HarnessError> {
+        let context = self.context(None, None);
+        let argv = probe_argv(&self.launch);
+        let mut child = self
+            .spawner
+            .spawn(&argv, &self.workspace_root, &context)
+            .await?;
+        let mut early = Vec::new();
+        let mut result_errors = Vec::new();
+        let initialize = json!({"subtype": "initialize"});
+        let reply = probe_request(
+            child.as_mut(),
+            &context,
+            &initialize,
+            &mut early,
+            &mut result_errors,
+        )
+        .await
+        .map_err(|error| match error {
+            HarnessError::Protocol(message) => {
+                HarnessError::Spawn(format!("claude refused initialize: {message}"))
+            }
+            other => other,
+        })?;
+        let reply = InitializeReply::from_value(&reply);
+        let snapshot = self.store_catalog(reply.models.as_deref().unwrap_or_default(), "probe");
+        let answer = match follow_up {
+            Some(body) => Some(
+                probe_request(
+                    child.as_mut(),
+                    &context,
+                    body,
+                    &mut early,
+                    &mut result_errors,
+                )
+                .await?,
+            ),
+            None => None,
+        };
+        reap(child.as_mut()).await;
+        Ok((snapshot, answer))
+    }
+}
+
+/// One probe request under `PROBE_TIMEOUT`. A refusal is `HarnessError::Protocol` and the child
+/// is reaped; an exit before the answer is the handshake error; a timeout kills the child.
+async fn probe_request(
+    child: &mut dyn ClaudeChild,
+    context: &ChildLogContext,
+    body: &Value,
+    early: &mut Vec<String>,
+    result_errors: &mut Vec<String>,
+) -> Result<Value, HarnessError> {
+    let subtype = body.get("subtype").and_then(Value::as_str).unwrap_or("?");
+    let reply = tokio::time::timeout(
+        PROBE_TIMEOUT,
+        request(child, &new_request_id(), body, early, result_errors),
+    )
+    .await;
+    match reply {
+        Ok(Ok(Ok(reply))) => Ok(reply),
+        Ok(Ok(Err(message))) => {
+            reap(child).await;
+            warn!(
+                project_id = display_opt(context.project_id),
+                harness = display_opt(context.harness.as_deref()),
+                action = "probe",
+                subtype,
+                error = %message,
+                "Claude Code refused a probe request"
+            );
+            Err(HarnessError::Protocol(message))
+        }
+        Ok(Err(failure)) => Err(failure.into_error(context)),
+        Err(_) => {
+            child.start_kill();
+            child.wait().await;
+            warn!(
+                project_id = display_opt(context.project_id),
+                harness = display_opt(context.harness.as_deref()),
+                action = "probe",
+                subtype,
+                timeout_ms = PROBE_TIMEOUT.as_millis() as u64,
+                "a probe child did not answer in time; killed it"
+            );
+            Err(HarnessError::Timeout(format!(
+                "claude did not answer {subtype} within {} s",
+                PROBE_TIMEOUT.as_secs()
+            )))
+        }
     }
 }
 
@@ -998,6 +1054,65 @@ impl AgentHarness for ClaudeHarness {
         self.ensure_running()?;
         let snapshot = self.probe_catalog().await?;
         Ok(descriptors(&snapshot))
+    }
+
+    /// A live child's servers when one runs (what the user's session connected), else a probe's.
+    async fn list_mcp_servers(&self) -> Result<Vec<McpServerStatus>, HarnessError> {
+        self.ensure_running()?;
+        let request = json!({"subtype": "mcp_status"});
+        let live = lock(&self.children)
+            .iter()
+            .next()
+            .map(|(thread, handle)| (*thread, handle.commands.clone()));
+        if let Some((thread, commands)) = live {
+            let payload = self
+                .call(thread, commands, "mcp_status", CONTROL_TIMEOUT, |reply| {
+                    ChildCommand::Control { request, reply }
+                })
+                .await
+                .inspect_err(|error| {
+                    warn!(
+                        project_id = display_opt(self.launch.project_id),
+                        harness = display_opt(self.launch.declaration.as_deref()),
+                        thread_id = %thread,
+                        action = "mcp_status",
+                        error = %error,
+                        "a live claude child did not report its MCP servers"
+                    );
+                })?;
+            let servers = mcp_servers(&payload);
+            info!(
+                project_id = display_opt(self.launch.project_id),
+                harness = display_opt(self.launch.declaration.as_deref()),
+                thread_id = %thread,
+                action = "mcp_status",
+                servers = servers.len(),
+                "read the MCP servers of a live claude child"
+            );
+            return Ok(servers);
+        }
+        let _probe = self.probe.lock().await;
+        self.ensure_running()?;
+        let started = Instant::now();
+        let (_, payload) = self.probe(Some(&request)).await.inspect_err(|error| {
+            warn!(
+                project_id = display_opt(self.launch.project_id),
+                harness = display_opt(self.launch.declaration.as_deref()),
+                action = "mcp_probe",
+                error = %error,
+                "the MCP probe failed"
+            );
+        })?;
+        let servers = mcp_servers(&payload.unwrap_or(Value::Null));
+        info!(
+            project_id = display_opt(self.launch.project_id),
+            harness = display_opt(self.launch.declaration.as_deref()),
+            action = "mcp_probe",
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            servers = servers.len(),
+            "read the Claude Code MCP servers from a probe child"
+        );
+        Ok(servers)
     }
 
     async fn list_providers(&self) -> Result<Vec<HarnessProvider>, HarnessError> {
@@ -4356,6 +4471,131 @@ mod tests {
         ));
     }
 
+    // ---- MCP servers ---------------------------------------------------------------------------
+
+    fn mcp_probe_child(answer: Action) -> (ScriptedChild, Arc<Mutex<ScriptRecord>>) {
+        ScriptedChild::new(vec![
+            Step::OnStdin(
+                control("initialize"),
+                vec![Action::Respond(initialize_payload())],
+            ),
+            Step::OnStdin(control("mcp_status"), vec![answer]),
+        ])
+    }
+
+    #[traced_test]
+    #[tokio::test]
+    async fn list_mcp_servers_probes_when_no_child_is_live() {
+        let (empty, empty_record) = mcp_probe_child(Action::Respond(json!({"mcpServers": []})));
+        let (two, _) = mcp_probe_child(Action::Respond(crate::mcp::tests::failed_and_pending()));
+        let (harness, spawner) = harness(vec![empty, two]);
+
+        assert!(harness.list_mcp_servers().await.unwrap().is_empty());
+        assert!(lock(&empty_record).stdin_closed, "the probe exits");
+        assert_eq!(harness.live_children(), 0, "a probe is not a live child");
+        assert!(
+            harness.catalog_snapshot().is_some(),
+            "the probe's initialize stores the catalog"
+        );
+
+        let servers = harness.list_mcp_servers().await.unwrap();
+        let names: Vec<_> = servers.iter().map(|server| server.name.as_str()).collect();
+        assert_eq!(names, ["broken", "echo"]);
+        assert!(servers.iter().all(|server| server.auth_status
+            == giskard_core::mcp::McpAuthStatus::Unknown
+            && server.tools.is_empty()));
+        assert_eq!(
+            servers[0]
+                .server_info
+                .as_ref()
+                .and_then(|info| info.description.as_deref()),
+            Some("failed: ENOENT: no such file or directory, posix_spawn 'stdio'")
+        );
+        assert_eq!(
+            spawner.spawns()[0],
+            crate::process::probe_argv(&ClaudeLaunchOptions::default())
+        );
+        assert!(logs_contain("action=\"mcp_probe\""));
+        assert!(logs_contain("servers=2"));
+    }
+
+    #[tokio::test]
+    async fn list_mcp_servers_maps_a_needs_auth_status() {
+        let (probe, _) = mcp_probe_child(Action::Respond(json!({"mcpServers": [
+            {"name": "remote", "status": "needs-auth", "scope": "user", "source": "user"}
+        ]})));
+        let (harness, _) = harness(vec![probe]);
+        let servers = harness.list_mcp_servers().await.unwrap();
+        assert_eq!(
+            servers[0].auth_status,
+            giskard_core::mcp::McpAuthStatus::NotLoggedIn
+        );
+    }
+
+    #[traced_test]
+    #[tokio::test]
+    async fn list_mcp_servers_asks_a_live_child_without_probing() {
+        let (session, record) = scripted(
+            handshake_steps("sonnet"),
+            vec![Step::OnStdin(
+                control("mcp_status"),
+                vec![Action::Respond(crate::mcp::tests::failed_and_pending())],
+            )],
+        );
+        let (harness, spawner) = harness(vec![session]);
+        let (options, _updates) = open_options(ThreadId::new(), None, "sonnet");
+        harness.open_thread(options).await.unwrap();
+
+        let servers = harness.list_mcp_servers().await.unwrap();
+        assert_eq!(servers.len(), 2);
+        assert_eq!(spawner.spawns().len(), 1, "no probe was spawned");
+        assert!(
+            written(&record)
+                .iter()
+                .any(|line| line["request"]["subtype"] == "mcp_status")
+        );
+        assert!(logs_contain("read the MCP servers of a live claude child"));
+        harness.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_refused_mcp_status_is_a_protocol_error() {
+        let (probe, record) = mcp_probe_child(Action::RespondError("mcp unavailable"));
+        let (harness, _) = harness(vec![probe]);
+        let error = harness.list_mcp_servers().await.unwrap_err();
+        assert!(
+            matches!(&error, HarnessError::Protocol(message) if message == "mcp unavailable"),
+            "{error}"
+        );
+        assert!(lock(&record).stdin_closed, "the refused probe is reaped");
+    }
+
+    #[tokio::test]
+    async fn an_mcp_probe_that_exits_before_answering_is_the_handshake_error() {
+        let (probe, _) = mcp_probe_child(Action::Exit {
+            code: 1,
+            stderr: vec!["boom".into()],
+        });
+        let (harness, _) = harness(vec![probe]);
+        let error = harness.list_mcp_servers().await.unwrap_err();
+        assert!(
+            matches!(&error, HarnessError::Spawn(message)
+                if message.contains("before answering mcp_status") && message.contains("boom")),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_mcp_servers_after_shutdown_is_refused() {
+        let (harness, spawner) = harness(Vec::new());
+        harness.shutdown().await.unwrap();
+        assert!(matches!(
+            harness.list_mcp_servers().await,
+            Err(HarnessError::Transport(_))
+        ));
+        assert!(spawner.spawns().is_empty());
+    }
+
     #[tokio::test]
     async fn list_providers_reports_anthropic_with_the_overlay() {
         let env = EnvOverlay::new([("ANTHROPIC_BASE_URL".into(), "http://proxy".into())]);
@@ -4423,6 +4663,13 @@ mod tests {
         harness.set_thread_name(&handle, "named").await.unwrap();
         harness.shutdown().await.unwrap();
         assert!(matches!(stream.recv().await, Err(EventStreamError::Closed)));
+    }
+
+    #[tokio::test]
+    async fn a_real_probe_lists_no_mcp_servers() {
+        let (harness, _workspace) = real_harness(&[]);
+        assert!(harness.list_mcp_servers().await.unwrap().is_empty());
+        assert_eq!(harness.live_children(), 0);
     }
 
     #[tokio::test]

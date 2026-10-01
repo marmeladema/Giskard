@@ -4185,9 +4185,12 @@ async fn refresh_project_model_catalog(
     } else {
         None
     };
+    // A configured provider the harness does not report is left out of this harness's group: the
+    // `validate_provider_ids` warning above already says its models cannot be routed.
     let discovery = crate::models::discover_models(
         config,
         harness_providers.as_deref().unwrap_or(&[]),
+        harness_providers.is_some(),
         client_version.as_deref(),
     )
     .await;

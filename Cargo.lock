@@ -841,6 +841,7 @@ dependencies = [
  "giskard-core",
  "giskard-git-parser",
  "giskard-harness",
+ "giskard-harness-claude",
  "giskard-harness-codex",
  "giskard-harness-replay",
  "giskard-persist",
