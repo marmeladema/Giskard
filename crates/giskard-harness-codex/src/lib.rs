@@ -8,6 +8,8 @@
 //! lifecycles, background-command ownership, and termination routing.
 
 mod instance;
+#[cfg(test)]
+mod log_checks;
 mod log_fields;
 mod mapping;
 mod native_ids;
@@ -37,7 +39,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::{mpsc, oneshot, watch};
-use tracing::{debug, error, info, warn};
+use tracing::{Instrument, debug, error, info, warn};
 
 use giskard_core::approval::ApprovalDecision;
 use giskard_core::error::HarnessError;
@@ -661,8 +663,9 @@ impl CodexHarness {
             },
         });
 
-        tokio::spawn(run_worker_queue_watchdog(Arc::downgrade(&worker_queue)));
-        tokio::spawn(instance.run());
+        // Both tasks log for the instance's whole life: they run in the span it was started in.
+        tokio::spawn(run_worker_queue_watchdog(Arc::downgrade(&worker_queue)).in_current_span());
+        tokio::spawn(instance.run().in_current_span());
         Ok(harness)
     }
 

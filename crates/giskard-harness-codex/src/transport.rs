@@ -18,7 +18,7 @@ use tokio::io::{
 use tokio::process::Child;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
-use tracing::{debug, error, trace, warn};
+use tracing::{Instrument, debug, error, trace, warn};
 
 const STDOUT_BUFFER_SIZE: usize = 10 * 1024 * 1024;
 const WRITER_QUEUE_CAPACITY: usize = 64;
@@ -144,8 +144,11 @@ impl StdioTransport {
         let inbox_reader = inbox.reader();
         let waiters = Arc::new(Mutex::new(HashMap::new()));
         let (writer_tx, writer_rx) = mpsc::channel(WRITER_QUEUE_CAPACITY);
-        let reader_task = tokio::spawn(read_stdout(reader, inbox.clone(), waiters.clone()));
-        let writer_task = tokio::spawn(write_stdin(writer, writer_rx, waiters.clone()));
+        // Both tasks log; they run in the span the transport was created in.
+        let reader_task =
+            tokio::spawn(read_stdout(reader, inbox.clone(), waiters.clone()).in_current_span());
+        let writer_task =
+            tokio::spawn(write_stdin(writer, writer_rx, waiters.clone()).in_current_span());
         Self {
             writer_tx: Some(writer_tx),
             inbox,
@@ -582,33 +585,37 @@ fn transport_closed() -> HarnessError {
 }
 
 fn drain_stderr(stderr: tokio::process::ChildStderr) -> JoinHandle<()> {
-    tokio::spawn(async move {
-        let mut reader = BufReader::new(stderr);
-        let mut line = String::new();
-        loop {
-            line.clear();
-            match reader.read_line(&mut line).await {
-                Ok(0) => return,
-                Ok(_) => {
-                    let line = strip_ansi(&line);
-                    let line = line.trim_end_matches(['\n', '\r']);
-                    if line.contains(" ERROR ") {
-                        error!(target: "codex_codes::stderr", "{line}");
-                    } else if line.contains(" WARN ") {
-                        warn!(target: "codex_codes::stderr", "{line}");
-                    } else if line.contains(" DEBUG ") {
-                        debug!(target: "codex_codes::stderr", "{line}");
-                    } else {
-                        trace!(target: "codex_codes::stderr", "{line}");
+    // Every stderr line is logged: the drain runs in the span the child was spawned in.
+    tokio::spawn(
+        async move {
+            let mut reader = BufReader::new(stderr);
+            let mut line = String::new();
+            loop {
+                line.clear();
+                match reader.read_line(&mut line).await {
+                    Ok(0) => return,
+                    Ok(_) => {
+                        let line = strip_ansi(&line);
+                        let line = line.trim_end_matches(['\n', '\r']);
+                        if line.contains(" ERROR ") {
+                            error!(target: "codex_codes::stderr", "{line}");
+                        } else if line.contains(" WARN ") {
+                            warn!(target: "codex_codes::stderr", "{line}");
+                        } else if line.contains(" DEBUG ") {
+                            debug!(target: "codex_codes::stderr", "{line}");
+                        } else {
+                            trace!(target: "codex_codes::stderr", "{line}");
+                        }
                     }
-                }
-                Err(error) => {
-                    debug!(%error, "stopped draining Codex stderr");
-                    return;
+                    Err(error) => {
+                        debug!(%error, "stopped draining Codex stderr");
+                        return;
+                    }
                 }
             }
         }
-    })
+        .in_current_span(),
+    )
 }
 
 fn strip_ansi(value: &str) -> String {
@@ -632,13 +639,14 @@ fn strip_ansi(value: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::log_checks::lines_with;
     use serde_json::json;
-    use std::io::Write;
     use std::pin::Pin;
     use std::sync::atomic::AtomicBool;
     use std::task::{Context, Poll};
     use tokio::io::{AsyncWriteExt, DuplexStream, ReadHalf, WriteHalf, duplex, split};
     use tokio::time::{Duration, timeout};
+    use tracing_test::traced_test;
 
     struct Peer {
         reader: BufReader<ReadHalf<DuplexStream>>,
@@ -647,33 +655,6 @@ mod tests {
 
     struct GatedWriter {
         polled: Arc<AtomicBool>,
-    }
-
-    #[derive(Clone)]
-    struct CapturedLogWriter(Arc<Mutex<Vec<u8>>>);
-
-    impl Write for CapturedLogWriter {
-        fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
-            lock_mutex(&self.0).extend_from_slice(buffer);
-            Ok(buffer.len())
-        }
-
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
-    fn capture_debug_logs(log: impl FnOnce()) -> String {
-        let output = Arc::new(Mutex::new(Vec::new()));
-        let writer_output = output.clone();
-        let subscriber = tracing_subscriber::fmt()
-            .without_time()
-            .with_ansi(false)
-            .with_max_level(tracing::Level::DEBUG)
-            .with_writer(move || CapturedLogWriter(writer_output.clone()))
-            .finish();
-        tracing::subscriber::with_default(subscriber, log);
-        String::from_utf8(lock_mutex(&output).clone()).unwrap()
     }
 
     impl AsyncWrite for GatedWriter {
@@ -885,18 +866,15 @@ mod tests {
     }
 
     #[test]
+    #[traced_test]
     fn a_late_response_is_logged_exactly_once() {
         let waiters = Arc::new(Mutex::new(HashMap::new()));
-        let output = capture_debug_logs(|| {
-            deliver_response(&waiters, RequestId::Integer(7), Ok(json!("late")));
-        });
-        assert_eq!(
-            output
-                .matches("dropping Codex response without a pending request")
-                .count(),
-            1
-        );
-        assert!(output.contains("request_id=7"), "{output}");
+        deliver_response(&waiters, RequestId::Integer(7), Ok(json!("late")));
+        logs_assert(lines_with(
+            1,
+            &["dropping Codex response without a pending request"],
+        ));
+        assert!(logs_contain("request_id=7"));
     }
 
     #[tokio::test]
