@@ -780,6 +780,15 @@ nesting tree by following those IDs"* — exactly the thread graph this design b
   gained only machine state (`.claude.json` and its backup, `policy-limits.json`,
   `remote-settings.json`) and **no `projects/` directory at all**. No `--session-id` is needed, and one
   request is enough: `initialize.models` and `list_models.models` came back byte-identical.
+  **Re-verified on 2.1.287 with `mcp_status` as the follow-up** (the MCP-status-per-thread change):
+  a probe launched with the adapter's exact protocol flags, sent `initialize` alone or `initialize`
+  then `mcp_status`, then closed, created **no `projects/<cwd>/` directory, no session `.jsonl`,
+  no `sessions/` entry and no project entry in `.claude.json`**; the only files touched were caches
+  (`cache/model-catalog/*`, the growth-book features in `.claude.json` and its backup,
+  `policy-limits.json`, `remote-settings.json`). It does start the user's configured MCP servers for
+  the second it lives, which is the price of reporting their status. **The rule** (`AGENTS.md`):
+  the probe never becomes a session, and every new control request sent on it is verified this
+  way first.
 
   The probe runs with the declaration's `command`, `args` and `env` overlay and
   `--setting-sources user` — the §8.3 choice — **against the user's real `CLAUDE_CONFIG_DIR`, not a
@@ -1644,7 +1653,12 @@ thread. The change: `list_mcp_servers` takes an optional `ThreadHandle`, the rou
 thread's child and falls through to the probe otherwise (also when the child just exited), Codex
 ignores the handle; `docs/api-endpoints.md` and the adapter README follow. It touches the trait,
 the route and `app.js`, so it is one small commit of its own after milestone 5 merges, not part of
-5 or 6.
+5 or 6. Its detailed plan is `claude-code-harness-plan/mcp-status-per-thread-plan.md`, written
+against milestone 5's tree: the hint is resolved from the open thread's binding on the server (a
+thread of another project is `404`, of another declaration `400`, one that is not open answers for
+the instance), a sub-agent hint asks the child that carries it, no hint or a hint without a live
+child asks the thread-less probe (never an arbitrary child), and a live child's failure is
+returned rather than probed around.
 
 ### Later, as its own decision — the hook route (§9.4)
 

@@ -103,6 +103,14 @@ Cargo workspace with 9 crates under `crates/`:
   always a deliberate act.
 - All Codex-specific types confined to `giskard-harness-codex`, and all Claude Code-specific types
   to `giskard-harness-claude`.
+- The Claude Code adapter's thread-less **probe child** (what answers an instance-scoped question
+  such as `list_models` or `list_mcp_servers` when no thread's process is asked) must never become a
+  Claude Code session: it is launched with the protocol flags only (no `--session-id`, `--resume`,
+  `--model`, `--permission-mode`), it is written only control requests through `control_line`, never
+  a `user` line, and its stdin is closed after the last answer. Before a new control request is sent
+  on a probe, verify against the real CLI that the request leaves no `projects/<cwd>/` transcript,
+  no session file and no entry in `.claude.json` (only cache files), and record the result in the
+  adapter README.
 - One `CodexInstance` is the single-task state authority for each Codex app-server process. Its
   transport, mapper, active turns, and pending context restores must remain task-owned. Do not share
   them through `Arc<Mutex<_>>`, `Arc<RwLock<_>>`, or independent state-mutating workers; helper
