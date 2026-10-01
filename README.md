@@ -540,6 +540,7 @@ Cargo workspace under `crates/`:
 | `giskard-git-parser` | Parsers for `git` porcelain v2 and numstat output (no I/O). |
 | `giskard-harness` | The `AgentHarness` trait + capabilities. |
 | `giskard-harness-codex` | Codex CLI adapter (spawns/speaks to `codex app-server`). |
+| `giskard-harness-claude` | Claude Code CLI adapter; milestone 1: the stream-json output mapper only, not yet selectable. |
 | `giskard-harness-replay` | Deterministic replay harness for tests. |
 | `giskard-persist` | Flat-file storage + the `giskard-admin` binary. |
 | `giskard-proto` | Shared client↔server wire types (path-mirrored `Wire*` types). |

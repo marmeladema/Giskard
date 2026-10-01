@@ -4,6 +4,7 @@ members = [
     "crates/giskard-core",
     "crates/giskard-git-parser",
     "crates/giskard-harness",
+    "crates/giskard-harness-claude",
     "crates/giskard-harness-codex",
     "crates/giskard-harness-replay",
     "crates/giskard-persist",
@@ -25,6 +26,7 @@ rust-version = "1.89"
 giskard-core = { path = "crates/giskard-core" }
 giskard-git-parser = { path = "crates/giskard-git-parser" }
 giskard-harness = { path = "crates/giskard-harness" }
+giskard-harness-claude = { path = "crates/giskard-harness-claude" }
 giskard-harness-codex = { path = "crates/giskard-harness-codex" }
 giskard-harness-replay = { path = "crates/giskard-harness-replay" }
 giskard-persist = { path = "crates/giskard-persist" }
