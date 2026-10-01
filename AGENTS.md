@@ -168,6 +168,14 @@ Cargo workspace with 9 crates under `crates/`:
   - degraded-but-usable flows should surface warnings rather than fail silently.
 - Error paths need tests too. When adding or changing a failure mode, add focused coverage for the
   structured error, warning, log-adjacent behavior, or persisted recovery path as appropriate.
+- Tests never install a scoped tracing subscriber (`tracing::subscriber::set_default` /
+  `with_default`): tracing-core caches each callsite's interest process-wide, so a scoped
+  subscriber can silently lose lines, failing positive assertions and passing negative ones.
+  Log assertions use `#[traced_test]` from `tracing-test` (after `#[tokio::test]`) with
+  `logs_contain` and `logs_assert`; a `logs_assert` check returns `Err`, never panics, since it runs
+  under the global log buffer's lock. Every spawned task that logs is instrumented with
+  `.in_current_span()` (`tracing::Instrument`), so its lines carry the span of the code that
+  spawned it, which is how `#[traced_test]` attributes them to a test.
 - New async, WebSocket, harness, persistence, approval, command/tool, or cross-thread lifecycle
   paths need useful observability at their boundaries. Prefer structured logs with stable fields
   such as `project_id`, `thread_id`, `turn_id`, `action`, `method`, `command_id`, `tool_call_id`,
