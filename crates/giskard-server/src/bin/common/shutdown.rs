@@ -4,7 +4,7 @@ use std::time::Duration;
 use axum::Router;
 use giskard_server::{AppShutdown, HarnessRegistry};
 use tokio::sync::watch;
-use tracing::{error, info, warn};
+use tracing::{Instrument, error, info, warn};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Phase {
@@ -20,14 +20,17 @@ pub enum RunOutcome<T> {
 
 pub fn install_signal_handler() -> watch::Receiver<Phase> {
     let (sender, receiver) = watch::channel(Phase::Running);
-    tokio::spawn(async move {
-        let signal = next_signal().await;
-        info!(signal, "server shutdown signal received");
-        sender.send_replace(Phase::Graceful(signal));
+    tokio::spawn(
+        async move {
+            let signal = next_signal().await;
+            info!(signal, "server shutdown signal received");
+            sender.send_replace(Phase::Graceful(signal));
 
-        let signal = next_signal().await;
-        sender.send_replace(Phase::Forced(signal));
-    });
+            let signal = next_signal().await;
+            sender.send_replace(Phase::Forced(signal));
+        }
+        .in_current_span(),
+    );
     receiver
 }
 

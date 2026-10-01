@@ -23,7 +23,7 @@ use giskard_persist::store::{ProjectConfig, ThreadFile, ThreadRecency};
 use giskard_proto::*;
 use serde::Deserialize;
 use tokio::sync::{mpsc, oneshot};
-use tracing::{debug, error, info, warn};
+use tracing::{Instrument, debug, error, info, warn};
 
 use crate::AppState;
 use crate::auth::{TokenPurpose, get_session_token_from_header, sign_token, verify_token};
@@ -335,7 +335,7 @@ async fn handle_ws(socket: WebSocket, state: AppState) {
             }
         }
         let _ = writer_done_tx.send(());
-    });
+    }.in_current_span());
 
     send_activity_bootstrap(&state, client_id, &tx).await;
 
@@ -460,42 +460,45 @@ async fn handle_client_msg(
             );
             let state = state.clone();
             let tx = tx.clone();
-            tokio::spawn(async move {
-                if let Err(e) = run_subscribe_bootstrap(
-                    &state, client_id, &tx, thread_id, since, generation, &cancelled,
-                )
-                .await
-                {
-                    // A superseded bootstrap must not surface its failure to the client: the
-                    // error belongs to a subscription the connection has already replaced or
-                    // dropped. Log it anyway so a bootstrap that fails while being cancelled
-                    // stays diagnosable instead of disappearing.
-                    if cancelled.load(Ordering::Acquire) {
-                        debug!(
+            tokio::spawn(
+                async move {
+                    if let Err(e) = run_subscribe_bootstrap(
+                        &state, client_id, &tx, thread_id, since, generation, &cancelled,
+                    )
+                    .await
+                    {
+                        // A superseded bootstrap must not surface its failure to the client: the
+                        // error belongs to a subscription the connection has already replaced or
+                        // dropped. Log it anyway so a bootstrap that fails while being cancelled
+                        // stays diagnosable instead of disappearing.
+                        if cancelled.load(Ordering::Acquire) {
+                            debug!(
+                                %client_id,
+                                %thread_id,
+                                generation,
+                                code = %e.info.code,
+                                detail = display_opt(e.info.detail.as_deref()),
+                                action = "subscribe",
+                                "cancelled subscribe bootstrap failed; dropping error"
+                            );
+                            return;
+                        }
+                        error!(
                             %client_id,
-                            %thread_id,
-                            generation,
                             code = %e.info.code,
+                            severity = ?e.info.severity,
+                            thread_id = display_opt(e.info.thread_id),
+                            request_id = display_opt(e.info.request_id.as_deref()),
+                            action = display_opt(e.info.action.as_deref()),
                             detail = display_opt(e.info.detail.as_deref()),
-                            action = "subscribe",
-                            "cancelled subscribe bootstrap failed; dropping error"
+                            "WS handler error: {}",
+                            e.info.message
                         );
-                        return;
+                        let _ = tx.send(e.into_server_message()).await;
                     }
-                    error!(
-                        %client_id,
-                        code = %e.info.code,
-                        severity = ?e.info.severity,
-                        thread_id = display_opt(e.info.thread_id),
-                        request_id = display_opt(e.info.request_id.as_deref()),
-                        action = display_opt(e.info.action.as_deref()),
-                        detail = display_opt(e.info.detail.as_deref()),
-                        "WS handler error: {}",
-                        e.info.message
-                    );
-                    let _ = tx.send(e.into_server_message()).await;
                 }
-            });
+                .in_current_span(),
+            );
         }
         ClientMessage::Unsubscribe { thread_id } => {
             slots.cancel(thread_id);
@@ -684,7 +687,7 @@ async fn handle_client_msg(
                         );
                     }
                 }
-            });
+            }.in_current_span());
         }
         ClientMessage::SwitchMode {
             thread_id,

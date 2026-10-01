@@ -10,7 +10,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use tokio::sync::{mpsc, oneshot};
-use tracing::warn;
+use tracing::{Instrument, warn};
 
 use giskard_core::ids::ProjectId;
 use giskard_core::token::{DailyTokenLedger, TokenUsage};
@@ -129,7 +129,7 @@ fn dropped_record_context(
 /// counts survive restarts (§5.1).
 pub fn spawn(store: Arc<PersistStore>) -> LedgerHandle {
     let (tx, rx) = mpsc::channel(1024);
-    tokio::spawn(actor(store, rx));
+    tokio::spawn(actor(store, rx).in_current_span());
     LedgerHandle { tx }
 }
 
@@ -228,10 +228,10 @@ async fn apply(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Mutex as StdMutex;
+    use tracing_test::traced_test;
 
     use super::*;
-    use crate::test_logs::CapturedLogWriter;
+    use crate::log_checks::a_line_with;
 
     fn record(project: ProjectId) -> Record {
         Record {
@@ -263,16 +263,8 @@ mod tests {
     }
 
     #[tokio::test]
+    #[traced_test]
     async fn dropped_usage_warning_identifies_the_record_and_queue_failure() {
-        let output = Arc::new(StdMutex::new(Vec::new()));
-        let writer_output = output.clone();
-        let subscriber = tracing_subscriber::fmt()
-            .without_time()
-            .with_ansi(false)
-            .with_max_level(tracing::Level::WARN)
-            .with_writer(move || CapturedLogWriter(writer_output.clone()))
-            .finish();
-        let _subscriber = tracing::subscriber::set_default(subscriber);
         let (tx, rx) = mpsc::channel(1);
         drop(rx);
         let handle = LedgerHandle { tx };
@@ -288,17 +280,16 @@ mod tests {
             )
             .await;
 
-        let output = String::from_utf8(output.lock().unwrap().clone()).unwrap();
-        for expected in [
-            format!("project_id={project}"),
-            "date=2026-08-26".into(),
-            "provider=openai".into(),
-            "model=gpt-5".into(),
-            "reason=\"closed\"".into(),
-            "action=\"record_token_usage\"".into(),
-        ] {
-            assert!(output.contains(&expected), "missing {expected}: {output}");
-        }
+        let project_field = format!("project_id={project}");
+        logs_assert(a_line_with(&[
+            " WARN ",
+            project_field.as_str(),
+            "date=2026-08-26",
+            "provider=openai",
+            "model=gpt-5",
+            "reason=\"closed\"",
+            "action=\"record_token_usage\"",
+        ]));
     }
 
     #[tokio::test]

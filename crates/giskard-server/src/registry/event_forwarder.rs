@@ -2154,7 +2154,6 @@ impl ThreadEventForwarder {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Mutex as StdMutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use async_trait::async_trait;
@@ -2178,8 +2177,9 @@ mod tests {
     use super::*;
     use crate::hub::Hub;
     use crate::ledger;
-    use crate::test_logs::CapturedLogWriter;
+    use crate::log_checks::{a_line_with, lines_with, no_line_with};
     use crate::thread_runtime::{RequestResolution, RuntimeRequestId, ThreadRuntimeSupport};
+    use tracing_test::traced_test;
 
     struct TestIntentHarness {
         start_result: Result<TurnId, HarnessError>,
@@ -2759,33 +2759,23 @@ mod tests {
         assert!(!command_completion_is_normal_success("interrupted", None));
     }
 
-    fn capture_logs(log: impl FnOnce()) -> String {
-        let output = Arc::new(StdMutex::new(Vec::new()));
-        let writer_output = output.clone();
-        let subscriber = tracing_subscriber::fmt()
-            .without_time()
-            .with_ansi(false)
-            .with_max_level(tracing::Level::WARN)
-            .with_writer(move || CapturedLogWriter(writer_output.clone()))
-            .finish();
-        tracing::subscriber::with_default(subscriber, log);
-        String::from_utf8(output.lock().unwrap().clone()).unwrap()
-    }
-
-    fn capture_cross_turn_warning(event: &AgentEvent) -> String {
-        capture_logs(|| {
-            log_cross_turn_event_drop(
-                ProjectId::new(),
-                ThreadId::new(),
-                TurnId::new(),
-                event.turn().unwrap(),
-                event,
-                42,
-            );
-        })
+    /// Log the cross-turn drop warning for `event` on a fresh thread, and return the
+    /// `thread_id=…` field that tells its line apart from the test's other lines.
+    fn log_cross_turn_warning(event: &AgentEvent) -> String {
+        let thread = ThreadId::new();
+        log_cross_turn_event_drop(
+            ProjectId::new(),
+            thread,
+            TurnId::new(),
+            event.turn().unwrap(),
+            event,
+            42,
+        );
+        format!("thread_id={thread}")
     }
 
     #[test]
+    #[traced_test]
     fn cross_turn_item_delta_warning_reports_bare_identity_without_content() {
         let item_id = ItemId::new();
         let event = AgentEvent::ItemDelta {
@@ -2800,18 +2790,15 @@ mod tests {
         assert_eq!(event.item_id(), Some(item_id));
         assert_eq!(event_item_delta_kind(&event), Some("command_output"));
 
-        let output = capture_cross_turn_warning(&event);
-        assert!(
-            output.contains(&format!("event_item_id={item_id}")),
-            "{output}"
-        );
-        assert!(
-            output.contains("item_delta_kind=\"command_output\""),
-            "{output}"
-        );
-        assert!(output.contains("elapsed_ms=42"), "{output}");
-        assert!(!output.contains("Some("), "{output}");
-        assert!(!output.contains("sensitive output"), "{output}");
+        let delta_line = log_cross_turn_warning(&event);
+        let item_field = format!("event_item_id={item_id}");
+        logs_assert(a_line_with(&[
+            " WARN ",
+            delta_line.as_str(),
+            item_field.as_str(),
+            "item_delta_kind=\"command_output\"",
+            "elapsed_ms=42",
+        ]));
 
         let text_event = AgentEvent::ItemDelta {
             thread: ThreadId::new(),
@@ -2822,20 +2809,30 @@ mod tests {
             },
         };
         assert_eq!(event_item_delta_kind(&text_event), Some("text"));
-        let output = capture_cross_turn_warning(&text_event);
-        assert!(output.contains("item_delta_kind=\"text\""), "{output}");
-        assert!(!output.contains("sensitive text"), "{output}");
+        let text_line = log_cross_turn_warning(&text_event);
+        logs_assert(a_line_with(&[
+            " WARN ",
+            text_line.as_str(),
+            "item_delta_kind=\"text\"",
+        ]));
 
         let turn_event = AgentEvent::TurnStarted {
             thread: ThreadId::new(),
             turn: TurnId::new(),
         };
-        let output = capture_cross_turn_warning(&turn_event);
-        assert!(!output.contains("event_item_id"), "{output}");
-        assert!(!output.contains("item_delta_kind"), "{output}");
+        let turn_line = log_cross_turn_warning(&turn_event);
+        logs_assert(lines_with(1, &[" WARN ", turn_line.as_str()]));
+        logs_assert(lines_with(0, &[turn_line.as_str(), "event_item_id"]));
+        logs_assert(lines_with(0, &[turn_line.as_str(), "item_delta_kind"]));
+
+        // No line of the test carries content or an `Option`'s debug form.
+        logs_assert(no_line_with("Some("));
+        logs_assert(no_line_with("sensitive output"));
+        logs_assert(no_line_with("sensitive text"));
     }
 
     #[test]
+    #[traced_test]
     fn dropped_and_rejected_event_logs_include_bare_identity_without_content() {
         let project_id = ProjectId::new();
         let expected_thread_id = ThreadId::new();
@@ -2851,10 +2848,8 @@ mod tests {
             },
         };
 
-        let output = capture_logs(|| {
-            log_foreign_thread_event_drop(project_id, expected_thread_id, event_thread_id, &event);
-        });
-        for expected in [
+        log_foreign_thread_event_drop(project_id, expected_thread_id, event_thread_id, &event);
+        let expected = [
             format!("project_id={project_id}"),
             format!("thread_id={expected_thread_id}"),
             format!("event_thread_id={event_thread_id}"),
@@ -2862,11 +2857,11 @@ mod tests {
             format!("event_item_id={item_id}"),
             "event_kind=\"item_delta\"".into(),
             "item_delta_kind=\"text\"".into(),
-        ] {
-            assert!(output.contains(&expected), "missing {expected}: {output}");
-        }
-        assert!(!output.contains("foreign sensitive text"), "{output}");
-        assert!(!output.contains("Some("), "{output}");
+        ];
+        let expected: Vec<&str> = expected.iter().map(String::as_str).collect();
+        logs_assert(a_line_with(&expected));
+        logs_assert(no_line_with("foreign sensitive text"));
+        logs_assert(no_line_with("Some("));
     }
 
     #[test]

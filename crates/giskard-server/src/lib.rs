@@ -23,7 +23,7 @@ pub mod worktree;
 mod ws;
 
 #[cfg(test)]
-pub(crate) mod test_logs;
+pub(crate) mod log_checks;
 
 pub use app::{AppShutdown, AppState, build_app};
 pub use harness_kinds::{

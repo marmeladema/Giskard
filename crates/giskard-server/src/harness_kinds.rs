@@ -205,8 +205,10 @@ impl HarnessFactory for HarnessKindFactory {
 
 #[cfg(test)]
 mod tests {
+    use tracing_test::traced_test;
+
     use super::*;
-    use crate::test_logs::CapturedLogWriter;
+    use crate::log_checks::lines_with;
 
     /// A kind whose `create` fails recognisably, so dispatch is observable without a harness. The
     /// error carries the declaration name, workspace root, and command the spec delivered.
@@ -318,21 +320,9 @@ command = "/opt/nightly/bin/codex"
         );
     }
 
-    /// One test for both the error and its warning: tracing caches a callsite's interest globally,
-    /// so a second test reaching this `warn!` on another thread with no subscriber could race
-    /// this thread's `set_default` and switch the callsite off, losing the captured event.
     #[tokio::test]
+    #[traced_test]
     async fn an_undeclared_name_is_unsupported_and_warned_about_once() {
-        let output = Arc::new(Mutex::new(Vec::new()));
-        let writer_output = output.clone();
-        let subscriber = tracing_subscriber::fmt()
-            .without_time()
-            .with_ansi(false)
-            .with_max_level(tracing::Level::WARN)
-            .with_writer(move || CapturedLogWriter(writer_output.clone()))
-            .finish();
-        let _subscriber = tracing::subscriber::set_default(subscriber);
-
         let factory = factory();
         let config = project("codex");
         let message = match create_error(&factory, &config).await {
@@ -344,16 +334,17 @@ command = "/opt/nightly/bin/codex"
         assert!(message.contains("[harnesses]"), "{message}");
         assert!(message.contains("stable, nightly"), "{message}");
         create_error(&factory, &project("codex")).await;
-        let output = String::from_utf8(output.lock().unwrap().clone()).unwrap();
-        assert_eq!(
-            output
-                .matches("a thread or project names a harness that config.toml does not declare")
-                .count(),
+        let warning = "a thread or project names a harness that config.toml does not declare";
+        logs_assert(lines_with(1, &[warning]));
+        logs_assert(lines_with(
             1,
-            "{output}"
-        );
-        assert!(output.contains("harness=codex"), "{output}");
-        assert!(output.contains("action=\"create_harness\""), "{output}");
+            &[
+                " WARN ",
+                warning,
+                "harness=codex",
+                "action=\"create_harness\"",
+            ],
+        ));
     }
 
     /// The declaration comes from the name the registry passes, not from the project: a thread on

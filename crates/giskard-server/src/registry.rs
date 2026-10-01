@@ -9,7 +9,7 @@ use chrono::Utc;
 use futures::future::join_all;
 use tokio::sync::{Mutex, Notify, OwnedMutexGuard, mpsc, oneshot, watch};
 use tokio::time::timeout;
-use tracing::{debug, error, info, warn};
+use tracing::{Instrument, debug, error, info, warn};
 
 use giskard_core::approval::ApprovalDecision;
 use giskard_core::error::HarnessError;
@@ -569,7 +569,7 @@ fn spawn_thread_update_forwarder(
             Err(error) => error!(%project_id, %thread_id, %error,
                 "failed to persist resumed context window"),
         }
-    }))
+    }.in_current_span()))
 }
 
 impl HarnessRegistry {
@@ -2135,7 +2135,8 @@ mod tests {
     use super::{TurnContext, TurnContextKind, turn_reservation};
     use crate::hub::Hub;
     use crate::ledger;
-    use crate::test_logs::CapturedLogWriter;
+    use crate::log_checks::a_line_with;
+    use tracing_test::traced_test;
 
     struct UnusedHarnessFactory;
 
@@ -3509,16 +3510,8 @@ mod tests {
     }
 
     #[tokio::test]
+    #[traced_test]
     async fn discovery_for_a_primary_is_ignored() {
-        let output = Arc::new(StdMutex::new(Vec::new()));
-        let writer_output = output.clone();
-        let subscriber = tracing_subscriber::fmt()
-            .without_time()
-            .with_ansi(false)
-            .with_max_level(tracing::Level::WARN)
-            .with_writer(move || CapturedLogWriter(writer_output.clone()))
-            .finish();
-        let _subscriber = tracing::subscriber::set_default(subscriber);
         let tmp = tempfile::tempdir().unwrap();
         let store = Arc::new(PersistStore::new(tmp.path().to_path_buf()));
         let (project, config) = create_test_project(&store, "primary-discovery").await;
@@ -3551,24 +3544,16 @@ mod tests {
         let unchanged = store.load_thread(project, primary).await.unwrap().unwrap();
         assert_eq!(unchanged.kind, giskard_core::ThreadKind::Primary);
         assert!(registry.shared.coordinator(primary).await.is_none());
-        let logs = String::from_utf8(output.lock().unwrap().clone()).unwrap();
-        assert!(
-            logs.contains("ignoring traffic discovery for an already persisted primary thread")
-        );
+        logs_assert(a_line_with(&[
+            " WARN ",
+            "ignoring traffic discovery for an already persisted primary thread",
+        ]));
         registry.shutdown().await.unwrap();
     }
 
     #[tokio::test]
+    #[traced_test]
     async fn discovery_consumer_retries_a_failed_record_after_success() {
-        let output = Arc::new(StdMutex::new(Vec::new()));
-        let writer_output = output.clone();
-        let subscriber = tracing_subscriber::fmt()
-            .without_time()
-            .with_ansi(false)
-            .with_max_level(tracing::Level::WARN)
-            .with_writer(move || CapturedLogWriter(writer_output.clone()))
-            .finish();
-        let _subscriber = tracing::subscriber::set_default(subscriber);
         let tmp = tempfile::tempdir().unwrap();
         let store = Arc::new(PersistStore::new(tmp.path().to_path_buf()));
         let (project, config) = create_test_project(&store, "discovery-recovery").await;
@@ -3589,13 +3574,10 @@ mod tests {
         });
         wait_for_discovery_records(&mut probe, &["native-dropped"]).await;
         assert!(store.load_thread(project, dropped).await.unwrap().is_none());
-        assert!(
-            String::from_utf8(output.lock().unwrap().clone())
-                .unwrap()
-                .contains(
-                    "project disappeared before a discovered native thread could be admitted"
-                )
-        );
+        logs_assert(a_line_with(&[
+            " WARN ",
+            "project disappeared before a discovered native thread could be admitted",
+        ]));
 
         store
             .create_project(project, "discovery-recovery", "/tmp/test", "codex")
