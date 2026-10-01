@@ -20,7 +20,7 @@ use serde_json::{Value, json};
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
-use tracing::{debug, error, info, warn};
+use tracing::{Instrument, debug, error, info, warn};
 
 use crate::log_fields::display_opt;
 use crate::mapper::{ClaudeMapper, MapperOutput, TurnKind};
@@ -527,7 +527,8 @@ pub(crate) fn spawn_supervisor(parts: SupervisorParts) -> JoinHandle<()> {
             .map(|effort| effort.0.clone()),
         current_model: parts.model,
     };
-    tokio::spawn(supervisor.run())
+    // The supervisor logs for the child's whole life: it runs in the span `open_thread` ran in.
+    tokio::spawn(supervisor.run().in_current_span())
 }
 
 /// How the main loop ended.

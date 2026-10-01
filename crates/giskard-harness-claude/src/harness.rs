@@ -1483,7 +1483,6 @@ impl AgentHarness for ClaudeHarness {
 #[cfg(test)]
 mod tests {
     use std::collections::VecDeque;
-    use std::io::Write;
 
     use giskard_core::event::AgentEvent;
     use giskard_core::turn::{Mode, PermissionPreset, TurnStatusKind};
@@ -1491,7 +1490,10 @@ mod tests {
         EnvOverlay, EventStreamError, ThreadUpdateStream, thread_update_channel,
     };
 
+    use tracing_test::traced_test;
+
     use super::*;
+    use crate::log_checks::{a_line_with, lines_with, no_line_with};
     use crate::process::MAX_STDOUT_LINE_BYTES;
     use crate::process::tests::fake_claude;
     use crate::session::tests::{
@@ -1689,37 +1691,6 @@ mod tests {
         panic!("children never went away");
     }
 
-    #[derive(Clone)]
-    struct LogWriter(Arc<Mutex<Vec<u8>>>);
-
-    impl Write for LogWriter {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            lock(&self.0).extend_from_slice(buf);
-            Ok(buf.len())
-        }
-
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
-    /// Capture this thread's logs (the test runtime is single-threaded, so the supervisor's too).
-    fn capture_logs() -> (Arc<Mutex<Vec<u8>>>, tracing::subscriber::DefaultGuard) {
-        let output = Arc::new(Mutex::new(Vec::new()));
-        let writer = output.clone();
-        let subscriber = tracing_subscriber::fmt()
-            .without_time()
-            .with_ansi(false)
-            .with_max_level(tracing::Level::DEBUG)
-            .with_writer(move || LogWriter(writer.clone()))
-            .finish();
-        (output, tracing::subscriber::set_default(subscriber))
-    }
-
-    fn logs(output: &Arc<Mutex<Vec<u8>>>) -> String {
-        String::from_utf8(lock(output).clone()).unwrap()
-    }
-
     // ---- open ----------------------------------------------------------------------------------
 
     #[tokio::test]
@@ -1766,25 +1737,26 @@ mod tests {
     }
 
     #[tokio::test]
+    #[traced_test]
     async fn open_thread_reports_the_applied_model_when_it_differs() {
         let (resolved, _) = scripted(handshake_steps("claude-sonnet-5-5"), Vec::new());
         let (other, _) = scripted(handshake_steps("claude-opus-5-5"), Vec::new());
         let (harness, _) = harness(vec![resolved, other]);
-        let (output, _guard) = capture_logs();
 
         // The catalog's resolved id for the requested alias counts as applied.
         let (options, _updates) = open_options(ThreadId::new(), None, "sonnet");
         let handle = harness.open_thread(options).await.unwrap();
         assert_eq!(handle.resumed_model, Some(model("sonnet")));
-        assert!(!logs(&output).contains("model_not_applied"));
+        logs_assert(no_line_with("model_not_applied"));
 
         let (options, _updates) = open_options(ThreadId::new(), None, "sonnet");
         let handle = harness.open_thread(options).await.unwrap();
         assert_eq!(handle.resumed_model, Some(model("claude-opus-5-5")));
-        let logs = logs(&output);
-        assert!(logs.contains("action=\"model_not_applied\""), "{logs}");
-        assert!(logs.contains("requested=sonnet"), "{logs}");
-        assert!(logs.contains("applied=claude-opus-5-5"), "{logs}");
+        logs_assert(a_line_with(&[
+            "action=\"model_not_applied\"",
+            "requested=sonnet",
+            "applied=claude-opus-5-5",
+        ]));
         harness.shutdown().await.unwrap();
     }
 
@@ -1948,6 +1920,7 @@ mod tests {
     // ---- resume --------------------------------------------------------------------------------
 
     #[tokio::test]
+    #[traced_test]
     async fn a_resume_that_finds_no_transcript_respawns_with_the_same_id() {
         let sentence = format!("No conversation found with session ID: {RESUME_ID}");
         let (missing, _) = ScriptedChild::new(vec![Step::OnStdin(
@@ -1962,7 +1935,6 @@ mod tests {
         )]);
         let (fresh, _) = scripted(handshake_steps("sonnet"), Vec::new());
         let (harness, spawner) = harness(vec![missing, fresh]);
-        let (output, _guard) = capture_logs();
         let (options, _updates) = open_options(ThreadId::new(), Some(RESUME_ID), "sonnet");
         let handle = harness.open_thread(options).await.unwrap();
 
@@ -1990,7 +1962,7 @@ mod tests {
             );
         }
         assert!(!spawns[1].iter().any(|arg| arg == "--resume"));
-        assert!(logs(&output).contains("action=\"claude_resume_failed\""));
+        assert!(logs_contain("action=\"claude_resume_failed\""));
         harness.shutdown().await.unwrap();
     }
 
@@ -2173,6 +2145,7 @@ mod tests {
     // ---- child exit ----------------------------------------------------------------------------
 
     #[tokio::test]
+    #[traced_test]
     async fn child_exit_mid_turn_fails_the_turn_and_closes_the_stream() {
         let (child, _) = scripted(
             handshake_steps("sonnet"),
@@ -2191,7 +2164,6 @@ mod tests {
             )],
         );
         let (harness, _) = harness(vec![child]);
-        let (output, _guard) = capture_logs();
         let (options, _updates) = open_options(ThreadId::new(), None, "sonnet");
         let handle = harness.open_thread(options).await.unwrap();
         let mut stream = harness.subscribe(&handle);
@@ -2220,18 +2192,17 @@ mod tests {
                 .await,
             Err(HarnessError::ThreadNotFound(_))
         ));
-        let logs = logs(&output);
-        let line = logs
-            .lines()
-            .find(|line| line.contains("claude child exited unexpectedly"))
-            .unwrap_or_else(|| panic!("{logs}"));
-        assert!(line.contains("WARN"), "{line}");
-        assert!(line.contains("exit_code=3"), "{line}");
-        assert!(line.contains("out of cheese"), "{line}");
-        assert!(line.contains("live_children=0"), "{line}");
+        logs_assert(a_line_with(&[
+            "WARN",
+            "claude child exited unexpectedly",
+            "exit_code=3",
+            "out of cheese",
+            "live_children=0",
+        ]));
     }
 
     #[tokio::test]
+    #[traced_test]
     async fn a_closed_log_is_reported_not_ignored() {
         let (child, _) = scripted(
             handshake_steps("sonnet"),
@@ -2244,7 +2215,6 @@ mod tests {
             )],
         );
         let (harness, _) = harness(vec![child]);
-        let (output, _guard) = capture_logs();
         let thread = ThreadId::new();
         let (options, _updates) = open_options(thread, None, "sonnet");
         let handle = harness.open_thread(options).await.unwrap();
@@ -2254,17 +2224,12 @@ mod tests {
             .await
             .unwrap();
         harness.shutdown().await.unwrap();
-        let logs = logs(&output);
-        assert_eq!(
-            logs.matches("the thread's event log is closed").count(),
-            1,
-            "{logs}"
-        );
-        let exit = logs
-            .lines()
-            .find(|line| line.contains("action=\"child_exited\""))
-            .unwrap();
-        assert!(!exit.contains("dropped_events=0"), "{exit}");
+        logs_assert(lines_with(1, &["the thread's event log is closed"]));
+        logs_assert(lines_with(1, &["action=\"child_exited\""]));
+        logs_assert(lines_with(
+            0,
+            &["action=\"child_exited\"", "dropped_events=0"],
+        ));
     }
 
     // ---- rename, archive, delete, shutdown -----------------------------------------------------
@@ -2319,6 +2284,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[traced_test]
     async fn archiving_and_deleting_stop_the_child() {
         let (busy, busy_record) = scripted(
             handshake_steps("sonnet"),
@@ -2344,7 +2310,6 @@ mod tests {
         );
         let (idle, idle_record) = scripted(handshake_steps("sonnet"), Vec::new());
         let (harness, _) = harness(vec![busy, idle]);
-        let (output, _guard) = capture_logs();
 
         let (options, _updates) = open_options(ThreadId::new(), None, "sonnet");
         let busy = harness.open_thread(options).await.unwrap();
@@ -2396,21 +2361,16 @@ mod tests {
             )
             .await
             .unwrap();
-        let logs = logs(&output);
-        assert!(logs.contains("action=\"stop_interrupt\""), "{logs}");
-        assert_eq!(
-            logs.matches("action=\"thread_stopped\"").count(),
-            2,
-            "{logs}"
-        );
-        assert!(!logs.contains("stop_kill"), "{logs}");
+        assert!(logs_contain("action=\"stop_interrupt\""));
+        logs_assert(lines_with(2, &["action=\"thread_stopped\""]));
+        logs_assert(no_line_with("stop_kill"));
     }
 
     #[tokio::test(start_paused = true)]
+    #[traced_test]
     async fn stop_kills_a_child_that_ignores_eof() {
         let (child, record) = scripted(handshake_steps("sonnet"), Vec::new());
         let (harness, _) = harness(vec![child.ignoring_eof()]);
-        let (output, _guard) = capture_logs();
         let (options, _updates) = open_options(ThreadId::new(), None, "sonnet");
         let handle = harness.open_thread(options).await.unwrap();
         let started = Instant::now();
@@ -2421,12 +2381,12 @@ mod tests {
         let record = lock(&record);
         assert!(record.stdin_closed);
         assert!(record.killed);
-        let logs = logs(&output);
-        assert!(logs.contains("action=\"stop_kill\""), "{logs}");
-        assert!(logs.contains("signal=9"), "{logs}");
+        assert!(logs_contain("action=\"stop_kill\""));
+        assert!(logs_contain("signal=9"));
     }
 
     #[tokio::test(start_paused = true)]
+    #[traced_test]
     async fn a_stop_that_times_out_still_closes_the_stream() {
         // The child is killed on the exit grace but its exit is never collected, so the
         // supervisor never reaches its own exit handling and the stop times out.
@@ -2441,7 +2401,6 @@ mod tests {
             )],
         );
         let (harness, _) = harness(vec![child.ignoring_eof().hanging_on_wait()]);
-        let (output, _guard) = capture_logs();
         let (options, _updates) = open_options(ThreadId::new(), None, "sonnet");
         let handle = harness.open_thread(options).await.unwrap();
         let mut stream = harness.subscribe(&handle);
@@ -2460,19 +2419,17 @@ mod tests {
             events.first(),
             Some(AgentEvent::TurnStarted { .. })
         ));
-        let logs = logs(&output);
-        assert!(
-            logs.contains("aborted its supervisor and closed its event stream"),
-            "{logs}"
-        );
+        assert!(logs_contain(
+            "aborted its supervisor and closed its event stream"
+        ));
     }
 
     #[tokio::test(start_paused = true)]
+    #[traced_test]
     async fn a_start_turn_whose_caller_timed_out_is_never_written() {
         let (child, record) = scripted(handshake_steps("sonnet"), Vec::new());
         let (child, gate) = child.gated();
         let (harness, _) = harness(vec![child]);
-        let (output, _guard) = capture_logs();
         let (options, _updates) = open_options(ThreadId::new(), None, "sonnet");
         let handle = harness.open_thread(options).await.unwrap();
         let mut stream = harness.subscribe(&handle);
@@ -2497,15 +2454,14 @@ mod tests {
             stream.try_recv().is_none(),
             "no TurnStarted for a turn nobody admitted"
         );
-        let logs = logs(&output);
-        assert!(
-            logs.contains("the caller gave up on this turn before it was started"),
-            "{logs}"
-        );
+        assert!(logs_contain(
+            "the caller gave up on this turn before it was started"
+        ));
         harness.shutdown().await.unwrap();
     }
 
     #[tokio::test(start_paused = true)]
+    #[traced_test]
     async fn a_late_answer_to_a_timed_out_handshake_request_is_expected() {
         let (child, _) = ScriptedChild::new(vec![
             Step::OnStdin(
@@ -2522,31 +2478,27 @@ mod tests {
             ),
         ]);
         let (harness, _) = harness(vec![child]);
-        let (output, _guard) = capture_logs();
         let (options, _updates) = open_options(ThreadId::new(), None, "sonnet");
         let handle = harness.open_thread(options).await.unwrap();
         assert_eq!(handle.resumed_model, None, "get_settings timed out");
 
         // The rename's write releases the late `get_settings` answer ahead of its own.
         harness.set_thread_name(&handle, "named").await.unwrap();
-        let logs = logs(&output);
-        assert!(
-            logs.contains("late answer to a handshake request that timed out"),
-            "{logs}"
-        );
-        assert!(
-            !logs.contains("control response for a request nobody is waiting on"),
-            "{logs}"
-        );
+        assert!(logs_contain(
+            "late answer to a handshake request that timed out"
+        ));
+        logs_assert(no_line_with(
+            "control response for a request nobody is waiting on",
+        ));
         harness.shutdown().await.unwrap();
     }
 
     #[tokio::test]
+    #[traced_test]
     async fn shutdown_stops_every_child_and_is_idempotent() {
         let (first, first_record) = scripted(handshake_steps("sonnet"), Vec::new());
         let (second, second_record) = scripted(handshake_steps("sonnet"), Vec::new());
         let (harness, _) = harness(vec![first, second]);
-        let (output, _guard) = capture_logs();
         for _ in 0..2 {
             let (options, _updates) = open_options(ThreadId::new(), None, "sonnet");
             harness.open_thread(options).await.unwrap();
@@ -2567,9 +2519,8 @@ mod tests {
             harness.list_models().await,
             Err(HarnessError::Transport(_))
         ));
-        let logs = logs(&output);
-        assert!(logs.contains("children_stopped=2"), "{logs}");
-        assert!(logs.contains("children_stopped=0"), "{logs}");
+        assert!(logs_contain("children_stopped=2"));
+        assert!(logs_contain("children_stopped=0"));
     }
 
     // ---- asks ----------------------------------------------------------------------------------
@@ -2738,12 +2689,12 @@ mod tests {
     }
 
     #[tokio::test]
+    #[traced_test]
     async fn a_refused_bypass_launch_falls_back_to_a_standard_launch() {
         let (refused, _) = root_refused_child();
         let (first, first_record) = scripted(handshake_steps("sonnet"), Vec::new());
         let (second, _) = scripted(handshake_steps("sonnet"), Vec::new());
         let (harness, spawner) = harness(vec![refused, first, second]);
-        let (output, _guard) = capture_logs();
         for _ in 0..2 {
             let (options, _updates) = open_options(ThreadId::new(), None, "sonnet");
             harness.open_thread(options).await.unwrap();
@@ -2760,12 +2711,7 @@ mod tests {
         assert_eq!(lock(&harness.bypass_refused).as_deref(), Some(ROOT_REFUSAL));
         // A standard child still sets `default` explicitly.
         assert_eq!(modes_written(&first_record), ["default"]);
-        let logs = logs(&output);
-        let warnings = logs
-            .lines()
-            .filter(|line| line.contains("WARN") && line.contains("action=\"bypass_refused\""))
-            .count();
-        assert_eq!(warnings, 1, "{logs}");
+        logs_assert(lines_with(1, &["WARN", "action=\"bypass_refused\""]));
         harness.shutdown().await.unwrap();
     }
 
@@ -2924,6 +2870,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[traced_test]
     async fn a_refused_mode_fails_the_turn_start() {
         let (child, record) = scripted(
             handshake_steps("sonnet"),
@@ -2943,7 +2890,6 @@ mod tests {
             )],
         );
         let (harness, _) = harness(vec![child]);
-        let (output, _guard) = capture_logs();
         let (options, _updates) = open_options(ThreadId::new(), None, "sonnet");
         let handle = harness.open_thread(options).await.unwrap();
         let mut stream = harness.subscribe(&handle);
@@ -2963,14 +2909,13 @@ mod tests {
         assert!(written(&record).iter().all(|line| line["type"] != "user"));
         // Shutdown reads stdout to EOF, so the status frame has been mapped once it returns.
         harness.shutdown().await.unwrap();
-        let logs = logs(&output);
-        let line = logs
-            .lines()
-            .find(|line| line.contains("WARN") && line.contains("action=\"set_permission_mode\""))
-            .unwrap_or_else(|| panic!("{logs}"));
-        assert!(line.contains("error_code=bypass_not_launched"), "{line}");
-        assert!(line.contains("mode=bypassPermissions"), "{line}");
-        assert!(!logs.contains("permission_mode_drift"), "{logs}");
+        logs_assert(a_line_with(&[
+            "WARN",
+            "action=\"set_permission_mode\"",
+            "error_code=bypass_not_launched",
+            "mode=bypassPermissions",
+        ]));
+        logs_assert(no_line_with("permission_mode_drift"));
         assert!(
             !until_closed(&mut stream)
                 .await
@@ -2981,6 +2926,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[traced_test]
     async fn the_mode_status_after_a_set_is_not_drift() {
         let status = r#"{"type":"system","subtype":"status","status":null,"permissionMode":"acceptEdits","session_id":"f18693ff-2d11-4f87-9556-2b527e19e081"}"#;
         let (child, _) = scripted(
@@ -3000,7 +2946,6 @@ mod tests {
             ],
         );
         let (harness, _) = harness(vec![child]);
-        let (output, _guard) = capture_logs();
         let (options, _updates) = open_options(ThreadId::new(), None, "sonnet");
         let handle = harness.open_thread(options).await.unwrap();
         let mut stream = harness.subscribe(&handle);
@@ -3018,11 +2963,12 @@ mod tests {
                 .iter()
                 .any(|event| matches!(event, AgentEvent::Notice { .. }))
         );
-        assert!(!logs(&output).contains("permission_mode_drift"));
+        logs_assert(no_line_with("permission_mode_drift"));
         harness.shutdown().await.unwrap();
     }
 
     #[tokio::test]
+    #[traced_test]
     async fn a_mode_the_adapter_did_not_set_is_drift_on_init_too() {
         let (child, _) = scripted(
             handshake_steps("sonnet"),
@@ -3032,7 +2978,6 @@ mod tests {
             )],
         );
         let (harness, _) = harness(vec![child]);
-        let (output, _guard) = capture_logs();
         let (options, _updates) = open_options(ThreadId::new(), None, "sonnet");
         let handle = harness.open_thread(options).await.unwrap();
         let mut stream = harness.subscribe(&handle);
@@ -3052,11 +2997,12 @@ mod tests {
             notices,
             ["Claude Code switched its permission mode to plan; Giskard set default"]
         );
-        assert!(logs(&output).contains("action=\"permission_mode_drift\""));
+        assert!(logs_contain("action=\"permission_mode_drift\""));
         harness.shutdown().await.unwrap();
     }
 
     #[tokio::test]
+    #[traced_test]
     async fn a_model_change_is_sent_and_read_back() {
         let (child, record) = scripted(
             handshake_steps("sonnet"),
@@ -3072,7 +3018,6 @@ mod tests {
             ],
         );
         let (harness, _) = harness(vec![child]);
-        let (output, _guard) = capture_logs();
         let (options, _updates) = open_options(ThreadId::new(), None, "sonnet");
         let handle = harness.open_thread(options).await.unwrap();
         let mut stream = harness.subscribe(&handle);
@@ -3096,15 +3041,11 @@ mod tests {
             .find(|line| line["request"]["subtype"] == "set_model")
             .unwrap();
         assert_eq!(set_model["request"]["model"], "opus");
-        let logs_now = logs(&output);
-        let line = logs_now
-            .lines()
-            .find(|line| line.contains("action=\"turn_settings\""))
-            .unwrap_or_else(|| panic!("{logs_now}"));
-        assert!(
-            line.contains("model=opus") && line.contains("mode=default"),
-            "{line}"
-        );
+        logs_assert(a_line_with(&[
+            "action=\"turn_settings\"",
+            "model=opus",
+            "mode=default",
+        ]));
 
         // The same model on the next turn sends nothing but the mode.
         let before = subtypes_written(&record).len();
@@ -3369,9 +3310,9 @@ mod tests {
     }
 
     #[tokio::test]
+    #[traced_test]
     async fn accept_writes_a_bare_allow() {
         let (child, record) = asking("tool-allowed");
-        let (output, _guard) = capture_logs();
         let (harness, _, mut stream, approval) = ask_pending(child).await;
         let (_, request_id) = ask_of("tool-allowed");
         assert_eq!(approval.0, request_id);
@@ -3391,20 +3332,12 @@ mod tests {
             }})]
         );
         assert!(lock(&harness.pending).approval(&approval).is_none());
-        let logs = logs(&output);
-        let line = logs
-            .lines()
-            .find(|line| line.contains("action=\"respond_approval\""))
-            .unwrap_or_else(|| panic!("{logs}"));
-        assert!(
-            line.contains("decision=\"accept\"") || line.contains("decision=accept"),
-            "{line}"
-        );
-        assert!(
-            line.contains("tool_name=\"Bash\"") || line.contains("tool_name=Bash"),
-            "{line}"
-        );
-        assert!(!logs.contains("touch probe.txt"), "{logs}");
+        logs_assert(a_line_with(&[
+            "action=\"respond_approval\"",
+            "decision=\"accept\"",
+            "tool_name=\"Bash\"",
+        ]));
+        logs_assert(no_line_with("touch probe.txt"));
         harness.shutdown().await.unwrap();
     }
 
@@ -3449,6 +3382,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[traced_test]
     async fn accept_for_session_without_a_rule_suggestion_degrades_to_accept() {
         let (index, request_id) = ask_of("tool-allowed");
         let lines = fixture_lines("tool-allowed");
@@ -3471,7 +3405,6 @@ mod tests {
                 ),
             ],
         );
-        let (output, _guard) = capture_logs();
         let (harness, _, mut stream, approval) = ask_pending(child).await;
         harness
             .respond_approval(approval, ApprovalDecision::AcceptForSession)
@@ -3482,15 +3415,11 @@ mod tests {
             answers_written(&record)[0]["response"],
             json!({"subtype": "success", "request_id": request_id, "response": {"behavior": "allow"}})
         );
-        let logs = logs(&output);
-        let line = logs
-            .lines()
-            .find(|line| line.contains("action=\"accept_for_session_degraded\""))
-            .unwrap_or_else(|| panic!("{logs}"));
-        assert!(
-            line.contains("WARN") && line.contains("suggestions=1"),
-            "{line}"
-        );
+        logs_assert(a_line_with(&[
+            "WARN",
+            "action=\"accept_for_session_degraded\"",
+            "suggestions=1",
+        ]));
         harness.shutdown().await.unwrap();
     }
 
@@ -3550,6 +3479,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[traced_test]
     async fn cancel_interrupts_and_the_turn_is_interrupted() {
         // Without `terminal_reason`, only the adapter's interrupt note makes the error result an
         // interruption; the exit 1 after it must then read as expected.
@@ -3557,7 +3487,6 @@ mod tests {
             "cancel",
             fixture_without("cancel", "result", "terminal_reason"),
         );
-        let (output, _guard) = capture_logs();
         let (harness, handle, mut stream, approval) =
             ask_pending(child.exiting_on_eof_with(1)).await;
         harness
@@ -3575,15 +3504,11 @@ mod tests {
             })
         );
         harness.delete_thread(&handle).await.unwrap();
-        let logs = logs(&output);
-        let exit = logs
-            .lines()
-            .find(|line| line.contains("action=\"child_exited\""))
-            .unwrap_or_else(|| panic!("{logs}"));
-        assert!(
-            exit.contains("INFO") && exit.contains("exit_code=1"),
-            "{exit}"
-        );
+        logs_assert(a_line_with(&[
+            "INFO",
+            "action=\"child_exited\"",
+            "exit_code=1",
+        ]));
     }
 
     #[tokio::test]
@@ -3635,6 +3560,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[traced_test]
     async fn a_cancelled_ask_is_dropped_and_a_late_answer_is_refused() {
         let (index, ask_id) = ask_of("cancel");
         let dialog = json!({"type": "control_request", "request_id": "dialog-1", "request": {
@@ -3671,7 +3597,6 @@ mod tests {
             ],
         );
         let (harness, _) = harness(vec![child]);
-        let (output, _guard) = capture_logs();
         let (options, _updates) = open_options(ThreadId::new(), None, "sonnet");
         let handle = harness.open_thread(options).await.unwrap();
         let mut stream = harness.subscribe(&handle);
@@ -3708,12 +3633,8 @@ mod tests {
         ));
         assert!(answers_written(&record).is_empty(), "nothing late is sent");
         assert_eq!(lock(&harness.pending).len(), 0);
-        let logs = logs(&output);
-        assert_eq!(
-            logs.matches("action=\"control_cancel_request\"").count(),
-            4,
-            "the mapper's and the supervisor's line per withdrawn ask: {logs}"
-        );
+        // The mapper's and the supervisor's line per withdrawn ask.
+        logs_assert(lines_with(4, &["action=\"control_cancel_request\""]));
         harness.shutdown().await.unwrap();
     }
 
@@ -3775,6 +3696,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[traced_test]
     async fn ask_user_question_round_trips() {
         let (first, input) = ask_user_question("q1");
         let (second, _) = ask_user_question("q2");
@@ -3787,7 +3709,6 @@ mod tests {
             ],
         );
         let (harness, _) = harness(vec![child]);
-        let (output, _guard) = capture_logs();
         let (options, _updates) = open_options(ThreadId::new(), None, "sonnet");
         let handle = harness.open_thread(options).await.unwrap();
         let mut stream = harness.subscribe(&handle);
@@ -3854,12 +3775,9 @@ mod tests {
             json!({"behavior": "deny", "message": "User input request cancelled."})
         );
         until_completed(&mut stream).await;
-        let logs = logs(&output);
-        assert!(logs.contains("action=\"respond_server_request\""), "{logs}");
-        assert!(
-            !logs.contains("Cats") && !logs.contains("cats or dogs"),
-            "{logs}"
-        );
+        assert!(logs_contain("action=\"respond_server_request\""));
+        logs_assert(no_line_with("Cats"));
+        logs_assert(no_line_with("cats or dogs"));
         harness.shutdown().await.unwrap();
     }
 
@@ -3960,6 +3878,7 @@ mod tests {
     // ---- milestone 3: compaction ----------------------------------------------------------------
 
     #[tokio::test]
+    #[traced_test]
     async fn compact_runs_a_compaction_turn() {
         // The `compact` fixture's frames after its first turn's `result`.
         let first_result = fixture_lines("compact")
@@ -3977,7 +3896,6 @@ mod tests {
             )],
         );
         let (harness, _) = harness(vec![child]);
-        let (output, _guard) = capture_logs();
         let (options, _updates) = open_options(ThreadId::new(), None, "sonnet");
         let handle = harness.open_thread(options).await.unwrap();
         let mut stream = harness.subscribe(&handle);
@@ -4002,7 +3920,7 @@ mod tests {
             giskard_core::item::ItemPayload::Activity { .. }
         ));
         assert_eq!(completion(&events), (turn, TurnStatusKind::Completed, None));
-        assert!(!logs(&output).contains("permission_mode_drift"));
+        logs_assert(no_line_with("permission_mode_drift"));
         // No per-turn settings for a compaction turn: only the message.
         assert_eq!(subtypes_written(&record).len(), before);
         assert_eq!(
@@ -4105,6 +4023,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[traced_test]
     async fn a_reply_that_cannot_be_written_while_waiting_breaks_the_child() {
         // While the turn's mode request is pending, the CLI asks for `ExitPlanMode` (which the
         // mapper denies itself) and its stdin breaks: the deny cannot be written.
@@ -4121,7 +4040,6 @@ mod tests {
             )],
         );
         let (harness, _) = harness(vec![child]);
-        let (output, _guard) = capture_logs();
         let (options, _updates) = open_options(ThreadId::new(), None, "sonnet");
         let handle = harness.open_thread(options).await.unwrap();
         let error = harness
@@ -4131,15 +4049,11 @@ mod tests {
         assert!(matches!(error, HarnessError::Transport(_)), "{error}");
         assert!(lock(&record).killed);
         until_no_children(&harness).await;
-        let logs = logs(&output);
-        assert!(
-            logs.lines()
-                .any(|line| line.contains("ERROR") && line.contains("action=\"write_stdin\"")),
-            "{logs}"
-        );
+        logs_assert(a_line_with(&["ERROR", "action=\"write_stdin\""]));
     }
 
     #[tokio::test]
+    #[traced_test]
     async fn an_answer_overtaken_by_a_withdrawal_is_not_sent() {
         let (index, ask_id) = ask_of("tool-allowed");
         let dialog = json!({"type": "control_request", "request_id": "dialog-1", "request": {
@@ -4160,7 +4074,6 @@ mod tests {
             )],
         );
         let injector = child.injector();
-        let (output, _guard) = capture_logs();
         let (harness, _handle, mut stream, approval) = ask_pending(child).await;
         next_matching(&mut stream, |event| {
             matches!(event, AgentEvent::ServerRequestReceived { .. }).then_some(())
@@ -4192,11 +4105,9 @@ mod tests {
         );
         assert!(answers_written(&record).is_empty(), "nothing late is sent");
         assert_eq!(lock(&harness.pending).len(), 0);
-        let logs = logs(&output);
-        assert!(
-            logs.contains("late answer to an approval Claude Code withdrew"),
-            "{logs}"
-        );
+        assert!(logs_contain(
+            "late answer to an approval Claude Code withdrew"
+        ));
         harness.shutdown().await.unwrap();
     }
 
@@ -4312,6 +4223,7 @@ mod tests {
     // ---- isolation and timeouts ----------------------------------------------------------------
 
     #[tokio::test]
+    #[traced_test]
     async fn an_overlong_stdout_line_is_fatal_for_that_child_only() {
         let (broken, broken_record) = scripted(
             handshake_steps("sonnet"),
@@ -4331,7 +4243,6 @@ mod tests {
             )],
         );
         let (harness, _) = harness(vec![broken, healthy]);
-        let (output, _guard) = capture_logs();
         let (options, _updates) = open_options(ThreadId::new(), None, "sonnet");
         let broken = harness.open_thread(options).await.unwrap();
         let (options, _updates) = open_options(ThreadId::new(), None, "sonnet");
@@ -4346,7 +4257,7 @@ mod tests {
         let events = until_closed(&mut broken_stream).await;
         assert_eq!(completion(&events).1, TurnStatusKind::Failed);
         assert!(lock(&broken_record).killed);
-        assert!(logs(&output).contains("action=\"read_stdout\""));
+        assert!(logs_contain("action=\"read_stdout\""));
 
         // The sibling is untouched and still runs turns.
         assert!(healthy_stream.try_recv().is_none());
