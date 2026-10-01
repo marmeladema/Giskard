@@ -1,0 +1,28 @@
+{
+ "scenario": "subagent-ask-withdrawn",
+ "argv": [
+  "claude",
+  "-p",
+  "--input-format",
+  "stream-json",
+  "--output-format",
+  "stream-json",
+  "--verbose",
+  "--permission-prompt-tool",
+  "stdio",
+  "--setting-sources",
+  "",
+  "--model",
+  "haiku",
+  "--permission-mode",
+  "default",
+  "--forward-subagent-text",
+  "--session-id",
+  "661581f3-5101-406d-8e3d-f0868da2648f"
+ ],
+ "cwd": "/work/project",
+ "exit": 0,
+ "results": 1,
+ "asks": 1,
+ "elapsed_s": 17.2
+}

@@ -1,7 +1,7 @@
 # Recorded Claude Code protocol fixtures
 
-Stream-json transcripts recorded against **Claude Code 2.1.286** by driving a real `claude -p` child
-over a stdio pipe, for the milestone 1 mapper tests of
+Stream-json transcripts recorded against **Claude Code 2.1.286** (the two `subagent-*` scenarios
+against **2.1.287**) by driving a real `claude -p` child over a stdio pipe, for the mapper tests of
 [`specs/claude-code-harness-plan.md`](../../../../specs/claude-code-harness-plan.md) (§11). They
 live in `crates/giskard-harness-claude/tests/fixtures/`, where the mapper tests read them.
 
@@ -34,6 +34,8 @@ closed stdin when the scenario's stop condition was met.
 | `plan-exit-denied` | plan | the plan file write, the `ExitPlanMode` ask answered deny, the plan in `permission_denials` | deny ExitPlanMode; 1 result |
 | `background-bash` | manual | a `run_in_background` shell command: `task_started` of type `local_bash`, the turn's `result`, then the task's completion, a re-emitted `init` and a **second `result`** for the continuation | allow; 25 s quiet |
 | `resume-missing` | manual, `--resume <unknown uuid>` | the failure shape: exit 1, `No conversation found` on stderr, an `error_during_execution` result with `num_turns: 0` | 1 result |
+| `subagent-stop` | default, `--forward-subagent-text` | a **foreground** delegation whose sub-agent runs `touch marker.txt && sleep 120 && cat data.txt`: the sub-agent's `can_use_tool` (with `agent_id`, **before** the forwarded `tool_use` frame), answered allow; `stop_task` 4 s later → `task_updated` killed, the child's rejection `tool_result` and interruption marker, the parent's `Agent` `tool_result` with `is_error`, one `result` | allow; stop_task; 1 result then 6 s quiet |
+| `subagent-ask-withdrawn` | default, `--forward-subagent-text` | the same delegation with `touch marker.txt && cat data.txt`, the sub-agent's ask **left pending**; `stop_task` 3 s later → `control_cancel_request` for the ask, then the same ending | no answer; stop_task; 1 result then 6 s quiet |
 | `autocompact-state` | — | the two top-level frames `active_goal` and `autocompact_state` a session emits before its first turn in some environments; two frames only, recorded separately with an environment that sets autocompact overrides | — |
 
 ## Sanitization

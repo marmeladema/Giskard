@@ -154,7 +154,7 @@ decisions rather than missing protocol.
 
 | Subtype | Request / response | Why it is not in v1 |
 | --- | --- | --- |
-| `stop_task` | `{task_id}` → `null` | Kills a live task. `task_started` classifies them: `local_bash` for shell commands, `local_agent` for sub-agents (§5.3) — the distinction that scopes the turn-completion rule. **The reply is not a confirmation**: it is `null` whether or not anything was stopped, and the real signal is a `task_updated` frame with `patch.status: "killed"`. Wiring it is what `terminate_command` needs |
+| `stop_task` | `{task_id}` → `{}` (`null` on 2.1.285; `{}` verified on 2.1.287) | Kills a live task. `task_started` classifies them: `local_bash` for shell commands, `local_agent` for sub-agents (§5.3) — the distinction that scopes the turn-completion rule. **The reply is not a confirmation**: it is the same whether or not anything was stopped, and the real signal is a `task_updated` frame with `patch.status: "killed"`; a pending `can_use_tool` of the killed task is withdrawn first with `control_cancel_request`, and a task already `completed` still gets a `killed` update. Milestone 5 wires it as a sub-agent thread's `interrupt`; wiring it for `local_bash` tasks is what `terminate_command` needs |
 | `background_tasks` | `{tool_use_id?}` → `null` | Backgrounds in-flight foreground tasks; without `tool_use_id`, all of them |
 | `mcp_reconnect` / `mcp_toggle` / `mcp_set_servers` | `{serverName}` / `{serverName, enabled}` | The MVP configures no MCP servers |
 | `get_workspace_diff` | `{diff:{stats, perFileStats, hunks}}`, `@internal` | Not the `structured_diffs` capability — see §6.1 |
@@ -638,9 +638,10 @@ harness_thread_id = "task:toolu_019ZAnC8ARVNvy7R4aspovTx"
 the id of the call it belongs to, so items land in the child thread rather than interleaving into the
 parent's transcript as if the main agent had run them. **It is not on the approval ask** — a
 sub-agent's `can_use_tool` carries `agent_id` and `tool_use_id` instead, so approvals route by
-matching `tool_use_id` against the tool_use block already seen (§3.3, §9.3). The parent's `Agent` item carries a `SubagentLink` with the same id,
-`initial_prompt`, and `action`/`status` mapped from the `system/task_*` messages (`task_started` →
-`Started`, `task_updated.patch.status` → `Completed`), which is what populates the Sub-agents card.
+`agent_id`, the `task_id` of the sub-agent's `task_started` (§3.3, §9.3). The parent's `Agent`
+item carries a `SubagentLink` with the same id, `initial_prompt`, and `action`/`status` mapped from
+the `system/task_*` messages (`task_started` → `Started`, `task_updated.patch.status` →
+`Completed`), which is what populates the Sub-agents card.
 
 **These threads are created through `claim_native_thread`, which the adapter must therefore
 implement.** The path is fixed by the server and leaves the adapter no choice:
@@ -1394,14 +1395,17 @@ the channel for diagnosing an `AcceptForSession` that silently fails to match.
 `task:` child thread rather than the primary one, and the adapter must route it there or the decision
 attaches to the wrong transcript.
 
-**Routing goes through `tool_use_id`, not `parent_tool_use_id`.** The ask carries **no
+**Routing goes through `agent_id`, not `parent_tool_use_id`.** The ask carries **no
 `parent_tool_use_id`** — its keys are `agent_id`, `blocked_path`, `description`, `display_name`,
 `input`, `permission_suggestions`, `subtype`, `tool_name`, `tool_use_id` (§3.3). `parent_tool_use_id`
-is on the *message* carrying the `tool_use` block, not on the control request. So the adapter matches
-the ask to the `tool_use` block already seen and reads that message's `parent_tool_use_id`, with
-`agent_id` as the alternative key. **It must therefore process the tool_use before the ask arrives** —
-which it does in practice (they land ~0.1s apart), but that makes the ordering a requirement rather
-than luck.
+is on the *message* carrying the `tool_use` block, not on the control request, and **that message
+can arrive after the ask**: in four of five 2.1.287 recordings the `can_use_tool` preceded the
+forwarded `assistant` frame carrying its block (the `subagent-stop` and `subagent-ask-withdrawn`
+fixtures show it). So the adapter routes the ask by `agent_id`, which equals the `task_id` of the
+sub-agent's `task_started` — a frame that always precedes the child's first frame — and falls
+back to matching `tool_use_id` against the `tool_use` blocks already seen only when the task is
+unknown. (This paragraph originally required the block to be processed first, on the strength of one
+recording where they landed ~0.1 s apart in that order; the milestone 5 recordings corrected it.)
 
 **`ApprovalKind` mapping.** `Bash` → `CommandExecution{command,cwd}`; `Edit`/`Write`/`NotebookEdit` →
 `FileChange{path,change}`; `mcp__<server>__<tool>` → `McpToolCall{server,tool_name}`; everything else
@@ -1580,7 +1584,8 @@ extended for a two-kind catalog; `config.example.toml` gains a `[harnesses.claud
 README's *Supported harnesses* entry changes; `list_mcp_servers` is implemented over the
 `mcp_status` control request (§3.3) and `mcp_status` is advertised; the spec gains a Claude Code
 mapping section beside §4.6 and the §9.1 / §9.2.1 amendments (§8.2, §9.3);
-`docs/api-endpoints.md` is unchanged because no route moves; the adapter README is completed. Two
+`docs/api-endpoints.md` only gains the `claude-code` value of `kind` because no route moves; the
+adapter README is completed. Two
 server-side hygiene items land here because a second *kind* makes them observable: P8
 (`resolve_reverse_subagent_target` filtered by `ThreadFile.harness`), and config-declared models
 under a provider a harness does not report leaving that harness's picker group (today they are
@@ -1596,9 +1601,15 @@ regeneration is expected. Milestone 4 is implemented: `ClaudeCodeKind` in `bin/g
 
 `--forward-subagent-text` on every child, `SubagentLink` on the parent's `Agent` item,
 `claim_native_thread` for `task:<tool_use_id>` ids, `subscribe` on a claimed child handle yielding
-the frames whose `parent_tool_use_id` matches, sub-agent approvals routed by `tool_use_id`, and the
-`open_thread` refusal to ever `--resume` a `task:` id (§5.3). `docs/subagents.md` gains the
-no-native-session model. The two halves ship together, never one without the other.
+the frames whose `parent_tool_use_id` matches, sub-agent approvals routed by `agent_id` (§9.3),
+`stop_task` as a sub-agent thread's `interrupt` (§3.3), and the `open_thread` refusal to ever
+`--resume` a `task:` id (§5.3). `docs/subagents.md` gains the no-native-session model. The two
+halves ship together, never one without the other. Its detailed plan is
+`claude-code-harness-plan/milestone-5-plan.md`, written against milestone 4's tree and 2.1.287:
+the mapper mints one route (a `ThreadId` and a retained log) per `Agent` call, the claim adopts
+that id or binds a silent cold route for a session that is gone, and a killed sub-agent's trailing
+frames are dropped in favour of its `Interrupted` status. Two fixtures recorded for it
+(`subagent-stop`, `subagent-ask-withdrawn`) settled the ask ordering and the `stop_task` shape.
 
 ### Milestones 6 to 8 — polish
 
@@ -1617,6 +1628,21 @@ one more loop input and must know what is in flight (a child is never reaped mid
 mid-settings or mid-answer), which is exactly the state the first half makes explicit. Milestones 4
 and 5 do not build on the polling: 4 touches no supervisor code and 5 changes the mapper's routes
 and the pending map's keys, not how responses are awaited.
+
+### After milestone 5, as its own change — MCP status per thread
+
+`list_mcp_servers` is instance-scoped (`AgentHarness::list_mcp_servers(&self)`, and the route
+`GET /api/projects/{id}/harnesses/{name}/mcp` names a declaration, not a thread), which fits Codex's
+one process per project. On this harness the configured server set is the same in every child
+(`--setting-sources user`), but the state the panel shows (`pending`, `failed`) is per process, so
+milestone 4's adapter asks whichever live child its map yields first, and does not fall back to a
+probe when that child's request fails. The browser already opens the MCP menu from a displayed
+thread. The change: `list_mcp_servers` takes an optional `ThreadHandle`, the route takes an optional
+`thread` query parameter the browser sends from `loadMcpServers`, the Claude adapter asks that
+thread's child and falls through to the probe otherwise (also when the child just exited), Codex
+ignores the handle; `docs/api-endpoints.md` and the adapter README follow. It touches the trait,
+the route and `app.js`, so it is one small commit of its own after milestone 5 merges, not part of
+5 or 6.
 
 ### Later, as its own decision — the hook route (§9.4)
 
