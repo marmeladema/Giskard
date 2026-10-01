@@ -137,10 +137,10 @@ below is established against a real CLI; response shapes are as observed.
 | --- | --- | --- | --- |
 | `initialize` | accepts `hooks`, `sdkMcpServers`, `systemPrompt`, `appendSystemPrompt`, `planModeInstructions`, `toolAliases`, `supportedDialogKinds` | `{commands, agents, models, output_style, account:{subscriptionType, apiProvider}, pid, current_permission_mode, …}` | The handshake, and the **model catalog arrives here** — see §6. Answers with no credentials and no network, which is what makes §6's probe viable. `current_permission_mode` uses the CLI's own mode names: `--permission-mode manual` is reported as **`default`** here and in `system/init.permissionMode` / `system/status.permissionMode`, so mode tracking compares against the CLI's name, never the flag's. **`account` is informational, not a credential signal**: with zero credentials it still reports `{subscriptionType: "Claude API", apiProvider: "firstParty"}`, so it is a default until an authenticated request happens (§7) |
 | `interrupt` | — | `{"still_queued":[]}` | `AgentHarness::interrupt`. Works mid-tool-call: it kills the running tool and ends the turn with `terminal_reason: "aborted_tools"`, distinct from `"aborted_streaming"` when it lands during generation |
-| `set_model` | `{model:"<id>"}` | `null` | Mid-session, no respawn, no session change. **The CLI re-emits `system/init`** afterwards |
-| `set_permission_mode` | `{mode:"<mode>"}` | echoes `{"mode":"plan"}` | Per-turn Plan/Build (§8.2) |
-| `apply_flag_settings` | `{settings:{effortLevel, ultracode, model, fastMode, advisorModel, viewMode}}` | success | The general session-settings channel. **Invalid values fail silently** — `effortLevel: "banana"` is answered `success`, leaves the previous value, and produces no error the client can see |
-| `get_settings` | — | `{applied:{model, effort, advisor, ultracode, ultracodeRequested, ultracodeAvailable}, effective, sources}` | The read-back for `apply_flag_settings`, and **the only way to confirm an effort change landed** |
+| `set_model` | `{model:"<id>"}` | `null` | Mid-session, no respawn, no session change. No frame follows the request itself; the next turn's re-emitted `system/init` and its `result.modelUsage` carry the new model. An unknown model answers `{"subtype":"error","error":"Model '…' not found","error_code":"catalog_unknown"}` and leaves the model unchanged. Also accepted mid-turn, and the rest of that turn then runs on the new model, so send it only while idle |
+| `set_permission_mode` | `{mode:"<mode>"}` | echoes `{"mode":"plan"}` | Per-turn Plan/Build (§8.2). Takes the CLI's names (`default`, not `manual`; `manual` is tolerated and echoed as `default`); a change is followed by a `system/status {permissionMode}` frame; an unknown mode answers an error with `error_code: "invalid_mode"`; `bypassPermissions` answers `error_code: "bypass_not_launched"` unless the child was launched in that mode (§8.1) |
+| `apply_flag_settings` | `{settings:{effortLevel, ultracode, model, fastMode, advisorModel, viewMode}}` | success | The general session-settings channel. **Invalid values fail silently** — `effortLevel: "banana"` is answered `success`, leaves the previous value, and produces no error the client can see. The read-back is `get_settings.applied.effort`, not `effective`: a valid `max` was applied yet cleared `effective` to `{}` |
+| `get_settings` | — | `{applied:{model, effort, advisor, ultracode, ultracodeRequested, ultracodeAvailable}, effective, sources}` | The read-back for `apply_flag_settings`, and **the only way to confirm an effort change landed**: `applied.model` is the resolved id, `applied.effort` the model-effective level (`null` on a model without effort, whatever the flag setting) |
 | `list_models` | — | `{models:[{value, resolvedModel, displayName, description, supportsEffort, supportedEffortLevels, supportsAdaptiveThinking, supportsAutoMode, supportsFastMode?}]}` | Refreshes the catalog `initialize` already delivered (§6) |
 | `mcp_status` | — | `{mcpServers:[{name, status, error, config, scope, source}]}` | Inventory with failure detail |
 | `get_context_usage` | — | `{categories:[{name, tokens, kind}], totalTokens, maxTokens, rawMaxTokens, autocompactSource, percentage}` | A third context-window source beside `autocompact_state` and `modelUsage` |
@@ -174,6 +174,10 @@ The enumeration also carries roughly a dozen more subtypes this adapter has no u
 - `request_user_dialog` / `elicitation` — MCP elicitation and host dialogs → Giskard's existing
   `ServerRequestReceived` / `respond_server_request` path.
 - `rename_session` — the CLI can also ask the *host* to rename, when the host registers the callback.
+- `control_cancel_request {request_id}` — the CLI withdraws a pending `can_use_tool` when an
+  `interrupt` lands while it waits; the interrupt's own response, the user frames and a `result`
+  (`aborted_tools`, the tool in `permission_denials`) follow. A control response written after it is
+  ignored, and the next turn runs normally.
 
 #### `claude-codes` models almost none of this
 
@@ -951,7 +955,7 @@ meantime, and composition merges it over whatever the probe returns.
 | --- | --- | --- |
 | `ask_first` | `manual` (echoed back as `default`) | **Not "ask about everything":** the CLI approves a built-in read-only command set itself, below the settings layer, with no settings loaded at all (§9.2.1). Calls with an effect reach `can_use_tool`. `default` still passes validation but is no longer among the advertised choices, while `manual` is — so send `manual` and expect `system/init.permissionMode` to echo `default`, treating that echo as success rather than a discrepancy to correct. |
 | `auto_approve` | `acceptEdits` | file edits and filesystem commands inside the workspace proceed; other escalations still ask |
-| `full_access` | `bypassPermissions` | **Not** "never consulted" — see the list below; some calls still reach `can_use_tool` in this mode. Refuses to start if the server process is running as root — see below, and this is documented rather than merely observed |
+| `full_access` | `bypassPermissions` | **Not** "never consulted" — see the list below; some calls still reach `can_use_tool` in this mode. Refuses to start if the server process is running as root — see below, and this is documented rather than merely observed. **Launch-time only:** `set_permission_mode bypassPermissions` answers `error_code: "bypass_not_launched"` on a child launched in any other mode, while a child launched with `--permission-mode bypassPermissions` can be set to `default` and back. So the adapter launches in bypass mode where the CLI allows it, sets `default` in the open handshake before any turn, and falls back to a `manual` launch (with `full_access` refused per turn) where the launch is refused (milestone 3) |
 
 **Two modes this table does not use, recorded so they are not rediscovered:**
 
