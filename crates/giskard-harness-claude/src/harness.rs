@@ -505,13 +505,7 @@ impl ClaudeHarness {
             &mut early,
             &mut result_errors,
         )
-        .await
-        .map_err(|error| match error {
-            HarnessError::Protocol(message) => {
-                HarnessError::Spawn(format!("claude refused initialize: {message}"))
-            }
-            other => other,
-        })?;
+        .await?;
         let reply = InitializeReply::from_value(&reply);
         let snapshot = self.store_catalog(reply.models.as_deref().unwrap_or_default(), "probe");
         let answer = match follow_up {
@@ -532,8 +526,10 @@ impl ClaudeHarness {
     }
 }
 
-/// One probe request under `PROBE_TIMEOUT`. A refusal is `HarnessError::Protocol` and the child
-/// is reaped; an exit before the answer is the handshake error; a timeout kills the child.
+/// One probe request under `PROBE_TIMEOUT`. A refusal reaps the child and is `HarnessError::Spawn`
+/// for `initialize` (the CLI cannot be used at all), `HarnessError::Protocol` otherwise; an exit
+/// before the answer is the handshake error; a timeout kills the child. Any other error (such as an
+/// overlong stdout line) is returned as it is.
 async fn probe_request(
     child: &mut dyn ClaudeChild,
     context: &ChildLogContext,
@@ -559,7 +555,13 @@ async fn probe_request(
                 error = %message,
                 "Claude Code refused a probe request"
             );
-            Err(HarnessError::Protocol(message))
+            if subtype == "initialize" {
+                Err(HarnessError::Spawn(format!(
+                    "claude refused initialize: {message}"
+                )))
+            } else {
+                Err(HarnessError::Protocol(message))
+            }
         }
         Ok(Err(failure)) => Err(failure.into_error(context)),
         Err(_) => {
@@ -4594,6 +4596,23 @@ mod tests {
             Err(HarnessError::Transport(_))
         ));
         assert!(spawner.spawns().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_probe_whose_initialize_is_refused_is_a_spawn_error() {
+        let (probe, record) = ScriptedChild::new(vec![Step::OnStdin(
+            control("initialize"),
+            vec![Action::RespondError("not now")],
+        )]);
+        let (harness, _) = harness(vec![probe]);
+        let error = harness.list_mcp_servers().await.unwrap_err();
+        assert!(
+            matches!(&error, HarnessError::Spawn(message)
+                if message == "claude refused initialize: not now"),
+            "{error}"
+        );
+        assert!(lock(&record).stdin_closed, "the refused probe is reaped");
+        assert!(harness.catalog_snapshot().is_none());
     }
 
     #[tokio::test]
