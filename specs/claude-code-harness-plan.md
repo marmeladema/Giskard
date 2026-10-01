@@ -27,6 +27,8 @@ harness-scoped MCP routes, and capabilities on the wire. This note proposes none
 holds is what only it has: the protocol as it actually behaves, and the decisions an adapter author
 has to make.
 
+Milestone 1 is implemented; see `claude-code-harness-plan/milestone-1-plan.md`.
+
 ---
 
 ## 1. Decisions already taken
@@ -1507,8 +1509,9 @@ sanitized stream-json transcript recorded against a real CLI with the exact argv
 file: the catalog probe, a plain text turn with partial messages, an allowed tool call, a denied one,
 a session-scoped `AcceptForSession`, a `Cancel` (deny with `interrupt`), a foreground delegation, an
 interrupted delegation, a `/compact`, a denied `ExitPlanMode`, a backgrounded shell command that
-outlives its turn, and a failed `--resume`. They live in the crate's `tests/fixtures/` and every
-mapper test reads one of them, so a test's input is a frame the CLI actually produced.
+outlives its turn, and a failed `--resume`. They live in
+`crates/giskard-harness-claude/tests/fixtures/` and every mapper test reads one of them, so a test's
+input is a frame the CLI actually produced.
 
 **The mapper** is a pure state machine like `CodexMapper`: one raw JSON line in, a list of outputs
 out, no I/O. It owns the turn state a single child needs (active turn, item ids keyed by tool-use id

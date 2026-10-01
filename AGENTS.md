@@ -20,6 +20,9 @@ When modifying `giskard-harness-codex`, read
 `crates/giskard-harness-codex/README.md` first and keep it synchronized with changes to native
 identifier mappings, lifecycle behavior, protocol routing, process control, and restart semantics.
 
+When modifying `giskard-harness-claude`, read `crates/giskard-harness-claude/README.md` first and
+keep it synchronized the same way.
+
 The HTTP/WS endpoint inventory and behavior notes live in `docs/api-endpoints.md`, linked from the
 README. Update that file in the same change whenever you add, remove, or change an HTTP or WebSocket
 route in `crates/giskard-server/src/routes.rs` (path, method, request/response shape, or documented
@@ -83,11 +86,12 @@ change, so the README never shows a stale UI. (No regeneration needed for change
 effect, e.g. backend-only or copy-only edits.)
 
 ## Architecture
-Cargo workspace with 8 crates under `crates/`:
+Cargo workspace with 9 crates under `crates/`:
 - `giskard-core` — pure domain types (no I/O)
 - `giskard-git-parser` — parsers for `git` command output (pure, no I/O)
 - `giskard-harness` — `AgentHarness` trait + capabilities
 - `giskard-harness-codex` — Codex CLI adapter
+- `giskard-harness-claude` — Claude Code CLI adapter (milestone 1: mapper only)
 - `giskard-harness-replay` — deterministic replay harness for tests
 - `giskard-persist` — flat-file storage + `giskard-admin` binary
 - `giskard-proto` — shared client↔server wire types
@@ -97,7 +101,8 @@ Cargo workspace with 8 crates under `crates/`:
 - Edition 2024, MSRV 1.89 (`std::fs::File::try_lock`). CI runs `@stable` with no
   `rust-toolchain.toml`, so it will not catch a newer API sneaking past this line — raising it is
   always a deliberate act.
-- All Codex-specific types confined to `giskard-harness-codex`.
+- All Codex-specific types confined to `giskard-harness-codex`, and all Claude Code-specific types
+  to `giskard-harness-claude`.
 - One `CodexInstance` is the single-task state authority for each Codex app-server process. Its
   transport, mapper, active turns, and pending context restores must remain task-owned. Do not share
   them through `Arc<Mutex<_>>`, `Arc<RwLock<_>>`, or independent state-mutating workers; helper

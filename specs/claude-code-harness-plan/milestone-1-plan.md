@@ -323,14 +323,19 @@ Group by lifetime, with a doc comment listing the classes, as `CodexMapper` does
   in and `53` out; a test pins that arithmetic.
 - `TurnUsageUpdated { thread, turn, usage, context_window, model }` is emitted from every
   `MessageDelta` that carries `usage` (live, mid-turn) and once more just before `TurnCompleted`
-  from `result.usage`. `context_window` is `effective_window` when the session reported one,
-  else `result.modelUsage[<session_model>].contextWindow` once a result has been seen, else
-  `None`. `model` is `Some(ModelRef { provider: "anthropic", model, reasoning_effort: None })`
-  only when `note_turn_model` was called for this turn. Consecutive identical `(usage, window)`
-  pairs are suppressed, as `CodexMapper` does through `emitted_usage`.
+  from the last entry of `result.usage.iterations` (`result.usage` itself when `iterations` is
+  empty, as on the degenerate compaction result). Its `usage` is always one API request's, because
+  the context gauge reads its input as current window occupancy (spec §10.3), and `result.usage`
+  sums every request of the turn (`tool-denied`: 22191 in the last request, 44178 summed).
+  `TurnCompleted.usage` is the summed `result.usage`, added across a held result and the CLI's
+  continuation result, which are two halves of one turn. `context_window` is `effective_window`
+  when the session reported one, else `result.modelUsage[<session_model>].contextWindow` once a
+  result has been seen, else `None`. `model` is `Some(ModelRef { provider: "anthropic", model,
+  reasoning_effort: None })` only when `note_turn_model` was called for this turn. Consecutive
+  identical `(usage, window)` pairs are suppressed, as `CodexMapper` does through `emitted_usage`.
 - `result.modelUsage` may carry a second model (plan §6). `AgentEvent` has no per-model usage
-  channel, so the turn's usage is `result.usage` and every `modelUsage` entry is logged at `debug`
-  with its tokens under `model = <id>`. Record that limitation in the README.
+  channel, so the turn's usage is the summed `result.usage` and every `modelUsage` entry is logged
+  at `debug` with its tokens under `model = <id>`. Record that limitation in the README.
 
 ### Items
 

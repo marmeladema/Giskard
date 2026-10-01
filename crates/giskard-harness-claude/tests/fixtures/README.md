@@ -2,9 +2,8 @@
 
 Stream-json transcripts recorded against **Claude Code 2.1.286** by driving a real `claude -p` child
 over a stdio pipe, for the milestone 1 mapper tests of
-[`../../claude-code-harness-plan.md`](../../claude-code-harness-plan.md) (§11). Milestone 1 moves
-this directory to `crates/giskard-harness-claude/tests/fixtures/`; until then it lives beside the
-plan so the plan can cite it.
+[`specs/claude-code-harness-plan.md`](../../../../specs/claude-code-harness-plan.md) (§11). They
+live in `crates/giskard-harness-claude/tests/fixtures/`, where the mapper tests read them.
 
 Each scenario has up to four files:
 

@@ -27,6 +27,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "anyhow"
+version = "1.0.104"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
+
+[[package]]
 name = "argon2"
 version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -273,6 +279,23 @@ dependencies = [
  "serde",
  "wasm-bindgen",
  "windows-link",
+]
+
+[[package]]
+name = "claude-codes"
+version = "2.1.286"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "92846f06e8ba75f6a86a95bebdd90defc56421df76e64730ec5a0b10ac82e01b"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "log",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+ "tokio",
+ "uuid",
+ "which",
 ]
 
 [[package]]
@@ -716,6 +739,21 @@ dependencies = [
  "thiserror 2.0.20",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "giskard-harness-claude"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "claude-codes",
+ "giskard-core",
+ "giskard-harness",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -2604,6 +2642,16 @@ name = "utf8_iter"
 version = "1.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b6c140620e7ffbb22c2dee59cafe6084a59b5ffc27a8859a5f0d494b5d52b6be"
+
+[[package]]
+name = "uuid"
+version = "1.26.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "2ef6dac1e96601b4fb3acccccff2139741fcb757cb9a36089bf5be91cfb285ce"
+dependencies = [
+ "getrandom 0.4.3",
+ "serde_core",
+]
 
 [[package]]
 name = "valuable"
