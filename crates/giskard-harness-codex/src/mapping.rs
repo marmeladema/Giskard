@@ -3326,37 +3326,10 @@ fn parse_hunk_header(line: &str) -> Option<(u32, u32, u32, u32)> {
 
 #[cfg(test)]
 mod tests {
-    use std::io::Write;
-    use std::sync::{Arc, Mutex};
+    use tracing_test::traced_test;
 
     use super::*;
-
-    #[derive(Clone)]
-    struct CapturedLogWriter(Arc<Mutex<Vec<u8>>>);
-
-    impl Write for CapturedLogWriter {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.0.lock().unwrap().extend_from_slice(buf);
-            Ok(buf.len())
-        }
-
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
-    fn capture_logs(log: impl FnOnce()) -> String {
-        let output = Arc::new(Mutex::new(Vec::new()));
-        let writer_output = output.clone();
-        let subscriber = tracing_subscriber::fmt()
-            .without_time()
-            .with_ansi(false)
-            .with_max_level(tracing::Level::WARN)
-            .with_writer(move || CapturedLogWriter(writer_output.clone()))
-            .finish();
-        tracing::subscriber::with_default(subscriber, log);
-        String::from_utf8(output.lock().unwrap().clone()).unwrap()
-    }
+    use crate::log_checks::{a_line_with, no_line_with};
 
     #[test]
     fn native_parentage_is_attested_by_link_items_and_never_inverted() {
@@ -3397,6 +3370,7 @@ mod tests {
     }
 
     #[test]
+    #[traced_test]
     fn unknown_native_thread_warning_identifies_notification_without_payload() {
         let fallback = ThreadId::new();
         let mut mapper = CodexMapper::new(PathBuf::new());
@@ -3408,19 +3382,22 @@ mod tests {
             delta: "sensitive delta payload".into(),
         });
 
-        let output = capture_logs(|| {
-            assert!(mapper.map_notification(&notification, fallback).is_none());
-        });
+        assert!(mapper.map_notification(&notification, fallback).is_none());
 
-        assert!(output.contains("notification_method=\"item/agentMessage/delta\""));
-        assert!(output.contains("native_thread_id=\"unknown-thread\""));
-        assert!(output.contains("native_turn_id=native-turn"));
-        assert!(output.contains("native_item_id=native-item"));
-        assert!(output.contains(&format!("fallback_thread={fallback}")));
-        assert!(!output.contains("sensitive delta payload"));
+        let fallback_field = format!("fallback_thread={fallback}");
+        logs_assert(a_line_with(&[
+            " WARN ",
+            "notification_method=\"item/agentMessage/delta\"",
+            "native_thread_id=\"unknown-thread\"",
+            "native_turn_id=native-turn",
+            "native_item_id=native-item",
+            fallback_field.as_str(),
+        ]));
+        logs_assert(no_line_with("sensitive delta payload"));
     }
 
     #[test]
+    #[traced_test]
     fn unknown_native_thread_resolved_request_warning_includes_request_id() {
         let fallback = ThreadId::new();
         let mut mapper = CodexMapper::new(PathBuf::new());
@@ -3433,17 +3410,20 @@ mod tests {
             .unwrap(),
         );
 
-        let output = capture_logs(|| {
-            assert!(mapper.map_notification(&notification, fallback).is_none());
-        });
+        assert!(mapper.map_notification(&notification, fallback).is_none());
 
-        assert!(output.contains("notification_method=\"serverRequest/resolved\""));
-        assert!(output.contains("native_thread_id=\"unknown-thread\""));
-        assert!(output.contains("native_request_id=native-request"));
-        assert!(output.contains(&format!("fallback_thread={fallback}")));
+        let fallback_field = format!("fallback_thread={fallback}");
+        logs_assert(a_line_with(&[
+            " WARN ",
+            "notification_method=\"serverRequest/resolved\"",
+            "native_thread_id=\"unknown-thread\"",
+            "native_request_id=native-request",
+            fallback_field.as_str(),
+        ]));
     }
 
     #[test]
+    #[traced_test]
     fn unknown_native_thread_warning_identifies_server_request_without_payload() {
         let fallback = ThreadId::new();
         let mut mapper = CodexMapper::new(PathBuf::new());
@@ -3463,21 +3443,23 @@ mod tests {
             .unwrap(),
         );
 
-        let output = capture_logs(|| {
-            assert!(
-                mapper
-                    .map_server_request(&RequestId::Integer(42), &request, fallback)
-                    .is_none()
-            );
-        });
+        assert!(
+            mapper
+                .map_server_request(&RequestId::Integer(42), &request, fallback)
+                .is_none()
+        );
 
-        assert!(output.contains("request_method=\"item/tool/requestUserInput\""));
-        assert!(output.contains("request_id=42"));
-        assert!(output.contains("native_thread_id=\"unknown-thread\""));
-        assert!(output.contains("native_turn_id=native-turn"));
-        assert!(output.contains("native_item_id=native-item"));
-        assert!(output.contains(&format!("fallback_thread={fallback}")));
-        assert!(!output.contains("sensitive request payload"));
+        let fallback_field = format!("fallback_thread={fallback}");
+        logs_assert(a_line_with(&[
+            " WARN ",
+            "request_method=\"item/tool/requestUserInput\"",
+            "request_id=42",
+            "native_thread_id=\"unknown-thread\"",
+            "native_turn_id=native-turn",
+            "native_item_id=native-item",
+            fallback_field.as_str(),
+        ]));
+        logs_assert(no_line_with("sensitive request payload"));
     }
 
     #[test]

@@ -20,4 +20,4 @@ rand = { workspace = true }
 codex-codes = { version = "=0.155.1", features = ["async-client"] }
 
 [dev-dependencies]
-tracing-subscriber = { workspace = true }
+tracing-test = { workspace = true }
