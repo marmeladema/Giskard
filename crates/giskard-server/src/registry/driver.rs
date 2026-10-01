@@ -7,7 +7,7 @@ use giskard_core::error::HarnessError;
 use giskard_core::ids::{ItemId, ProjectId, ThreadId, TurnId};
 use giskard_harness::{AgentHarness, DiscoveryStream, EventStreamError, ThreadHandle};
 use tokio::sync::{mpsc, oneshot, watch};
-use tracing::{debug, error, warn};
+use tracing::{Instrument, debug, error, warn};
 
 use super::SubagentActivityInfo;
 use super::admission::{self, Admission, Admitted};
@@ -461,10 +461,13 @@ pub(super) fn spawn_project_event_driver(
         deferred: VecDeque::new(),
         quiesced: false,
     };
-    tokio::spawn(async move {
-        let _permit = permit;
-        driver.run().await;
-    });
+    tokio::spawn(
+        async move {
+            let _permit = permit;
+            driver.run().await;
+        }
+        .in_current_span(),
+    );
     DriverHandle {
         tx: DriverSender::Strong(tx),
     }

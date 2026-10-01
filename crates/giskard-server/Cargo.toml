@@ -44,6 +44,7 @@ indexmap = { workspace = true }
 sha2 = { workspace = true }
 
 [dev-dependencies]
+tracing-test = { workspace = true }
 giskard-harness-replay = { workspace = true }
 giskard-testenv = { workspace = true }
 tempfile = { workspace = true }
