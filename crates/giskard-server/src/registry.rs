@@ -2338,13 +2338,25 @@ mod tests {
             if let Some(gate) = gate {
                 gate.notified().await;
             }
-            if self
-                .shutdown_failures
-                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
-                    remaining.checked_sub(1)
-                })
-                .is_ok()
-            {
+            // Consume one injected failure if any are left. A `compare_exchange` loop rather than
+            // `fetch_update`, which newer toolchains deprecate in favour of `try_update`, itself
+            // newer than the MSRV.
+            let mut remaining = self.shutdown_failures.load(Ordering::SeqCst);
+            let inject_failure = loop {
+                let Some(next) = remaining.checked_sub(1) else {
+                    break false;
+                };
+                match self.shutdown_failures.compare_exchange(
+                    remaining,
+                    next,
+                    Ordering::SeqCst,
+                    Ordering::SeqCst,
+                ) {
+                    Ok(_) => break true,
+                    Err(actual) => remaining = actual,
+                }
+            };
+            if inject_failure {
                 return Err(HarnessError::Protocol("injected shutdown failure".into()));
             }
             self.shutdown_observed_finished_claim.store(
