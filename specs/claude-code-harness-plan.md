@@ -1658,7 +1658,8 @@ against milestone 5's tree: the hint is resolved from the open thread's binding 
 thread of another project is `404`, of another declaration `400`, one that is not open answers for
 the instance), a sub-agent hint asks the child that carries it, no hint or a hint without a live
 child asks the thread-less probe (never an arbitrary child), and a live child's failure is
-returned rather than probed around.
+returned rather than probed around. MCP status per thread is implemented; see
+`claude-code-harness-plan/mcp-status-per-thread-plan.md`.
 
 ### Later, as its own decision — the hook route (§9.4)
 

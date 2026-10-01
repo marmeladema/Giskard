@@ -3235,7 +3235,7 @@ async fn mcp_status_routes_surface_empty_replay_status_and_reload() {
     let base = server.base.clone();
     let client = reqwest::Client::new();
     let cookie = auth::login(&client, &base).await;
-    let (project_id, _) = create_project_and_thread(state, &client, &base, &cookie).await;
+    let (project_id, thread_id) = create_project_and_thread(state, &client, &base, &cookie).await;
 
     let status: serde_json::Value = client
         .get(format!(
@@ -3252,6 +3252,29 @@ async fn mcp_status_routes_surface_empty_replay_status_and_reload() {
     assert_eq!(status["capabilities"]["status"], true);
     assert_eq!(status["capabilities"]["reload"], true);
     assert_eq!(status["capabilities"]["oauth_login"], false);
+
+    // The open thread as a hint: the replay harness ignores it, so the body is the same. A thread
+    // that is not open is answered for the instance; a malformed id is Axum's `400`.
+    let mcp = |query: String| {
+        let client = client.clone();
+        let cookie = cookie.clone();
+        let url = format!("{base}/api/projects/{project_id}/harnesses/codex/mcp{query}");
+        async move {
+            client
+                .get(url)
+                .header("cookie", &cookie)
+                .send()
+                .await
+                .unwrap()
+        }
+    };
+    let hinted = mcp(format!("?thread={thread_id}")).await;
+    assert_eq!(hinted.status(), 200);
+    assert_eq!(hinted.json::<serde_json::Value>().await.unwrap(), status);
+    let not_open = mcp(format!("?thread={}", ThreadId::new())).await;
+    assert_eq!(not_open.status(), 200);
+    assert_eq!(not_open.json::<serde_json::Value>().await.unwrap(), status);
+    assert_eq!(mcp("?thread=nope".into()).await.status(), 400);
 
     let reload: serde_json::Value = client
         .post(format!(
@@ -3284,6 +3307,146 @@ async fn mcp_status_routes_surface_empty_replay_status_and_reload() {
         .await
         .unwrap();
     assert_eq!(undeclared.status(), 404);
+}
+
+/// A server declaring `stable` (the default) and `nightly`, both constructing replay harnesses.
+/// Duplicated from `thread_lifecycle.rs`, where it is private.
+async fn start_two_declaration_server() -> TestServer {
+    TestServer::spawn(factory::with_catalog(
+        factory::from_fn(|_, _| Ok(Arc::new(giskard_harness_replay::ReplayHarness::new()))),
+        factory::catalog(
+            r#"
+[harnesses.stable]
+kind = "codex"
+default = true
+
+[harnesses.nightly]
+kind = "codex"
+"#,
+        ),
+    ))
+    .await
+}
+
+/// Start a thread on `harness` (the project default when `None`) and return its id.
+async fn start_thread_on(server: &TestServer, pid: ProjectId, harness: Option<&str>) -> ThreadId {
+    let mut body = serde_json::json!({
+        "text": "hello",
+        "model_ref": {"provider": "openai", "model": "gpt-5.5", "reasoning_effort": null},
+        "mode": "build",
+        "permission_preset": "ask_first",
+    });
+    if let Some(harness) = harness {
+        body["harness"] = harness.into();
+    }
+    let response = server
+        .client
+        .post(server.url(&format!("/api/projects/{pid}/threads/start")))
+        .header("cookie", &server.cookie)
+        .json(&body)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let started: serde_json::Value = response.json().await.unwrap();
+    started["thread_id"].as_str().unwrap().parse().unwrap()
+}
+
+#[tokio::test]
+async fn mcp_status_hint_is_checked_against_the_path() {
+    let server = start_two_declaration_server().await;
+    let project = server.create_project("mcp-hint").await;
+    let nightly = start_thread_on(&server, project.id, Some("nightly")).await;
+    let get = |pid: ProjectId, harness: &str, thread: ThreadId| {
+        server
+            .client
+            .get(server.url(&format!(
+                "/api/projects/{pid}/harnesses/{harness}/mcp?thread={thread}"
+            )))
+            .header("cookie", &server.cookie)
+            .send()
+    };
+
+    assert_eq!(
+        get(project.id, "nightly", nightly).await.unwrap().status(),
+        200
+    );
+    let other_declaration = get(project.id, "stable", nightly).await.unwrap();
+    assert_eq!(other_declaration.status(), 400);
+    let body = other_declaration.text().await.unwrap();
+    assert!(body.contains("nightly"), "{body}");
+
+    let other = server.create_project("mcp-hint-other").await;
+    let foreign = start_thread_on(&server, other.id, None).await;
+    assert_eq!(
+        get(project.id, "stable", foreign).await.unwrap().status(),
+        404,
+        "a thread of another project is not addressable through this project's path"
+    );
+}
+
+/// Answers MCP status with one server named after the hint's native id, or `none`.
+struct McpHintScript;
+
+#[async_trait::async_trait]
+impl Script for McpHintScript {
+    fn capabilities(&self) -> HarnessCapabilities {
+        HarnessCapabilities {
+            mcp_status: true,
+            ..caps::TURNS
+        }
+    }
+
+    async fn list_mcp_servers(
+        &self,
+        _core: &FakeCore,
+        thread: Option<&ThreadHandle>,
+    ) -> Result<Vec<giskard_core::mcp::McpServerStatus>, HarnessError> {
+        let name = thread.map_or("none", |handle| handle.harness_thread_id.as_str());
+        Ok(vec![giskard_core::mcp::McpServerStatus {
+            name: name.to_owned(),
+            auth_status: giskard_core::mcp::McpAuthStatus::Unknown,
+            server_info: None,
+            tools: Vec::new(),
+            resources: Vec::new(),
+            resource_templates: Vec::new(),
+        }])
+    }
+}
+
+#[tokio::test]
+async fn mcp_status_hint_reaches_the_harness() {
+    let server =
+        start_custom_server_on_available_port(fake::factory(FakeHarness::new(McpHintScript))).await;
+    let state = &server.state;
+    let base = server.base.clone();
+    let client = reqwest::Client::new();
+    let cookie = auth::login(&client, &base).await;
+    let (project_id, thread_id) = create_project_and_thread(state, &client, &base, &cookie).await;
+    let name = |query: String| {
+        let client = client.clone();
+        let cookie = cookie.clone();
+        let url = format!("{base}/api/projects/{project_id}/harnesses/codex/mcp{query}");
+        async move {
+            let status: serde_json::Value = client
+                .get(url)
+                .header("cookie", &cookie)
+                .send()
+                .await
+                .unwrap()
+                .json()
+                .await
+                .unwrap();
+            status["servers"][0]["name"].as_str().unwrap().to_owned()
+        }
+    };
+    assert_eq!(name(format!("?thread={thread_id}")).await, "th_test");
+    assert_eq!(name(String::new()).await, "none");
+    assert_eq!(
+        name(format!("?thread={}", ThreadId::new())).await,
+        "none",
+        "a thread that is not open is answered for the instance"
+    );
 }
 
 #[tokio::test]

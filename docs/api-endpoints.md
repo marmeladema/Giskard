@@ -32,6 +32,15 @@ declaration, and an undeclared name is a `404`. The browser addresses the open t
 hides the MCP menu on a draft, which has no instance yet. There are no project-wide
 `/api/projects/{id}/mcp` paths.
 
+`GET /api/projects/{id}/harnesses/{name}/mcp` takes an optional `thread=<thread_id>` query
+parameter, which the browser sets to the open thread's id. It is a hint, not a scope: a harness
+with one process per thread (Claude Code) reports that thread's process (for a sub-agent thread,
+the process that carries it), and Codex, with one process per project, ignores it. A thread that
+is not open (closed since the page rendered, or never opened) is answered for the instance (the
+Claude Code adapter's thread-less probe), a thread of another project is a `404`, a thread on
+another declaration is a `400` naming its harness, and a malformed id is a `400`. Without the
+parameter the instance answers for itself. The reload and OAuth-login routes take no thread.
+
 `GET /api/ws-ticket` returns the short-lived `ticket` and `ui_version`, the content identity of the
 server's embedded JavaScript. The browser compares `ui_version` with the identity embedded in its
 loaded page before opening or reopening a WebSocket. A mismatch means the tab predates a server

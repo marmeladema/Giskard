@@ -459,6 +459,24 @@ impl ClaudeHarness {
         );
     }
 
+    /// The child that carries `thread`: its own child, else, for a sub-agent route, its owner's.
+    /// `None` when neither is live (a cold route, or a thread this instance does not hold). The
+    /// two locks are taken one after the other, never nested.
+    fn child_carrying(&self, thread: ThreadId) -> Option<(ThreadId, mpsc::Sender<ChildCommand>)> {
+        if let Some(commands) = lock(&self.children)
+            .get(&thread)
+            .map(|handle| handle.commands.clone())
+        {
+            return Some((thread, commands));
+        }
+        let owner = lock(&self.routes)
+            .get(&thread)
+            .and_then(|route| route.owner)?;
+        lock(&self.children)
+            .get(&owner)
+            .map(|handle| (owner, handle.commands.clone()))
+    }
+
     /// `interrupt` on a sub-agent thread: `stop_task` through the child that carries its route.
     async fn interrupt_route(&self, thread: &ThreadHandle) -> Result<(), HarnessError> {
         let route = lock(&self.routes)
@@ -1132,17 +1150,19 @@ impl AgentHarness for ClaudeHarness {
         Ok(descriptors(&snapshot))
     }
 
-    /// A live child's servers when one runs (what the user's session connected), else a probe's.
-    async fn list_mcp_servers(&self) -> Result<Vec<McpServerStatus>, HarnessError> {
+    /// The hinted thread's child when it has one (a sub-agent's owner child), else a probe's:
+    /// never an arbitrary child, since `pending` and `failed` are per process.
+    async fn list_mcp_servers(
+        &self,
+        thread: Option<&ThreadHandle>,
+    ) -> Result<Vec<McpServerStatus>, HarnessError> {
         self.ensure_running()?;
         let request = json!({"subtype": "mcp_status"});
-        let live = lock(&self.children)
-            .iter()
-            .next()
-            .map(|(thread, handle)| (*thread, handle.commands.clone()));
-        if let Some((thread, commands)) = live {
+        let hinted = thread.map(|handle| handle.thread);
+        let child = hinted.and_then(|thread| self.child_carrying(thread));
+        if let Some((owner, commands)) = child {
             let payload = self
-                .call(thread, commands, "mcp_status", CONTROL_TIMEOUT, |reply| {
+                .call(owner, commands, "mcp_status", CONTROL_TIMEOUT, |reply| {
                     ChildCommand::Control { request, reply }
                 })
                 .await
@@ -1150,7 +1170,9 @@ impl AgentHarness for ClaudeHarness {
                     warn!(
                         project_id = display_opt(self.launch.project_id),
                         harness = display_opt(self.launch.declaration.as_deref()),
-                        thread_id = %thread,
+                        thread_id = display_opt(hinted),
+                        owner_thread_id = %owner,
+                        hinted = true,
                         action = "mcp_status",
                         error = %error,
                         "a live claude child did not report its MCP servers"
@@ -1160,12 +1182,23 @@ impl AgentHarness for ClaudeHarness {
             info!(
                 project_id = display_opt(self.launch.project_id),
                 harness = display_opt(self.launch.declaration.as_deref()),
-                thread_id = %thread,
+                thread_id = display_opt(hinted),
+                owner_thread_id = %owner,
+                hinted = true,
                 action = "mcp_status",
                 servers = servers.len(),
                 "read the MCP servers of a live claude child"
             );
             return Ok(servers);
+        }
+        if let Some(thread_id) = hinted {
+            debug!(
+                project_id = display_opt(self.launch.project_id),
+                harness = display_opt(self.launch.declaration.as_deref()),
+                thread_id = %thread_id,
+                action = "mcp_status",
+                "the hinted thread has no live child; probing"
+            );
         }
         let _probe = self.probe.lock().await;
         self.ensure_running()?;
@@ -1174,6 +1207,8 @@ impl AgentHarness for ClaudeHarness {
             warn!(
                 project_id = display_opt(self.launch.project_id),
                 harness = display_opt(self.launch.declaration.as_deref()),
+                thread_id = display_opt(hinted),
+                hinted = hinted.is_some(),
                 action = "mcp_probe",
                 error = %error,
                 "the MCP probe failed"
@@ -1183,6 +1218,8 @@ impl AgentHarness for ClaudeHarness {
         info!(
             project_id = display_opt(self.launch.project_id),
             harness = display_opt(self.launch.declaration.as_deref()),
+            thread_id = display_opt(hinted),
+            hinted = hinted.is_some(),
             action = "mcp_probe",
             elapsed_ms = started.elapsed().as_millis() as u64,
             servers = servers.len(),
@@ -4664,7 +4701,7 @@ mod tests {
         let (two, _) = mcp_probe_child(Action::Respond(crate::mcp::tests::failed_and_pending()));
         let (harness, spawner) = harness(vec![empty, two]);
 
-        assert!(harness.list_mcp_servers().await.unwrap().is_empty());
+        assert!(harness.list_mcp_servers(None).await.unwrap().is_empty());
         assert!(lock(&empty_record).stdin_closed, "the probe exits");
         assert_eq!(harness.live_children(), 0, "a probe is not a live child");
         assert!(
@@ -4672,7 +4709,7 @@ mod tests {
             "the probe's initialize stores the catalog"
         );
 
-        let servers = harness.list_mcp_servers().await.unwrap();
+        let servers = harness.list_mcp_servers(None).await.unwrap();
         let names: Vec<_> = servers.iter().map(|server| server.name.as_str()).collect();
         assert_eq!(names, ["broken", "echo"]);
         assert!(servers.iter().all(|server| server.auth_status
@@ -4699,44 +4736,179 @@ mod tests {
             {"name": "remote", "status": "needs-auth", "scope": "user", "source": "user"}
         ]})));
         let (harness, _) = harness(vec![probe]);
-        let servers = harness.list_mcp_servers().await.unwrap();
+        let servers = harness.list_mcp_servers(None).await.unwrap();
         assert_eq!(
             servers[0].auth_status,
             giskard_core::mcp::McpAuthStatus::NotLoggedIn
         );
     }
 
+    /// A primary thread's child that answers one `mcp_status` with `answer`.
+    fn mcp_session(answer: Action) -> (ScriptedChild, Arc<Mutex<ScriptRecord>>) {
+        scripted(
+            handshake_steps("sonnet"),
+            vec![Step::OnStdin(control("mcp_status"), vec![answer])],
+        )
+    }
+
+    fn mcp_status_lines(record: &Arc<Mutex<ScriptRecord>>) -> usize {
+        written(record)
+            .iter()
+            .filter(|line| line["request"]["subtype"] == "mcp_status")
+            .count()
+    }
+
     #[traced_test]
     #[tokio::test]
-    async fn list_mcp_servers_asks_a_live_child_without_probing() {
-        let (session, record) = scripted(
-            handshake_steps("sonnet"),
+    async fn list_mcp_servers_asks_the_hinted_thread_s_child() {
+        let (first, first_record) = mcp_session(Action::Respond(json!({"mcpServers": []})));
+        let (second, second_record) =
+            mcp_session(Action::Respond(crate::mcp::tests::failed_and_pending()));
+        let (probe, probe_record) = mcp_probe_child(Action::Respond(json!({"mcpServers": []})));
+        let (harness, spawner) = harness(vec![first, second, probe]);
+        let (options, _first_updates) = open_options(ThreadId::new(), None, "sonnet");
+        let first_handle = harness.open_thread(options).await.unwrap();
+        let (options, _second_updates) = open_options(ThreadId::new(), None, "sonnet");
+        let second_handle = harness.open_thread(options).await.unwrap();
+
+        let servers = harness
+            .list_mcp_servers(Some(&second_handle))
+            .await
+            .unwrap();
+        assert_eq!(servers.len(), 2);
+        assert_eq!(mcp_status_lines(&second_record), 1);
+        assert_eq!(mcp_status_lines(&first_record), 0);
+
+        let servers = harness.list_mcp_servers(Some(&first_handle)).await.unwrap();
+        assert!(servers.is_empty());
+        assert_eq!(mcp_status_lines(&first_record), 1);
+        assert_eq!(mcp_status_lines(&second_record), 1);
+        assert_eq!(spawner.spawns().len(), 2, "no probe was spawned");
+        assert!(logs_contain("read the MCP servers of a live claude child"));
+
+        // No hint: the instance's thread-less view, never some live child's.
+        assert!(harness.list_mcp_servers(None).await.unwrap().is_empty());
+        assert_eq!(spawner.spawns().len(), 3, "the probe answered");
+        assert_eq!(mcp_status_lines(&probe_record), 1);
+        assert_eq!(mcp_status_lines(&first_record), 1);
+        assert_eq!(mcp_status_lines(&second_record), 1);
+        harness.shutdown().await.unwrap();
+    }
+
+    #[traced_test]
+    #[tokio::test]
+    async fn a_sub_agent_hint_asks_its_owner() {
+        let (harness, handle, _stream, route, record, _injector) = delegating(
+            "delegation",
+            7,
             vec![Step::OnStdin(
                 control("mcp_status"),
                 vec![Action::Respond(crate::mcp::tests::failed_and_pending())],
             )],
+        )
+        .await;
+        let servers = harness.list_mcp_servers(Some(&route)).await.unwrap();
+        assert_eq!(servers.len(), 2);
+        assert_eq!(mcp_status_lines(&record), 1);
+        let owner = format!("owner_thread_id={}", handle.thread);
+        let thread = format!("thread_id={}", route.thread);
+        logs_assert(a_line_with(&[
+            r#"action="mcp_status""#,
+            &owner,
+            &thread,
+            "hinted=true",
+        ]));
+        harness.shutdown().await.unwrap();
+    }
+
+    #[traced_test]
+    #[tokio::test]
+    async fn a_hint_for_a_thread_without_a_child_probes() {
+        let (probe, probe_record) =
+            mcp_probe_child(Action::Respond(crate::mcp::tests::failed_and_pending()));
+        let (cold_probe, cold_record) = mcp_probe_child(Action::Respond(json!({"mcpServers": []})));
+        let (harness, spawner) = harness(vec![probe, cold_probe]);
+
+        let stranger = ThreadHandle::detached(ThreadId::new(), "x".into());
+        let servers = harness.list_mcp_servers(Some(&stranger)).await.unwrap();
+        assert_eq!(servers.len(), 2);
+        assert_eq!(spawner.spawns().len(), 1);
+        assert!(lock(&probe_record).stdin_closed, "the probe exits");
+        assert!(logs_contain("the hinted thread has no live child; probing"));
+        logs_assert(a_line_with(&[r#"action="mcp_probe""#, "hinted=true"]));
+
+        let cold = harness
+            .claim_native_thread(
+                ThreadId::new(),
+                "task:toolu_gone".into(),
+                PathBuf::from(WORKSPACE),
+            )
+            .await
+            .unwrap();
+        assert!(
+            harness
+                .list_mcp_servers(Some(&cold))
+                .await
+                .unwrap()
+                .is_empty()
         );
+        assert_eq!(spawner.spawns().len(), 2, "a cold route is probed");
+        assert_eq!(mcp_status_lines(&cold_record), 1);
+        harness.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_hinted_child_s_failure_is_returned_not_probed() {
+        let (session, record) = mcp_session(Action::RespondError("mcp unavailable"));
         let (harness, spawner) = harness(vec![session]);
         let (options, _updates) = open_options(ThreadId::new(), None, "sonnet");
-        harness.open_thread(options).await.unwrap();
-
-        let servers = harness.list_mcp_servers().await.unwrap();
-        assert_eq!(servers.len(), 2);
-        assert_eq!(spawner.spawns().len(), 1, "no probe was spawned");
+        let handle = harness.open_thread(options).await.unwrap();
+        let error = harness.list_mcp_servers(Some(&handle)).await.unwrap_err();
         assert!(
-            written(&record)
-                .iter()
-                .any(|line| line["request"]["subtype"] == "mcp_status")
+            matches!(&error, HarnessError::Protocol(message) if message == "mcp unavailable"),
+            "{error}"
         );
-        assert!(logs_contain("read the MCP servers of a live claude child"));
+        assert_eq!(mcp_status_lines(&record), 1);
+        assert_eq!(spawner.spawns().len(), 1, "no probe was spawned");
         harness.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_probe_never_becomes_a_session() {
+        let (models_probe, models_record) = probe_child();
+        let (mcp_probe, mcp_record) = mcp_probe_child(Action::Respond(json!({"mcpServers": []})));
+        let (harness, spawner) = harness(vec![models_probe, mcp_probe]);
+        harness.list_models().await.unwrap();
+        harness.list_mcp_servers(None).await.unwrap();
+        assert_eq!(spawner.spawns().len(), 2);
+        for argv in spawner.spawns() {
+            for flag in ["--session-id", "--resume", "--model", "--permission-mode"] {
+                assert!(!argv.iter().any(|arg| arg == flag), "{flag} in {argv:?}");
+            }
+        }
+        for (record, subtypes) in [
+            (&models_record, vec!["initialize"]),
+            (&mcp_record, vec!["initialize", "mcp_status"]),
+        ] {
+            let lines = written(record);
+            assert!(
+                lines.iter().all(|line| line["type"] == "control_request"),
+                "{lines:?}"
+            );
+            let written: Vec<_> = lines
+                .iter()
+                .map(|line| line["request"]["subtype"].as_str().unwrap_or_default())
+                .collect();
+            assert_eq!(written, subtypes);
+            assert!(lock(record).stdin_closed, "the probe's stdin is closed");
+        }
     }
 
     #[tokio::test]
     async fn a_refused_mcp_status_is_a_protocol_error() {
         let (probe, record) = mcp_probe_child(Action::RespondError("mcp unavailable"));
         let (harness, _) = harness(vec![probe]);
-        let error = harness.list_mcp_servers().await.unwrap_err();
+        let error = harness.list_mcp_servers(None).await.unwrap_err();
         assert!(
             matches!(&error, HarnessError::Protocol(message) if message == "mcp unavailable"),
             "{error}"
@@ -4751,7 +4923,7 @@ mod tests {
             stderr: vec!["boom".into()],
         });
         let (harness, _) = harness(vec![probe]);
-        let error = harness.list_mcp_servers().await.unwrap_err();
+        let error = harness.list_mcp_servers(None).await.unwrap_err();
         assert!(
             matches!(&error, HarnessError::Spawn(message)
                 if message.contains("before answering mcp_status") && message.contains("boom")),
@@ -4764,7 +4936,7 @@ mod tests {
         let (harness, spawner) = harness(Vec::new());
         harness.shutdown().await.unwrap();
         assert!(matches!(
-            harness.list_mcp_servers().await,
+            harness.list_mcp_servers(None).await,
             Err(HarnessError::Transport(_))
         ));
         assert!(spawner.spawns().is_empty());
@@ -4777,7 +4949,7 @@ mod tests {
             vec![Action::RespondError("not now")],
         )]);
         let (harness, _) = harness(vec![probe]);
-        let error = harness.list_mcp_servers().await.unwrap_err();
+        let error = harness.list_mcp_servers(None).await.unwrap_err();
         assert!(
             matches!(&error, HarnessError::Spawn(message)
                 if message == "claude refused initialize: not now"),
@@ -4859,7 +5031,7 @@ mod tests {
     #[tokio::test]
     async fn a_real_probe_lists_no_mcp_servers() {
         let (harness, _workspace) = real_harness(&[]);
-        assert!(harness.list_mcp_servers().await.unwrap().is_empty());
+        assert!(harness.list_mcp_servers(None).await.unwrap().is_empty());
         assert_eq!(harness.live_children(), 0);
     }
 

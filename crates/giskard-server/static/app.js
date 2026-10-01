@@ -8887,7 +8887,8 @@ function renderMcpButton() {
   if (!$("mcpMenu").hidden) renderMcpMenu();
 }
 // MCP servers belong to one harness instance: the active thread's. A view with none yet (a draft)
-// has no instance to ask, so the menu stays hidden rather than guessing one.
+// has no instance to ask, so the menu stays hidden rather than guessing one. The open thread's id
+// rides along as a hint: a harness with one process per thread reports that thread's process.
 async function loadMcpServers(opts) {
   opts = opts || {};
   if (!state.projectId || state.mcpLoading) return;
@@ -8898,8 +8899,10 @@ async function loadMcpServers(opts) {
   state.mcpError = null;
   renderMcpButton();
   try {
+    const thread = state.threadId;
+    const query = thread ? `?thread=${encodeURIComponent(thread)}` : "";
     const res = await api("GET",
-      `/api/projects/${projectId}/harnesses/${encodeURIComponent(harness)}/mcp`);
+      `/api/projects/${projectId}/harnesses/${encodeURIComponent(harness)}/mcp${query}`);
     if (state.projectId !== projectId) return;
     state.mcpServers = Array.isArray(res.servers) ? res.servers : [];
     state.mcpCapabilities = res.capabilities || { status:true, reload:false, oauth_login:false };

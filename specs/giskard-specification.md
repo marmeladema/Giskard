@@ -22,7 +22,8 @@
 > declared; picking a model picks its harness, and the thread is created on that instance.
 > Sub-agents inherit their parent's declaration. An existing thread's picker, capabilities, and MCP
 > menu address its own instance only: the models route composes one declaration when asked with
-> `?harness=<name>`, and the MCP routes live under `/api/projects/{id}/harnesses/{name}/mcp`. A
+> `?harness=<name>`, and the MCP routes live under `/api/projects/{id}/harnesses/{name}/mcp`. The
+> MCP status route takes the open thread as a hint for harnesses with one process per thread. A
 > thread whose declaration is no longer declared opens read-only naming it while its siblings open
 > normally.
 
@@ -1898,8 +1899,12 @@ pub trait AgentHarness: Send + Sync {
     /// List the providers this harness routes to, if it can introspect its own config (§8.2).
     async fn list_providers(&self) -> Result<Vec<HarnessProvider>, HarnessError>;
 
-    /// List configured MCP servers and their visible tools/resources.
-    async fn list_mcp_servers(&self) -> Result<Vec<McpServerStatus>, HarnessError>;
+    /// List configured MCP servers and their visible tools/resources. `thread` is a hint: an
+    /// adapter with one process per thread answers from that thread's process, others ignore it.
+    async fn list_mcp_servers(
+        &self,
+        thread: Option<&ThreadHandle>,
+    ) -> Result<Vec<McpServerStatus>, HarnessError>;
 
     /// Reload MCP server configuration.
     async fn reload_mcp_servers(&self) -> Result<(), HarnessError>;

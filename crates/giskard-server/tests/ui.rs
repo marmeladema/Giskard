@@ -3770,8 +3770,12 @@ fn browser_groups_the_picker_by_harness_only_with_a_choice() {
         "an existing thread refuses another harness's model"
     );
     assert!(
-        source.contains("/harnesses/${encodeURIComponent(harness)}/mcp`"),
+        source.contains("/harnesses/${encodeURIComponent(harness)}/mcp${query}`"),
         "MCP requests address the active thread's harness instance"
+    );
+    assert!(
+        source.contains("?thread=${encodeURIComponent(thread)}"),
+        "MCP status names the open thread as a hint"
     );
     // The sidebar names a thread's harness only when there is more than one to tell apart, and
     // learns the declarations at start so a view scoped to one thread still knows them all.

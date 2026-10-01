@@ -257,7 +257,10 @@ impl AgentHarness for ReplayHarness {
         }
     }
 
-    async fn list_mcp_servers(&self) -> Result<Vec<McpServerStatus>, HarnessError> {
+    async fn list_mcp_servers(
+        &self,
+        _thread: Option<&ThreadHandle>,
+    ) -> Result<Vec<McpServerStatus>, HarnessError> {
         Ok(vec![])
     }
 
