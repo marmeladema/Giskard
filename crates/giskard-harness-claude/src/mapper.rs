@@ -2019,39 +2019,12 @@ fn content_block_type(block: &ContentBlock) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use std::io::Write;
-    use std::sync::{Arc, Mutex};
+    use tracing_test::traced_test;
 
     use super::*;
+    use crate::log_checks::{a_line_with, lines_with, no_line_with};
 
     const WORKSPACE: &str = "/work/project";
-
-    #[derive(Clone)]
-    struct CapturedLogWriter(Arc<Mutex<Vec<u8>>>);
-
-    impl Write for CapturedLogWriter {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.0.lock().unwrap().extend_from_slice(buf);
-            Ok(buf.len())
-        }
-
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
-    fn capture_logs(level: tracing::Level, log: impl FnOnce()) -> String {
-        let output = Arc::new(Mutex::new(Vec::new()));
-        let writer_output = output.clone();
-        let subscriber = tracing_subscriber::fmt()
-            .without_time()
-            .with_ansi(false)
-            .with_max_level(level)
-            .with_writer(move || CapturedLogWriter(writer_output.clone()))
-            .finish();
-        tracing::subscriber::with_default(subscriber, log);
-        String::from_utf8(output.lock().unwrap().clone()).unwrap()
-    }
 
     fn fixture(name: &str, extension: &str) -> Option<String> {
         let path = format!(
@@ -2593,24 +2566,23 @@ mod tests {
     }
 
     #[test]
+    #[traced_test]
     fn blank_lines_are_skipped_without_a_warning() {
         let mut mapper = new_mapper();
         let mut outputs = Vec::new();
-        let logs = capture_logs(tracing::Level::WARN, || {
-            outputs.extend(mapper.map_line(""));
-            outputs.extend(mapper.map_line("  \r"));
-        });
+        outputs.extend(mapper.map_line(""));
+        outputs.extend(mapper.map_line("  \r"));
         assert!(outputs.is_empty());
-        assert!(logs.is_empty(), "{logs}");
+        // Nothing at `WARN` or above.
+        logs_assert(lines_with(0, &[" WARN "]));
+        logs_assert(lines_with(0, &[" ERROR "]));
     }
 
     #[test]
+    #[traced_test]
     fn a_background_shell_task_never_gates_the_turn() {
         let lines = out_lines("background-bash");
-        let mut per_line = Vec::new();
-        let logs = capture_logs(tracing::Level::INFO, || {
-            per_line = drive(&mut new_mapper(), "background-bash", TurnKind::User);
-        });
+        let per_line = drive(&mut new_mapper(), "background-bash", TurnKind::User);
         let results: Vec<usize> = lines
             .iter()
             .enumerate()
@@ -2649,7 +2621,7 @@ mod tests {
                 text: "Background task completed.".into()
             }]
         );
-        assert!(logs.contains(r#"action="external_turn""#), "{logs}");
+        logs_assert(a_line_with(&[" INFO ", r#"action="external_turn""#]));
     }
 
     #[test]
@@ -2866,35 +2838,37 @@ mod tests {
     }
 
     #[test]
+    #[traced_test]
     fn a_permission_mode_the_adapter_did_not_set_is_a_notice() {
         let mut mapper = new_mapper();
         mapper.set_expected_mode("default");
         let status = r#"{"type":"system","subtype":"status","status":null,"permissionMode":"plan","session_id":"s"}"#;
-        let mut outputs = Vec::new();
-        let logs = capture_logs(tracing::Level::WARN, || {
-            outputs = mapper.map_line(status);
-        });
+        let outputs = mapper.map_line(status);
         assert_eq!(notices(&outputs).len(), 1);
-        assert!(logs.contains(r#"action="permission_mode_drift""#), "{logs}");
+        logs_assert(a_line_with(&[
+            " WARN ",
+            r#"action="permission_mode_drift""#,
+        ]));
 
         mapper.set_expected_mode("plan");
         assert!(events(&mapper.map_line(status)).is_empty());
     }
 
     #[test]
+    #[traced_test]
     fn a_permission_mode_the_adapter_did_not_set_on_init_is_a_notice() {
         let mut mapper = new_mapper();
         mapper.set_expected_mode("acceptEdits");
         let init = line_of("text-turn", "system");
-        let mut outputs = Vec::new();
-        let logs = capture_logs(tracing::Level::WARN, || {
-            outputs = mapper.map_line(&init);
-        });
+        let outputs = mapper.map_line(&init);
         assert_eq!(
             notices(&outputs),
             ["Claude Code switched its permission mode to default; Giskard set acceptEdits"]
         );
-        assert!(logs.contains(r#"action="permission_mode_drift""#), "{logs}");
+        logs_assert(a_line_with(&[
+            " WARN ",
+            r#"action="permission_mode_drift""#,
+        ]));
 
         // No expectation yet (before the adapter set a mode): no drift.
         let mut fresh = new_mapper();
@@ -2902,25 +2876,24 @@ mod tests {
     }
 
     #[test]
+    #[traced_test]
     fn a_control_cancel_request_is_handed_to_the_adapter() {
         let mut mapper = new_mapper();
-        let mut outputs = Vec::new();
-        let logs = capture_logs(tracing::Level::INFO, || {
-            outputs =
-                mapper.map_line(r#"{"type":"control_cancel_request","request_id":"a949f115"}"#);
-        });
+        let outputs =
+            mapper.map_line(r#"{"type":"control_cancel_request","request_id":"a949f115"}"#);
         assert!(matches!(
             &outputs[..],
             [MapperOutput::CancelRequest { request_id }] if request_id == "a949f115"
         ));
-        assert!(
-            logs.contains(r#"action="control_cancel_request""#),
-            "{logs}"
-        );
-        assert!(!logs.contains("does not know"), "{logs}");
+        logs_assert(a_line_with(&[
+            " INFO ",
+            r#"action="control_cancel_request""#,
+        ]));
+        logs_assert(no_line_with("does not know"));
     }
 
     #[test]
+    #[traced_test]
     fn a_denial_the_adapter_noted_completes_the_tool_declined() {
         let mut mapper = new_mapper();
         let lines = out_lines("tool-allowed");
@@ -2937,86 +2910,73 @@ mod tests {
             vec![("touch probe.txt".into(), Some("declined".into()))]
         );
 
-        let logs = capture_logs(tracing::Level::WARN, || new_mapper().note_denied("toolu_x"));
-        assert!(logs.contains(r#"action="note_denied""#), "{logs}");
+        new_mapper().note_denied("toolu_x");
+        logs_assert(a_line_with(&[" WARN ", r#"action="note_denied""#]));
     }
 
     #[test]
+    #[traced_test]
     fn an_orphan_tool_result_is_dropped_with_a_warning() {
         let mut mapper = new_mapper();
         mapper.begin_turn(TurnId::new(), TurnKind::User);
         let line = r#"{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_orphan","content":"secret output","is_error":false}]},"parent_tool_use_id":null,"session_id":"f18693ff-2d11-4f87-9556-2b527e19e081"}"#;
-        let mut outputs = Vec::new();
-        let logs = capture_logs(tracing::Level::WARN, || {
-            outputs = mapper.map_line(line);
-        });
+        let outputs = mapper.map_line(line);
         assert!(events(&outputs).is_empty());
-        let warnings: Vec<&str> = logs.lines().filter(|line| line.contains("WARN")).collect();
-        assert_eq!(warnings.len(), 1, "{logs}");
-        assert!(
-            warnings[0].contains("native_item_id=toolu_orphan"),
-            "{logs}"
-        );
-        assert!(!logs.contains("secret output"));
+        logs_assert(lines_with(1, &[" WARN "]));
+        logs_assert(lines_with(1, &[" WARN ", "native_item_id=toolu_orphan"]));
+        logs_assert(no_line_with("secret output"));
     }
 
     #[test]
+    #[traced_test]
     fn unknown_frames_are_logged_once_per_kind() {
         let mut mapper = new_mapper();
         let line = r#"{"type":"active_goal","value":null,"session_id":"s"}"#;
         let mut outputs = Vec::new();
-        let logs = capture_logs(tracing::Level::DEBUG, || {
-            outputs.extend(mapper.map_line(line));
-            outputs.extend(mapper.map_line(line));
-        });
+        outputs.extend(mapper.map_line(line));
+        outputs.extend(mapper.map_line(line));
         assert!(outputs.is_empty());
-        let lines: Vec<&str> = logs
-            .lines()
-            .filter(|line| line.contains("frame kind this adapter does not know"))
-            .collect();
-        assert_eq!(lines.len(), 2, "{logs}");
-        assert!(lines[0].contains("WARN") && lines[0].contains("frame_type=active_goal"));
-        assert!(lines[1].contains("DEBUG"));
+        let message = "frame kind this adapter does not know";
+        logs_assert(lines_with(2, &[message]));
+        logs_assert(lines_with(
+            1,
+            &[message, " WARN ", "frame_type=active_goal"],
+        ));
+        logs_assert(lines_with(1, &[message, " DEBUG "]));
     }
 
     #[test]
+    #[traced_test]
     fn unparseable_lines_are_logged_without_their_content() {
         let mut mapper = new_mapper();
         let mut outputs = Vec::new();
-        let logs = capture_logs(tracing::Level::WARN, || {
-            outputs.extend(mapper.map_line("Error: touch probe.txt failed"));
-            outputs.extend(mapper.map_line(
-                r#"{"type":"assistant","session_id":"s","message":{"id":"m","role":"assistant","content":"touch probe.txt"}}"#,
-            ));
-        });
+        outputs.extend(mapper.map_line("Error: touch probe.txt failed"));
+        outputs.extend(mapper.map_line(
+            r#"{"type":"assistant","session_id":"s","message":{"id":"m","role":"assistant","content":"touch probe.txt"}}"#,
+        ));
         assert!(outputs.is_empty());
-        assert!(
-            logs.contains("not JSON") && logs.contains("bytes=29"),
-            "{logs}"
-        );
-        assert!(logs.contains("frame_type=assistant"), "{logs}");
-        assert!(!logs.contains("touch probe.txt"), "{logs}");
+        logs_assert(a_line_with(&[" WARN ", "not JSON", "bytes=29"]));
+        logs_assert(a_line_with(&[" WARN ", "frame_type=assistant"]));
+        logs_assert(no_line_with("touch probe.txt"));
     }
 
     #[test]
+    #[traced_test]
     fn logs_never_carry_frame_content() {
-        let logs = capture_logs(tracing::Level::TRACE, || {
-            run_fixture("tool-denied", TurnKind::User);
-        });
-        assert!(!logs.is_empty());
-        assert!(!logs.contains("touch probe.txt"), "{logs}");
+        run_fixture("tool-denied", TurnKind::User);
+        // Something was logged, at any level, and none of it is frame content.
+        logs_assert(a_line_with(&[]));
+        logs_assert(no_line_with("touch probe.txt"));
     }
 
     #[test]
+    #[traced_test]
     fn a_turn_begun_while_one_is_active_fails_the_first() {
         let mut mapper = new_mapper();
         let first = TurnId::new();
         let second = TurnId::new();
         mapper.begin_turn(first, TurnKind::User);
-        let mut outputs = Vec::new();
-        let logs = capture_logs(tracing::Level::ERROR, || {
-            outputs = mapper.begin_turn(second, TurnKind::User);
-        });
+        let outputs = mapper.begin_turn(second, TurnKind::User);
         let completions = turn_completions(&outputs);
         assert_eq!(completions.len(), 1);
         assert_eq!(completions[0].0, first);
@@ -3029,10 +2989,7 @@ mod tests {
             events(&outputs).last(),
             Some(AgentEvent::TurnStarted { turn, .. }) if *turn == second
         ));
-        assert_eq!(
-            logs.lines().filter(|line| line.contains("ERROR")).count(),
-            1
-        );
+        logs_assert(lines_with(1, &[" ERROR "]));
         assert_eq!(mapper.active_turn(), Some(second));
     }
 
@@ -3112,6 +3069,7 @@ mod tests {
     }
 
     #[test]
+    #[traced_test]
     fn child_exited_and_note_context_window() {
         // No turn: nothing to complete.
         let mut mapper = new_mapper();
@@ -3124,18 +3082,16 @@ mod tests {
         for line in &lines[..4] {
             mapper.map_line(line);
         }
-        let logs = capture_logs(tracing::Level::WARN, || {
-            let outputs = mapper.child_exited("code 3");
-            let completions = turn_completions(&outputs);
-            assert_eq!(completions.len(), 1);
-            assert_eq!(completions[0].0, turn);
-            assert_eq!(completions[0].2.kind, TurnStatusKind::Failed);
-            assert_eq!(
-                completions[0].2.message.as_deref(),
-                Some("Claude Code exited (code 3) before the turn completed")
-            );
-        });
-        assert!(logs.contains("action=\"child_exited\""), "{logs}");
+        let outputs = mapper.child_exited("code 3");
+        let completions = turn_completions(&outputs);
+        assert_eq!(completions.len(), 1);
+        assert_eq!(completions[0].0, turn);
+        assert_eq!(completions[0].2.kind, TurnStatusKind::Failed);
+        assert_eq!(
+            completions[0].2.message.as_deref(),
+            Some("Claude Code exited (code 3) before the turn completed")
+        );
+        logs_assert(a_line_with(&[" WARN ", "action=\"child_exited\""]));
         assert!(mapper.active_turn().is_none());
 
         // After an interrupt the same exit is an interruption.

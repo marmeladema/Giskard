@@ -478,6 +478,8 @@ overlay.
 - `src/mapper.rs`: `ClaudeMapper`, the frame-to-event state machine, and its fixture-driven tests.
 - `src/ids.rs`: `NativeItemKey` and the `task:` sub-agent id prefix.
 - `src/log_fields.rs`: optional-field logging helper.
+- `src/log_checks.rs` (tests only): the line checks the `#[traced_test]` log assertions pass to
+  `logs_assert`.
 - [`tests/fixtures/README.md`](tests/fixtures/README.md): the recorded scenarios, the recorder's
   argv and the sanitization.
 - `tests/fake-claude.sh`: a POSIX `sh` stand-in for `claude` that replays the fixtures, so the real

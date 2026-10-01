@@ -14,6 +14,8 @@ mod catalog;
 mod frame;
 mod harness;
 mod ids;
+#[cfg(test)]
+mod log_checks;
 mod log_fields;
 mod mapper;
 mod process;

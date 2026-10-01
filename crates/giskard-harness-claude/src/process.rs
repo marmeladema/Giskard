@@ -17,7 +17,7 @@ use giskard_harness::EnvOverlay;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter};
 use tokio::process::{Child, ChildStdin, ChildStdout};
 use tokio::task::JoinHandle;
-use tracing::{debug, info, warn};
+use tracing::{Instrument, debug, info, warn};
 
 use crate::log_fields::display_opt;
 
@@ -326,12 +326,16 @@ pub(crate) async fn spawn_child(
         )));
     };
     let stderr_tail = Arc::new(Mutex::new(VecDeque::with_capacity(STDERR_TAIL_LINES)));
-    let stderr_task = tokio::spawn(drain_stderr(
-        BufReader::new(stderr),
-        stderr_tail.clone(),
-        context.clone(),
-        pid,
-    ));
+    // The drain logs every line: it runs in the spawner's span, so its lines keep that context.
+    let stderr_task = tokio::spawn(
+        drain_stderr(
+            BufReader::new(stderr),
+            stderr_tail.clone(),
+            context.clone(),
+            pid,
+        )
+        .in_current_span(),
+    );
     Ok(SpawnedChild {
         child,
         stdin: Some(BufWriter::new(stdin)),

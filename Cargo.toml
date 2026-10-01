@@ -56,6 +56,7 @@ base64 = "0.23"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 tracing-appender = "0.2"
+tracing-test = { version = "0.2", features = ["no-env-filter"] }
 hex = "0.4"
 syntect = { version = "5", default-features = false, features = ["default-fancy"] }
 two-face = { version = "0.5.1", default-features = false, features = ["syntect-fancy"] }
