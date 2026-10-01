@@ -135,7 +135,7 @@ below is established against a real CLI; response shapes are as observed.
 
 | Subtype | Request | Response | Notes |
 | --- | --- | --- | --- |
-| `initialize` | accepts `hooks`, `sdkMcpServers`, `systemPrompt`, `appendSystemPrompt`, `planModeInstructions`, `toolAliases`, `supportedDialogKinds` | `{commands, agents, models, output_style, account:{subscriptionType, apiProvider}, pid, current_permission_mode, …}` | The handshake, and the **model catalog arrives here** — see §6. Answers with no credentials and no network, which is what makes §6's probe viable. **`account` is informational, not a credential signal**: with zero credentials it still reports `{subscriptionType: "Claude API", apiProvider: "firstParty"}`, so it is a default until an authenticated request happens (§7) |
+| `initialize` | accepts `hooks`, `sdkMcpServers`, `systemPrompt`, `appendSystemPrompt`, `planModeInstructions`, `toolAliases`, `supportedDialogKinds` | `{commands, agents, models, output_style, account:{subscriptionType, apiProvider}, pid, current_permission_mode, …}` | The handshake, and the **model catalog arrives here** — see §6. Answers with no credentials and no network, which is what makes §6's probe viable. `current_permission_mode` uses the CLI's own mode names: `--permission-mode manual` is reported as **`default`** here and in `system/init.permissionMode` / `system/status.permissionMode`, so mode tracking compares against the CLI's name, never the flag's. **`account` is informational, not a credential signal**: with zero credentials it still reports `{subscriptionType: "Claude API", apiProvider: "firstParty"}`, so it is a default until an authenticated request happens (§7) |
 | `interrupt` | — | `{"still_queued":[]}` | `AgentHarness::interrupt`. Works mid-tool-call: it kills the running tool and ends the turn with `terminal_reason: "aborted_tools"`, distinct from `"aborted_streaming"` when it lands during generation |
 | `set_model` | `{model:"<id>"}` | `null` | Mid-session, no respawn, no session change. **The CLI re-emits `system/init`** afterwards |
 | `set_permission_mode` | `{mode:"<mode>"}` | echoes `{"mode":"plan"}` | Per-turn Plan/Build (§8.2) |
@@ -516,7 +516,11 @@ overlay is applied by the layer above.
 
   The recovery is cheaper here than for Codex, because **Claude's session ids are client-minted**.
   Relaunching with `--session-id <the same uuid>` succeeds, recreates the transcript under that id,
-  and reports the same `session_id` — so the `(native id, ThreadId)` binding never changes. There is
+  and reports the same `session_id` — so the `(native id, ThreadId)` binding never changes. It
+  succeeds **only because the transcript is gone**: `--session-id` naming an existing transcript
+  exits 1 at once with `Error: Session ID <uuid> is already in use.`, so the respawn is taken only
+  for `No conversation found with session ID`, and a resume that fails for any other reason is an
+  error, not a retry. There is
   no new identity to adopt, nothing to rewrite in `ThreadFile`, and **no route replacement**, so
   `AGENTS.md`'s rule that a resume-fallback replacement must require the exact prior binding simply
   never comes into play. Codex needs that rule because its ids are provider-minted and a failed
@@ -1539,7 +1543,13 @@ built on `tokio::process::Command` directly, because `ClaudeCliBuilder` cannot e
 the encoded-size ceilings (§3.6), `interrupt`, `shutdown` that interrupts before it stops, and the
 three lifecycle methods that stop a child. `list_models` from the freshest `initialize` or the probe
 (§6), `list_providers` reporting `anthropic`. Capabilities as §4, except that `live_approvals`,
-`plan_build_modes`, `per_turn_model` and `reasoning_effort` are reported only from milestone 3.
+`plan_build_modes`, `per_turn_model`, `reasoning_effort` and `context_compaction` are reported only
+from milestone 3, and `mcp_status` only from milestone 4, which wires `list_mcp_servers` over the
+`mcp_status` control request. Verified while planning it: nothing reaches stdout before the first
+user message, so the open handshake is the `initialize` control response; a missing transcript
+makes `--resume` exit before answering it, so the fallback is decided at open; closing stdin lets
+a running turn finish and exits the idle CLI; `get_context_usage` answers `maxTokens` at open, which
+a resumed thread reports through `ThreadUpdate::ContextWindowRestored`.
 
 Tested without a real CLI: a scripted fake `claude` (a small test binary in the crate that replays a
 milestone-1 fixture and answers control requests) drives the supervisor in CI, the way the Codex
@@ -1561,7 +1571,9 @@ persisted as an assistant turn. `rate_limit_event` and `api_retry` → `Notice`.
 
 `ClaudeCodeKind` beside `CodexKind` in `bin/giskard-server.rs` (§5.1), with the startup tests
 extended for a two-kind catalog; `config.example.toml` gains a `[harnesses.claude]` declaration;
-README's *Supported harnesses* entry changes; the spec gains a Claude Code mapping section beside
+README's *Supported harnesses* entry changes; `list_mcp_servers` is implemented over the
+`mcp_status` control request (§3.3) and `mcp_status` is advertised; the spec gains a Claude Code
+mapping section beside
 §4.6 and the §9.1 / §9.2.1 amendments (§8.2, §9.3); `docs/api-endpoints.md` is unchanged because no
 route moves; the adapter README is completed. P8 (`resolve_reverse_subagent_target` filtered by
 `ThreadFile.harness`) lands here because it is the one server-side hygiene item. **Stage 3 of
