@@ -52,9 +52,10 @@ The agent harness is a replaceable component behind a neutral `AgentHarness` tra
   appears under its own group in the model picker, beside any Codex declaration, and is chosen per
   thread. A working, logged-in Claude Code CLI must be installed (see
   [Prerequisites](#prerequisites)). Delegations appear as linked sub-agent threads, read-only and
-  never resumable (see [Sub-agent threads](docs/subagents.md)). Idle-process reaping and structured
-  diffs are not there yet; see the [adapter README](crates/giskard-harness-claude/README.md) for what
-  the adapter does today.
+  never resumable (see [Sub-agent threads](docs/subagents.md)). A thread's process idle for
+  `idle_shutdown_secs` is stopped and resumed on the thread's next message, without the thread
+  noticing. Structured diffs are not there yet; see the
+  [adapter README](crates/giskard-harness-claude/README.md) for what the adapter does today.
 
 ---
 
@@ -72,7 +73,8 @@ The agent harness is a replaceable component behind a neutral `AgentHarness` tra
   `apiKeySource` notice), not unset an inherited variable. `full_access` needs the server to run as
   an ordinary user: the CLI refuses `bypassPermissions` as root, and Giskard then refuses
   `full_access` turns quoting the CLI's sentence. Each open thread costs one `claude` process of
-  roughly 440–530 MB RSS, and idle ones are not reaped yet.
+  roughly 440–530 MB RSS, and one idle for `idle_shutdown_secs` (default 10 minutes) is stopped
+  and resumed on the next message.
 
 Giskard runs one harness instance per project and harness declaration, which for Codex is one
 `codex app-server` process, and for Claude Code one `claude` process per open thread; each project
@@ -284,7 +286,8 @@ service does not silently run with an empty provider list.
 | | `command` | `codex` or `claude` on `PATH`, by kind | Program to spawn. A bare name is resolved on Giskard's own `PATH`, not a `PATH` set in `env`, so use an absolute path for a binary that is not on Giskard's `PATH`; otherwise the one on Giskard's `PATH` runs instead, silently. |
 | | `args` | `[]` | Extra arguments, appended after `app-server --listen stdio://` (Codex) or after the stream-json protocol flags (Claude Code). |
 | | `env` | `{}` | `[harnesses.<name>.env]`: variables applied over Giskard's environment for the instance's processes and for discovery on its behalf. Values are never logged. |
-| | `profile` | Codex's own | **Codex only.** Passed as `-c profile=<name>`. Any other Codex key is a startup error; a `claude-code` declaration has no kind-specific keys, and any extra key is a startup error. |
+| | `profile` | Codex's own | **Codex only.** Passed as `-c profile=<name>`. Any other Codex key is a startup error. |
+| | `idle_shutdown_secs` | `600` | **Claude Code only.** Seconds a thread's `claude` process may sit idle (no turn, no pending approval or question, no running sub-agent or background command) before it is stopped; the thread stays open and its next message resumes the session. `0` keeps every process until its thread is archived, deleted or the server stops. Any other kind-specific key is a startup error. |
 | `[providers.<id>]` | `model_listing`, `[[providers.<id>.models]]` | — | **Optional.** Models are found without it: every provider Codex has a `base_url` for is discovered from `GET {base_url}/models` with the key Codex holds for it, and the provider Codex routes to also contributes its `model/list` catalog. A built-in Codex has no endpoint for and does not route to — `ollama` or `lmstudio` when you use neither — has nothing to contribute and is not offered; declare models for it if you want it in the picker. Declare a provider only to turn discovery off (`model_listing = false`), to add models by hand for an endpoint with no `/models` route, to override metadata, or to pin picker order — declared providers come first in the order written, the rest by id. Keyed by routing id, the same way Codex keys `[model_providers.<id>]`; the id must name a provider Codex knows (see below). |
 
 Harness declarations are read once at startup and validated before the server listens: a blank
@@ -298,7 +301,8 @@ warning) until it is declared again, while threads on other declarations keep wo
 the table switches off the synthesized `codex`; projects and threads created before you declared it
 are stamped `codex`, so keep a declaration named `codex` for them.
 
-**Claude Code.** A `claude-code` declaration takes only the neutral keys above:
+**Claude Code.** A `claude-code` declaration takes the neutral keys above and
+`idle_shutdown_secs`:
 
 ```toml
 [harnesses.codex]
@@ -307,6 +311,7 @@ default = true
 
 [harnesses.claude]
 kind = "claude-code"
+idle_shutdown_secs = 600
 [harnesses.claude.env]
 CLAUDE_CONFIG_DIR = "/home/you/.claude"
 ```

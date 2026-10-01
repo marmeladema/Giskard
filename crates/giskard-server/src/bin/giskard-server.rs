@@ -4,7 +4,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use giskard_core::error::{HarnessError, PersistError};
 use giskard_harness::EnvOverlay;
-use giskard_harness_claude::{ClaudeHarness, ClaudeLaunchOptions};
+use giskard_harness_claude::{ClaudeHarness, ClaudeLaunchOptions, DEFAULT_IDLE_TIMEOUT};
 use giskard_harness_codex::{CodexDeclarationOptions, CodexHarness, CodexLaunchOptions};
 use giskard_persist::{Config, HarnessCatalog, HarnessDeclaration};
 use giskard_server::{
@@ -67,14 +67,30 @@ impl HarnessKind for CodexKind {
 
 struct ClaudeCodeKind;
 
-/// A `claude-code` declaration has no kind-specific keys (plan §5.1): everything the adapter
-/// needs from the environment is the neutral `env` overlay. Typing the empty table keeps a
-/// misspelt or misplaced key a startup error, as it is for Codex.
+/// A `claude-code` declaration's one kind-specific key: everything else the adapter needs from the
+/// environment is the neutral `env` overlay (plan §5.1). Typing the table keeps a misspelt or
+/// misplaced key a startup error, as it is for Codex.
 #[derive(Default, serde::Deserialize)]
 #[serde(deny_unknown_fields)]
-struct ClaudeDeclarationOptions {}
+struct ClaudeDeclarationOptions {
+    /// Seconds a thread's `claude` process may sit idle before it is stopped (and resumed on the
+    /// thread's next message). Absent is the adapter's default; `0` never stops one.
+    #[serde(default)]
+    idle_shutdown_secs: Option<u64>,
+}
 
-/// Type-check a `claude-code` declaration's kind-specific keys (there are none).
+impl ClaudeDeclarationOptions {
+    /// The adapter's idle timeout: absent → `DEFAULT_IDLE_TIMEOUT`, `0` → never.
+    fn idle_timeout(&self) -> Option<std::time::Duration> {
+        match self.idle_shutdown_secs {
+            None => Some(DEFAULT_IDLE_TIMEOUT),
+            Some(0) => None,
+            Some(secs) => Some(std::time::Duration::from_secs(secs)),
+        }
+    }
+}
+
+/// Type-check a `claude-code` declaration's kind-specific keys.
 fn claude_options(declaration: &HarnessDeclaration) -> Result<ClaudeDeclarationOptions, String> {
     toml::Value::Table(declaration.options.clone())
         .try_into()
@@ -98,9 +114,10 @@ impl HarnessKind for ClaudeCodeKind {
     ) -> Result<Arc<dyn giskard_harness::AgentHarness>, HarnessError> {
         let declaration = spec.declaration;
         // Validated at boot; re-checked rather than trusted so a failure is an error, not a panic.
-        claude_options(declaration).map_err(|message| {
+        let options = claude_options(declaration).map_err(|message| {
             HarnessError::Unsupported(format!("[harnesses.{}] {message}", spec.name))
         })?;
+        let idle_timeout = options.idle_timeout();
         let launch = ClaudeLaunchOptions {
             command: declaration.command.as_ref().map(std::path::PathBuf::from),
             args: declaration.args.clone(),
@@ -112,6 +129,7 @@ impl HarnessKind for ClaudeCodeKind {
             ),
             project_id: Some(spec.project_id),
             declaration: Some(spec.name.to_owned()),
+            idle_timeout,
         };
         // A per-thread-process adapter needs no bootstrap: each thread's child is spawned from
         // its own stored session id at `open_thread`. Logged so a surprising count is visible.
@@ -119,6 +137,7 @@ impl HarnessKind for ClaudeCodeKind {
             project_id = %spec.project_id,
             harness = spec.name,
             known_threads = bootstrap.known_threads.len(),
+            idle_timeout_ms = idle_timeout.map(|timeout| timeout.as_millis() as u64),
             "claude-code instance created"
         );
         Ok(ClaudeHarness::new(spec.workspace_root, launch))
@@ -534,6 +553,7 @@ default = true
 
 [harnesses.claude]
 kind = "claude-code"
+idle_shutdown_secs = 600
 [harnesses.claude.env]
 CLAUDE_CONFIG_DIR = "/home/you/.claude"
 "#,
@@ -566,6 +586,14 @@ CLAUDE_CONFIG_DIR = "/home/you/.claude"
                 "invalid config.toml: [harnesses.x] unknown field `profile`",
             ),
             (
+                "[harnesses.x]\nkind = \"claude-code\"\nidle_shutdown_secs = \"soon\"\n",
+                "invalid config.toml: [harnesses.x] invalid type: string \"soon\"",
+            ),
+            (
+                "[harnesses.x]\nkind = \"codex\"\nidle_shutdown_secs = 30\n",
+                "invalid config.toml: [harnesses.x] unknown field `idle_shutdown_secs`",
+            ),
+            (
                 "[harnesses.x]\nkind = \"codex\"\nprofile = \"\"\n",
                 "invalid config.toml: [harnesses.x] `profile` must not be blank",
             ),
@@ -588,6 +616,26 @@ CLAUDE_CONFIG_DIR = "/home/you/.claude"
                 Ok(_) => panic!("{src:?} must refuse startup"),
             };
             assert!(error.starts_with(expected), "{src:?}: {error}");
+        }
+    }
+
+    #[test]
+    fn idle_shutdown_secs_is_a_claude_code_key() {
+        for (src, expected) in [
+            ("", Some(DEFAULT_IDLE_TIMEOUT)),
+            ("idle_shutdown_secs = 0\n", None),
+            (
+                "idle_shutdown_secs = 30\n",
+                Some(std::time::Duration::from_secs(30)),
+            ),
+        ] {
+            let factory = startup_factory(&format!(
+                "[harnesses.claude]\nkind = \"claude-code\"\n{src}"
+            ))
+            .unwrap_or_else(|error| panic!("{src:?} must be accepted: {error}"));
+            let declaration = factory.catalog().get("claude").expect("declared");
+            let options = claude_options(declaration).expect("typed");
+            assert_eq!(options.idle_timeout(), expected, "{src:?}");
         }
     }
 

@@ -4,7 +4,8 @@
 //! stream-json output to Giskard's [`AgentEvent`](giskard_core::event::AgentEvent)s, plus
 //! [`ClaudeHarness`], an `AgentHarness` that supervises one `claude` child per primary thread and
 //! answers its approvals and server requests, applies per-turn permission mode, model and effort,
-//! runs manual compaction, and lists the CLI's MCP servers. The server registers it as the
+//! runs manual compaction, lists the CLI's MCP servers, and (milestone 6) reaps an idle child and
+//! respawns it with `--resume` on the thread's next turn. The server registers it as the
 //! `claude-code` kind (milestone 4); see this crate's README for which milestone supplies what is
 //! missing.
 //!
@@ -27,7 +28,7 @@ pub use catalog::ANTHROPIC_PROVIDER_ID;
 pub use frame::{BlockStart, Delta, Frame, FrameError, StreamEvent, StreamEventKind};
 pub use harness::ClaudeHarness;
 pub use mapper::{ClaudeMapper, MapperOutput, Route, TurnKind};
-pub use process::ClaudeLaunchOptions;
+pub use process::{ClaudeLaunchOptions, DEFAULT_IDLE_TIMEOUT};
 
 use giskard_harness::HarnessCapabilities;
 

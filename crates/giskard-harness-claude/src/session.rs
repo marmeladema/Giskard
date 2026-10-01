@@ -1,11 +1,13 @@
 //! The supervisor: one task per `claude` child.
 //!
-//! The task is the single owner of the child process, the [`ClaudeMapper`], the pending
-//! control-request waiters and the thread's retained [`EventLog`]. Nothing else touches them: the
+//! The task is the single owner of the child process, the [`ClaudeMapper`] and the pending
+//! control-request waiters, and the only writer of the thread's retained [`EventLog`] while its
+//! child lives (a reaped child's respawn appends to the same log). Nothing else touches them: the
 //! façade reaches the task only through its command channel, so there is no lock around the
 //! mapper or the stdin handle (the `CodexInstance` rule of `AGENTS.md`, applied per child).
 
 use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
@@ -64,7 +66,8 @@ pub(crate) enum ChildCommand {
         /// The model reported on the turn's usage events.
         model: ModelRef,
         settings: TurnSettings,
-        /// A sentence appended as `AgentEvent::Notice` right after `TurnStarted`.
+        /// A sentence appended as `AgentEvent::Notice` right after `TurnStarted` (a respawn that
+        /// lost its transcript).
         notice: Option<String>,
         reply: oneshot::Sender<Result<(), HarnessError>>,
     },
@@ -99,6 +102,8 @@ pub(crate) enum ChildCommand {
     /// Run `/compact` as a compaction turn.
     Compact {
         turn: TurnId,
+        /// As `StartTurn`'s.
+        notice: Option<String>,
         reply: oneshot::Sender<Result<(), HarnessError>>,
     },
     Stop {
@@ -121,22 +126,33 @@ impl ChildCommand {
     }
 }
 
+/// One primary thread this instance holds: its session, its retained log, and its child while
+/// one runs. The entry outlives a reaped child; only delete, archive, an unexpected child exit and
+/// shutdown remove it.
+pub(crate) struct ThreadEntry {
+    /// The session id: `--session-id` at the first spawn, `--resume` on every respawn.
+    pub harness_thread_id: String,
+    /// One log for the thread's whole life here: a respawned child appends to it.
+    pub log: Arc<EventLog>,
+    pub workspace_root: PathBuf,
+    /// The model the CLI holds or held: the open model, then what the reaped supervisor held. A
+    /// turn without a model override runs on it, and a respawn launches with it.
+    pub model: ModelRef,
+    pub child: Option<ChildHandle>,
+}
+
 /// The façade's view of one live child.
 pub(crate) struct ChildHandle {
-    pub harness_thread_id: String,
-    pub log: Arc<EventLog>,
     pub commands: mpsc::Sender<ChildCommand>,
     pub task: JoinHandle<()>,
-    /// The model the thread was opened on; a turn without a model override runs on it.
-    pub model: ModelRef,
     /// The mode the child was launched with: `full_access` needs `Bypass`.
     pub launch_mode: LaunchMode,
     /// Distinguishes this child from a later one for the same thread, so a supervisor that ends
-    /// after its thread was reopened never removes the new entry.
+    /// after its thread was reopened or respawned never touches the new child.
     pub generation: u64,
 }
 
-pub(crate) type Children = Arc<Mutex<HashMap<ThreadId, ChildHandle>>>;
+pub(crate) type Threads = Arc<Mutex<HashMap<ThreadId, ThreadEntry>>>;
 pub(crate) type Routes = Arc<Mutex<HashMap<ThreadId, RouteHandle>>>;
 
 /// The façade's view of one sub-agent route: a live one, published by its child's supervisor, or
@@ -271,6 +287,15 @@ impl PendingRequests {
         request
             .and_then(|id| self.server_requests.remove(&id))
             .map(|ask| (RequestKind::ServerRequest, ask))
+    }
+
+    /// How many asks `owner`'s child published that nothing answered yet, its routes' included.
+    pub fn count_owner(&self, owner: ThreadId) -> usize {
+        self.approvals
+            .values()
+            .chain(self.server_requests.values())
+            .filter(|ask| ask.owner == owner)
+            .count()
     }
 
     /// Drop every ask `owner`'s child published, its routes' included; returns how many.
@@ -623,11 +648,13 @@ enum Phase {
 }
 
 struct Stopping {
-    /// `stop`, `shutdown` or `harness_dropped`.
+    /// `stop`, `shutdown`, `harness_dropped` or `idle`.
     reason: &'static str,
     /// Every `Stop` that arrived; all are answered when the child has exited.
     replies: Vec<oneshot::Sender<()>>,
     stage: StopStage,
+    /// The child is reaped for idleness: its thread keeps its entry and its log stays open.
+    reaped: bool,
 }
 
 enum StopStage {
@@ -658,7 +685,9 @@ pub(crate) struct SupervisorParts {
     pub log: Arc<EventLog>,
     pub commands: mpsc::Receiver<ChildCommand>,
     pub shutdown: watch::Receiver<bool>,
-    pub children: Children,
+    /// The façade's thread entries: the reap clears this child's slot, another exit removes the
+    /// entry.
+    pub threads: Threads,
     pub pending: Pending,
     /// The façade's sub-agent routes, where this supervisor publishes its own.
     pub routes: Routes,
@@ -673,6 +702,8 @@ pub(crate) struct SupervisorParts {
     pub abandoned_requests: Vec<String>,
     /// The model the child was opened on, which the CLI holds until a turn changes it.
     pub model: ModelRef,
+    /// Reap the child once it was idle this long; `None` never reaps.
+    pub idle_timeout: Option<Duration>,
 }
 
 pub(crate) fn spawn_supervisor(parts: SupervisorParts) -> JoinHandle<()> {
@@ -683,7 +714,7 @@ pub(crate) fn spawn_supervisor(parts: SupervisorParts) -> JoinHandle<()> {
         log: parts.log,
         commands: parts.commands,
         shutdown: parts.shutdown,
-        children: parts.children,
+        threads: parts.threads,
         pending: parts.pending,
         routes: parts.routes,
         commands_sender: parts.commands_sender,
@@ -703,6 +734,9 @@ pub(crate) fn spawn_supervisor(parts: SupervisorParts) -> JoinHandle<()> {
         phase: Phase::Serving,
         commands_closed: false,
         ending: None,
+        idle_timeout: parts.idle_timeout,
+        idle_since: None,
+        busy_reason: None,
         // The handshake set `default` on both launch modes.
         current_mode: "default".into(),
         current_effort: parts
@@ -722,8 +756,12 @@ enum Ending {
     Eof,
     /// A read or write failed; the child was killed.
     Broken,
-    /// `Stop`, shutdown, or a dropped façade; the stop sequence ran.
-    Stopped { replies: Vec<oneshot::Sender<()>> },
+    /// `Stop`, shutdown, a dropped façade or idleness; the stop sequence ran.
+    Stopped {
+        replies: Vec<oneshot::Sender<()>>,
+        /// Reaped for idleness: the thread keeps its entry and its log stays open.
+        reaped: bool,
+    },
 }
 
 struct Supervisor {
@@ -732,7 +770,7 @@ struct Supervisor {
     log: Arc<EventLog>,
     commands: mpsc::Receiver<ChildCommand>,
     shutdown: watch::Receiver<bool>,
-    children: Children,
+    threads: Threads,
     pending: Pending,
     routes: Routes,
     commands_sender: mpsc::WeakSender<ChildCommand>,
@@ -793,6 +831,11 @@ struct Supervisor {
     commands_closed: bool,
     /// Set by a loop arm that ends the loop (the stop sequence's kill).
     ending: Option<Ending>,
+    idle_timeout: Option<Duration>,
+    /// When the child last became idle; `None` while it has something to do.
+    idle_since: Option<Instant>,
+    /// What last kept the child busy, so only a change is logged.
+    busy_reason: Option<&'static str>,
     /// The permission mode the CLI holds, by the CLI's name: `default` after the handshake, then
     /// whatever the last successful `set_permission_mode` set. The mapper's session mode stays
     /// what the CLI *reports*.
@@ -822,23 +865,25 @@ impl Supervisor {
             Some(ending) => ending,
             None => self.main_loop().await,
         };
-        let (requested, replies) = match ending {
-            Ending::Eof | Ending::Broken => (false, Vec::new()),
-            Ending::Stopped { replies } => (true, replies),
+        let (requested, replies, reaped) = match ending {
+            Ending::Eof | Ending::Broken => (false, Vec::new(), false),
+            Ending::Stopped { replies, reaped } => (true, replies, reaped),
         };
         let exit = self.child.wait().await;
-        self.on_exit(&exit, requested);
+        self.on_exit(&exit, requested, reaped);
         for reply in replies {
             let _ = reply.send(());
         }
     }
 
     /// One loop: every input the supervisor waits on (a frame, a command, the shutdown flag, the
-    /// in-flight stage's deadline) is an arm of one `select!`, and every arm body runs to
+    /// in-flight stage's deadline, the idle timer) is an arm of one `select!`, and every arm body runs to
     /// completion, so a write made from a body is never cancelled.
     async fn main_loop(&mut self) -> Ending {
         loop {
+            self.track_idle();
             let stage_deadline = self.stage_deadline();
+            let idle_deadline = self.idle_deadline();
             let stopping = self.stopping();
             tokio::select! {
                 biased;
@@ -865,10 +910,12 @@ impl Supervisor {
                 }
                 // So does a set flag: the arm is disabled while the stop sequence runs.
                 () = shutdown_signal(&mut self.shutdown), if !stopping => {
-                    self.enter_stopping("shutdown", None).await;
+                    self.enter_stopping("shutdown", None, false).await;
                 }
                 () = tokio::time::sleep_until(stage_deadline.unwrap_or_else(Instant::now)),
                     if stage_deadline.is_some() => self.on_deadline(),
+                () = tokio::time::sleep_until(idle_deadline.unwrap_or_else(Instant::now)),
+                    if idle_deadline.is_some() => self.reap().await,
             }
             if let Some(ending) = self.ending.take() {
                 return ending;
@@ -880,7 +927,7 @@ impl Supervisor {
     async fn on_command(&mut self, command: Option<ChildCommand>) -> Result<(), HarnessError> {
         match command {
             Some(ChildCommand::Stop { reply }) => {
-                self.enter_stopping("stop", Some(reply)).await;
+                self.enter_stopping("stop", Some(reply), false).await;
                 Ok(())
             }
             Some(command) if self.stopping() => {
@@ -890,13 +937,17 @@ impl Supervisor {
             Some(command) => self.handle_command(command).await,
             None => {
                 self.commands_closed = true;
+                if self.stopping() {
+                    // A reaped child's façade handle, its last sender, is gone: nothing new.
+                    return Ok(());
+                }
                 debug!(
                     thread_id = %self.thread,
                     harness_thread_id = display_opt(self.context.harness_thread_id.as_deref()),
                     action = "stop",
                     "the harness dropped this child's command channel; stopping it"
                 );
-                self.enter_stopping("harness_dropped", None).await;
+                self.enter_stopping("harness_dropped", None, false).await;
                 Ok(())
             }
         }
@@ -1289,10 +1340,14 @@ impl Supervisor {
                 reply,
             } => self.respond_server_request(id, ask, response, reply).await,
             ChildCommand::StopTask { thread, reply } => self.stop_task(thread, reply).await,
-            ChildCommand::Compact { turn, reply } => self.compact(turn, reply).await,
+            ChildCommand::Compact {
+                turn,
+                notice,
+                reply,
+            } => self.compact(turn, notice, reply).await,
             ChildCommand::Stop { reply } => {
                 // `on_command` routes every `Stop` to the stop sequence.
-                self.enter_stopping("stop", Some(reply)).await;
+                self.enter_stopping("stop", Some(reply), false).await;
                 Ok(())
             }
         }
@@ -2063,6 +2118,7 @@ impl Supervisor {
     async fn compact(
         &mut self,
         turn: TurnId,
+        notice: Option<String>,
         reply: oneshot::Sender<Result<(), HarnessError>>,
     ) -> Result<(), HarnessError> {
         if reply.is_closed() {
@@ -2081,6 +2137,13 @@ impl Supervisor {
             if let MapperOutput::Event(event) = output {
                 self.append(event);
             }
+        }
+        if let Some(message) = notice {
+            self.append(AgentEvent::Notice {
+                thread: self.thread,
+                turn: Some(turn),
+                message,
+            });
         }
         info!(
             project_id = display_opt(self.context.project_id),
@@ -2112,6 +2175,143 @@ impl Supervisor {
         matches!(self.phase, Phase::Stopping(_))
     }
 
+    /// What keeps the child busy, by name, or `None` when it is idle: no turn hand-off in flight,
+    /// no ask awaiting the user, no live sub-agent route, no open task (a background shell
+    /// outlives its turn and can still ask), no control request awaiting its answer, and no
+    /// active turn. The most specific reason comes first: an ask or a task usually comes with a
+    /// turn, and is the one that can outlast it.
+    fn busy_with(&self) -> Option<&'static str> {
+        if self.turn_setup.is_some() {
+            Some("turn_setup")
+        } else if lock(&self.pending).count_owner(self.thread) > 0 {
+            Some("asks")
+        } else if self.mapper.has_routes() {
+            Some("routes")
+        } else if self.mapper.has_tasks() {
+            Some("tasks")
+        } else if !self.waiters.is_empty() {
+            Some("control_request")
+        } else if self.mapper.active_turn().is_some() {
+            Some("turn")
+        } else {
+            None
+        }
+    }
+
+    /// Start or stop the idle clock, logging each transition and each change of what keeps the
+    /// child busy. Runs at the top of every loop iteration while serving; the clock is tracked
+    /// even when reaping is off.
+    fn track_idle(&mut self) {
+        if self.stopping() {
+            return;
+        }
+        let busy = self.busy_with();
+        let unchanged = match busy {
+            None => self.idle_since.is_some(),
+            Some(_) => self.idle_since.is_none() && busy == self.busy_reason,
+        };
+        if unchanged {
+            return;
+        }
+        self.busy_reason = busy;
+        match busy {
+            None => {
+                self.idle_since = Some(Instant::now());
+                debug!(
+                    thread_id = %self.thread,
+                    harness_thread_id = display_opt(self.context.harness_thread_id.as_deref()),
+                    pid = display_opt(self.pid),
+                    action = "idle",
+                    idle = true,
+                    timeout_ms = display_opt(self.idle_timeout.map(|timeout| timeout.as_millis())),
+                    "claude child is idle"
+                );
+            }
+            Some(reason) => {
+                self.idle_since = None;
+                debug!(
+                    thread_id = %self.thread,
+                    harness_thread_id = display_opt(self.context.harness_thread_id.as_deref()),
+                    pid = display_opt(self.pid),
+                    action = "idle",
+                    idle = false,
+                    reason,
+                    open_tasks = self.mapper.open_tasks(),
+                    "claude child is busy"
+                );
+            }
+        }
+    }
+
+    /// When the idle child is reaped: only while serving, with reaping on.
+    fn idle_deadline(&self) -> Option<Instant> {
+        if self.stopping() {
+            return None;
+        }
+        Some(self.idle_since? + self.idle_timeout?)
+    }
+
+    /// Whether the thread's entry still holds this child.
+    fn holds_entry(&self, threads: &HashMap<ThreadId, ThreadEntry>) -> bool {
+        threads
+            .get(&self.thread)
+            .and_then(|entry| entry.child.as_ref())
+            .is_some_and(|child| child.generation == self.generation)
+    }
+
+    /// The idle timer fired: take this child out of its thread's entry, then stop it. The thread
+    /// stays bound and its log open; the next turn respawns the child with `--resume`.
+    async fn reap(&mut self) {
+        let idle_ms = self
+            .idle_since
+            .map_or(0, |since| since.elapsed().as_millis() as u64);
+        let timeout_ms = self
+            .idle_timeout
+            .map_or(0, |timeout| timeout.as_millis() as u64);
+        // Taken before stdin closes: from here on the façade sees a thread with no child, and a
+        // hand-off already sent here is refused and retried on a fresh child.
+        let (kept, live_children, loaded_threads) = {
+            let mut threads = lock(&self.threads);
+            let kept = self.holds_entry(&threads);
+            if let Some(entry) = threads.get_mut(&self.thread).filter(|_| kept) {
+                entry.child = None;
+                // What the CLI held, so the respawn launches with it and a turn without a model
+                // override runs on it.
+                entry.model = self.current_model.clone();
+            }
+            let (live_children, loaded_threads) = thread_counts(&threads);
+            (kept, live_children, loaded_threads)
+        };
+        if kept {
+            info!(
+                project_id = display_opt(self.context.project_id),
+                harness = display_opt(self.context.harness.as_deref()),
+                thread_id = %self.thread,
+                harness_thread_id = display_opt(self.context.harness_thread_id.as_deref()),
+                pid = display_opt(self.pid),
+                action = "child_reaped",
+                idle_ms,
+                timeout_ms,
+                live_children,
+                loaded_threads,
+                "claude child idle too long; stopping it, the thread stays open"
+            );
+        } else {
+            warn!(
+                project_id = display_opt(self.context.project_id),
+                thread_id = %self.thread,
+                harness_thread_id = display_opt(self.context.harness_thread_id.as_deref()),
+                pid = display_opt(self.pid),
+                action = "child_reaped",
+                idle_ms,
+                timeout_ms,
+                "the thread's entry no longer holds this child; stopping it as for any exit"
+            );
+        }
+        self.enter_stopping(if kept { "idle" } else { "stop" }, None, kept)
+            .await;
+    }
+
     /// The deadline the main loop waits on besides frames and commands: the in-flight turn
     /// hand-off's while serving, the stop stage's while stopping.
     fn stage_deadline(&self) -> Option<Instant> {
@@ -2129,7 +2329,12 @@ impl Supervisor {
     /// the child on the grace timeout. A stop that arrives while one runs joins it.
     ///
     /// SIGTERM is deliberately not used: it leaves the turn without a `result`.
-    async fn enter_stopping(&mut self, reason: &'static str, reply: Option<oneshot::Sender<()>>) {
+    async fn enter_stopping(
+        &mut self,
+        reason: &'static str,
+        reply: Option<oneshot::Sender<()>>,
+        reaped: bool,
+    ) {
         if let Phase::Stopping(stopping) = &mut self.phase {
             stopping.replies.extend(reply);
             debug!(
@@ -2193,10 +2398,12 @@ impl Supervisor {
             }
             None => self.begin_draining(),
         };
+        self.idle_since = None;
         self.phase = Phase::Stopping(Stopping {
             reason,
             replies: reply.into_iter().collect(),
             stage,
+            reaped,
         });
     }
 
@@ -2288,9 +2495,11 @@ impl Supervisor {
         match std::mem::replace(&mut self.phase, Phase::Serving) {
             Phase::Stopping(stopping) => Ending::Stopped {
                 replies: stopping.replies,
+                reaped: stopping.reaped,
             },
             Phase::Serving => Ending::Stopped {
                 replies: Vec::new(),
+                reaped: false,
             },
         }
     }
@@ -2350,7 +2559,11 @@ impl Supervisor {
     }
 
     /// Child-exit handling, whatever ended the child.
-    fn on_exit(&mut self, exit: &ChildExit, requested: bool) {
+    ///
+    /// A reaped child's thread stays: its log is not closed, its entry is not touched (the reap
+    /// took the child out of it) and the pending map is left alone (idle means none, and a
+    /// respawned child may already own asks under the same thread id).
+    fn on_exit(&mut self, exit: &ChildExit, requested: bool, reaped: bool) {
         let mut described = exit.describe();
         if let Some(failure) = self.failure {
             described = format!("{described}, after {failure}");
@@ -2360,7 +2573,11 @@ impl Supervisor {
             self.fail_turn_setup(setup, child_stopped());
         }
         // Counted before the routes close, so the exit line reports every ask of this child.
-        let pending_dropped = lock(&self.pending).remove_owner(self.thread);
+        let pending_dropped = if reaped {
+            0
+        } else {
+            lock(&self.pending).remove_owner(self.thread)
+        };
         let outputs = if self.mapper.active_turn().is_some() || self.mapper.has_routes() {
             self.mapper.child_exited(&described)
         } else {
@@ -2384,7 +2601,9 @@ impl Supervisor {
             self.close_route(thread);
         }
         let routes_cooled = self.cool_routes();
-        self.log.close();
+        if !reaped {
+            self.log.close();
+        }
         for (request_id, waiter) in self.waiters.drain() {
             if !matches!(waiter, Waiter::Stop) {
                 warn!(
@@ -2396,15 +2615,12 @@ impl Supervisor {
             }
             waiter.resolve(Err(child_stopped()));
         }
-        let live_children = {
-            let mut children = lock(&self.children);
-            if children
-                .get(&self.thread)
-                .is_some_and(|handle| handle.generation == self.generation)
-            {
-                children.remove(&self.thread);
+        let (live_children, loaded_threads) = {
+            let mut threads = lock(&self.threads);
+            if !reaped && self.holds_entry(&threads) {
+                threads.remove(&self.thread);
             }
-            children.len()
+            thread_counts(&threads)
         };
         let expected =
             requested && (exit.code == Some(0) || (exit.code == Some(1) && self.interrupt_sent));
@@ -2421,7 +2637,9 @@ impl Supervisor {
                     signal = display_opt(exit.signal),
                     stderr_tail = ?exit.stderr_tail,
                     requested,
+                    reaped,
                     live_children,
+                    loaded_threads,
                     pending_dropped,
                     routes_cooled,
                     dropped_events = self.dropped_events,
@@ -2435,6 +2653,15 @@ impl Supervisor {
             exit_line!(warn, "claude child exited unexpectedly");
         }
     }
+}
+
+/// `(live_children, loaded_threads)`: entries with a child, and entries.
+pub(crate) fn thread_counts(threads: &HashMap<ThreadId, ThreadEntry>) -> (usize, usize) {
+    let live = threads
+        .values()
+        .filter(|entry| entry.child.is_some())
+        .count();
+    (live, threads.len())
 }
 
 #[cfg(test)]
@@ -2785,5 +3012,38 @@ pub(crate) mod tests {
         fn pid(&self) -> Option<u32> {
             Some(4242)
         }
+    }
+
+    fn ask(thread: ThreadId, owner: ThreadId, request_id: &str) -> PendingAsk {
+        PendingAsk {
+            thread,
+            owner,
+            request_id: request_id.into(),
+            tool_use_id: None,
+            tool_name: None,
+            suggestions: Vec::new(),
+            subtype: "can_use_tool".into(),
+            input: Value::Null,
+        }
+    }
+
+    #[test]
+    fn count_owner_counts_approvals_and_server_requests_of_one_owner() {
+        let owner = ThreadId::new();
+        let route = ThreadId::new();
+        let other = ThreadId::new();
+        let mut pending = PendingRequests::default();
+        assert_eq!(pending.count_owner(owner), 0);
+        pending.insert_approval(ApprovalId::new("a1"), ask(owner, owner, "a1"));
+        // A sub-agent route's ask is its owner's too.
+        pending.insert_approval(ApprovalId::new("a2"), ask(route, owner, "a2"));
+        pending.insert_server_request(ServerRequestId::new("s1"), ask(owner, owner, "s1"));
+        pending.insert_approval(ApprovalId::new("a3"), ask(other, other, "a3"));
+        assert_eq!(pending.count_owner(owner), 3);
+        assert_eq!(pending.count_owner(other), 1);
+        pending.remove_approval(&ApprovalId::new("a1"));
+        assert_eq!(pending.count_owner(owner), 2);
+        assert_eq!(pending.remove_owner(owner), 2);
+        assert_eq!(pending.count_owner(owner), 0);
     }
 }

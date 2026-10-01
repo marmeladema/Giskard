@@ -107,8 +107,8 @@ max_command_output_bytes = 134217728   # 128 MiB
 #     instance spawns, and for Giskard's own model discovery on its behalf (env-backed keys,
 #     headers, and auth commands resolve through it first). Values are literal and are never
 #     logged; only the variable names are.
-#   * The only Codex-specific key is `profile`, passed as `-c profile=<name>`; a `claude-code`
-#     declaration accepts no kind-specific key. Any other key is a startup error, as are a blank
+#   * The only Codex-specific key is `profile`, passed as `-c profile=<name>`; the only
+#     `claude-code` one is `idle_shutdown_secs`. Any other key is a startup error, as are a blank
 #     declaration name, an unknown `kind`, two defaults, a blank command or profile, and an
 #     environment variable name that is empty or contains `=`.
 #   * Claude Code reads its own login from CLAUDE_CONFIG_DIR (default ~/.claude). Never put
@@ -131,6 +131,8 @@ max_command_output_bytes = 134217728   # 128 MiB
 # kind = "claude-code"
 # # `claude` on PATH; set `command` for another binary. Two declarations with different
 # # CLAUDE_CONFIG_DIR values are two independent logins, settings and transcript stores.
+# # Stop a thread's `claude` process idle this many seconds; its next message resumes it. 0 never.
+# idle_shutdown_secs = 600
 # [harnesses.claude.env]
 # CLAUDE_CONFIG_DIR = "/home/you/.claude"
 

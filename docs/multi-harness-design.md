@@ -139,8 +139,10 @@ promise to spawn a process.
   process exit ends that thread's stream only.
 - **`discoveries`.** Codex reports native threads first seen in traffic. Claude Code's stream is
   always empty; a per-thread process produces no foreign traffic.
-- **Idle policy.** Codex applies it at instance level and terminates the app-server. Claude Code
-  applies it per process, inside the adapter.
+- **Idle policy.** Codex would apply it at instance level and terminate the app-server (not
+  implemented). Claude Code applies it per process, inside the adapter, through
+  `idle_shutdown_secs` on the declaration: an idle thread's process is stopped and the thread
+  resumed with `--resume` on its next message.
 - **`shutdown`.** Codex closes the transport and kills the process. Claude Code stops every live
   process.
 
@@ -228,7 +230,8 @@ Rules:
   replaces it at the top level: the default lives on the entry. An old config still carrying the
   section is ignored, as unknown top-level tables are today, since no config is known to have
   used the key. `idle_shutdown_secs` was removed with it in Stage 0 rather than kept parsed but
-  unused; idle shutdown as an instance policy remains an open question.
+  unused; idle shutdown as an instance policy remains an open question, answered for Claude Code
+  by its milestone 6 (`idle_shutdown_secs` on a `claude-code` declaration).
 - **Providers are not declarations.** A provider is something an instance reports, not something
   the user declares as a harness. See *Provider scoping* for what is global and what is not.
 
@@ -517,9 +520,9 @@ not opt in.
 
 ## Open questions
 
-- **Idle shutdown.** Implement as an instance policy on the declaration, or drop the key. If
-  implemented, Codex terminates the app-server and resumes threads on next use; Claude Code applies
-  it per process.
+- **Idle shutdown.** Answered for Claude Code: a declaration key, `idle_shutdown_secs`, applied
+  per process inside the adapter (default 600 s, `0` never). Open for Codex: whether to implement
+  it as an instance policy that terminates the app-server and resumes threads on next use.
 - **Claude Code credentials for discovery.** See *Claude Code models*. Resolve against a real
   install before designing the `ProviderAuth` extension in detail.
 - **Per-declaration provider overlay.** Deferred until the same-id, different-endpoint warning in

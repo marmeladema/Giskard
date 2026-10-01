@@ -24,9 +24,10 @@ plan §4 matrix, with `live_approvals`, `plan_build_modes`, `per_turn_model`, `r
 `context_compaction` and `mcp_status` true. A delegation (an `Agent` tool call) is a **sub-agent
 thread**: the mapper mints a route for it, `claim_native_thread` binds it, its forwarded frames are
 its transcript, its asks are published on it, and `interrupt` on it is `stop_task` (see *Sub-agent
-routes*). Still to come: idle reaping of children and a supervisor state machine (milestone 6),
-synthesized diffs (milestone 7), and version-drift and headroom surfacing, including an MCP tool
-inventory from `init.tools` (milestone 8).
+routes*). A child idle for `idle_shutdown_secs` is stopped and its thread respawned with
+`--resume` on its next message (see *Process control*). Still to come: synthesized diffs
+(milestone 7), and version-drift and headroom surfacing, including an MCP tool inventory from
+`init.tools` (milestone 8).
 
 ## Runtime ownership
 
@@ -56,33 +57,44 @@ inventory from `init.tools` (milestone 8).
     has exited. The shutdown and command-channel arms are disabled once they fired, so the loop
     never spins on a closed channel or a set flag.
 
+  While serving, the supervisor also runs the **idle clock**: at the top of every loop iteration
+  it checks whether the child has anything to do (*Idle reaping*), starts or stops the clock
+  (`idle` at `debug`), and arms the idle timer; when it fires, the reap is a stop sequence that
+  keeps the thread.
+
   A reply the mapper must write (an `ExitPlanMode` deny) that cannot be written breaks the child
   wherever it happens.
 - **The façade** (`src/harness.rs`) holds three maps behind `std` mutexes that are never held
-  across an await: `children` (thread → live child: its session id, retained log, command sender,
-  task, open model, launch mode), `pending` (approval / server-request id → the thread the ask was
+  across an await: `threads` (primary thread → its session id, retained log, workspace root and
+  model, and its live child while it has one: command sender, task, launch mode, generation),
+  `pending` (approval / server-request id → the thread the ask was
   published on, its **owner** (the primary thread whose child answers it), CLI `request_id`, and
   what the answer needs: the tool-use id, the tool name and the raw `permission_suggestions` of an
   approval, the subtype and `input` of a server request) and `routes` (sub-agent thread → its
   `task:` id, retained log, owning primary thread and command sender, parent native id, name and
   model; a **cold** route has a fresh, open, silent log and no owner). The façade
   also remembers, once, the sentence in which the CLI refused a bypass launch (`bypass_refused`).
-  `open_thread` inserts a child after its handshake; the supervisor removes its own entry when the
-  child exits (a generation number keeps a stale supervisor from removing a reopened thread's
-  entry); `delete_thread`, `set_thread_archived(true)` and `shutdown` take entries out before
-  stopping them. A supervisor drops every `pending` entry it owns (its routes' included) when its
-  child exits; an answer or a `control_cancel_request` removes one entry. A supervisor publishes a
-  route into `routes` on the mapper's `RouteOpened`, and at exit turns its own routes (guarded by
-  its generation) **cold**: owner and command sender cleared, log left open. `claim_native_thread`
-  inserts a cold route. Only the sub-agent thread's own `delete_thread` or
-  `set_thread_archived(true)`, and `shutdown`, remove a route and close its log, like a Codex
-  thread log that lives as long as its thread.
+  `open_thread` inserts an entry after its child's handshake. An entry **outlives a reaped
+  child**: the reap clears its child (keeping the session id, the open log and the model the CLI
+  last held) and the next turn's respawn fills it again. The supervisor removes its own entry when
+  its child exits any other way (a generation number keeps a stale supervisor from touching a
+  reopened or respawned thread's entry); `delete_thread`, `set_thread_archived(true)` and
+  `shutdown` take entries out before stopping their children, and close the log of an entry that
+  has none. A supervisor drops every `pending` entry it owns (its routes' included) when its
+  child exits, unless it was reaped (idle means none); an answer or a `control_cancel_request`
+  removes one entry. A supervisor publishes a route into `routes` on the mapper's `RouteOpened`,
+  and at exit turns its own routes (guarded by its generation) **cold**: owner and command sender
+  cleared, log left open. `claim_native_thread` inserts a cold route. Only the sub-agent thread's
+  own `delete_thread` or `set_thread_archived(true)`, and `shutdown`, remove a route and close its
+  log, like a Codex thread log that lives as long as its thread.
 - **The retained log is created at open**, so `subscribe` returns a live reader for any handle
-  `open_thread` issued before the child has written a frame. Frames read during the handshake that
-  were not its responses are mapped first, once the supervisor starts.
+  `open_thread` issued before the child has written a frame. It lives as long as the thread's
+  entry: a respawned child appends to the same log, so a reader sees one continuous stream. Frames
+  read during the handshake that were not its responses are mapped first, once the supervisor
+  starts.
 - **The probe child** that `list_models` spawns when no handshake has reported a catalog yet, or
   `list_mcp_servers` when the call names no thread with a live child, is owned by the call: it is
-  not in `children` and does not count as a live child. It must never become a Claude Code session
+  not in `threads` and does not count as a live child. It must never become a Claude Code session
   (`AGENTS.md`): it is launched with the protocol flags only (no `--session-id`, `--resume`,
   `--model`, `--permission-mode`), it is written only control requests through `control_line`,
   never a `user` line, and its stdin is closed after the last answer. Verified on 2.1.287:
@@ -299,7 +311,14 @@ shape could not be reproduced. Every other failure is `HarnessError::Spawn` quot
 the handshake request left unanswered (`initialize`, `set_permission_mode`, `get_settings` or
 `get_context_usage`) and the stderr tail, which is what the browser shows.
 
-A second `open_thread` for a thread with a live child returns that child's handle.
+A second `open_thread` for a thread with a live child returns that child's handle. For a thread
+whose child was reaped (the server reopens one only after a restart or a forget; it never learns of
+a reap), `open_thread` respawns at once with `--resume` on the thread's session id, under the same
+fallbacks, and reports the restored window and a lost transcript as a first open does. The lazy
+respawn on a turn (*Idle reaping*) is the same path: same argv, same bypass fallback, same
+missing-transcript fallback, same handshake; there the lost-transcript notice is an
+`AgentEvent::Notice` right after the turn's `TurnStarted` (its turn set, so a second loss is not
+deduplicated away), since the server reads no handle.
 
 ## Process control
 
@@ -316,8 +335,9 @@ A second `open_thread` for a thread with a live child returns that child's handl
 - **Interrupt** writes the `interrupt` control request and resolves on its response, within 10 s.
   With no active turn the CLI answers at once and nothing else happens. On a sub-agent thread it is
   `stop_task` instead (see *Sub-agent routes*).
-- **Rename.** `set_thread_name` sends `rename_session` (`source: "host"`) to a live child; a cold
-  or `task:` thread is a no-op, since Giskard keeps its own name.
+- **Rename.** `set_thread_name` sends `rename_session` (`source: "host"`) to a live child; a cold,
+  reaped or `task:` thread is a no-op, since Giskard keeps its own name. `interrupt` on a reaped
+  thread is `Ok` too: it has no active turn.
 - **Stop** (archive, delete, shutdown, or a dropped instance): if a turn is live, write `interrupt`
   and keep mapping frames for up to 5 s so the turn's `result` reaches the log; close stdin and
   read to EOF for up to 5 s; then SIGKILL (`stop_kill` at `warn`). SIGTERM is not used: it leaves
@@ -327,15 +347,35 @@ A second `open_thread` for a thread with a live child returns that child's handl
   thread's event log itself, so the stream still ends.
   `set_thread_archived(false)` does nothing; `delete_thread` does not touch `~/.claude`.
 - **Shutdown** is idempotent: it marks the instance shut down, stops every child concurrently,
-  clears `pending`, and logs `children_stopped`. Afterwards `open_thread` and `list_models` fail.
+  closes the log of every reaped thread, clears `pending`, and logs `children_stopped` and
+  `threads_closed`. A child still draining from its reap finishes on its own. Afterwards
+  `open_thread` and `list_models` fail.
 - **Child exit.** However a child ends, an active turn completes from `ClaudeMapper::child_exited`
   (`Interrupted` after an interrupt, else `Failed`, naming the exit code or signal), as does every
   open sub-agent route turn; the thread's log closes (only that stream ends), its routes turn cold
-  with their logs left open, the child leaves `children`, waiters fail, and one
-  `child_exited` line logs the exit code or signal, the stderr tail, whether the stop was requested
-  and `live_children`: at `info` for a requested stop that exited 0 (or 1 after an interrupt), at
-  `warn` otherwise. The spawn line logs `live_children` too. A closed log's refusal of an event is
-  logged once and counted on that line.
+  with their logs left open, the thread leaves `threads`, waiters fail, and one
+  `child_exited` line logs the exit code or signal, the stderr tail, whether the stop was
+  requested, whether it was a reap, `live_children` and `loaded_threads`: at `info` for a
+  requested stop that exited 0 (or 1 after an interrupt), at `warn` otherwise. The spawn line logs
+  `live_children` too. A closed log's refusal of an event is logged once and counted on that line.
+  A **reaped** child's exit is the exception: the thread's log stays open, its entry keeps the
+  thread, and its pending map is left alone; its routes turn cold as after any exit.
+- **Idle reaping.** A child is idle when it has no turn hand-off in flight, no ask awaiting the
+  user, no live sub-agent route, no open task (a `local_bash` task outlives its turn and can still
+  ask), no control request awaiting its answer and no active turn. Once idle for
+  `idle_shutdown_secs` (a key on the `claude-code` declaration; 600 s by default, `0` never), the
+  supervisor takes its child out of the thread's entry (`child_reaped` at `info`, with `idle_ms`,
+  `live_children` and `loaded_threads`) and runs the stop sequence with no turn to interrupt:
+  close stdin, read to EOF, kill on the grace timeout. The thread stays bound on the server, which
+  is never told, and its stream stays open. The next `start_turn`, `compact_thread` or
+  `open_thread` respawns the child with `--resume` (`respawn` at `info`, with `resume_fallback`
+  and `elapsed_ms`); the user sees nothing, or the "Agent context was lost" notice under the new
+  message when the transcript is gone. A failed respawn fails that turn and keeps the thread, so
+  the next message tries again. A hand-off that reached a supervisor already reaping is refused at
+  once and runs on a fresh child (one retry, the same turn id). A task whose terminal update never
+  comes keeps its child alive for good (`idle` with `reason = "tasks"`), the right failure: the
+  CLI believes it runs. An MCP status read never respawns: a reaped thread's hint is answered by
+  the probe.
 - **Asks.** `can_use_tool` and other inbound control requests are published as events, recorded
   in `pending`, and answered by `respond_approval` / `respond_server_request` (below).
 
@@ -641,6 +681,7 @@ error. `mcp_status` carries **no tool inventory**: tools reach the model as
   `set_permission_mode` (`bypass_not_launched` for `bypassPermissions` on a child not launched
   with it), `set_model` (`catalog_unknown` outside the `initialize` catalog), `apply_flag_settings`,
   `get_settings` (echoing the model and effort it was told), `stop_task` (`{}`) and `mcp_status`
-  (no servers), replays
+  (no servers), treats `--resume` as the missing-transcript failure unless
+  `FAKE_CLAUDE_RESUME_OK=1` makes it a successful resume, replays
   the `tool-allowed` ask on a message containing `touch` and the rest once answered, and with
   `FAKE_CLAUDE_REFUSE_BYPASS=1` refuses a bypass launch with the root sentence.
