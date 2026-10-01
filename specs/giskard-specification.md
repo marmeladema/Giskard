@@ -2414,6 +2414,8 @@ verified protocol is recorded in [`claude-code-harness-plan.md`](claude-code-har
 | `AskUserQuestion` and other inbound control requests | `ServerRequestReceived` / `ServerRequestResolved` |
 | `result` (held while the CLI's agent tasks still run) | `TurnCompleted` |
 | `interrupt` control request | `interrupt` |
+| `Agent` tool call + `system/task_started` / `task_updated` of its `local_agent` task | a sub-agent thread (`task:<tool_use_id>`, the §7 sub-agent model) whose items are the frames forwarded with `--forward-subagent-text`; read-only and never resumable |
+| `stop_task` control request | `interrupt` on a sub-agent thread |
 | `/compact` user line | `compact_thread` |
 | `mcp_status` control request | `list_mcp_servers` |
 

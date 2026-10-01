@@ -9,15 +9,15 @@
 #   sentence on stderr, exit 1.
 # - `FAKE_CLAUDE_STDERR_FLOOD=1`: 50 stderr lines of 1000 characters, then exit 0.
 # - otherwise one stdin line at a time: `initialize`, `get_settings` (echoing the model and effort
-#   it was last told), `get_context_usage`, `interrupt`, `mcp_status` (no servers) and
-#   `rename_session` control requests are answered; `set_permission_mode` echoes the mode
-#   (`bypassPermissions` on a child not launched with it is the `bypass_not_launched` error);
-#   `set_model` succeeds for a model of the `initialize` fixture's catalog, else the
-#   `catalog_unknown` error; `apply_flag_settings` succeeds and remembers `effortLevel`. A user
-#   message containing `touch` replays the `tool-allowed` frames up to its `can_use_tool` ask, and
-#   the rest once a control response answers it; any other user message replays the `text-turn`
-#   frames (`FAKE_CLAUDE_EXIT_MID_TURN=<n>`: only the first n, then exit 3). EOF exits 0
-#   (`FAKE_CLAUDE_IGNORE_EOF=1`: sleeps 30 s instead).
+#   it was last told), `get_context_usage`, `interrupt`, `stop_task` (an empty success),
+#   `mcp_status` (no servers) and `rename_session` control requests are answered;
+#   `set_permission_mode` echoes the mode (`bypassPermissions` on a child not launched with it is
+#   the `bypass_not_launched` error); `set_model` succeeds for a model of the `initialize` fixture's
+#   catalog, else the `catalog_unknown` error; `apply_flag_settings` succeeds and remembers
+#   `effortLevel`. A user message containing `touch` replays the `tool-allowed` frames up to its
+#   `can_use_tool` ask, and the rest once a control response answers it; any other user message
+#   replays the `text-turn` frames (`FAKE_CLAUDE_EXIT_MID_TURN=<n>`: only the first n, then exit 3).
+#   EOF exits 0 (`FAKE_CLAUDE_IGNORE_EOF=1`: sleeps 30 s instead).
 
 fixtures="$(dirname "$0")/fixtures"
 model=""
@@ -118,6 +118,9 @@ while IFS= read -r line; do
             ;;
         *'"subtype":"interrupt"'*)
             respond "$request_id" '{"still_queued":[]}'
+            ;;
+        *'"subtype":"stop_task"'*)
+            respond "$request_id" '{}'
             ;;
         *'"subtype":"mcp_status"'*)
             respond "$request_id" '{"mcpServers":[]}'

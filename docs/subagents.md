@@ -4,8 +4,8 @@ Giskard represents a delegated agent as a real linked thread, not as a copied tr
 child keeps its native harness thread ID and its own persisted turns while remaining owned by the
 thread that spawned it.
 
-This document describes the supported Codex event shapes, native event ownership, read-only child
-behavior, prompt persistence, approvals, and deletion behavior.
+This document describes the supported Codex event shapes, Claude Code's sub-agent threads, native
+event ownership, read-only child behavior, prompt persistence, approvals, and deletion behavior.
 
 ## Finding and opening children
 
@@ -18,11 +18,11 @@ button follows `parent_thread_id`, so it also works after a reload and for neste
 A reverse activity from a child to its parent navigates to the existing parent. It never creates a
 second thread or changes ownership.
 
-The harness-neutral activity link is intentionally direction-neutral: Codex identifies the related
-native thread but does not reliably label the relationship from the source thread's perspective.
-Giskard resolves the direction from its persisted ownership graph. Automatic activity aimed at the
-direct parent is therefore treated as navigation-only rather than as a failed child import;
-genuinely incompatible ownership remains a warning.
+The harness-neutral activity link is intentionally direction-neutral: a harness identifies the
+related native thread but does not reliably label the relationship from the source thread's
+perspective. Giskard resolves the direction from its persisted ownership graph. Automatic activity
+aimed at the direct parent is therefore treated as navigation-only rather than as a failed child
+import; genuinely incompatible ownership remains a warning.
 
 The browser opens a transcript link with the Giskard parent-thread and item IDs. The server reads
 the authoritative live or persisted item, extracts the native routing ID and lifecycle evidence,
@@ -81,6 +81,41 @@ The Codex adapter maps both known protocols into the same harness-neutral sub-ag
 Giskard does not decrypt or inspect Codex rollout storage to recover a missing prompt. It uses only
 the fields exposed through the adapter protocol.
 
+## Claude Code: sub-agent threads without native sessions
+
+A Claude Code delegation is an `Agent` tool call. Its sub-agent runs inside the parent's session and
+has **no session of its own**, so its native identity is `task:<tool_use_id>`, the id of the
+parent's `Agent` call. The adapter mints the child's Giskard thread when it maps that call, and the
+parent's `Agent` item carries the link at start (spawned, pending, with the delegated prompt) and
+at completion (the sub-agent's status then). The server's claim adopts the thread the adapter
+minted; the Sub-agents monitor names it after the call's `description`.
+
+- **Transcript.** The child's transcript is the stream Claude Code forwards for it
+  (`--forward-subagent-text`): the delegated prompt as the turn's user message, the sub-agent's
+  own tool calls and results, its thinking when shown, and its closing message. Its usage comes
+  from its own API messages.
+- **Permanently read-only, never resumable.** There is no session to attach, so the thread stays
+  read-only forever. Reopening it after a restart (or after its parent's process ended) shows its
+  persisted history over a silent live stream; nothing is spawned or resumed for it.
+- **Approvals.** A sub-agent's ask names its task (`agent_id`), not its parent tool call, and can
+  arrive before the frame carrying the tool use it asks for. It is routed by `agent_id` to the
+  child's thread and answered from the child like any other approval (see *Approvals raised inside
+  a child*); the answer reaches the parent's process, which carries the sub-agent. An ask whose
+  sub-agent is unknown stays on the parent thread, with a warning, so it remains answerable.
+- **Interrupt.** Interrupting the child sends `stop_task`: the sub-agent is killed, its pending ask
+  is withdrawn by Claude Code, its turn ends `Interrupted`, and the parent's turn continues with
+  the interruption as the `Agent` call's result. A child whose session is gone reports that the
+  sub-agent is no longer running.
+- **Backgrounded delegations.** The parent's `Agent` call completes as soon as the sub-agent is
+  launched, with its link still running. When the sub-agent ends, an activity row on the parent
+  carries the outcome (completed, killed or failed) and the link, so **Open linked thread** works
+  from either row.
+- **Nesting.** A sub-agent's own delegation is a child of the child: its link appears in the outer
+  child's transcript and its native parent is `task:<outer>`.
+- **Not shown.** The rejection sentence and the `[Request interrupted by user for tool use]` marker
+  that trail a killed sub-agent are dropped in favour of the `Interrupted` status, and
+  `task_progress` counters are not displayed.
+
 ## Long-lived native event ownership
 
 Opening or materializing a child installs one coordinator and one long-lived subscriber for that
@@ -110,8 +145,7 @@ boundary and is reported to the owner as a gap. The owner persists the received 
 
 A child's approval routes like any other: the harness maps it to the child's Giskard thread, the
 long-lived owner registers it, and answering it from the child transcript reaches the right harness.
-The child is resumable, so its pending approval also survives a browser reload through the live-turn
-snapshot.
+Its pending approval also survives a browser reload through the live-turn snapshot.
 
 What needs care is telling the user, because a managed child has no sidebar row. Three surfaces
 report it:

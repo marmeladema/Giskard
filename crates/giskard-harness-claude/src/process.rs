@@ -110,6 +110,7 @@ fn protocol_argv() -> Vec<String> {
         "EnterPlanMode",
         "ExitPlanMode",
         "--include-partial-messages",
+        "--forward-subagent-text",
     ]
     .into_iter()
     .map(str::to_owned)
@@ -660,6 +661,7 @@ pub(crate) mod tests {
         "EnterPlanMode",
         "ExitPlanMode",
         "--include-partial-messages",
+        "--forward-subagent-text",
     ];
 
     #[test]

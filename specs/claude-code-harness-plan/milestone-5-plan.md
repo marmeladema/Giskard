@@ -302,7 +302,12 @@ which is how the supervisor picks the log.
   map and a clone of the command sender (the façade already holds it; pass it in). On
   `RouteClosed` and at exit the supervisor removes its own routes from the map, guarded by
   `generation` exactly like the `children` removal in `on_exit` (`session.rs:1690`), and closes
-  their logs.
+  their logs. **Amended in implementation:** closing a route's log ends the sub-agent thread's
+  owner as a failed owner (`StreamEndedWithoutTurn` outside teardown), and a claim landing after
+  the close would bind an empty cold route. So `RouteClosed` only stops appending and drops the
+  route's asks; the log stays open and published, child exit turns the child's routes cold (owner
+  and commands cleared, log open), and only the sub-agent thread's own delete or archive, or
+  shutdown, removes a route and closes its log.
 - **Asks.** `PendingAsk` (`session.rs:129`) gains `owner: ThreadId` (the primary thread whose child
   answers it; `thread` becomes the route's or the primary's thread, whatever the mapper said).
   `remove_by_request_id` searches by `owner`; `remove_thread(owner)` becomes `remove_owner`, so a
@@ -573,8 +578,9 @@ Then, on a shell with a logged-in `claude`, a `claude-code` declaration and a pr
   `stop_task`.
 - A sub-agent's ask is published on its thread, by `agent_id` even when the ask precedes its
   `tool_use` frame, and answered through its owning child.
-- Route turns end on the terminal `task_updated`, on child exit, or with their spawning turn; no
-  route outlives its child.
+- Route turns end on the terminal `task_updated`, on child exit, or with their spawning turn; a
+  route's log stays open until the sub-agent thread's own delete or archive, or shutdown (turned
+  cold when its child exits).
 - The two new fixtures are exercised by the mapper and façade tests; every existing test passes.
 - `docs/subagents.md`, the adapter README, the fixtures README, spec §4.6a, the root README and
   the plan's §11 say what the code does.
