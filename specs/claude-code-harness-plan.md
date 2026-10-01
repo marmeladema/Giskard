@@ -1638,7 +1638,15 @@ the write), with responses routed by the existing `ControlResponse` dispatch, no
 one more loop input and must know what is in flight (a child is never reaped mid-handshake,
 mid-settings or mid-answer), which is exactly the state the first half makes explicit. Milestones 4
 and 5 do not build on the polling: 4 touches no supervisor code and 5 changes the mapper's routes
-and the pending map's keys, not how responses are awaited.
+and the pending map's keys, not how responses are awaited. Its detailed plan is
+`claude-code-harness-plan/milestone-6-plan.md`, written against the tree with MCP status per
+thread merged: the hand-off becomes a `TurnSetup` the main loop advances and the stop sequence
+a phase, so commands are refused at once while a child stops; a child idle for
+`idle_shutdown_secs` (a key on the `claude-code` declaration, default 600 s, `0` never) is
+stopped with its thread's log open and its entry kept, and the next message respawns it with
+`--resume` under the open's own fallbacks. Idle means no turn, no sub-agent route, no open task
+(`local_bash` included), no outstanding control request, no in-flight hand-off and no pending
+ask. The server is not told and must not be: it reuses the binding and keeps reading the log.
 
 ### After milestone 5, as its own change — MCP status per thread
 
