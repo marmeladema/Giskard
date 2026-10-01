@@ -1500,9 +1500,9 @@ with a preset that hangs or a thread that cannot be created.
 | 1 | Crate, fixtures, output mapper | `giskard-harness-claude` as a workspace member with `claude-codes`; recorded and sanitized protocol fixtures; the pure mapper from stream-json frames to `AgentEvent`s and control replies, tested on the fixtures | nothing |
 | 2 | Child supervisor and thread lifecycle | one `claude` process per thread; `open_thread` / resume / resume-fallback, `subscribe`, `start_turn` with attachments, `interrupt`, `shutdown`, `delete_thread`, `set_thread_archived`, `set_thread_name`; the catalog probe and provider report | 1 |
 | 3 | Approvals, server requests, per-turn settings | `can_use_tool` ↔ `respond_approval` with the §9.3 mapping, `AskUserQuestion` and dialogs ↔ `respond_server_request`, the permission mode per turn, `set_model` / effort with read-back, `/compact` | 2 |
-| 4 | Registration and documentation | `ClaudeCodeKind` in the server binary, `config.example.toml`, README, spec mapping section, the adapter README; P8 hygiene. **The MVP becomes reachable here** | 3, and Stage 3 of `docs/multi-harness-design.md` |
+| 4 | Registration and documentation | `ClaudeCodeKind` in the server binary, `config.example.toml`, README, spec mapping section, the adapter README; `list_mcp_servers`; P8 hygiene and the per-harness filter of config-declared models. **The MVP becomes reachable here** | 3 |
 | 5 | Sub-agent child threads | `--forward-subagent-text`, `SubagentLink` on the `Agent` item, `claim_native_thread` for `task:` ids, `parent_tool_use_id` routing, sub-agent approvals, `docs/subagents.md` | 4 |
-| 6 | Idle reaping | an adapter-level idle policy over children, answering the design doc's open question | 4 |
+| 6 | Supervisor hardening and idle reaping | the supervisor's in-flight control requests as a state the main loop drives (replacing milestone 3's polled `await_control`), then an adapter-level idle policy over children built on it, answering the design doc's open question | 4 |
 | 7 | Synthesized diffs | `FileChange` / `DiffUpdated` from `Edit` / `Write` / `NotebookEdit` plus git | 4 |
 | 8 | Drift and headroom surfacing | `system/init.capabilities` feature detection, a version-drift warning, and `rate_limit_event` headroom in the UI | 4 |
 
@@ -1579,14 +1579,17 @@ implemented in `crates/giskard-harness-claude` and one dispatch line in `static/
 extended for a two-kind catalog; `config.example.toml` gains a `[harnesses.claude]` declaration;
 README's *Supported harnesses* entry changes; `list_mcp_servers` is implemented over the
 `mcp_status` control request (§3.3) and `mcp_status` is advertised; the spec gains a Claude Code
-mapping section beside
-§4.6 and the §9.1 / §9.2.1 amendments (§8.2, §9.3); `docs/api-endpoints.md` is unchanged because no
-route moves; the adapter README is completed. P8 (`resolve_reverse_subagent_target` filtered by
-`ThreadFile.harness`) lands here because it is the one server-side hygiene item. **Stage 3 of
-`docs/multi-harness-design.md` lands before this milestone**, since it rewrites the registry
-methods this adapter's lifecycle methods are called through. Checking that a second *kind* renders
-correctly in a picker built against two Codex declarations, and regenerating the screenshots if it
-does not, is part of this milestone.
+mapping section beside §4.6 and the §9.1 / §9.2.1 amendments (§8.2, §9.3);
+`docs/api-endpoints.md` is unchanged because no route moves; the adapter README is completed. Two
+server-side hygiene items land here because a second *kind* makes them observable: P8
+(`resolve_reverse_subagent_target` filtered by `ThreadFile.harness`), and config-declared models
+under a provider a harness does not report leaving that harness's picker group (today they are
+offered with a warning that they cannot be routed). Stage 3 of `docs/multi-harness-design.md` is
+**not** a prerequisite: verified while planning, the registry resolves every thread operation's
+harness from the thread file's name and passes a detached handle for a cold thread, which the
+adapter handles, so Stage 3 remains desirable plumbing. The picker already groups by declaration
+name and `GET /api/harnesses` already carries `kind`, so no browser change and no screenshot
+regeneration is expected.
 
 ### Milestone 5 — sub-agent child threads
 
@@ -1598,9 +1601,21 @@ no-native-session model. The two halves ship together, never one without the oth
 
 ### Milestones 6 to 8 — polish
 
-Idle reaping (§5.2, and the design doc's open question), synthesized structured diffs (§6.1), and
-surfacing `system/init.capabilities`, `claude_code_version` drift and subscription headroom in the
-UI (§12). Each is independent of the others and follows milestone 4.
+Supervisor hardening with idle reaping (§5.2, and the design doc's open question), synthesized
+structured diffs (§6.1), and surfacing `system/init.capabilities`, `claude_code_version` drift and
+subscription headroom in the UI (§12). Each is independent of the others and follows milestone 4.
+
+**Milestone 6 has two halves that belong together.** Milestone 3's `await_control` waits for a
+control response by pumping frames in 50 ms slices, which is a pragmatic answer rather than a
+design: the supervisor's main loop is the one place that reads stdout, so a handler that needs a
+response cannot await it directly. The first half makes the in-flight request a state the main
+loop drives — a `TurnSetup` state for the per-turn settings (mode, model, effort, read-back, then
+the write), with responses routed by the existing `ControlResponse` dispatch, no slices, and
+`Stop` / shutdown handled as ordinary loop inputs. The second half, idle reaping, adds a timer as
+one more loop input and must know what is in flight (a child is never reaped mid-handshake,
+mid-settings or mid-answer), which is exactly the state the first half makes explicit. Milestones 4
+and 5 do not build on the polling: 4 touches no supervisor code and 5 changes the mapper's routes
+and the pending map's keys, not how responses are awaited.
 
 ### Later, as its own decision — the hook route (§9.4)
 
