@@ -39,16 +39,21 @@ These are generated from the real UI (no host Node/npm needed) with `tests/e2e/s
 
 The agent harness is a replaceable component behind a neutral `AgentHarness` trait:
 
-- **[Codex CLI](https://github.com/openai/codex) — supported, and required today.** Giskard drives
+- **[Codex CLI](https://github.com/openai/codex) — supported, and the default.** Giskard drives
   Codex over its `app-server` JSON-RPC protocol. A working, authenticated Codex CLI must be installed
-  on the machine (see [Prerequisites](#prerequisites)); without it you can create projects, but turns
-  fail. Giskard manages a harness *instance* per project and declaration; whether that is one
+  on the machine for a Codex declaration (see [Prerequisites](#prerequisites)); without it you can
+  create projects, but turns fail. Giskard manages a harness *instance* per project and declaration; whether that is one
   process or one per thread is the adapter's concern. Several Codex declarations (different
   binaries, profiles, or `CODEX_HOME`s) can run side by side, chosen per thread from the model
   picker; see [Configuration](#configuration).
-- **Claude Code — not yet supported.** The trait makes it addable without touching the rest of the
-  app; it just hasn't been built yet. _(Anthropic, if you're reading this: a generous pile of Claude
-  credits would move this up the roadmap_ 😁_.)_
+- **[Claude Code](https://docs.anthropic.com/en/docs/claude-code) — supported.** Giskard drives the
+  `claude` CLI over `claude -p` stream-json, one `claude` process per open thread. Declare it as a
+  `[harnesses.<name>]` of kind `claude-code` (see [Configuration](#configuration)); its catalog
+  appears under its own group in the model picker, beside any Codex declaration, and is chosen per
+  thread. A working, logged-in Claude Code CLI must be installed (see
+  [Prerequisites](#prerequisites)). Sub-agent threads, idle-process reaping and structured diffs are
+  not there yet; see the [adapter README](crates/giskard-harness-claude/README.md) for what the
+  adapter does today.
 
 ---
 
@@ -59,10 +64,18 @@ The agent harness is a replaceable component behind a neutral `AgentHarness` tra
   Codex's credentials — it inherits `~/.codex` (ChatGPT login or an API key / custom provider) when
   it spawns the app-server. If Codex isn't configured, turns will fail with an "unauthenticated"
   message. See [§12.2 of the spec](specs/giskard-specification.md).
+- **Claude Code** (only for a `claude-code` declaration), installed and logged in: run `claude` once
+  and log in interactively, or export a `claude setup-token` token as `CLAUDE_CODE_OAUTH_TOKEN`.
+  Never put `ANTHROPIC_API_KEY` in Giskard's environment unless API billing is what you want: it
+  moves a subscriber to API billing, and Giskard can only warn about it (through the CLI's
+  `apiKeySource` notice), not unset an inherited variable. `full_access` needs the server to run as
+  an ordinary user: the CLI refuses `bypassPermissions` as root, and Giskard then refuses
+  `full_access` turns quoting the CLI's sentence. Each open thread costs one `claude` process of
+  roughly 440–530 MB RSS, and idle ones are not reaped yet.
 
 Giskard runs one harness instance per project and harness declaration, which for Codex is one
-`codex app-server` process; each project is bound to a filesystem directory that becomes the agent's
-sandbox/workspace.
+`codex app-server` process, and for Claude Code one `claude` process per open thread; each project
+is bound to a filesystem directory that becomes the agent's sandbox/workspace.
 
 ---
 
@@ -117,8 +130,8 @@ Then open **http://127.0.0.1:8787**, log in, and:
 
 1. **+** next to *Projects* → name it and give an **absolute directory path** that exists on the
    server machine (the agent's workspace).
-2. **+** on the project → draft a new thread. No Codex thread is created until the first message is
-   sent, so choose the **Plan/Build** mode, **permission preset**, and **model** first if needed.
+2. **+** on the project → draft a new thread. No harness thread is created until the first message
+   is sent, so choose the **Plan/Build** mode, **permission preset**, and **model** first if needed.
    A draft on a Git project also picks its **Git checkout** from the dropdown on the **Git status
    row** above the composer: shared with the project, or a **Git worktree** of its own, so its file
    changes never touch the project's checkout. Choosing a worktree while the project has uncommitted
@@ -132,9 +145,9 @@ Then open **http://127.0.0.1:8787**, log in, and:
    attachment button, drop files onto the composer, or paste files and screenshots into the
    focused composer
    to include images, PDFs, or other files with the message. A message accepts up to eight files
-   and 25 MiB total. The first send creates the Codex thread with the selected
-   provider/model and starts the turn. While an ordinary Codex turn is running, type text to reveal
-   **Send** beside **Stop** and append that message to the same turn; an empty composer keeps the
+   and 25 MiB total. The first send creates the harness thread with the selected
+   provider/model and starts the turn. While an ordinary turn is running on a Codex thread, type
+   text to reveal **Send** beside **Stop** and append that message to the same turn; an empty composer keeps the
    single Stop control. Active-turn steering is text-only, so attachments become available again
    after the turn completes. Existing threads show the **Tasks** menu for running
    commands/tools, **Sub-agents** monitor, **MCP** status menu, and **Context** usage button;
@@ -193,15 +206,16 @@ RUST_LOG=giskard=debug,tower_http=info \
 For verbose turn-lifecycle, Codex harness, and HTTP request diagnostics, use `trace` selectively:
 
 ```bash
-RUST_LOG=giskard=trace,giskard_harness_codex=trace,tower_http=debug giskard-server
+RUST_LOG=giskard=trace,giskard_harness_codex=trace,giskard_harness_claude=trace,tower_http=debug \
+  giskard-server
 ```
 
 If the output is too noisy, scope logging to the area being diagnosed. For example, this focuses on
 thread turn ownership and Codex harness events while keeping the rest of Giskard at `info`:
 
 ```bash
-RUST_LOG=giskard_server::registry=trace,giskard_harness_codex=trace,giskard=info,tower_http=info \
-  giskard-server
+RUST_LOG=giskard_server::registry=trace,giskard_harness_codex=trace,giskard_harness_claude=trace,\
+giskard=info,tower_http=info giskard-server
 ```
 
 Use `debug` first for most issues. `trace` can be very verbose, but it is useful when diagnosing
@@ -264,12 +278,12 @@ service does not silently run with an empty provider list.
 | `[viz]` | `max_highlight_size` | `10485760` (10 MiB) | Files larger than this aren't syntax-highlighted. |
 | `[history]` | `initial` / `page` | `5` / `5` | Turns fetched on open (topped up client-side to ~2 screens) / per scroll-up page. |
 | `[retention]` | `max_command_output_bytes` | `134217728` (128 MiB) | Maximum durable completed-command output. Must be at least `32768` (32 KiB); larger output retains a UTF-8-safe head and tail. |
-| `[harnesses.<name>]` | `kind` | — | **Optional.** A named harness declaration; the whole table defaults to one harness named `codex` of kind `codex`. `kind` is the adapter (`codex`). |
+| `[harnesses.<name>]` | `kind` | — | **Optional.** A named harness declaration; the whole table defaults to one harness named `codex` of kind `codex`. `kind` is the adapter: `codex` or `claude-code`. |
 | | `default` | first declared | At most one declaration may be `true`; new projects use it when no harness is chosen, and a project's declaration is what a new thread preselects. |
-| | `command` | `codex` on `PATH` | Program to spawn. A bare name is resolved on Giskard's own `PATH`, not a `PATH` set in `env`, so use an absolute path for a binary that is not on Giskard's `PATH`; otherwise the `codex` on Giskard's `PATH` runs instead, silently. |
-| | `args` | `[]` | Extra arguments, appended after `app-server --listen stdio://`. |
+| | `command` | `codex` or `claude` on `PATH`, by kind | Program to spawn. A bare name is resolved on Giskard's own `PATH`, not a `PATH` set in `env`, so use an absolute path for a binary that is not on Giskard's `PATH`; otherwise the one on Giskard's `PATH` runs instead, silently. |
+| | `args` | `[]` | Extra arguments, appended after `app-server --listen stdio://` (Codex) or after the stream-json protocol flags (Claude Code). |
 | | `env` | `{}` | `[harnesses.<name>.env]`: variables applied over Giskard's environment for the instance's processes and for discovery on its behalf. Values are never logged. |
-| | `profile` | Codex's own | **Codex only.** Passed as `-c profile=<name>`. Any other Codex key is a startup error. |
+| | `profile` | Codex's own | **Codex only.** Passed as `-c profile=<name>`. Any other Codex key is a startup error; a `claude-code` declaration has no kind-specific keys, and any extra key is a startup error. |
 | `[providers.<id>]` | `model_listing`, `[[providers.<id>.models]]` | — | **Optional.** Models are found without it: every provider Codex has a `base_url` for is discovered from `GET {base_url}/models` with the key Codex holds for it, and the provider Codex routes to also contributes its `model/list` catalog. A built-in Codex has no endpoint for and does not route to — `ollama` or `lmstudio` when you use neither — has nothing to contribute and is not offered; declare models for it if you want it in the picker. Declare a provider only to turn discovery off (`model_listing = false`), to add models by hand for an endpoint with no `/models` route, to override metadata, or to pin picker order — declared providers come first in the order written, the rest by id. Keyed by routing id, the same way Codex keys `[model_providers.<id>]`; the id must name a provider Codex knows (see below). |
 
 Harness declarations are read once at startup and validated before the server listens: a blank
@@ -282,6 +296,27 @@ declaration leaves the threads on it read-only (with the missing name and `[harn
 warning) until it is declared again, while threads on other declarations keep working. Declaring
 the table switches off the synthesized `codex`; projects and threads created before you declared it
 are stamped `codex`, so keep a declaration named `codex` for them.
+
+**Claude Code.** A `claude-code` declaration takes only the neutral keys above:
+
+```toml
+[harnesses.codex]
+kind = "codex"
+default = true
+
+[harnesses.claude]
+kind = "claude-code"
+[harnesses.claude.env]
+CLAUDE_CONFIG_DIR = "/home/you/.claude"
+```
+
+The adapter passes some flags on its own: `--setting-sources user`, so only the user's
+`~/.claude/settings.json` applies and a checkout's `.claude/` settings do not;
+`--permission-prompt-tool stdio`, so approvals reach the browser; and `--disallowedTools
+EnterPlanMode ExitPlanMode`, since Giskard chooses Plan or Build per turn. Two declarations with
+different `CLAUDE_CONFIG_DIR` values in `env` are two independent installs (login, settings and
+transcripts). The catalog is the CLI's own model list; a model shows a conservative context window
+until its first turn reports the real one.
 
 Provider config governs the **picker** and optional `/v1/models` discovery only — Codex itself
 reads `~/.codex/config.toml` for real provider/auth, so any model you select must be one Codex can
@@ -296,9 +331,11 @@ unquoted form would read as a provider `openrouter` with a sub-table). Keys Gisk
 recognise are rejected rather than ignored. The id must match a provider Codex knows: a built-in
 (`openai`, `amazon-bedrock`, `amazon-bedrock-runtime`, `ollama`, `lmstudio`) or one of your own
 `[model_providers.<id>]` tables.
-Giskard checks this when it composes a project's model list and shows a warning naming any id Codex
-has never heard of — its models stay in the picker, but they cannot be routed until you add the
-provider to Codex.
+Giskard checks this when it composes a project's model list and shows a warning naming any id the
+harness has never heard of; its models are left out of that harness's picker group, since they
+cannot be routed until you add the provider there. The Claude Code adapter reports one provider,
+`anthropic`, and needs no `[providers.anthropic]` entry: its models come from the CLI's catalog
+(declare one only for `[[models]]` overrides or `model_listing = false`).
 
 Discovery authenticates the way Codex does. A provider with `env_key` has its key read from that
 environment variable; one with `[model_providers.<id>.auth]` has its command run and the stdout
@@ -358,7 +395,7 @@ With more than one `[harnesses.<name>]` declared, a new thread's picker lists th
 declaration, grouped by harness; picking a model picks its harness, and the thread is created on
 that declaration's instance. A thread's harness is fixed at creation like its provider, so an
 existing thread's picker, MCP menu, and compaction control address only its own instance, and
-opening it never starts another declaration's app-server. With a single declaration the picker is
+opening it never starts another declaration's harness process. With a single declaration the picker is
 not grouped.
 
 Models with `supports_reasoning_effort = true` expose a thread-header **Effort** selector next to
@@ -540,7 +577,7 @@ Cargo workspace under `crates/`:
 | `giskard-git-parser` | Parsers for `git` porcelain v2 and numstat output (no I/O). |
 | `giskard-harness` | The `AgentHarness` trait + capabilities. |
 | `giskard-harness-codex` | Codex CLI adapter (spawns/speaks to `codex app-server`). |
-| `giskard-harness-claude` | Claude Code CLI adapter; milestone 1: the stream-json output mapper only, not yet selectable. |
+| `giskard-harness-claude` | Claude Code CLI adapter (one `claude` process per thread, spoken to over stream-json). |
 | `giskard-harness-replay` | Deterministic replay harness for tests. |
 | `giskard-persist` | Flat-file storage + the `giskard-admin` binary. |
 | `giskard-proto` | Shared client↔server wire types (path-mirrored `Wire*` types). |

@@ -58,6 +58,11 @@ cost_estimation = false
 # [tokens.rates."openai/gpt-5.5"]
 # input_per_mtok_eur = 3.0
 # output_per_mtok_eur = 10.0
+# Claude Code models are keyed under `anthropic`. Their prompt-cache tiers bill cache writes above
+# and cache reads below the input rate, so a flat rate is an estimate in both directions.
+# [tokens.rates."anthropic/claude-sonnet-5-5"]
+# input_per_mtok_eur = 3.0
+# output_per_mtok_eur = 15.0
 
 [viz]
 # Files larger than this (bytes) are not syntax-highlighted; the code overlay shows metadata only.
@@ -81,9 +86,10 @@ max_command_output_bytes = 134217728   # 128 MiB
 # `codex`, launched as `codex` on PATH with Codex's own configuration — which is what every setup
 # had before this section existed.
 #
-# Declare harnesses to run more than one Codex side by side (a stable and a nightly build, or two
-# CODEX_HOMEs). A project picks its default in the new-project dialog; each new thread picks its
-# harness from the model picker, which groups models by harness. The rules:
+# Declare harnesses to run Claude Code, or more than one Codex side by side (a stable and a nightly
+# build, or two CODEX_HOMEs). A project picks its default in the new-project dialog; each new thread
+# picks its harness from the model picker, which groups models by harness. The rules:
+#   * `kind` is `codex` or `claude-code`.
 #   * The table key (`codex-stable` below) is the harness's name. It is durable: each project
 #     stores its default in project.json and each thread the name it runs on in its thread.json,
 #     so renaming or removing a declaration leaves the threads on it read-only until a declaration
@@ -92,17 +98,22 @@ max_command_output_bytes = 134217728   # 128 MiB
 #     one is the default. The default is what new projects get when no choice is made.
 #   * Declaring the table switches off the synthesized `codex`. Projects and threads created before
 #     you declared it are stamped `codex`, so keep a declaration named `codex` for them to open.
-#   * `command` is the program to spawn (default: `codex` on PATH); `args` are appended after
-#     `app-server --listen stdio://`. A bare name is looked up on Giskard's own PATH, not on a
-#     PATH set in this declaration's `env`: use an absolute path for a binary that is not on
-#     Giskard's PATH, or the `codex` on Giskard's PATH runs instead, with no error.
+#   * `command` is the program to spawn (default: `codex` or `claude` on PATH, by kind); `args` are
+#     appended after `app-server --listen stdio://` (Codex) or after the stream-json protocol flags
+#     (Claude Code). A bare name is looked up on Giskard's own PATH, not on a PATH set in this
+#     declaration's `env`: use an absolute path for a binary that is not on Giskard's PATH, or the
+#     one on Giskard's PATH runs instead, with no error.
 #   * `[harnesses.<name>.env]` is applied over Giskard's own environment for every process that
 #     instance spawns, and for Giskard's own model discovery on its behalf (env-backed keys,
 #     headers, and auth commands resolve through it first). Values are literal and are never
 #     logged; only the variable names are.
-#   * The only Codex-specific key is `profile`, passed as `-c profile=<name>`. Any other key is a
-#     startup error, as are a blank declaration name, an unknown `kind`, two defaults, a blank
-#     command or profile, and an environment variable name that is empty or contains `=`.
+#   * The only Codex-specific key is `profile`, passed as `-c profile=<name>`; a `claude-code`
+#     declaration accepts no kind-specific key. Any other key is a startup error, as are a blank
+#     declaration name, an unknown `kind`, two defaults, a blank command or profile, and an
+#     environment variable name that is empty or contains `=`.
+#   * Claude Code reads its own login from CLAUDE_CONFIG_DIR (default ~/.claude). Never put
+#     ANTHROPIC_API_KEY in `env` or in Giskard's environment unless API billing is intended: it
+#     moves a subscriber to API billing.
 # Declarations are read once at startup; restart giskard-server after editing them.
 #
 # [harnesses.codex-stable]
@@ -115,6 +126,13 @@ max_command_output_bytes = 134217728   # 128 MiB
 # profile = "nightly"
 # [harnesses.codex-nightly.env]
 # CODEX_HOME = "/home/you/.codex-nightly"
+#
+# [harnesses.claude]
+# kind = "claude-code"
+# # `claude` on PATH; set `command` for another binary. Two declarations with different
+# # CLAUDE_CONFIG_DIR values are two independent logins, settings and transcript stores.
+# [harnesses.claude.env]
+# CLAUDE_CONFIG_DIR = "/home/you/.claude"
 
 # ---- Providers ----
 # This whole section is OPTIONAL, and most setups need none of it.

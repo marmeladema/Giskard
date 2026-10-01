@@ -10,6 +10,7 @@ giskard-core = { workspace = true }
 giskard-git-parser = { workspace = true }
 giskard-harness = { workspace = true }
 giskard-harness-codex = { workspace = true }
+giskard-harness-claude = { workspace = true }
 giskard-persist = { workspace = true }
 giskard-proto = { workspace = true }
 serde = { workspace = true }

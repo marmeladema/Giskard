@@ -91,7 +91,7 @@ Cargo workspace with 9 crates under `crates/`:
 - `giskard-git-parser` — parsers for `git` command output (pure, no I/O)
 - `giskard-harness` — `AgentHarness` trait + capabilities
 - `giskard-harness-codex` — Codex CLI adapter
-- `giskard-harness-claude` — Claude Code CLI adapter (milestone 1: mapper only)
+- `giskard-harness-claude` — Claude Code CLI adapter (one `claude` process per thread)
 - `giskard-harness-replay` — deterministic replay harness for tests
 - `giskard-persist` — flat-file storage + `giskard-admin` binary
 - `giskard-proto` — shared client↔server wire types
