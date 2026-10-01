@@ -1,0 +1,28 @@
+{
+ "scenario": "subagent-stop",
+ "argv": [
+  "claude",
+  "-p",
+  "--input-format",
+  "stream-json",
+  "--output-format",
+  "stream-json",
+  "--verbose",
+  "--permission-prompt-tool",
+  "stdio",
+  "--setting-sources",
+  "",
+  "--model",
+  "haiku",
+  "--permission-mode",
+  "default",
+  "--forward-subagent-text",
+  "--session-id",
+  "f2bbd12d-6aaa-4f66-b2ca-93473da06d1e"
+ ],
+ "cwd": "/work/project",
+ "exit": 0,
+ "results": 1,
+ "asks": 1,
+ "elapsed_s": 21.1
+}
