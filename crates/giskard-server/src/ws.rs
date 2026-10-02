@@ -204,8 +204,10 @@ fn harness_error_means_command_unmanaged(error: &HarnessError) -> bool {
         return false;
     };
     let message = message.to_ascii_lowercase();
+    // Codex's wordings, then the Claude Code adapter's for a task id it holds no command for.
     message.contains("no active command/exec for process id")
         || message.contains("no active turn to interrupt")
+        || message.contains("no background command")
 }
 
 fn steer_ws_error(error: SteerTurnError, thread_id: ThreadId) -> WsError {
@@ -2148,6 +2150,24 @@ async fn save_plan(
 mod tests {
     use super::*;
     use giskard_core::ids::TurnId;
+
+    #[test]
+    fn a_missing_background_command_reads_as_unmanaged() {
+        assert!(harness_error_means_command_unmanaged(
+            &HarnessError::Transport("no background command with task id bx9de5w1u".into())
+        ));
+        assert!(harness_error_means_command_unmanaged(
+            &HarnessError::Transport(
+                "JSON-RPC error (-32600): no active command/exec for process id \"proc_1\"".into()
+            )
+        ));
+        assert!(!harness_error_means_command_unmanaged(
+            &HarnessError::Transport("terminate failed".into())
+        ));
+        assert!(!harness_error_means_command_unmanaged(
+            &HarnessError::Unsupported("no background command".into())
+        ));
+    }
 
     #[test]
     fn steering_error_codes_distinguish_authority_and_harness_failures() {

@@ -6090,7 +6090,9 @@ function renderCommandBody(body, cmd) {
   term.className = "danger";
   term.textContent = cmd.terminating ? "Stop requested" : "Stop";
   term.disabled = cmd.terminating || !cmd.processId;
-  term.title = cmd.processId ? "Ask the harness to stop this running command" : "No process id available";
+  term.title = cmd.processId ? "Ask the harness to stop this running command" : commandStopUnsupportedTitle();
+  // Some browsers show no tooltip on a disabled button; its action group carries the reason too.
+  if (!cmd.processId) actions.title = term.title;
   term.onclick = (e) => { e.stopPropagation(); terminateCommand(cmd.id); };
   actions.append(term);
   head.append(title, status, actions);
@@ -6105,6 +6107,11 @@ function renderCommandBody(body, cmd) {
   renderCommandOutputBlock(body, { itemId:cmd.id, output:cmd.output || "", phase:"running" });
   syncTaskGroupItem(cmd.id);
   refreshOutputOverlay(cmd.id);
+}
+// Why a running command's Stop is disabled: the harness gave no handle to stop it by (rule R6
+// forbids falling back to interrupting the turn), so the turn's own Stop is the remedy.
+function commandStopUnsupportedTitle() {
+  return `Not supported by ${state.threadHarness || "this harness"}; stop the turn instead`;
 }
 function commandStatusLabel(cmd) {
   const elapsed = formatDuration(Date.now() - (cmd.startedAtMs || Date.now()));
@@ -7335,7 +7342,8 @@ function renderTaskCards(box, cmds, emptyText) {
     term.textContent = cmd.terminating ? "Stop requested" : "Stop";
     // Commands stop by process id; tools have no process, so stopping interrupts the owning turn.
     term.disabled = cmd.terminating || (cmd.kind !== "tool" && !cmd.processId);
-    term.title = cmd.kind === "tool" ? "Interrupt the turn running this tool call" : (cmd.processId ? "Ask the harness to stop this running command" : "No process id available");
+    term.title = cmd.kind === "tool" ? "Interrupt the turn running this tool call" : (cmd.processId ? "Ask the harness to stop this running command" : commandStopUnsupportedTitle());
+    if (cmd.kind !== "tool" && !cmd.processId) actions.title = term.title;
     term.onclick = (e) => { e.stopPropagation(); stopTask(cmd.id); };
     actions.append(term);
     row.append(title, meta, actions);

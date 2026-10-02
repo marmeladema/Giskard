@@ -5,15 +5,17 @@
 //! `Utc::now()` for timestamps.
 
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::io::{Read, Seek, SeekFrom};
+use std::path::{Path, PathBuf};
 
 use chrono::Utc;
 use claude_codes::io::{AssistantMessage, AssistantUsage, ResultMessage, UserMessage};
 use claude_codes::{
     ApiKeySource, ApiRetryMessage, CompactBoundaryMessage, ContentBlock, InitMessage,
-    PermissionDeniedMessage, RateLimitEvent, RateLimitStatus, StatusMessage, TaskStartedMessage,
-    TaskStatus, TaskType, TaskUpdatedMessage, ToolPermissionRequest, ToolResultBlock,
-    ToolResultContent, ToolResultMeta, ToolUseBlock, UsageInfo,
+    PermissionDeniedMessage, RateLimitEvent, RateLimitStatus, StatusMessage,
+    TaskNotificationMessage, TaskStartedMessage, TaskStatus, TaskType, TaskUpdatedMessage,
+    ToolPermissionRequest, ToolResultBlock, ToolResultContent, ToolResultMeta, ToolUseBlock,
+    UsageInfo,
 };
 use giskard_core::approval::{ApprovalDecision, ApprovalKind, ApprovalMetadata, ApprovalRequest};
 use giskard_core::event::AgentEvent;
@@ -184,8 +186,9 @@ struct SessionState {
     // Structural reason: `task_updated` and `can_use_tool` name the task id alone; its type gates
     //   turn completion and its route receives the ask.
     // Synchronization: The single adapter task that owns the child process owns the mapper.
-    // Invalidation/removal: A terminal `task_updated` removes the entry; dropping a route clears
-    //   the entry's route; shutdown drops the rest.
+    // Invalidation/removal: A terminal `task_updated` removes the entry (a background command's
+    //   entry waits for its `task_notification`, or child exit); dropping a route clears the
+    //   entry's route; shutdown drops the rest.
     tasks: HashMap<String, TaskEntry>,
     // ENTITY-AUTHORITY-EXCEPTION:
     // Role: One sub-agent route per `Agent` call of this session, keyed by the call's tool-use id.
@@ -214,6 +217,27 @@ struct TaskEntry {
     kind: TaskType,
     /// The sub-agent route of a `local_agent` task whose `tool_use_id` names a minted route.
     route: Option<String>,
+    /// The command item of a `local_bash` task behind a background `Bash` call.
+    command: Option<BackgroundCommand>,
+}
+
+/// A `local_bash` task behind a background `Bash` call: the command item it completes later.
+struct BackgroundCommand {
+    route: Route,
+    /// The route's thread, kept because a sub-agent route may be dropped before the task ends.
+    thread: ThreadId,
+    turn: TurnId,
+    item_id: ItemId,
+    /// The `tool_use` id, the item's `harness_item_id`.
+    tool_use_id: String,
+    command: String,
+    /// When the item started, for its duration.
+    started_at_ms: Option<i64>,
+    /// Set by the terminal `task_updated`; the item completes on the `task_notification` that
+    /// follows, or on child exit.
+    terminal: Option<TaskStatus>,
+    /// `task_updated.patch.end_time` of the terminal update.
+    end_time_ms: Option<u64>,
 }
 
 /// One sub-agent route: an `Agent` call of this session and the thread its frames map onto.
@@ -366,6 +390,8 @@ struct OpenBlock {
 struct OpenTool {
     item_id: ItemId,
     call: ToolKind,
+    /// When its `ItemStarted` was emitted.
+    started_at_ms: Option<i64>,
 }
 
 enum ToolKind {
@@ -585,6 +611,13 @@ impl ClaudeMapper {
         self.session.tasks.len()
     }
 
+    /// The background command behind task `task_id`: the thread its item is on and its command
+    /// line. `None` for an unknown task, or one that is no background `Bash` call.
+    pub fn background_command(&self, task_id: &str) -> Option<(ThreadId, &str)> {
+        let command = self.session.tasks.get(task_id)?.command.as_ref()?;
+        Some((command.thread, command.command.as_str()))
+    }
+
     /// The active turn of `thread`: the primary's, or a sub-agent route's.
     pub fn active_turn_of(&self, thread: ThreadId) -> Option<TurnId> {
         let route = self.route_of_thread(thread)?;
@@ -598,6 +631,43 @@ impl ClaudeMapper {
     /// turn there is nothing to complete.
     pub fn child_exited(&mut self, exit: &str) -> Vec<MapperOutput> {
         let mut out = Vec::new();
+        // A background command dies with the child: no notification will come for it.
+        let lost: Vec<String> = self
+            .session
+            .tasks
+            .iter()
+            .filter(|(_, entry)| entry.command.is_some())
+            .map(|(id, _)| id.clone())
+            .collect();
+        for task_id in lost {
+            let Some(command) = self
+                .session
+                .tasks
+                .remove(&task_id)
+                .and_then(|entry| entry.command)
+            else {
+                continue;
+            };
+            warn!(
+                thread_id = %command.thread,
+                harness_thread_id = %self.harness_thread_id,
+                route = display_opt(command.route.label()),
+                turn_id = %command.turn,
+                task_id = %task_id,
+                tool_call_id = %command.tool_use_id,
+                item_id = %command.item_id,
+                action = "background_command_lost",
+                exit,
+                "Claude Code exited while a background command ran; completing it as terminated"
+            );
+            self.complete_background_command(
+                &task_id,
+                command,
+                "terminated",
+                BackgroundOutput::default(),
+                &mut out,
+            );
+        }
         // Every open route turn ends with the child: no `task_updated` will come for it.
         let primary_interrupted = self.turn.as_ref().is_some_and(|turn| turn.interrupt_sent);
         let open: Vec<String> = self
@@ -801,9 +871,8 @@ impl ClaudeMapper {
                     payload,
                 });
             }
-            frame @ (Frame::TaskNotification(_)
-            | Frame::SessionTitleChanged(_)
-            | Frame::SystemIgnored { .. }) => {
+            Frame::TaskNotification(task) => self.on_task_notification(task, &mut out),
+            frame @ (Frame::SessionTitleChanged(_) | Frame::SystemIgnored { .. }) => {
                 let (frame_type, subtype) = frame.kind();
                 debug!(
                     thread_id = %self.thread,
@@ -811,10 +880,6 @@ impl ClaudeMapper {
                     turn_id = display_opt(self.active_turn()),
                     frame_type,
                     frame_subtype = display_opt(subtype),
-                    task_id = display_opt(match &frame {
-                        Frame::TaskNotification(task) => Some(task.task_id.as_str()),
-                        _ => None,
-                    }),
                     "frame read; no event in this milestone"
                 );
             }
@@ -1062,6 +1127,11 @@ impl ClaudeMapper {
             .as_ref()
             .filter(|id| gates && self.session.routes.contains_key(*id))
             .cloned();
+        // A `local_bash` task names the background `Bash` call it runs.
+        let command = match (&task_type, &task.tool_use_id) {
+            (TaskType::LocalBash, Some(tool_use_id)) => self.background_command_of(tool_use_id),
+            _ => None,
+        };
         info!(
             thread_id = %self.thread,
             harness_thread_id = %self.harness_thread_id,
@@ -1074,6 +1144,7 @@ impl ClaudeMapper {
             route = display_opt(route.as_ref().map(|id| format!("{TASK_ID_PREFIX}{id}"))),
             spawn_depth = display_opt(task.spawn_depth),
             gates_turn = gates,
+            background_command = command.is_some(),
             "Claude Code task started"
         );
         self.session.tasks.insert(
@@ -1081,6 +1152,7 @@ impl ClaudeMapper {
             TaskEntry {
                 kind: task_type,
                 route: route.clone(),
+                command,
             },
         );
         if let Some(id) = &route {
@@ -1147,7 +1219,14 @@ impl ClaudeMapper {
             status,
             TaskStatus::Completed | TaskStatus::Failed | TaskStatus::Killed | TaskStatus::Stopped
         );
-        let entry = if terminal {
+        // A background command's entry stays until its notification, which carries the output.
+        let background = terminal
+            && self
+                .session
+                .tasks
+                .get(&task.task_id)
+                .is_some_and(|entry| entry.command.is_some());
+        let entry = if terminal && !background {
             self.session.tasks.remove(&task.task_id)
         } else {
             None
@@ -1168,9 +1247,22 @@ impl ClaudeMapper {
             task_id = %task.task_id,
             task_type = display_opt(task_type.as_ref()),
             status = %status,
+            background_command = background,
             "Claude Code task updated"
         );
         if !terminal {
+            return;
+        }
+        if background {
+            if let Some(command) = self
+                .session
+                .tasks
+                .get_mut(&task.task_id)
+                .and_then(|entry| entry.command.as_mut())
+            {
+                command.terminal = Some(status);
+                command.end_time_ms = task.patch.end_time;
+            }
             return;
         }
         match entry {
@@ -1240,6 +1332,167 @@ impl ClaudeMapper {
         };
         self.emit_usage(&Route::Primary, out);
         self.finish_turn(status, out);
+    }
+
+    /// The background command a `local_bash` task runs: the open `Command` tool `tool_use_id`
+    /// names on any route.
+    fn background_command_of(&self, tool_use_id: &str) -> Option<BackgroundCommand> {
+        let route = if self
+            .turn
+            .as_ref()
+            .is_some_and(|turn| turn.items.tools.contains_key(tool_use_id))
+        {
+            Route::Primary
+        } else {
+            self.route_with_open_tool(tool_use_id)?
+        };
+        let turn = self.turn_of(&route)?;
+        let open = turn.items.tools.get(tool_use_id)?;
+        let ToolKind::Command { command } = &open.call else {
+            return None;
+        };
+        Some(BackgroundCommand {
+            thread: self.thread_of(&route),
+            turn: turn.id,
+            item_id: open.item_id,
+            tool_use_id: tool_use_id.to_owned(),
+            command: command.clone(),
+            started_at_ms: open.started_at_ms,
+            terminal: None,
+            end_time_ms: None,
+            route,
+        })
+    }
+
+    /// `task_notification`: for a background command, its end, with the output file to read.
+    fn on_task_notification(&mut self, task: TaskNotificationMessage, out: &mut Out) {
+        let command = self
+            .session
+            .tasks
+            .get(&task.task_id)
+            .is_some_and(|entry| entry.command.is_some());
+        if !command {
+            debug!(
+                thread_id = %self.thread,
+                harness_thread_id = %self.harness_thread_id,
+                turn_id = display_opt(self.active_turn()),
+                task_id = %task.task_id,
+                status = %task.status,
+                action = "task_notification",
+                "notification for a task that is no background command; no event"
+            );
+            return;
+        }
+        let Some(command) = self
+            .session
+            .tasks
+            .remove(&task.task_id)
+            .and_then(|entry| entry.command)
+        else {
+            return;
+        };
+        let status = match &command.terminal {
+            Some(status) => status.clone(),
+            None => {
+                warn!(
+                    thread_id = %command.thread,
+                    harness_thread_id = %self.harness_thread_id,
+                    turn_id = %command.turn,
+                    task_id = %task.task_id,
+                    tool_call_id = %command.tool_use_id,
+                    status = %task.status,
+                    action = "task_notification",
+                    "notification for a background command whose terminal update was not seen"
+                );
+                task.status.clone()
+            }
+        };
+        let status = match status {
+            TaskStatus::Completed => "completed",
+            TaskStatus::Killed | TaskStatus::Stopped => "terminated",
+            _ => "failed",
+        };
+        let output = match task.output_file.as_deref() {
+            Some(path) => match background_output(Path::new(path)) {
+                Ok(output) => output,
+                Err(error) => {
+                    warn!(
+                        thread_id = %command.thread,
+                        harness_thread_id = %self.harness_thread_id,
+                        task_id = %task.task_id,
+                        path,
+                        error = %error,
+                        action = "background_output",
+                        "could not read a background command's output file; reporting no output"
+                    );
+                    BackgroundOutput::default()
+                }
+            },
+            None => {
+                warn!(
+                    thread_id = %command.thread,
+                    harness_thread_id = %self.harness_thread_id,
+                    task_id = %task.task_id,
+                    action = "background_output",
+                    "the notification names no output file; reporting no output"
+                );
+                BackgroundOutput::default()
+            }
+        };
+        info!(
+            thread_id = %command.thread,
+            harness_thread_id = %self.harness_thread_id,
+            route = display_opt(command.route.label()),
+            turn_id = %command.turn,
+            task_id = %task.task_id,
+            tool_call_id = %command.tool_use_id,
+            item_id = %command.item_id,
+            status,
+            exit_code = display_opt(output.exit_code),
+            output_bytes = output.text.len(),
+            action = "task_notification",
+            "background command ended"
+        );
+        self.complete_background_command(&task.task_id, command, status, output, out);
+    }
+
+    /// The second, terminal completion of a background command's item, on its original turn.
+    fn complete_background_command(
+        &mut self,
+        task_id: &str,
+        command: BackgroundCommand,
+        status: &str,
+        output: BackgroundOutput,
+        out: &mut Out,
+    ) {
+        let duration_ms = match (command.started_at_ms, command.end_time_ms) {
+            (Some(start), Some(end)) => i64::try_from(end)
+                .ok()
+                .and_then(|end| end.checked_sub(start))
+                .filter(|duration| *duration >= 0),
+            _ => None,
+        };
+        out.push(self.event(AgentEvent::ItemCompleted {
+            thread: command.thread,
+            turn: command.turn,
+            item: Item {
+                id: command.item_id,
+                harness_item_id: command.tool_use_id,
+                payload: ItemPayload::CommandExecution {
+                    command: command.command,
+                    cwd: self.workspace_root.clone(),
+                    output: output.text,
+                    output_truncated: output.original_bytes.is_some(),
+                    output_original_bytes: output.original_bytes,
+                    output_original_lines: None,
+                    exit_code: output.exit_code,
+                    status: Some(status.into()),
+                    process_id: Some(task_id.to_owned()),
+                    duration_ms,
+                },
+                created_at: Utc::now(),
+            },
+        }));
     }
 
     // ---- turns ---------------------------------------------------------------------------------
@@ -2324,10 +2577,14 @@ impl ClaudeMapper {
             },
         };
         if let Some(state) = self.turn_of_mut(route) {
-            state
-                .items
-                .tools
-                .insert(tool_use.id.clone(), OpenTool { item_id: id, call });
+            state.items.tools.insert(
+                tool_use.id.clone(),
+                OpenTool {
+                    item_id: id,
+                    call,
+                    started_at_ms,
+                },
+            );
         }
         debug!(
             thread_id = %thread,
@@ -2612,7 +2869,38 @@ impl ClaudeMapper {
             status,
             "tool call completed"
         );
+        // A background `Bash` call's result only says the command went to a task: the item is
+        // running, its process id the task's, and the CLI's note is not its output.
+        let background_task = (status == "completed")
+            .then(|| self.background_task_of(&result.tool_use_id, tool_use_result))
+            .flatten();
         let payload = match open.call {
+            ToolKind::Command { command } if background_task.is_some() => {
+                info!(
+                    thread_id = %thread,
+                    harness_thread_id = %self.harness_thread_id,
+                    route = display_opt(route.label()),
+                    turn_id = %turn,
+                    task_id = display_opt(background_task.as_deref()),
+                    tool_call_id = %result.tool_use_id,
+                    item_id = %open.item_id,
+                    command = %command,
+                    action = "background_command",
+                    "the command runs in the background; its item stays running"
+                );
+                ItemPayload::CommandExecution {
+                    command,
+                    cwd: self.workspace_root.clone(),
+                    output: String::new(),
+                    output_truncated: false,
+                    output_original_bytes: None,
+                    output_original_lines: None,
+                    exit_code: None,
+                    status: Some("in_progress".into()),
+                    process_id: background_task,
+                    duration_ms: None,
+                }
+            }
             ToolKind::Command { command } => ItemPayload::CommandExecution {
                 command,
                 cwd: self.workspace_root.clone(),
@@ -2673,6 +2961,32 @@ impl ClaudeMapper {
                 created_at: Utc::now(),
             },
         }));
+    }
+
+    /// The `local_bash` task running the background command of `tool_use_id`: the task whose
+    /// command names it, else the result's `backgroundTaskId` when that task has a command.
+    fn background_task_of(
+        &self,
+        tool_use_id: &str,
+        tool_use_result: Option<&Value>,
+    ) -> Option<String> {
+        let tasks = &self.session.tasks;
+        tasks
+            .iter()
+            .find(|(_, entry)| {
+                entry
+                    .command
+                    .as_ref()
+                    .is_some_and(|command| command.tool_use_id == tool_use_id)
+            })
+            .map(|(id, _)| id.clone())
+            .or_else(|| {
+                tool_use_result
+                    .and_then(|value| value.get("backgroundTaskId"))
+                    .and_then(Value::as_str)
+                    .filter(|id| tasks.get(*id).is_some_and(|entry| entry.command.is_some()))
+                    .map(str::to_owned)
+            })
     }
 
     /// Get-or-mint the item id for a native key, so start, delta and completion share it.
@@ -3157,6 +3471,81 @@ fn content_block_type(block: &ContentBlock) -> &'static str {
         ContentBlock::Fallback(_) => "fallback",
         ContentBlock::Unknown(_) => "unknown",
     }
+}
+
+/// How much of a background command's output file is read: its head and its tail. The server
+/// bounds persisted output again; the read takes microseconds at this size, so it stays on the
+/// supervisor's task.
+const BACKGROUND_OUTPUT_HEAD: u64 = 64 * 1024;
+const BACKGROUND_OUTPUT_TAIL: u64 = 64 * 1024;
+
+/// What a background command's output file says.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct BackgroundOutput {
+    /// stdout and stderr as written, without the CLI's marker line.
+    text: String,
+    /// From `[exited with code N]`; none after `[killed]` or without a marker.
+    exit_code: Option<i32>,
+    /// The file's size, when only its head and tail were read.
+    original_bytes: Option<u64>,
+}
+
+/// Read the output file the CLI writes for a `local_bash` task (`…/tasks/<task_id>.output`):
+/// stdout and stderr as written, then a blank line and one marker line, `[exited with code N]`
+/// or `[killed]`. The file and its marker are the CLI's own and unversioned, so an unknown last
+/// line is kept as output and gives no exit code. At most `BACKGROUND_OUTPUT_HEAD` bytes from
+/// the start and `BACKGROUND_OUTPUT_TAIL` from the end are read.
+fn background_output(path: &Path) -> std::io::Result<BackgroundOutput> {
+    let mut file = std::fs::File::open(path)?;
+    let size = file.metadata()?.len();
+    let (text, original_bytes) = if size <= BACKGROUND_OUTPUT_HEAD + BACKGROUND_OUTPUT_TAIL {
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)?;
+        (String::from_utf8_lossy(&bytes).into_owned(), None)
+    } else {
+        let mut head = Vec::new();
+        (&mut file)
+            .take(BACKGROUND_OUTPUT_HEAD)
+            .read_to_end(&mut head)?;
+        file.seek(SeekFrom::Start(size - BACKGROUND_OUTPUT_TAIL))?;
+        let mut tail = Vec::new();
+        file.read_to_end(&mut tail)?;
+        let omitted = size - BACKGROUND_OUTPUT_HEAD - BACKGROUND_OUTPUT_TAIL;
+        let text = format!(
+            "{}\n[… {omitted} bytes omitted …]\n{}",
+            String::from_utf8_lossy(&head),
+            String::from_utf8_lossy(&tail)
+        );
+        (text, Some(size))
+    };
+    let body = text.trim_end_matches(['\n', '\r']);
+    let (rest, last) = match body.rsplit_once('\n') {
+        Some((rest, last)) => (rest, last.trim_end()),
+        None => ("", body.trim_end()),
+    };
+    let exit_code = if last == "[killed]" {
+        None
+    } else if let Some(code) = last
+        .strip_prefix("[exited with code ")
+        .and_then(|code| code.strip_suffix(']'))
+        .and_then(|code| code.parse::<i32>().ok())
+    {
+        Some(code)
+    } else {
+        return Ok(BackgroundOutput {
+            text,
+            exit_code: None,
+            original_bytes,
+        });
+    };
+    // The marker and the blank line before it.
+    let rest = rest.strip_suffix('\n').unwrap_or(rest);
+    let rest = rest.strip_suffix('\r').unwrap_or(rest);
+    Ok(BackgroundOutput {
+        text: rest.to_owned(),
+        exit_code,
+        original_bytes,
+    })
 }
 
 #[cfg(test)]
@@ -3849,8 +4238,17 @@ mod tests {
         let second = turn_completions(&per_line[results[1]]);
         assert_eq!(second.len(), 1);
         assert_eq!(second[0].0, started[0]);
+        // The command's terminal completion belongs to the first turn, not the continuation.
+        let continuation: Vec<MapperOutput> = outputs
+            .iter()
+            .filter(|output| {
+                !matches!(output, MapperOutput::Event(AgentEvent::ItemCompleted { turn, .. })
+                    if *turn == first[0].0)
+            })
+            .cloned()
+            .collect();
         assert_eq!(
-            completed_items(&outputs)
+            completed_items(&continuation)
                 .iter()
                 .map(|item| item.payload.clone())
                 .collect::<Vec<_>>(),
@@ -4061,6 +4459,262 @@ mod tests {
             1,
             &[" WARN ", "a second replayed user message in one turn"],
         ));
+    }
+
+    /// `name`'s stdout lines with every `output_file` pointing at a temp file holding `content`.
+    fn with_output_file(name: &str, content: &str) -> (Vec<String>, tempfile::NamedTempFile) {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(file.path(), content).unwrap();
+        let path = file.path().display().to_string();
+        let lines = out_lines(name)
+            .into_iter()
+            .map(|line| {
+                let mut frame: Value = serde_json::from_str(&line).unwrap();
+                if frame.get("output_file").is_some() {
+                    frame["output_file"] = json!(path);
+                    return frame.to_string();
+                }
+                line
+            })
+            .collect();
+        (lines, file)
+    }
+
+    /// Every `CommandExecution` completion: `(turn, item)`.
+    fn command_completions(outputs: &[MapperOutput]) -> Vec<(TurnId, &Item)> {
+        events(outputs)
+            .into_iter()
+            .filter_map(|event| match event {
+                AgentEvent::ItemCompleted { turn, item, .. }
+                    if matches!(item.payload, ItemPayload::CommandExecution { .. }) =>
+                {
+                    Some((*turn, item))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn command_fields(item: &Item) -> (&str, Option<&str>, Option<i32>, Option<&str>) {
+        let ItemPayload::CommandExecution {
+            output,
+            status,
+            exit_code,
+            process_id,
+            ..
+        } = &item.payload
+        else {
+            panic!("not a command: {item:?}");
+        };
+        (
+            output.as_str(),
+            status.as_deref(),
+            *exit_code,
+            process_id.as_deref(),
+        )
+    }
+
+    fn line_index(lines: &[String], needle: &str) -> usize {
+        lines.iter().position(|line| line.contains(needle)).unwrap()
+    }
+
+    #[test]
+    #[traced_test]
+    fn a_background_command_is_a_running_task() {
+        let (lines, _file) = with_output_file(
+            "background-complete",
+            "line 1\nline 2\nfinished\n\n[exited with code 0]\n",
+        );
+        let result = line_index(&lines, r#""type": "result""#);
+        let mut mapper = new_mapper();
+        let first: Vec<MapperOutput> =
+            drive_lines(&mut mapper, &lines[..=result], 1, TurnKind::User, false)
+                .into_iter()
+                .flatten()
+                .collect();
+        let running = command_completions(&first);
+        assert_eq!(running.len(), 1);
+        let (turn, item) = running[0];
+        assert_eq!(
+            command_fields(item),
+            ("", Some("in_progress"), None, Some("bx9de5w1u"))
+        );
+        let completions = turn_completions(&first);
+        assert_eq!(completions.len(), 1);
+        assert_eq!(completions[0].0, turn);
+        assert!(mapper.has_tasks(), "the command outlives its turn");
+        assert_eq!(
+            mapper
+                .background_command("bx9de5w1u")
+                .map(|(_, command)| command),
+            Some("for i in 1 2 3 4 5 6; do echo line $i; sleep 5; done; echo finished")
+        );
+
+        let rest: Vec<MapperOutput> =
+            drive_lines(&mut mapper, &lines[result + 1..], 0, TurnKind::User, false)
+                .into_iter()
+                .flatten()
+                .collect();
+        let ended = command_completions(&rest);
+        assert_eq!(ended.len(), 1);
+        assert_eq!(ended[0].0, turn, "completed on its original turn");
+        assert_eq!(ended[0].1.id, item.id);
+        assert_eq!(ended[0].1.harness_item_id, item.harness_item_id);
+        assert_eq!(
+            command_fields(ended[0].1),
+            (
+                "line 1\nline 2\nfinished",
+                Some("completed"),
+                Some(0),
+                Some("bx9de5w1u")
+            )
+        );
+        assert!(!mapper.has_tasks());
+        assert!(mapper.background_command("bx9de5w1u").is_none());
+        // The CLI's continuation is a turn of its own.
+        let continuation = turn_completions(&rest);
+        assert_eq!(continuation.len(), 1);
+        assert_ne!(continuation[0].0, turn);
+        logs_assert(a_line_with(&[" INFO ", r#"action="background_command""#]));
+        logs_assert(a_line_with(&[
+            " INFO ",
+            r#"action="task_notification""#,
+            "exit_code=0",
+        ]));
+        logs_assert(no_line_with(" WARN "));
+    }
+
+    #[test]
+    fn a_stopped_background_command_is_terminated() {
+        let (lines, _file) = with_output_file("background-stop", "line 1\nline 2\n\n[killed]\n");
+        let outputs: Vec<MapperOutput> =
+            drive_lines(&mut new_mapper(), &lines, 1, TurnKind::User, false)
+                .into_iter()
+                .flatten()
+                .collect();
+        let commands = command_completions(&outputs);
+        assert_eq!(commands.len(), 2);
+        assert_eq!(commands[0].0, commands[1].0);
+        assert_eq!(
+            command_fields(commands[1].1),
+            (
+                "line 1\nline 2",
+                Some("terminated"),
+                None,
+                Some("b93m9v2sw")
+            )
+        );
+    }
+
+    #[test]
+    #[traced_test]
+    fn a_background_command_dies_with_the_child() {
+        let lines = out_lines("background-complete");
+        let result = line_index(&lines, r#""type": "result""#);
+        let mut mapper = new_mapper();
+        drive_lines(&mut mapper, &lines[..=result], 1, TurnKind::User, false);
+        let outputs = mapper.child_exited("code 1");
+        let commands = command_completions(&outputs);
+        assert_eq!(commands.len(), 1);
+        assert_eq!(
+            command_fields(commands[0].1),
+            ("", Some("terminated"), None, Some("bx9de5w1u"))
+        );
+        assert!(!mapper.has_tasks());
+        logs_assert(lines_with(
+            1,
+            &[" WARN ", r#"action="background_command_lost""#, "bx9de5w1u"],
+        ));
+    }
+
+    #[test]
+    #[traced_test]
+    fn a_notification_without_a_terminal_update_still_completes() {
+        let (mut lines, _file) =
+            with_output_file("background-complete", "finished\n\n[exited with code 3]\n");
+        let update = line_index(&lines, r#""subtype": "task_updated""#);
+        lines.remove(update);
+        let outputs: Vec<MapperOutput> =
+            drive_lines(&mut new_mapper(), &lines, 1, TurnKind::User, false)
+                .into_iter()
+                .flatten()
+                .collect();
+        let commands = command_completions(&outputs);
+        assert_eq!(commands.len(), 2);
+        assert_eq!(
+            command_fields(commands[1].1),
+            ("finished", Some("completed"), Some(3), Some("bx9de5w1u"))
+        );
+        logs_assert(lines_with(
+            1,
+            &[
+                " WARN ",
+                r#"action="task_notification""#,
+                "terminal update was not seen",
+            ],
+        ));
+    }
+
+    #[test]
+    fn output_file_markers_are_parsed() {
+        let dir = tempfile::tempdir().unwrap();
+        let write = |name: &str, content: &[u8]| {
+            let path = dir.path().join(name);
+            std::fs::write(&path, content).unwrap();
+            path
+        };
+        let read = |path: &Path| background_output(path).unwrap();
+
+        let done = write(
+            "done",
+            b"line 1 \xe2\x80\xa6 finished\n\n[exited with code 0]\n",
+        );
+        assert_eq!(
+            read(&done),
+            BackgroundOutput {
+                text: "line 1 … finished".into(),
+                exit_code: Some(0),
+                original_bytes: None,
+            }
+        );
+        let failed = write("failed", b"oops\n\n[exited with code 127]\n");
+        assert_eq!(read(&failed).exit_code, Some(127));
+        let killed = write("killed", b"line 1\nline 2\n\n[killed]\n");
+        assert_eq!(
+            read(&killed),
+            BackgroundOutput {
+                text: "line 1\nline 2".into(),
+                exit_code: None,
+                original_bytes: None,
+            }
+        );
+        let silent = write("silent", b"\n[exited with code 0]\n");
+        assert_eq!(read(&silent).text, "");
+        // An unknown last line is output, not a marker.
+        let running = write("running", b"line 1\nline 2\n");
+        assert_eq!(
+            read(&running),
+            BackgroundOutput {
+                text: "line 1\nline 2\n".into(),
+                exit_code: None,
+                original_bytes: None,
+            }
+        );
+        assert!(background_output(&dir.path().join("missing")).is_err());
+
+        // Over the bounds: the head and the tail, the marker still read from the tail.
+        let mut big = vec![b'a'; (BACKGROUND_OUTPUT_HEAD + 100) as usize];
+        big.extend(vec![b'z'; BACKGROUND_OUTPUT_TAIL as usize]);
+        big.extend(b"\n\n[exited with code 2]\n");
+        let size = big.len() as u64;
+        let large = write("large", &big);
+        let output = read(&large);
+        assert_eq!(output.exit_code, Some(2));
+        assert_eq!(output.original_bytes, Some(size));
+        assert!(output.text.starts_with(&"a".repeat(1000)));
+        assert!(output.text.ends_with(&"z".repeat(1000)));
+        assert!(output.text.contains("bytes omitted"));
+        assert!((output.text.len() as u64) < BACKGROUND_OUTPUT_HEAD + BACKGROUND_OUTPUT_TAIL + 100);
     }
 
     #[test]
@@ -4466,7 +5120,7 @@ mod tests {
     }
 
     #[test]
-    fn has_tasks_is_true_from_task_started_to_the_terminal_update() {
+    fn has_tasks_is_true_from_task_started_to_the_task_s_end() {
         for (name, kind) in [
             ("background-bash", "local_bash"),
             ("delegation", "local_agent"),
@@ -4476,10 +5130,13 @@ mod tests {
                 .iter()
                 .position(|line| line.contains(r#""subtype": "task_started""#))
                 .unwrap();
-            let terminal = lines
-                .iter()
-                .rposition(|line| line.contains(r#""subtype": "task_updated""#))
-                .unwrap();
+            // A background command's task ends with its notification, an agent's with its
+            // terminal update.
+            let end = match kind {
+                "local_bash" => r#""subtype": "task_notification""#,
+                _ => r#""subtype": "task_updated""#,
+            };
+            let terminal = lines.iter().rposition(|line| line.contains(end)).unwrap();
             let mut mapper = new_mapper();
             assert!(!mapper.has_tasks());
             drive_lines(&mut mapper, &lines[..started], 1, TurnKind::User, false);
@@ -4500,10 +5157,7 @@ mod tests {
                 TurnKind::User,
                 false,
             );
-            assert!(
-                !mapper.has_tasks(),
-                "{kind}: after the terminal task_updated"
-            );
+            assert!(!mapper.has_tasks(), "{kind}: after the task's end");
         }
     }
 
