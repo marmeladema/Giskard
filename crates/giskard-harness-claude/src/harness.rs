@@ -7240,6 +7240,78 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    #[traced_test]
+    async fn a_lost_notification_settles_after_the_grace_and_frees_the_child() {
+        let lines = fixture_lines("background-stop");
+        let result = lines
+            .iter()
+            .position(|line| line.contains("\"type\": \"result\""))
+            .unwrap();
+        let turn: Vec<String> = lines[..=result]
+            .iter()
+            .filter(|line| !line.contains("\"control_request\""))
+            .cloned()
+            .collect();
+        // The `killed` update and the `{}` answer, but never the notification.
+        let killed: Vec<String> = lines[result + 1..]
+            .iter()
+            .filter(|line| !line.contains("\"task_notification\""))
+            .cloned()
+            .collect();
+        let (child, record) = scripted(
+            handshake_steps("sonnet"),
+            vec![
+                Step::OnStdin(user(), vec![Action::Emit(turn)]),
+                Step::OnStdin(
+                    control("stop_task"),
+                    vec![Action::Emit(killed), Action::Respond(json!({}))],
+                ),
+            ],
+        );
+        let (harness, _) = harness_with(reaping(), vec![child]);
+        let (options, _updates) = open_options(ThreadId::new(), None, "sonnet");
+        let handle = harness.open_thread(options).await.unwrap();
+        let mut stream = harness.subscribe(&handle);
+        let turn = harness
+            .start_turn(&handle, text("run it in the background"), overrides())
+            .await
+            .unwrap();
+        until_completed(&mut stream).await;
+        harness
+            .terminate_command(&handle, "b93m9v2sw")
+            .await
+            .unwrap();
+
+        let (on, item) = next_matching(&mut stream, |event| match event {
+            AgentEvent::ItemCompleted { turn, item, .. }
+                if matches!(
+                    item.payload,
+                    giskard_core::item::ItemPayload::CommandExecution { .. }
+                ) =>
+            {
+                Some((*turn, item.clone()))
+            }
+            _ => None,
+        })
+        .await;
+        assert_eq!(on, turn);
+        assert!(matches!(
+            &item.payload,
+            giskard_core::item::ItemPayload::CommandExecution { status: Some(status), .. }
+                if status == "terminated"
+        ));
+        logs_assert(a_line_with(&[
+            " WARN ",
+            "action=\"task_notification\"",
+            "reason=\"grace\"",
+        ]));
+        // Nothing keeps the child busy any more: it is reaped like any idle child.
+        tokio::time::sleep(IDLE).await;
+        reaped(&harness, &record).await;
+        harness.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn terminate_command_on_a_reaped_thread_is_unmanaged() {
         let (child, record) = scripted(handshake_steps("sonnet"), Vec::new());
         let (harness, spawner) = harness_with(reaping(), vec![child]);

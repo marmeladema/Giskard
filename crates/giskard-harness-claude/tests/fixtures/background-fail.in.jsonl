@@ -1,0 +1,2 @@
+{"type": "user", "message": {"role": "user", "content": [{"type": "text", "text": "Run exactly this with the Bash tool in the background (run_in_background: true): `sleep 4; echo oops >&2; exit 3`. Then reply with the single word started and stop."}]}}
+{"type": "control_response", "response": {"subtype": "success", "request_id": "e2245edc-36be-4a0f-a432-840cecc50247", "response": {"behavior": "allow"}}}

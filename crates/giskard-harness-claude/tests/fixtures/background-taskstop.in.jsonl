@@ -1,0 +1,2 @@
+{"type": "user", "message": {"role": "user", "content": [{"type": "text", "text": "Run exactly this with the Bash tool in the background (run_in_background: true): `for i in 1 2 3 4 5 6; do echo line $i; sleep 5; done; echo finished`. Then run `sleep 7` with the Bash tool in the foreground. Then stop the background command with the TaskStop tool. Then reply with the single word stopped."}]}}
+{"type": "control_response", "response": {"subtype": "success", "request_id": "a547d9be-970e-4d00-a0ba-a9b94dee2316", "response": {"behavior": "allow"}}}

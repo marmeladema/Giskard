@@ -28,6 +28,10 @@ use crate::log_fields::display_opt;
 use crate::mapper::{ClaudeMapper, MapperOutput, RouteLookup, TurnKind};
 use crate::process::{ChildExit, ChildLogContext, ClaudeChild, LaunchMode};
 
+/// How long a background command's terminal `task_updated` may wait for the `task_notification`
+/// that carries its output file before the mapper completes it from the update alone. The
+/// notification followed within ~70 ms in every recording.
+pub(crate) const NOTIFICATION_GRACE: Duration = Duration::from_secs(2);
 /// How long one request of a turn's settings may take (each stage of the hand-off).
 pub(crate) const CONTROL_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long a turn's settings (mode, model, effort, read-back) may take in all. It stays under the
@@ -772,6 +776,7 @@ pub(crate) fn spawn_supervisor(parts: SupervisorParts) -> JoinHandle<()> {
         idle_since: None,
         busy_reason: None,
         last_line: Instant::now(),
+        awaiting_notification_since: None,
         reaped: false,
         reaped_outputs: 0,
         // The handshake set `default` on both launch modes.
@@ -884,6 +889,8 @@ struct Supervisor {
     busy_reason: Option<&'static str>,
     /// When stdout last produced a line; the idle timer also waits for it to go quiet.
     last_line: Instant,
+    /// Since when a background command's terminal update has waited for its notification.
+    awaiting_notification_since: Option<Instant>,
     /// The child was reaped: whatever it still says is dropped, never published on the thread
     /// a respawned child now serves.
     reaped: bool,
@@ -937,6 +944,7 @@ impl Supervisor {
             self.track_idle();
             let stage_deadline = self.stage_deadline();
             let idle_deadline = self.idle_deadline();
+            let notification_deadline = self.notification_deadline();
             let stopping = self.stopping();
             tokio::select! {
                 biased;
@@ -968,6 +976,15 @@ impl Supervisor {
                 }
                 () = tokio::time::sleep_until(stage_deadline.unwrap_or_else(Instant::now)),
                     if stage_deadline.is_some() => self.on_deadline(),
+                () = tokio::time::sleep_until(notification_deadline.unwrap_or_else(Instant::now)),
+                    if notification_deadline.is_some() => {
+                    self.awaiting_notification_since = None;
+                    let outputs = self.mapper.settle_background_commands("grace");
+                    if let Err(error) = self.dispatch_all(outputs).await {
+                        self.broken("write_stdin", "a stdin write failed", &error);
+                        return self.end_broken();
+                    }
+                }
                 () = tokio::time::sleep_until(idle_deadline.unwrap_or_else(Instant::now)),
                     if idle_deadline.is_some() => {
                     if let Err(error) = self.reap().await {
@@ -2423,6 +2440,18 @@ impl Supervisor {
                 );
             }
         }
+    }
+
+    /// When a background command's terminal update stops waiting for its notification: the
+    /// grace after the update was first seen waiting, while one is.
+    fn notification_deadline(&mut self) -> Option<Instant> {
+        if !self.mapper.awaiting_notification() {
+            self.awaiting_notification_since = None;
+            return None;
+        }
+        self.awaiting_notification_since
+            .get_or_insert_with(Instant::now)
+            .checked_add(NOTIFICATION_GRACE)
     }
 
     /// When the idle child is reaped: only while serving, with reaping on, once it has been idle

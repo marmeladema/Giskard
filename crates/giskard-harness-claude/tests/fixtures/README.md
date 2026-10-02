@@ -1,8 +1,8 @@
 # Recorded Claude Code protocol fixtures
 
 Stream-json transcripts recorded against **Claude Code 2.1.286** (the two `subagent-*`, the three
-`replay-*`, the two `background-{stop,complete}` and the `mcp-status` scenarios against
-**2.1.287**) by driving a real `claude -p` child over a stdio pipe, for the mapper tests of
+`replay-*`, the four `background-{stop,complete,taskstop,fail}` and the `mcp-status` scenarios
+against **2.1.287**) by driving a real `claude -p` child over a stdio pipe, for the mapper tests of
 [`specs/claude-code-harness-plan.md`](../../../../specs/claude-code-harness-plan.md) (§11). They
 live in `crates/giskard-harness-claude/tests/fixtures/`, where the mapper tests read them.
 
@@ -42,6 +42,8 @@ closed stdin when the scenario's stop condition was met.
 | `replay-compact` | manual, `--replay-user-messages` | a text turn, then `/compact`: the prompt replayed; the `/compact` line itself not, the compaction summary `isSynthetic: true, isReplay: false` and the `<local-command-stdout>` frame `isReplay: true`, as without the flag | 2 results |
 | `background-stop` | manual, `--replay-user-messages` | a background `Bash` command (`for i in 1 2 3 4 5 6; do echo line $i; sleep 5; done; echo finished`): the ask answered allow and **the answer echoed back on stdout** (line 9, an effect of the flag), `task_started` of type `local_bash` **before** the `tool_result` whose `tool_use_result.backgroundTaskId` names the same task, the turn's `result`; `stop_task` 7 s after `task_started` → `task_updated` killed, `task_notification` stopped with `output_file`, then the `{}` reply | allow; stop_task; 1 result |
 | `background-complete` | manual, `--replay-user-messages` | the same command left to finish: `task_updated` completed, `task_notification` completed with `summary: "… completed (exit code 0)"` and `output_file`, then the CLI's own continuation turn (`init`, text, a second `result`) | allow; 2 results |
+| `background-taskstop` | manual, `--replay-user-messages` | the same background command, then a foreground `sleep 7` and the model's own `TaskStop` tool on the background task: the foreground call's `task_started` with `is_backgrounded: false` and its `task_notification` with an empty `output_file` and **no** `task_updated` (lines 15–16); `TaskStop` → `task_updated` killed then `task_notification` stopped (lines 26–27), as for `stop_task` | allow; 1 result then 12 s quiet |
+| `background-fail` | manual, `--replay-user-messages` | a background `sleep 4; echo oops >&2; exit 3`: `task_updated` failed then `task_notification` failed with `output_file` (lines 20–21), then the CLI's continuation turn | allow; 2 results |
 | `mcp-status` | manual, `--mcp-config` naming a minimal stdio server (`mini`: one tool, one resource, one template, written for the recording) and a broken one, `--strict-mcp-config` | `initialize`, then `mcp_status` answering a **connected** entry (`serverInfo`, `tools: [{name, annotations}]`) beside a failed one (`error`, no `serverInfo`, no `tools`), then one text turn whose `init` lists `mcp_servers` and the `mcp__mini__echo` tool. The recorder's stdin was reconstructed after the fact; the paths are rewritten | 1 result |
 | `autocompact-state` | — | the two top-level frames `active_goal` and `autocompact_state` a session emits before its first turn in some environments; two frames only, recorded separately with an environment that sets autocompact overrides | — |
 
@@ -59,7 +61,11 @@ repository:
   and the `initialize` response's `commands` and `agents` lists are trimmed to built-ins. Nothing
   the mapper reads is among them;
 - session ids, message ids, tool-use ids, task ids and frame uuids are the recorded ones. They are
-  random and identify nothing.
+  random and identify nothing;
+- a background command's output file lives under the CLI's temporary directory,
+  `/tmp/claude-<uid>/<encoded cwd>/…`. `background-taskstop` and `background-fail` keep that
+  prefix (`/tmp/claude-1000`); `background-stop` and `background-complete` read
+  `/home/user/.claude/…` there instead, an artefact of their sanitization.
 
 `rate_limit_event` frames are kept as recorded: they carry utilization fractions and reset
 timestamps, not identifiers.
