@@ -32,8 +32,8 @@ pub use item::{
     command_output_logical_lines, command_output_tail_preview, resolve_command_output_counts,
 };
 pub use mcp::{
-    McpAuthStatus, McpOauthStart, McpResource, McpResourceTemplate, McpServerInfo, McpServerStatus,
-    McpTool,
+    McpAuthStatus, McpConnection, McpConnectionState, McpOauthStart, McpResource,
+    McpResourceTemplate, McpServerInfo, McpServerStatus, McpTool,
 };
 pub use model::{Effort, ModelDescriptor, ModelRef};
 pub use server_request::{ServerRequest, ServerRequestResponse};

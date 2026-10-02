@@ -31,8 +31,8 @@ pub use giskard_core::item::{
     SubagentAction, SubagentLink, SubagentStatus,
 };
 pub use giskard_core::mcp::{
-    McpAuthStatus, McpOauthStart, McpResource, McpResourceTemplate, McpServerInfo, McpServerStatus,
-    McpTool,
+    McpAuthStatus, McpConnection, McpConnectionState, McpOauthStart, McpResource,
+    McpResourceTemplate, McpServerInfo, McpServerStatus, McpTool,
 };
 pub use giskard_core::model::{Effort, ModelDescriptor, ModelRef};
 pub use giskard_core::server_request::{ServerRequest, ServerRequestResponse};
@@ -1427,5 +1427,58 @@ mod tests {
             back.answered_approvals[0].decision,
             ApprovalDecision::Accept
         );
+    }
+
+    #[test]
+    fn list_mcp_servers_response_carries_the_connection_and_omits_unreported_resources() {
+        let response = ListMcpServersResponse {
+            servers: vec![
+                McpServerStatus {
+                    name: "mini".into(),
+                    auth_status: McpAuthStatus::Unsupported,
+                    connection: Some(McpConnection {
+                        state: McpConnectionState::Connected,
+                        error: None,
+                    }),
+                    server_info: None,
+                    tools: vec![McpTool {
+                        name: "echo".into(),
+                        title: None,
+                        description: None,
+                        input_schema: serde_json::Value::Null,
+                        output_schema: None,
+                    }],
+                    resources: None,
+                    resource_templates: None,
+                },
+                McpServerStatus {
+                    name: "codex-side".into(),
+                    auth_status: McpAuthStatus::OAuth,
+                    connection: None,
+                    server_info: None,
+                    tools: Vec::new(),
+                    resources: Some(Vec::new()),
+                    resource_templates: Some(Vec::new()),
+                },
+            ],
+            capabilities: McpCapabilitiesResponse {
+                status: true,
+                reload: false,
+                oauth_login: false,
+            },
+        };
+        let json = serde_json::to_value(&response).unwrap();
+        let mini = &json["servers"][0];
+        assert_eq!(
+            mini["connection"],
+            serde_json::json!({"state": "connected"})
+        );
+        assert_eq!(mini["tools"][0]["name"], "echo");
+        assert!(mini.get("resources").is_none());
+        assert!(mini.get("resource_templates").is_none());
+        let codex = &json["servers"][1];
+        assert!(codex.get("connection").is_none());
+        assert_eq!(codex["resources"], serde_json::json!([]));
+        assert_eq!(codex["resource_templates"], serde_json::json!([]));
     }
 }

@@ -41,6 +41,16 @@ Claude Code adapter's thread-less probe), a thread of another project is a `404`
 another declaration is a `400` naming its harness, and a malformed id is a `400`. Without the
 parameter the instance answers for itself. The reload and OAuth-login routes take no thread.
 
+Its response is `{servers, capabilities}`; each server is `{name, auth_status, connection?,
+server_info?, tools, resources?, resource_templates?}`. `connection` is `{state, error?}`, with
+`state` one of `not_started`, `starting`, `connected`, `authentication_required`, `failed`,
+`cancelled`, `disabled` or `unknown` (a state the adapter did not recognise, its raw name in
+`error`); `error` is the harness's reason for a `failed` state. `connection` is absent when the
+harness does not report it. `resources` and `resource_templates` are absent (or `null`) when the
+harness cannot report them, which is the case for Claude Code, whose stdio host exposes no
+resource listing; an empty array means the harness reported none. Codex reports both, and
+`connection` from its `runtimeStatus`.
+
 `GET /api/ws-ticket` returns the short-lived `ticket` and `ui_version`, the content identity of the
 server's embedded JavaScript. The browser compares `ui_version` with the identity embedded in its
 loaded page before opening or reopening a WebSocket. A mismatch means the tab predates a server

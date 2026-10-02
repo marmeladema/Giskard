@@ -3406,10 +3406,11 @@ impl Script for McpHintScript {
         Ok(vec![giskard_core::mcp::McpServerStatus {
             name: name.to_owned(),
             auth_status: giskard_core::mcp::McpAuthStatus::Unknown,
+            connection: None,
             server_info: None,
             tools: Vec::new(),
-            resources: Vec::new(),
-            resource_templates: Vec::new(),
+            resources: None,
+            resource_templates: None,
         }])
     }
 }
