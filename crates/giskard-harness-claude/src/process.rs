@@ -134,6 +134,9 @@ pub(crate) fn session_argv(options: &ClaudeLaunchOptions, session: &SessionArgs)
         LaunchMode::Standard => "manual",
     };
     argv.extend(["--permission-mode".into(), mode.into()]);
+    // Echo each user line back (`isReplay`): the turn's acknowledgement, its `UserMessage` item.
+    // A session flag only: a probe never writes a user line.
+    argv.push("--replay-user-messages".into());
     argv.extend(["--model".into(), session.model.model.clone()]);
     if let Some(effort) = &session.model.reasoning_effort {
         argv.extend(["--effort".into(), effort.0.clone()]);
@@ -690,6 +693,7 @@ pub(crate) mod tests {
         expected.extend(strings(&[
             "--permission-mode",
             "bypassPermissions",
+            "--replay-user-messages",
             "--model",
             "sonnet",
             "--session-id",
@@ -711,6 +715,7 @@ pub(crate) mod tests {
         expected.extend(strings(&[
             "--permission-mode",
             "manual",
+            "--replay-user-messages",
             "--model",
             "sonnet",
             "--effort",
@@ -733,7 +738,13 @@ pub(crate) mod tests {
             ..ClaudeLaunchOptions::default()
         };
         let argv = probe_argv(&options);
-        for flag in ["--session-id", "--resume", "--model", "--permission-mode"] {
+        for flag in [
+            "--session-id",
+            "--resume",
+            "--model",
+            "--permission-mode",
+            "--replay-user-messages",
+        ] {
             assert!(!argv.iter().any(|arg| arg == flag), "{flag} in {argv:?}");
         }
     }

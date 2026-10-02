@@ -750,6 +750,7 @@ pub(crate) fn spawn_supervisor(parts: SupervisorParts) -> JoinHandle<()> {
         dropped_events: 0,
         failure: None,
         withdrawn: HashSet::new(),
+        answered_asks: HashSet::new(),
         turn_setup: None,
         phase: Phase::Serving,
         commands_closed: false,
@@ -846,6 +847,15 @@ struct Supervisor {
     // Synchronization: Owned by this supervisor task alone.
     // Invalidation/removal: The late answer removes its entry; the next turn clears the rest.
     withdrawn: HashSet<String>,
+    // ENTITY-AUTHORITY-EXCEPTION:
+    // Role: Recognise the CLI's echo of an answer this supervisor wrote to one of its asks.
+    // Source of truth: Every `control_response` the supervisor writes for a CLI ask
+    //   (`respond_approval`, `respond_server_request`, the mapper's own `Reply`).
+    // Structural reason: `--replay-user-messages` echoes each such line back on stdout, verbatim
+    //   and unmarked, where it reads as a response to a request of the adapter's own.
+    // Synchronization: Owned by this supervisor task alone.
+    // Invalidation/removal: The echo removes its entry; the next turn clears the rest.
+    answered_asks: HashSet<String>,
     /// The `StartTurn` hand-off whose settings are in flight. Not keyed: one at a time, cleared
     /// when it replies.
     turn_setup: Option<TurnSetup>,
@@ -1038,7 +1048,13 @@ impl Supervisor {
         }
         match output {
             MapperOutput::Event(event) => self.append(event),
-            MapperOutput::Reply(value) => self.child.write_line(&value.to_string()).await?,
+            MapperOutput::Reply(value) => {
+                // The mapper's own answer to an ask (an `ExitPlanMode` deny): the CLI echoes it.
+                if let Some(request_id) = value["response"]["request_id"].as_str() {
+                    self.answered_asks.insert(request_id.to_owned());
+                }
+                self.child.write_line(&value.to_string()).await?
+            }
             MapperOutput::ControlResponse {
                 request_id,
                 payload,
@@ -1048,6 +1064,22 @@ impl Supervisor {
                 .is_some_and(|setup| setup.request_id == request_id) =>
             {
                 self.on_setup_response(payload).await?;
+            }
+            MapperOutput::ControlResponse {
+                request_id,
+                payload,
+            } if self.answered_asks.remove(&request_id) => {
+                // Checked before the waiters, so "abandoned" and "nobody is waiting" keep meaning
+                // what they say; the adapter's own request ids are fresh UUIDs, never an ask's.
+                debug!(
+                    thread_id = %self.thread,
+                    harness_thread_id = display_opt(self.context.harness_thread_id.as_deref()),
+                    request_id = %request_id,
+                    action = "control_response",
+                    echo = true,
+                    success = control_outcome(&payload).is_ok(),
+                    "the CLI echoed the adapter's own answer; ignored"
+                );
             }
             MapperOutput::ControlResponse {
                 request_id,
@@ -1843,6 +1875,8 @@ impl Supervisor {
         }
         // Asks belong to a turn: a withdrawal of an earlier turn's ask can match nothing now.
         self.withdrawn.clear();
+        // An echo follows its answer within milliseconds: none is still on its way.
+        self.answered_asks.clear();
         // `TurnStarted` reaches the log before the line is written, so the server sees the turn
         // before its first frame.
         let outputs = self.mapper.begin_turn(turn, TurnKind::User);
@@ -1984,6 +2018,7 @@ impl Supervisor {
                 self.mapper.note_interrupt_sent();
             }
         }
+        self.answered_asks.insert(ask.request_id.clone());
         if let Err(error) = self
             .child
             .write_line(&control_response_line(&ask.request_id, response))
@@ -2062,6 +2097,7 @@ impl Supervisor {
                 return Ok(());
             }
         };
+        self.answered_asks.insert(ask.request_id.clone());
         if let Err(error) = self.child.write_line(&line).await {
             let _ = reply.send(Err(error.clone()));
             return Err(error);
@@ -2219,6 +2255,7 @@ impl Supervisor {
             return Ok(());
         }
         self.withdrawn.clear();
+        self.answered_asks.clear();
         for output in self.mapper.begin_turn(turn, TurnKind::Compaction) {
             if let MapperOutput::Event(event) = output {
                 self.append(event);
@@ -2812,6 +2849,12 @@ pub(crate) mod tests {
         EmitFixturePrefix { name: &'static str, count: usize },
         /// Emit the lines `EmitFixture` would, from index `from` on.
         EmitFixtureFrom { name: &'static str, from: usize },
+        /// Emit the triggering stdin line back verbatim, as `--replay-user-messages` does with
+        /// each `control_response` the adapter writes.
+        Echo,
+        /// Emit the triggering user line back with `isReplay` and a `uuid`, as
+        /// `--replay-user-messages` acknowledges a prompt.
+        Replay,
         /// Answer the triggering control request with this success payload.
         Respond(Value),
         /// Answer the triggering control request with an error.
@@ -3004,6 +3047,17 @@ pub(crate) mod tests {
                         for line in fixture_lines(name).into_iter().skip(from) {
                             let _ = self.tx.send(Out::Line(line));
                         }
+                    }
+                    Action::Echo => {
+                        let _ = self.tx.send(Out::Line(trigger.to_string()));
+                    }
+                    Action::Replay => {
+                        let mut line = trigger.clone();
+                        line["isReplay"] = json!(true);
+                        line["uuid"] = json!("00000000-0000-4000-8000-00000000beef");
+                        line["parent_tool_use_id"] = Value::Null;
+                        line["session_id"] = json!("f18693ff-2d11-4f87-9556-2b527e19e081");
+                        let _ = self.tx.send(Out::Line(line.to_string()));
                     }
                     Action::Respond(payload) => {
                         let line = json!({"type": "control_response", "response": {
