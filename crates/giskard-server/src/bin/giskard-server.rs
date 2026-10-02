@@ -628,6 +628,12 @@ CLAUDE_CONFIG_DIR = "/home/you/.claude"
                 "idle_shutdown_secs = 30\n",
                 Some(std::time::Duration::from_secs(30)),
             ),
+            // TOML's largest integer: accepted, and the adapter never reaps on a deadline the
+            // clock cannot hold.
+            (
+                "idle_shutdown_secs = 9223372036854775807\n",
+                Some(std::time::Duration::from_secs(i64::MAX as u64)),
+            ),
         ] {
             let factory = startup_factory(&format!(
                 "[harnesses.claude]\nkind = \"claude-code\"\n{src}"

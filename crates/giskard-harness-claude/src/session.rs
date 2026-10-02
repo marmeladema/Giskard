@@ -139,6 +139,12 @@ pub(crate) struct ThreadEntry {
     /// turn without a model override runs on it, and a respawn launches with it.
     pub model: ModelRef,
     pub child: Option<ChildHandle>,
+    /// Held by the one caller respawning the thread's child, so two callers never start two
+    /// `claude --resume` of one session.
+    pub respawn: Arc<tokio::sync::Mutex<()>>,
+    /// The `apiKeySource` notice the thread already showed; a respawned mapper is seeded with it
+    /// so the notice is not repeated after every reap.
+    pub api_key_source_noticed: Option<String>,
 }
 
 /// The façade's view of one live child.
@@ -323,6 +329,20 @@ impl PendingRequests {
 
     pub fn len(&self) -> usize {
         self.approvals.len() + self.server_requests.len()
+    }
+}
+
+/// A mapper output's name, for logs.
+fn output_kind(output: &MapperOutput) -> &'static str {
+    match output {
+        MapperOutput::Event(_) => "event",
+        MapperOutput::Reply(_) => "reply",
+        MapperOutput::ControlResponse { .. } => "control_response",
+        MapperOutput::PendingApproval { .. } => "pending_approval",
+        MapperOutput::PendingServerRequest { .. } => "pending_server_request",
+        MapperOutput::CancelRequest { .. } => "cancel_request",
+        MapperOutput::RouteOpened { .. } => "route_opened",
+        MapperOutput::RouteClosed { .. } => "route_closed",
     }
 }
 
@@ -737,6 +757,9 @@ pub(crate) fn spawn_supervisor(parts: SupervisorParts) -> JoinHandle<()> {
         idle_timeout: parts.idle_timeout,
         idle_since: None,
         busy_reason: None,
+        last_line: Instant::now(),
+        reaped: false,
+        reaped_outputs: 0,
         // The handshake set `default` on both launch modes.
         current_mode: "default".into(),
         current_effort: parts
@@ -836,6 +859,13 @@ struct Supervisor {
     idle_since: Option<Instant>,
     /// What last kept the child busy, so only a change is logged.
     busy_reason: Option<&'static str>,
+    /// When stdout last produced a line; the idle timer also waits for it to go quiet.
+    last_line: Instant,
+    /// The child was reaped: whatever it still says is dropped, never published on the thread
+    /// a respawned child now serves.
+    reaped: bool,
+    /// Outputs of a reaped child dropped.
+    reaped_outputs: u64,
     /// The permission mode the CLI holds, by the CLI's name: `default` after the handshake, then
     /// whatever the last successful `set_permission_mode` set. The mapper's session mode stays
     /// what the CLI *reports*.
@@ -889,6 +919,7 @@ impl Supervisor {
                 biased;
                 line = self.child.next_line() => match line {
                     Ok(Some(line)) => {
+                        self.last_line = Instant::now();
                         if let Err(error) = self.dispatch_line(&line).await {
                             self.broken("write_stdin", "a stdin write failed", &error);
                             return self.end_broken();
@@ -915,7 +946,12 @@ impl Supervisor {
                 () = tokio::time::sleep_until(stage_deadline.unwrap_or_else(Instant::now)),
                     if stage_deadline.is_some() => self.on_deadline(),
                 () = tokio::time::sleep_until(idle_deadline.unwrap_or_else(Instant::now)),
-                    if idle_deadline.is_some() => self.reap().await,
+                    if idle_deadline.is_some() => {
+                    if let Err(error) = self.reap().await {
+                        self.broken("write_stdin", "a stdin write failed", &error);
+                        return self.end_broken();
+                    }
+                }
             }
             if let Some(ending) = self.ending.take() {
                 return ending;
@@ -930,11 +966,14 @@ impl Supervisor {
                 self.enter_stopping("stop", Some(reply), false).await;
                 Ok(())
             }
-            Some(command) if self.stopping() => {
-                self.refuse(command);
-                Ok(())
-            }
-            Some(command) => self.handle_command(command).await,
+            Some(command) => match &self.phase {
+                Phase::Stopping(stopping) => {
+                    let reason = stopping.reason;
+                    self.refuse(command, reason);
+                    Ok(())
+                }
+                Phase::Serving => self.handle_command(command).await,
+            },
             None => {
                 self.commands_closed = true;
                 if self.stopping() {
@@ -983,6 +1022,20 @@ impl Supervisor {
     }
 
     async fn dispatch(&mut self, output: MapperOutput) -> Result<(), HarnessError> {
+        if self.reaped
+            && matches!(
+                output,
+                MapperOutput::Event(_)
+                    | MapperOutput::Reply(_)
+                    | MapperOutput::PendingApproval { .. }
+                    | MapperOutput::PendingServerRequest { .. }
+                    | MapperOutput::RouteOpened { .. }
+            )
+        {
+            // Mapped all the same, so the mapper stays consistent; nothing reaches the thread.
+            self.drop_reaped_output(output_kind(&output));
+            return Ok(());
+        }
         match output {
             MapperOutput::Event(event) => self.append(event),
             MapperOutput::Reply(value) => self.child.write_line(&value.to_string()).await?,
@@ -1228,9 +1281,29 @@ impl Supervisor {
         }
     }
 
+    /// A reaped child still produced something: dropped, reported once and counted.
+    fn drop_reaped_output(&mut self, kind: &'static str) {
+        self.reaped_outputs += 1;
+        if self.reaped_outputs == 1 {
+            warn!(
+                thread_id = %self.thread,
+                harness_thread_id = display_opt(self.context.harness_thread_id.as_deref()),
+                pid = display_opt(self.pid),
+                action = "reaped_frame",
+                output = kind,
+                "a reaped claude child is still writing; dropping what it says"
+            );
+        }
+    }
+
     /// Append to the retained log of the event's thread (the primary's or a route's); a closed or
-    /// missing log is reported once and counted, never ignored.
+    /// missing log is reported once and counted, never ignored. A reaped child appends nothing:
+    /// the log is the thread's, and a respawned child may already be writing to it.
     fn append(&mut self, event: AgentEvent) {
+        if self.reaped {
+            self.drop_reaped_output(AgentEvent::kind(&event));
+            return;
+        }
         let thread = event_thread(&event);
         if thread != self.thread {
             let appended = self
@@ -1346,7 +1419,8 @@ impl Supervisor {
                 reply,
             } => self.compact(turn, notice, reply).await,
             ChildCommand::Stop { reply } => {
-                // `on_command` routes every `Stop` to the stop sequence.
+                // A defensive duplicate: `on_command` handles every `Stop` itself, so this is
+                // reached only if a caller bypasses it.
                 self.enter_stopping("stop", Some(reply), false).await;
                 Ok(())
             }
@@ -1619,6 +1693,7 @@ impl Supervisor {
         self.current_effort = applied_effort.clone();
         self.current_model.reasoning_effort =
             applied_effort.clone().map(giskard_core::model::Effort);
+        self.sync_entry_model();
         if let Some(level) = setup.effort_change.as_deref()
             && applied_effort.as_deref() != Some(level)
         {
@@ -1803,6 +1878,17 @@ impl Supervisor {
                 let _ = reply.send(Err(error.clone()));
                 Err(error)
             }
+        }
+    }
+
+    /// The thread's entry follows what the CLI holds, so a turn without a model override falls
+    /// back to it, before a reap as after.
+    fn sync_entry_model(&self) {
+        let mut threads = lock(&self.threads);
+        if self.holds_entry(&threads)
+            && let Some(entry) = threads.get_mut(&self.thread)
+        {
+            entry.model = self.current_model.clone();
         }
     }
 
@@ -2243,12 +2329,17 @@ impl Supervisor {
         }
     }
 
-    /// When the idle child is reaped: only while serving, with reaping on.
+    /// When the idle child is reaped: only while serving, with reaping on, once it has been idle
+    /// **and** silent on stdout for the timeout. A frame the mapper does not model (a future
+    /// background mechanism) postpones the reap: a child that keeps talking is never reaped, the
+    /// safe direction. A timeout too large for the clock never reaps.
     fn idle_deadline(&self) -> Option<Instant> {
         if self.stopping() {
             return None;
         }
-        Some(self.idle_since? + self.idle_timeout?)
+        self.idle_since?
+            .max(self.last_line)
+            .checked_add(self.idle_timeout?)
     }
 
     /// Whether the thread's entry still holds this child.
@@ -2261,28 +2352,60 @@ impl Supervisor {
 
     /// The idle timer fired: take this child out of its thread's entry, then stop it. The thread
     /// stays bound and its log open; the next turn respawns the child with `--resume`.
-    async fn reap(&mut self) {
+    ///
+    /// The façade looks a child up and enqueues to it in one critical section of `threads`, and
+    /// this takes the child and drains the queue in one critical section of the same lock. So a
+    /// command either is in the queue drained here, which cancels the reap (the child goes back
+    /// into its entry and serves it), or was never sent to this child: once the child is out of
+    /// its entry no command can reach it. Its routes turn cold first, under the `routes` lock
+    /// their senders are reached through. `Err` is a stdin write failure serving that command.
+    async fn reap(&mut self) -> Result<(), HarnessError> {
         let idle_ms = self
             .idle_since
             .map_or(0, |since| since.elapsed().as_millis() as u64);
         let timeout_ms = self
             .idle_timeout
             .map_or(0, |timeout| timeout.as_millis() as u64);
-        // Taken before stdin closes: from here on the façade sees a thread with no child, and a
-        // hand-off already sent here is refused and retried on a fresh child.
-        let (kept, live_children, loaded_threads) = {
+        let routes_cooled = self.cool_routes();
+        let (kept, queued, live_children, loaded_threads) = {
             let mut threads = lock(&self.threads);
             let kept = self.holds_entry(&threads);
+            let mut queued = None;
             if let Some(entry) = threads.get_mut(&self.thread).filter(|_| kept) {
-                entry.child = None;
-                // What the CLI held, so the respawn launches with it and a turn without a model
-                // override runs on it.
-                entry.model = self.current_model.clone();
+                let child = entry.child.take();
+                match self.commands.try_recv() {
+                    Ok(command) => {
+                        entry.child = child;
+                        queued = Some(command);
+                    }
+                    Err(_) => {
+                        // What the CLI held, so the respawn launches with it, and the notice
+                        // the thread already showed.
+                        entry.model = self.current_model.clone();
+                        entry.api_key_source_noticed =
+                            self.mapper.api_key_source_noticed().map(str::to_owned);
+                    }
+                }
             }
             let (live_children, loaded_threads) = thread_counts(&threads);
-            (kept, live_children, loaded_threads)
+            (kept, queued, live_children, loaded_threads)
         };
+        if let Some(command) = queued {
+            // The routes stay cold. That is benign: idle means every route already ended in the
+            // mapper, so a `stop_task` on one now answers "no longer running" instead of "already
+            // ended", and an MCP read hinting one of them goes to the probe instead of this child.
+            debug!(
+                thread_id = %self.thread,
+                harness_thread_id = display_opt(self.context.harness_thread_id.as_deref()),
+                action = "reap_cancelled",
+                command = command.name(),
+                routes_cooled,
+                "a command reached the child before the reap took it; the reap is cancelled"
+            );
+            return self.on_command(Some(command)).await;
+        }
         if kept {
+            self.reaped = true;
             info!(
                 project_id = display_opt(self.context.project_id),
                 harness = display_opt(self.context.harness.as_deref()),
@@ -2294,6 +2417,7 @@ impl Supervisor {
                 timeout_ms,
                 live_children,
                 loaded_threads,
+                routes_cooled,
                 "claude child idle too long; stopping it, the thread stays open"
             );
         } else {
@@ -2310,6 +2434,7 @@ impl Supervisor {
         }
         self.enter_stopping(if kept { "idle" } else { "stop" }, None, kept)
             .await;
+        Ok(())
     }
 
     /// The deadline the main loop waits on besides frames and commands: the in-flight turn
@@ -2525,11 +2650,7 @@ impl Supervisor {
 
     /// A command that arrived during the stop sequence is answered at once: the child will not
     /// serve it. A `Stop` joins the sequence.
-    fn refuse(&mut self, command: ChildCommand) {
-        let reason = match &self.phase {
-            Phase::Stopping(stopping) => stopping.reason,
-            Phase::Serving => "serving",
-        };
+    fn refuse(&mut self, command: ChildCommand, reason: &'static str) {
         debug!(
             thread_id = %self.thread,
             harness_thread_id = display_opt(self.context.harness_thread_id.as_deref()),
@@ -2643,6 +2764,7 @@ impl Supervisor {
                     pending_dropped,
                     routes_cooled,
                     dropped_events = self.dropped_events,
+                    reaped_outputs = self.reaped_outputs,
                     $message
                 )
             };

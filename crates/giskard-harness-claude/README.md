@@ -31,17 +31,20 @@ routes*). A child idle for `idle_shutdown_secs` is stopped and its thread respaw
 
 ## Runtime ownership
 
-- **One supervisor task per child** (`src/session.rs`) is the single owner of the child process,
-  its `ClaudeMapper`, its pending control-request waiters and the thread's retained `EventLog`.
-  Nothing else touches them, and none of them sits behind a lock: the façade reaches the task only
-  through its bounded command channel (`StartTurn`, `Interrupt`, `Control`, `RespondApproval`,
-  `RespondServerRequest`, `StopTask`, `Compact`, `Stop`). It also owns **one retained `EventLog` per
-  sub-agent route** of its child: each event goes to the log of the thread it names (the primary's
-  or a route's). The task is an explicit state machine driven by **one** `select!` loop over the
-  child's stdout lines (first, so a frame already read is mapped before a new command is
-  accepted), its commands, the instance's shutdown signal, and the deadline of whatever it is
-  waiting on; every arm body runs to completion, so a write made from one is never cancelled. It
-  is in one of two phases:
+- **One supervisor task per child** (`src/session.rs`) is the single owner of the child process, its
+  `ClaudeMapper`, its pending control-request waiters and the thread's retained `EventLog`. Nothing
+  else touches them, and none of them sits behind a lock: the façade reaches the task only through
+  its bounded command channel (`StartTurn`, `Interrupt`, `Control`, `RespondApproval`,
+  `RespondServerRequest`, `StopTask`, `Compact`, `Stop`). The façade never waits for room in it: a
+  command is enqueued with `try_send` while the façade holds the `threads` lock (the `routes` lock
+  for a sub-agent's `stop_task`), and a full queue (16 deep; the server serializes per thread, so
+  only a wedged supervisor fills it) is a `Transport` error logged at `warn`. It also owns **one
+  retained `EventLog` per sub-agent route** of its child: each event goes to the log of the thread
+  it names (the primary's or a route's). The task is an explicit state machine driven by **one**
+  `select!` loop over the child's stdout lines (first, so a frame already read is mapped before a
+  new command is accepted), its commands, the instance's shutdown signal, and the deadline of
+  whatever it is waiting on; every arm body runs to completion, so a write made from one is never
+  cancelled. It is in one of two phases:
   - **serving**: frames are mapped and commands served. At most one **turn hand-off**
     (`TurnSetup`) is in flight: a `StartTurn`'s settings requests are written one at a time, each
     response (recognised by its `request_id`) advances the hand-off to its next stage (mode,
@@ -59,34 +62,37 @@ routes*). A child idle for `idle_shutdown_secs` is stopped and its thread respaw
 
   While serving, the supervisor also runs the **idle clock**: at the top of every loop iteration
   it checks whether the child has anything to do (*Idle reaping*), starts or stops the clock
-  (`idle` at `debug`), and arms the idle timer; when it fires, the reap is a stop sequence that
+  (`idle` at `debug`, on each change of what keeps it busy), and arms the idle timer from the
+  later of "idle since" and "last stdout line"; when it fires, the reap is a stop sequence that
   keeps the thread.
 
   A reply the mapper must write (an `ExitPlanMode` deny) that cannot be written breaks the child
   wherever it happens.
-- **The façade** (`src/harness.rs`) holds three maps behind `std` mutexes that are never held
-  across an await: `threads` (primary thread → its session id, retained log, workspace root and
-  model, and its live child while it has one: command sender, task, launch mode, generation),
-  `pending` (approval / server-request id → the thread the ask was
-  published on, its **owner** (the primary thread whose child answers it), CLI `request_id`, and
-  what the answer needs: the tool-use id, the tool name and the raw `permission_suggestions` of an
-  approval, the subtype and `input` of a server request) and `routes` (sub-agent thread → its
-  `task:` id, retained log, owning primary thread and command sender, parent native id, name and
-  model; a **cold** route has a fresh, open, silent log and no owner). The façade
-  also remembers, once, the sentence in which the CLI refused a bypass launch (`bypass_refused`).
-  `open_thread` inserts an entry after its child's handshake. An entry **outlives a reaped
-  child**: the reap clears its child (keeping the session id, the open log and the model the CLI
-  last held) and the next turn's respawn fills it again. The supervisor removes its own entry when
-  its child exits any other way (a generation number keeps a stale supervisor from touching a
-  reopened or respawned thread's entry); `delete_thread`, `set_thread_archived(true)` and
-  `shutdown` take entries out before stopping their children, and close the log of an entry that
-  has none. A supervisor drops every `pending` entry it owns (its routes' included) when its
-  child exits, unless it was reaped (idle means none); an answer or a `control_cancel_request`
-  removes one entry. A supervisor publishes a route into `routes` on the mapper's `RouteOpened`,
-  and at exit turns its own routes (guarded by its generation) **cold**: owner and command sender
-  cleared, log left open. `claim_native_thread` inserts a cold route. Only the sub-agent thread's
-  own `delete_thread` or `set_thread_archived(true)`, and `shutdown`, remove a route and close its
-  log, like a Codex thread log that lives as long as its thread.
+- **The façade** (`src/harness.rs`) holds three maps behind `std` mutexes that are never held across
+  an await: `threads` (primary thread → its session id, retained log, workspace root and model, and
+  its live child while it has one: command sender, task, launch mode, generation), `pending`
+  (approval / server-request id → the thread the ask was published on, its **owner** (the primary
+  thread whose child answers it), CLI `request_id`, and what the answer needs: the tool-use id, the
+  tool name and the raw `permission_suggestions` of an approval, the subtype and `input` of a server
+  request) and `routes` (sub-agent thread → its `task:` id, retained log, owning primary thread and
+  command sender, parent native id, name and model; a **cold** route has a fresh, open, silent log
+  and no owner). The façade also remembers, once, the sentence in which the CLI refused a bypass
+  launch (`bypass_refused`). `open_thread` inserts an entry after its child's handshake. An entry
+  **outlives a reaped child**: the reap clears its child (keeping the session id, the open log, the
+  model the CLI holds, which a confirmed model change also updates, and the API-billing notice it
+  already showed) and the next turn's respawn fills it again. Each entry carries a **respawn gate**,
+  an async mutex, so one respawn runs per thread: a caller that waited on another's finds its child.
+  The supervisor removes its own entry when its child exits any other way (a generation number keeps
+  a stale supervisor from touching a reopened or respawned thread's entry); `delete_thread`,
+  `set_thread_archived(true)` and `shutdown` take entries out before stopping their children, and
+  close the log of an entry that has none. A supervisor drops every `pending` entry it owns (its
+  routes' included) when its child exits, unless it was reaped (idle means none); an answer or a
+  `control_cancel_request` removes one entry. A supervisor publishes a route into `routes` on the
+  mapper's `RouteOpened`, and at a reap or at exit turns its own routes (guarded by its generation)
+  **cold**: owner and command sender cleared, log left open. `claim_native_thread` inserts a cold
+  route. Only the sub-agent thread's own `delete_thread` or `set_thread_archived(true)`, and
+  `shutdown`, remove a route and close its log, like a Codex thread log that lives as long as its
+  thread.
 - **The retained log is created at open**, so `subscribe` returns a live reader for any handle
   `open_thread` issued before the child has written a frame. It lives as long as the thread's
   entry: a respawned child appends to the same log, so a reader sees one continuous stream. Frames
@@ -359,23 +365,35 @@ deduplicated away), since the server reads no handle.
   requested stop that exited 0 (or 1 after an interrupt), at `warn` otherwise. The spawn line logs
   `live_children` too. A closed log's refusal of an event is logged once and counted on that line.
   A **reaped** child's exit is the exception: the thread's log stays open, its entry keeps the
-  thread, and its pending map is left alone; its routes turn cold as after any exit.
+  thread, and its pending map is left alone; its routes turned cold at the reap. Whatever a reaped
+  child still writes while it drains is mapped and dropped (`reaped_frame` at `warn` once,
+  `reaped_outputs` on the exit line): the log is the thread's, and a respawned child may already
+  be writing to it.
 - **Idle reaping.** A child is idle when it has no turn hand-off in flight, no ask awaiting the
   user, no live sub-agent route, no open task (a `local_bash` task outlives its turn and can still
-  ask), no control request awaiting its answer and no active turn. Once idle for
-  `idle_shutdown_secs` (a key on the `claude-code` declaration; 600 s by default, `0` never), the
-  supervisor takes its child out of the thread's entry (`child_reaped` at `info`, with `idle_ms`,
-  `live_children` and `loaded_threads`) and runs the stop sequence with no turn to interrupt:
-  close stdin, read to EOF, kill on the grace timeout. The thread stays bound on the server, which
-  is never told, and its stream stays open. The next `start_turn`, `compact_thread` or
-  `open_thread` respawns the child with `--resume` (`respawn` at `info`, with `resume_fallback`
-  and `elapsed_ms`); the user sees nothing, or the "Agent context was lost" notice under the new
-  message when the transcript is gone. A failed respawn fails that turn and keeps the thread, so
-  the next message tries again. A hand-off that reached a supervisor already reaping is refused at
-  once and runs on a fresh child (one retry, the same turn id). A task whose terminal update never
-  comes keeps its child alive for good (`idle` with `reason = "tasks"`), the right failure: the
-  CLI believes it runs. An MCP status read never respawns: a reaped thread's hint is answered by
-  the probe.
+  ask), no control request awaiting its answer and no active turn. Once it has been idle, and has
+  written no stdout line, for `idle_shutdown_secs` (a key on the `claude-code` declaration; 600 s by
+  default, `0` never; a value too large for the clock never reaps), the supervisor reaps it. The
+  quiet-stdout condition makes the closed list fail safe: a frame the mapper does not model (a
+  future background mechanism) postpones the reap, and a child that keeps talking while idle is
+  never reaped. The reap turns the child's routes cold, then, in one critical section of the
+  `threads` lock, takes the child out of the thread's entry and drains its command queue: since the
+  façade only enqueues under that lock, a command that reached the supervisor before the take
+  cancels the reap (`reap_cancelled` at `debug`; the child goes back into its entry and serves it,
+  its routes left cold, which is benign since idle means every route already ended), and once the
+  child is out no command can reach it. Otherwise it logs `child_reaped` at `info` (with `idle_ms`,
+  `live_children` and `loaded_threads`) and runs the stop sequence with no turn to interrupt: close
+  stdin, read to EOF, kill on the grace timeout. The thread stays bound on the server, which is
+  never told, and its stream stays open. The next `start_turn`, `compact_thread` or `open_thread`
+  respawns the child with `--resume` (`respawn` at `info`, with `resume_fallback` and `elapsed_ms`);
+  the user sees nothing, or the "Agent context was lost" notice under the new message when the
+  transcript is gone. Respawns are gated per thread, so two callers never start two `claude
+  --resume` of one session. The first message after a reap pays the `--resume` handshake (a few
+  seconds) before its `TurnStarted`; the server's forwarder has no timeout of its own on
+  `start_turn`, so nothing fails, it just waits. A failed respawn fails that turn and keeps the
+  thread, so the next message tries again. A task whose terminal update never comes keeps its child
+  alive for good (`idle` with `reason = "tasks"`), the right failure: the CLI believes it runs. An
+  MCP status read never respawns: a reaped thread's hint is answered by the probe.
 - **Asks.** `can_use_tool` and other inbound control requests are published as events, recorded
   in `pending`, and answered by `respond_approval` / `respond_server_request` (below).
 
@@ -529,12 +547,13 @@ route's thread and turn and recorded with the route's thread and the primary as 
   published routes cold (logged as `routes_cooled` on the exit line). A route's mapper state never
   outlives its child; its log lives until the sub-agent thread's own delete or archive, or shutdown.
 - **`stop_task`.** `interrupt` on a sub-agent thread sends `StopTask` to the owning child; the
-  supervisor writes `{"subtype":"stop_task","task_id":…}`, resolves the call when its answer
-  comes (the façade bounds it by 10 s), and logs `stop_task` at `info`. The stop is noted on the route **before** the write, since the CLI emits
-  the task's `killed` update before it answers. A route whose task has not started yet is
-  `Protocol("the sub-agent has not started yet")`; one that already ended is `Ok` at `debug`; a
-  thread that is no route of the child is `Protocol`. The CLI withdraws the sub-agent's pending ask
-  with a `control_cancel_request` (the existing path), and the parent's turn continues.
+  supervisor writes `{"subtype":"stop_task","task_id":…}`, resolves the call when its answer comes
+  (the façade bounds it by 10 s), and logs `stop_task` at `info`. The stop is noted on the route
+  **before** the write, since the CLI emits the task's `killed` update before it answers. A route
+  whose task has not started yet is `Protocol("the sub-agent has not started yet")`; one that
+  already ended is `Ok` at `debug`; a thread that is no route of the child is `Protocol`. The CLI
+  withdraws the sub-agent's pending ask with a `control_cancel_request` (the existing path), and the
+  parent's turn continues.
 - **Claim.** `claim_native_thread` accepts only a `task:` id (anything else is `Protocol`). A live
   route is **adopted**: the handle's thread is the mapper's, with `agent_name`, `resumed_model`
   (the child's model) and `parent_harness_thread_id`. Otherwise the session that produced the
@@ -656,11 +675,11 @@ error. `mcp_status` carries **no tool inventory**: tools reach the model as
 - `src/harness.rs`: `ClaudeHarness`, the handshake, the bypass and resume fallbacks, the probe,
   the per-turn mode, and the façade tests against a scripted child and against
   `tests/fake-claude.sh`.
-- `src/session.rs`: the per-child supervisor's state machine (its serving and stopping phases
-  and the in-flight turn hand-off that applies the per-turn settings), the approval and server-request answers, `stop_task`, the route logs, compaction, the stop sequence,
-  the pending-ask map, and the
-  in-process `ScriptedChild` the façade tests drive (it echoes every `set_permission_mode` the
-  script does not handle itself).
+- `src/session.rs`: the per-child supervisor's state machine (its serving and stopping phases, the
+  idle clock and the reap, and the in-flight turn hand-off that applies the per-turn settings), the
+  approval and server-request answers, `stop_task`, the route logs, compaction, the stop sequence,
+  the pending-ask map, and the in-process `ScriptedChild` the façade tests drive (it echoes every
+  `set_permission_mode` the script does not handle itself).
 - `src/process.rs`: `ClaudeLaunchOptions`, argv and the launch mode, spawning, the capped stdout
   reader, the stderr tail and exit classification.
 - `src/attachments.rs`: the user message line and attachment blocks.
