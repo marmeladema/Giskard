@@ -560,6 +560,17 @@ impl ClaudeMapper {
         !self.session.routes.is_empty()
     }
 
+    /// The non-`none` `apiKeySource` this thread already surfaced.
+    pub fn api_key_source_noticed(&self) -> Option<&str> {
+        self.session.api_key_source_noticed.as_deref()
+    }
+
+    /// Seed a respawned child's mapper with the `apiKeySource` its thread already surfaced, so
+    /// the notice is not repeated after every respawn.
+    pub fn note_api_key_source_noticed(&mut self, source: Option<String>) {
+        self.session.api_key_source_noticed = source;
+    }
+
     /// Whether any Claude Code task (a sub-agent or a background shell) has started and not yet
     /// reached a terminal `task_updated`. A `local_bash` task outlives its turn.
     pub fn has_tasks(&self) -> bool {

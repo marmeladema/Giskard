@@ -216,29 +216,101 @@ impl ClaudeHarness {
         lock(&self.routes).len()
     }
 
-    /// The command channel, model, launch mode and generation of a thread's live child.
-    fn live(&self, thread: ThreadId) -> Option<LiveChild> {
+    /// The model of a thread that has a live child: what the CLI holds.
+    fn live_model(&self, thread: ThreadId) -> Option<ModelRef> {
         let threads = lock(&self.threads);
         let entry = threads.get(&thread)?;
-        let child = entry.child.as_ref()?;
-        Some(LiveChild {
-            commands: child.commands.clone(),
-            model: entry.model.clone(),
-            launch_mode: child.launch_mode,
-            generation: child.generation,
-        })
+        entry.child.as_ref().map(|_| entry.model.clone())
     }
 
-    /// The hand-off sent to `generation` failed because its child was reaped meanwhile: the entry
-    /// is still there, with no child or a newer one. `false` when the entry is gone (a crash or a
-    /// delete), so the original error stands.
-    fn reaped_under(&self, thread: ThreadId, generation: u64) -> bool {
-        lock(&self.threads).get(&thread).is_some_and(|entry| {
-            entry
-                .child
-                .as_ref()
-                .is_none_or(|child| child.generation != generation)
-        })
+    /// Look the thread's live child up and enqueue `make`'s command, in one critical section of
+    /// `threads`. A supervisor's reap takes its child out of the entry and drains its queue in one
+    /// critical section of the same lock, so a command is either in the queue the reap drains
+    /// (which cancels the reap) or never reaches a reaping child. `make` may refuse the command.
+    fn enqueue<T>(
+        &self,
+        thread: ThreadId,
+        what: &'static str,
+        make: impl FnOnce(
+            &ThreadEntry,
+            &ChildHandle,
+            oneshot::Sender<Result<T, HarnessError>>,
+        ) -> Result<ChildCommand, HarnessError>,
+    ) -> Result<Enqueued<T>, HarnessError> {
+        let threads = lock(&self.threads);
+        let Some(entry) = threads.get(&thread) else {
+            return Ok(Enqueued::NoThread);
+        };
+        let Some(child) = entry.child.as_ref() else {
+            return Ok(Enqueued::NoChild);
+        };
+        let (reply, answer) = oneshot::channel();
+        let command = make(entry, child, reply)?;
+        send_now(&child.commands, command, thread, what)?;
+        Ok(Enqueued::Sent(answer))
+    }
+
+    /// `enqueue`, respawning a reaped child first. A child reaped between that check and the
+    /// enqueue was sent nothing, so it is respawned once more: this is not a retry of a hand-off,
+    /// which can never reach a reaping child. `make` gets the lost-transcript notice a respawn
+    /// reported, for the turn to carry.
+    async fn enqueue_respawning<T>(
+        &self,
+        thread: ThreadId,
+        what: &'static str,
+        make: impl Fn(
+            &ThreadEntry,
+            &ChildHandle,
+            Option<String>,
+            oneshot::Sender<Result<T, HarnessError>>,
+        ) -> Result<ChildCommand, HarnessError>,
+    ) -> Result<Answer<T>, HarnessError> {
+        let mut notice: Option<HarnessNotice> = None;
+        for _ in 0..2 {
+            let respawned = self.ensure_child(thread).await?;
+            notice = notice.or(respawned.notice);
+            let message = notice.as_ref().map(|notice| notice.message.clone());
+            match self.enqueue(thread, what, |entry, child, reply| {
+                make(entry, child, message, reply)
+            })? {
+                Enqueued::Sent(answer) => return Ok(answer),
+                Enqueued::NoThread => return Err(HarnessError::ThreadNotFound(thread)),
+                Enqueued::NoChild => debug!(
+                    thread_id = %thread,
+                    action = what,
+                    "the child was reaped before the command was enqueued; respawning it"
+                ),
+            }
+        }
+        Err(HarnessError::Transport(
+            "the claude child was reaped twice while the turn was being sent".into(),
+        ))
+    }
+
+    /// Await a child's answer to an enqueued command under `limit`.
+    async fn answer<T>(
+        &self,
+        thread: ThreadId,
+        what: &'static str,
+        limit: Duration,
+        answer: Answer<T>,
+    ) -> Result<T, HarnessError> {
+        match tokio::time::timeout(limit, answer).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(_)) => Err(child_stopped()),
+            Err(_) => {
+                warn!(
+                    thread_id = %thread,
+                    action = what,
+                    timeout_ms = limit.as_millis() as u64,
+                    "claude did not answer in time"
+                );
+                Err(HarnessError::Timeout(format!(
+                    "claude did not answer {what} within {} s",
+                    limit.as_secs()
+                )))
+            }
+        }
     }
 
     /// Spawn a session child in bypass mode unless the CLI already refused one, falling back to a
@@ -514,98 +586,86 @@ impl ClaudeHarness {
         );
     }
 
-    /// The child that carries `thread`: its own child, else, for a sub-agent route, its owner's.
-    /// `None` when neither is live (a cold route, or a thread this instance does not hold). The
-    /// two locks are taken one after the other, never nested.
-    fn child_carrying(&self, thread: ThreadId) -> Option<(ThreadId, mpsc::Sender<ChildCommand>)> {
-        if let Some(live) = self.live(thread) {
-            return Some((thread, live.commands));
-        }
-        let owner = lock(&self.routes)
-            .get(&thread)
-            .and_then(|route| route.owner)?;
-        self.live(owner).map(|live| (owner, live.commands))
-    }
-
-    /// `interrupt` on a sub-agent thread: `stop_task` through the child that carries its route.
+    /// `interrupt` on a sub-agent thread: `stop_task` through the child that carries its route,
+    /// enqueued under the `routes` lock, which is where a reap turns the route cold first.
     async fn interrupt_route(&self, thread: &ThreadHandle) -> Result<(), HarnessError> {
-        let route = lock(&self.routes)
-            .get(&thread.thread)
-            .map(|route| (route.owner, route.commands.clone()));
-        let (owner, commands) = match route {
-            Some((Some(owner), Some(commands))) => (owner, commands),
-            Some(_) => {
-                debug!(
-                    thread_id = %thread.thread,
-                    harness_thread_id = %thread.harness_thread_id,
-                    action = "stop_task",
-                    "interrupt on a cold sub-agent route"
-                );
-                return Err(HarnessError::Unsupported(
-                    "this Claude Code sub-agent is no longer running".into(),
-                ));
-            }
-            None => {
-                debug!(
-                    thread_id = %thread.thread,
-                    harness_thread_id = %thread.harness_thread_id,
-                    action = "stop_task",
-                    "interrupt on a sub-agent thread with no route"
-                );
-                return Err(HarnessError::Unsupported(
-                    "this Claude Code sub-agent is no longer running".into(),
-                ));
+        let no_longer_running =
+            || HarnessError::Unsupported("this Claude Code sub-agent is no longer running".into());
+        let sent = {
+            let routes = lock(&self.routes);
+            match routes.get(&thread.thread) {
+                Some(RouteHandle {
+                    owner: Some(owner),
+                    commands: Some(commands),
+                    ..
+                }) => {
+                    debug!(
+                        thread_id = %thread.thread,
+                        owner_thread_id = %owner,
+                        harness_thread_id = %thread.harness_thread_id,
+                        action = "stop_task",
+                        "stopping a sub-agent through its parent's child"
+                    );
+                    let (reply, answer) = oneshot::channel();
+                    let command = ChildCommand::StopTask {
+                        thread: thread.thread,
+                        reply,
+                    };
+                    send_now(commands, command, *owner, "stop_task").map(|()| (*owner, answer))
+                }
+                Some(_) => {
+                    debug!(
+                        thread_id = %thread.thread,
+                        harness_thread_id = %thread.harness_thread_id,
+                        action = "stop_task",
+                        "interrupt on a cold sub-agent route"
+                    );
+                    Err(no_longer_running())
+                }
+                None => {
+                    debug!(
+                        thread_id = %thread.thread,
+                        harness_thread_id = %thread.harness_thread_id,
+                        action = "stop_task",
+                        "interrupt on a sub-agent thread with no route"
+                    );
+                    Err(no_longer_running())
+                }
             }
         };
-        debug!(
-            thread_id = %thread.thread,
-            owner_thread_id = %owner,
-            harness_thread_id = %thread.harness_thread_id,
-            action = "stop_task",
-            "stopping a sub-agent through its parent's child"
-        );
-        let route_thread = thread.thread;
-        self.call(owner, commands, "stop_task", CONTROL_TIMEOUT, |reply| {
-            ChildCommand::StopTask {
-                thread: route_thread,
-                reply,
-            }
-        })
-        .await
+        let (owner, answer) = sent?;
+        self.answer(owner, "stop_task", CONTROL_TIMEOUT, answer)
+            .await
     }
 
-    /// Send one command to a live child and await its reply, both under `limit`.
-    async fn call<T>(
+    /// `mcp_status` for a hint: the hinted thread's own child, else, for a sub-agent route, its
+    /// owner's. `None` when neither is live (a reaped thread, a cold route, a thread this instance
+    /// does not hold): a status read never respawns, the probe answers.
+    fn enqueue_mcp_status(
         &self,
-        thread: ThreadId,
-        commands: mpsc::Sender<ChildCommand>,
-        what: &'static str,
-        limit: Duration,
-        make: impl FnOnce(oneshot::Sender<Result<T, HarnessError>>) -> ChildCommand,
-    ) -> Result<T, HarnessError> {
-        let (reply, answer) = oneshot::channel();
-        let outcome = tokio::time::timeout(limit, async {
-            commands
-                .send(make(reply))
-                .await
-                .map_err(|_| child_stopped())?;
-            answer.await.map_err(|_| child_stopped())?
-        })
-        .await;
-        match outcome {
-            Ok(result) => result,
-            Err(_) => {
-                warn!(
-                    thread_id = %thread,
-                    action = what,
-                    timeout_ms = limit.as_millis() as u64,
-                    "claude did not answer in time"
-                );
-                Err(HarnessError::Timeout(format!(
-                    "claude did not answer {what} within {} s",
-                    limit.as_secs()
-                )))
-            }
+        hinted: ThreadId,
+        request: &Value,
+    ) -> Result<Option<(ThreadId, Answer<Value>)>, HarnessError> {
+        let make = |reply| {
+            Ok(ChildCommand::Control {
+                request: request.clone(),
+                reply,
+            })
+        };
+        match self.enqueue(hinted, "mcp_status", |_, _, reply| make(reply))? {
+            Enqueued::Sent(answer) => return Ok(Some((hinted, answer))),
+            Enqueued::NoChild => return Ok(None),
+            Enqueued::NoThread => {}
+        }
+        let Some(owner) = lock(&self.routes)
+            .get(&hinted)
+            .and_then(|route| route.owner)
+        else {
+            return Ok(None);
+        };
+        match self.enqueue(owner, "mcp_status", |_, _, reply| make(reply))? {
+            Enqueued::Sent(answer) => Ok(Some((owner, answer))),
+            Enqueued::NoChild | Enqueued::NoThread => Ok(None),
         }
     }
 
@@ -696,7 +756,7 @@ impl ClaudeHarness {
         mapper: ClaudeMapper,
         model: ModelRef,
         respawn: bool,
-    ) -> Result<LiveChild, Box<Refused>> {
+    ) -> Result<(), Box<Refused>> {
         let Spawned {
             child,
             handshake,
@@ -709,7 +769,6 @@ impl ClaudeHarness {
             return Err(Box::new(Refused {
                 error: HarnessError::Transport("Claude Code harness is shut down".into()),
                 child,
-                existing: None,
             }));
         }
         let log = match threads.get(&target.thread) {
@@ -717,36 +776,28 @@ impl ClaudeHarness {
                 return Err(Box::new(Refused {
                     error: HarnessError::ThreadNotFound(target.thread),
                     child,
-                    existing: None,
                 }));
             }
             None => Arc::new(EventLog::new()),
             Some(entry) => match &entry.child {
-                Some(existing) => {
-                    let existing = LiveChild {
-                        commands: existing.commands.clone(),
-                        model: entry.model.clone(),
-                        launch_mode: existing.launch_mode,
-                        generation: existing.generation,
-                    };
-                    return Err(Box::new(Refused {
-                        error: HarnessError::Protocol(format!(
-                            "thread {} was opened concurrently",
-                            target.thread
-                        )),
-                        child,
-                        existing: Some(existing),
-                    }));
-                }
                 None if respawn => entry.log.clone(),
-                None => {
+                // A respawn is gated per thread and re-checks for a live child under the gate,
+                // so this is an invariant breach there; for a first open, a concurrent open.
+                _ => {
+                    if respawn {
+                        warn!(
+                            thread_id = %target.thread,
+                            harness_thread_id = %session_id,
+                            action = "respawn",
+                            "a respawn found the thread already holding a live child"
+                        );
+                    }
                     return Err(Box::new(Refused {
                         error: HarnessError::Protocol(format!(
                             "thread {} was opened concurrently",
                             target.thread
                         )),
                         child,
-                        existing: None,
                     }));
                 }
             },
@@ -772,7 +823,7 @@ impl ClaudeHarness {
             idle_timeout: self.launch.idle_timeout,
         });
         let handle = ChildHandle {
-            commands: commands.clone(),
+            commands,
             task,
             launch_mode,
             generation,
@@ -781,35 +832,41 @@ impl ClaudeHarness {
             Entry::Occupied(mut slot) => {
                 let entry = slot.get_mut();
                 entry.child = Some(handle);
-                entry.model = model.clone();
+                entry.model = model;
             }
             Entry::Vacant(slot) => {
                 slot.insert(ThreadEntry {
                     harness_thread_id: session_id.to_owned(),
                     log,
                     workspace_root: target.workspace_root.clone(),
-                    model: model.clone(),
+                    model,
                     child: Some(handle),
+                    respawn: Arc::new(tokio::sync::Mutex::new(())),
+                    api_key_source_noticed: None,
                 });
             }
         }
-        Ok(LiveChild {
-            commands,
-            model,
-            launch_mode,
-            generation,
-        })
+        Ok(())
     }
 
-    /// The thread's live child, respawned from its entry with `--resume` when it was reaped, under
-    /// the open's launch rules. A failed respawn leaves the entry as it was, so the next call
-    /// tries again.
+    /// Make sure the thread has a live child, respawning it from its entry with `--resume` when it
+    /// was reaped, under the open's launch rules. One respawn per thread at a time: a caller that
+    /// waited on another's respawn finds its child. A failed respawn leaves the entry as it was,
+    /// so the next call tries again.
     async fn ensure_child(&self, thread: ThreadId) -> Result<Respawned, HarnessError> {
-        if let Some(live) = self.live(thread) {
-            return Ok(Respawned::already_live(live));
+        if let Some(model) = self.live_model(thread) {
+            return Ok(Respawned::already_live(model));
+        }
+        let gate = lock(&self.threads)
+            .get(&thread)
+            .map(|entry| entry.respawn.clone())
+            .ok_or(HarnessError::ThreadNotFound(thread))?;
+        let _respawning = gate.lock().await;
+        if let Some(model) = self.live_model(thread) {
+            return Ok(Respawned::already_live(model));
         }
         self.ensure_running()?;
-        let (session_id, target) = lock(&self.threads)
+        let (session_id, target, api_key_source_noticed) = lock(&self.threads)
             .get(&thread)
             .map(|entry| {
                 (
@@ -819,6 +876,7 @@ impl ClaudeHarness {
                         workspace_root: entry.workspace_root.clone(),
                         model: entry.model.clone(),
                     },
+                    entry.api_key_source_noticed.clone(),
                 )
             })
             .ok_or(HarnessError::ThreadNotFound(thread))?;
@@ -847,6 +905,8 @@ impl ClaudeHarness {
         // The handshake set `default`; a `status` it emitted (mapped from `early_lines`) is not
         // drift.
         mapper.set_expected_mode("default");
+        // The thread already showed its API-billing notice, if any: once per thread.
+        mapper.note_api_key_source_noticed(api_key_source_noticed);
         let context_window = spawned.handshake.context_window;
         // The window was persisted at the first resume; seeding the mapper makes the next turn's
         // usage carry it.
@@ -858,26 +918,20 @@ impl ClaudeHarness {
         let model = resumed_model
             .clone()
             .unwrap_or_else(|| target.model.clone());
-        let live = match self.register_child(&target, &session_id, spawned, mapper, model, true) {
-            Ok(live) => live,
-            Err(refused) => {
-                let Refused {
-                    error,
-                    mut child,
-                    existing,
-                } = *refused;
-                debug!(
-                    thread_id = %thread,
-                    harness_thread_id = %session_id,
-                    action = "respawn",
-                    error = %error,
-                    "discarding a freshly respawned claude child"
-                );
-                reap(child.as_mut()).await;
-                // Two callers raced to respawn: both get the winner.
-                return existing.map(Respawned::already_live).ok_or(error);
-            }
-        };
+        if let Err(refused) =
+            self.register_child(&target, &session_id, spawned, mapper, model.clone(), true)
+        {
+            let Refused { error, mut child } = *refused;
+            debug!(
+                thread_id = %thread,
+                harness_thread_id = %session_id,
+                action = "respawn",
+                error = %error,
+                "discarding a freshly respawned claude child"
+            );
+            reap(child.as_mut()).await;
+            return Err(error);
+        }
         info!(
             project_id = display_opt(self.launch.project_id),
             harness = display_opt(self.launch.declaration.as_deref()),
@@ -892,143 +946,11 @@ impl ClaudeHarness {
             "respawned the reaped thread's claude child"
         );
         Ok(Respawned {
-            live,
+            model,
             notice,
             context_window,
             resumed_model,
         })
-    }
-
-    /// `start_turn` on the thread's child, from `attempt`. A hand-off refused because the child
-    /// was reaped under it runs once more on a fresh child, under the same turn id.
-    async fn start_turn_on(
-        &self,
-        thread: &ThreadHandle,
-        mut attempt: Respawned,
-        line: String,
-        overrides: TurnOverrides,
-    ) -> Result<TurnId, HarnessError> {
-        let turn = TurnId::new();
-        let mode = turn_mode(&overrides);
-        let mut notice = attempt.notice.take();
-        let mut retried = false;
-        loop {
-            let live = attempt.live.clone();
-            if mode == "bypassPermissions" && live.launch_mode == LaunchMode::Standard {
-                // `bypassPermissions` is a launch-time capability: the CLI refuses to set it on a
-                // child launched without it.
-                let why = lock(&self.bypass_refused).clone().map_or_else(
-                    || "the child was not launched in that mode".to_owned(),
-                    |sentence| {
-                        format!(
-                            "Claude Code refused to start in bypassPermissions mode ({sentence})"
-                        )
-                    },
-                );
-                warn!(
-                    thread_id = %thread.thread,
-                    harness_thread_id = %thread.harness_thread_id,
-                    action = "start_turn",
-                    mode,
-                    launch_mode = live.launch_mode.as_str(),
-                    "refusing a full_access turn on a child that cannot bypass permissions"
-                );
-                return Err(HarnessError::Unsupported(format!(
-                    "full_access is not available: {why}"
-                )));
-            }
-            let model = overrides.model.clone().unwrap_or(live.model);
-            let resolved_model = self
-                .catalog_snapshot()
-                .and_then(|snapshot| snapshot.resolved_model(&model.model).map(str::to_owned));
-            let settings = TurnSettings {
-                mode: mode.to_owned(),
-                model: Some(model.model.clone()),
-                effort: model
-                    .reasoning_effort
-                    .as_ref()
-                    .map(|effort| effort.0.clone()),
-                resolved_model,
-            };
-            let message = notice.as_ref().map(|notice| notice.message.clone());
-            let line = line.clone();
-            let outcome = self
-                .call(
-                    thread.thread,
-                    live.commands,
-                    "start_turn",
-                    START_TURN_TIMEOUT,
-                    |reply| ChildCommand::StartTurn {
-                        line,
-                        turn,
-                        model,
-                        settings,
-                        notice: message,
-                        reply,
-                    },
-                )
-                .await;
-            match outcome {
-                Err(error) if !retried && self.reaped_under(thread.thread, live.generation) => {
-                    debug!(
-                        thread_id = %thread.thread,
-                        harness_thread_id = %thread.harness_thread_id,
-                        turn_id = %turn,
-                        action = "start_turn",
-                        error = %error,
-                        "reaped under the hand-off; respawning"
-                    );
-                    retried = true;
-                    attempt = self.ensure_child(thread.thread).await?;
-                    notice = notice.or(attempt.notice.take());
-                }
-                outcome => return outcome.map(|()| turn),
-            }
-        }
-    }
-
-    /// `compact_thread` on the thread's child, from `attempt`, retried once as `start_turn_on`.
-    async fn compact_on(
-        &self,
-        thread: &ThreadHandle,
-        mut attempt: Respawned,
-    ) -> Result<(), HarnessError> {
-        let turn = TurnId::new();
-        let mut notice = attempt.notice.take();
-        let mut retried = false;
-        loop {
-            let generation = attempt.live.generation;
-            let message = notice.as_ref().map(|notice| notice.message.clone());
-            let outcome = self
-                .call(
-                    thread.thread,
-                    attempt.live.commands.clone(),
-                    "compact",
-                    CONTROL_TIMEOUT,
-                    |reply| ChildCommand::Compact {
-                        turn,
-                        notice: message,
-                        reply,
-                    },
-                )
-                .await;
-            match outcome {
-                Err(error) if !retried && self.reaped_under(thread.thread, generation) => {
-                    debug!(
-                        thread_id = %thread.thread,
-                        harness_thread_id = %thread.harness_thread_id,
-                        turn_id = %turn,
-                        action = "compact",
-                        error = %error,
-                        "reaped under the hand-off; respawning"
-                    );
-                    retried = true;
-                    attempt = self.ensure_child(thread.thread).await?;
-                    notice = notice.or(attempt.notice.take());
-                }
-                outcome => return outcome,
-            }
-        }
     }
 
     /// Spawn a probe child, read its catalog, and let it exit. Leaves no transcript.
@@ -1183,14 +1105,43 @@ fn child_stopped() -> HarnessError {
     HarnessError::Transport("claude child stopped".into())
 }
 
-/// What the trait methods need of a live child.
-#[derive(Clone)]
-struct LiveChild {
-    commands: mpsc::Sender<ChildCommand>,
-    /// The thread's model: a turn without a model override runs on it.
-    model: ModelRef,
-    launch_mode: LaunchMode,
-    generation: u64,
+/// Where a child's answer to an enqueued command arrives.
+type Answer<T> = oneshot::Receiver<Result<T, HarnessError>>;
+
+/// What `enqueue` did with a command for a thread's child.
+enum Enqueued<T> {
+    /// In the child's queue; its answer comes on this receiver.
+    Sent(Answer<T>),
+    /// This instance holds no such thread.
+    NoThread,
+    /// The thread has no live child: it was reaped.
+    NoChild,
+}
+
+/// Put one command in a child's queue without waiting. The queue is `COMMAND_QUEUE` deep and the
+/// server serializes per thread, so a full queue means a wedged supervisor: waiting would only
+/// hide it.
+fn send_now(
+    commands: &mpsc::Sender<ChildCommand>,
+    command: ChildCommand,
+    thread: ThreadId,
+    what: &'static str,
+) -> Result<(), HarnessError> {
+    match commands.try_send(command) {
+        Ok(()) => Ok(()),
+        Err(mpsc::error::TrySendError::Full(_)) => {
+            warn!(
+                thread_id = %thread,
+                action = what,
+                capacity = COMMAND_QUEUE,
+                "command queue full; the claude supervisor is not keeping up"
+            );
+            Err(HarnessError::Transport(
+                "the claude child's command queue is full".into(),
+            ))
+        }
+        Err(mpsc::error::TrySendError::Closed(_)) => Err(child_stopped()),
+    }
 }
 
 /// Which thread a session child serves, where, and on which model it launches.
@@ -1211,26 +1162,25 @@ struct Spawned {
     context: ChildLogContext,
 }
 
-/// A registration that did not take: the fresh child to reap, and the thread's live child when
-/// another caller registered one first.
+/// A registration that did not take: the fresh child to reap.
 struct Refused {
     error: HarnessError,
     child: Box<dyn ClaudeChild>,
-    existing: Option<LiveChild>,
 }
 
-/// The thread's live child, and what a respawn learned when one ran.
+/// What `ensure_child` found or did: the thread's model, and what a respawn learned when one ran.
 struct Respawned {
-    live: LiveChild,
+    /// The model the thread's child holds.
+    model: ModelRef,
     notice: Option<HarnessNotice>,
     context_window: Option<u32>,
     resumed_model: Option<ModelRef>,
 }
 
 impl Respawned {
-    fn already_live(live: LiveChild) -> Self {
+    fn already_live(model: ModelRef) -> Self {
         Self {
-            live,
+            model,
             notice: None,
             context_window: None,
             resumed_model: None,
@@ -1699,12 +1649,24 @@ impl AgentHarness for ClaudeHarness {
         self.ensure_running()?;
         let request = json!({"subtype": "mcp_status"});
         let hinted = thread.map(|handle| handle.thread);
-        let child = hinted.and_then(|thread| self.child_carrying(thread));
-        if let Some((owner, commands)) = child {
+        let sent = match hinted {
+            Some(hinted) => self.enqueue_mcp_status(hinted, &request),
+            None => Ok(None),
+        };
+        let sent = sent.inspect_err(|error| {
+            warn!(
+                project_id = display_opt(self.launch.project_id),
+                harness = display_opt(self.launch.declaration.as_deref()),
+                thread_id = display_opt(hinted),
+                hinted = true,
+                action = "mcp_status",
+                error = %error,
+                "could not ask a live claude child for its MCP servers"
+            );
+        })?;
+        if let Some((owner, answer)) = sent {
             let payload = self
-                .call(owner, commands, "mcp_status", CONTROL_TIMEOUT, |reply| {
-                    ChildCommand::Control { request, reply }
-                })
+                .answer(owner, "mcp_status", CONTROL_TIMEOUT, answer)
                 .await
                 .inspect_err(|error| {
                     warn!(
@@ -1876,7 +1838,7 @@ impl AgentHarness for ClaudeHarness {
                 let model = respawned
                     .resumed_model
                     .clone()
-                    .unwrap_or_else(|| respawned.live.model.clone());
+                    .unwrap_or_else(|| respawned.model.clone());
                 send_context_window(&opts, model, window);
             }
             handle.warning = respawned.notice;
@@ -2058,7 +2020,11 @@ impl AgentHarness for ClaudeHarness {
             );
             return Ok(());
         }
-        let Some(LiveChild { commands, .. }) = self.live(thread.thread) else {
+        let request = json!({"subtype": "rename_session", "title": name, "source": "host"});
+        let sent = self.enqueue(thread.thread, "rename_session", |_, _, reply| {
+            Ok(ChildCommand::Control { request, reply })
+        })?;
+        let Enqueued::Sent(answer) = sent else {
             debug!(
                 thread_id = %thread.thread,
                 harness_thread_id = %thread.harness_thread_id,
@@ -2067,16 +2033,9 @@ impl AgentHarness for ClaudeHarness {
             );
             return Ok(());
         };
-        let request = json!({"subtype": "rename_session", "title": name, "source": "host"});
-        self.call(
-            thread.thread,
-            commands,
-            "rename_session",
-            CONTROL_TIMEOUT,
-            |reply| ChildCommand::Control { request, reply },
-        )
-        .await
-        .map(|_| ())
+        self.answer(thread.thread, "rename_session", CONTROL_TIMEOUT, answer)
+            .await
+            .map(|_| ())
     }
 
     async fn set_thread_archived(
@@ -2100,28 +2059,26 @@ impl AgentHarness for ClaudeHarness {
         if is_task_native_id(&thread.harness_thread_id) {
             return self.interrupt_route(thread).await;
         }
-        let child = lock(&self.threads)
-            .get(&thread.thread)
-            .map(|entry| entry.child.as_ref().map(|child| child.commands.clone()))
-            .ok_or(HarnessError::ThreadNotFound(thread.thread))?;
-        let Some(commands) = child else {
-            // Reaped: the trait's contract is "interrupt the active turn", and there is none.
-            debug!(
-                thread_id = %thread.thread,
-                harness_thread_id = %thread.harness_thread_id,
-                action = "interrupt",
-                "no live claude child; nothing to interrupt"
-            );
-            return Ok(());
-        };
-        self.call(
-            thread.thread,
-            commands,
-            "interrupt",
-            CONTROL_TIMEOUT,
-            |reply| ChildCommand::Interrupt { reply },
-        )
-        .await
+        let sent = self.enqueue(thread.thread, "interrupt", |_, _, reply| {
+            Ok(ChildCommand::Interrupt { reply })
+        })?;
+        match sent {
+            Enqueued::Sent(answer) => {
+                self.answer(thread.thread, "interrupt", CONTROL_TIMEOUT, answer)
+                    .await
+            }
+            Enqueued::NoThread => Err(HarnessError::ThreadNotFound(thread.thread)),
+            Enqueued::NoChild => {
+                // Reaped: the trait's contract is "interrupt the active turn", and there is none.
+                debug!(
+                    thread_id = %thread.thread,
+                    harness_thread_id = %thread.harness_thread_id,
+                    action = "interrupt",
+                    "no live claude child; nothing to interrupt"
+                );
+                Ok(())
+            }
+        }
     }
 
     async fn start_turn(
@@ -2132,13 +2089,85 @@ impl AgentHarness for ClaudeHarness {
     ) -> Result<TurnId, HarnessError> {
         let UserInput::Text { text, attachments } = input;
         let line = user_message_line(&text, &attachments)?;
-        let attempt = self.ensure_child(thread.thread).await?;
-        self.start_turn_on(thread, attempt, line, overrides).await
+        let turn = TurnId::new();
+        let mode = turn_mode(&overrides);
+        // Read before the `threads` lock, so `enqueue` nests no other lock.
+        let bypass_refused = lock(&self.bypass_refused).clone();
+        let catalog = self.catalog_snapshot();
+        let answer = self
+            .enqueue_respawning(
+                thread.thread,
+                "start_turn",
+                |entry, child, notice, reply| {
+                    if mode == "bypassPermissions" && child.launch_mode == LaunchMode::Standard {
+                        // `bypassPermissions` is a launch-time capability: the CLI refuses to set
+                        // it on a child launched without it.
+                        let why = bypass_refused.clone().map_or_else(
+                            || "the child was not launched in that mode".to_owned(),
+                            |sentence| {
+                                format!(
+                                    "Claude Code refused to start in bypassPermissions mode \
+                                     ({sentence})"
+                                )
+                            },
+                        );
+                        warn!(
+                            thread_id = %thread.thread,
+                            harness_thread_id = %thread.harness_thread_id,
+                            action = "start_turn",
+                            mode,
+                            launch_mode = child.launch_mode.as_str(),
+                            "refusing a full_access turn on a child that cannot bypass permissions"
+                        );
+                        return Err(HarnessError::Unsupported(format!(
+                            "full_access is not available: {why}"
+                        )));
+                    }
+                    let model = overrides
+                        .model
+                        .clone()
+                        .unwrap_or_else(|| entry.model.clone());
+                    let resolved_model = catalog.as_ref().and_then(|snapshot| {
+                        snapshot.resolved_model(&model.model).map(str::to_owned)
+                    });
+                    let settings = TurnSettings {
+                        mode: mode.to_owned(),
+                        model: Some(model.model.clone()),
+                        effort: model
+                            .reasoning_effort
+                            .as_ref()
+                            .map(|effort| effort.0.clone()),
+                        resolved_model,
+                    };
+                    Ok(ChildCommand::StartTurn {
+                        line: line.clone(),
+                        turn,
+                        model,
+                        settings,
+                        notice,
+                        reply,
+                    })
+                },
+            )
+            .await?;
+        self.answer(thread.thread, "start_turn", START_TURN_TIMEOUT, answer)
+            .await
+            .map(|()| turn)
     }
 
     async fn compact_thread(&self, thread: &ThreadHandle) -> Result<(), HarnessError> {
-        let attempt = self.ensure_child(thread.thread).await?;
-        self.compact_on(thread, attempt).await
+        let turn = TurnId::new();
+        let answer = self
+            .enqueue_respawning(thread.thread, "compact", |_, _, notice, reply| {
+                Ok(ChildCommand::Compact {
+                    turn,
+                    notice,
+                    reply,
+                })
+            })
+            .await?;
+        self.answer(thread.thread, "compact", CONTROL_TIMEOUT, answer)
+            .await
     }
 
     async fn respond_approval(
@@ -2171,22 +2200,20 @@ impl AgentHarness for ClaudeHarness {
         }
         // A sub-agent's ask is answered by the child that carries its route.
         let thread = ask.owner;
-        let LiveChild { commands, .. } = self
-            .live(thread)
-            .ok_or(HarnessError::ThreadNotFound(ask.thread))?;
-        self.call(
-            thread,
-            commands,
-            "respond_approval",
-            CONTROL_TIMEOUT,
-            |reply| ChildCommand::RespondApproval {
+        let asked_on = ask.thread;
+        let sent = self.enqueue(thread, "respond_approval", |_, _, reply| {
+            Ok(ChildCommand::RespondApproval {
                 id: req,
                 ask,
                 decision,
                 reply,
-            },
-        )
-        .await
+            })
+        })?;
+        let Enqueued::Sent(answer) = sent else {
+            return Err(HarnessError::ThreadNotFound(asked_on));
+        };
+        self.answer(thread, "respond_approval", CONTROL_TIMEOUT, answer)
+            .await
     }
 
     async fn respond_server_request(
@@ -2205,22 +2232,20 @@ impl AgentHarness for ClaudeHarness {
             )));
         };
         let thread = ask.owner;
-        let LiveChild { commands, .. } = self
-            .live(thread)
-            .ok_or(HarnessError::ThreadNotFound(ask.thread))?;
-        self.call(
-            thread,
-            commands,
-            "respond_server_request",
-            CONTROL_TIMEOUT,
-            |reply| ChildCommand::RespondServerRequest {
+        let asked_on = ask.thread;
+        let sent = self.enqueue(thread, "respond_server_request", |_, _, reply| {
+            Ok(ChildCommand::RespondServerRequest {
                 id: req,
                 ask,
                 response,
                 reply,
-            },
-        )
-        .await
+            })
+        })?;
+        let Enqueued::Sent(answer) = sent else {
+            return Err(HarnessError::ThreadNotFound(asked_on));
+        };
+        self.answer(thread, "respond_server_request", CONTROL_TIMEOUT, answer)
+            .await
     }
 }
 
@@ -4957,6 +4982,16 @@ mod tests {
 
     // ---- milestone 6: the supervisor state machine ---------------------------------------------
 
+    /// The command sender of a thread's live child, for a test that drives the supervisor
+    /// directly, past the façade.
+    fn child_commands(harness: &ClaudeHarness, thread: ThreadId) -> mpsc::Sender<ChildCommand> {
+        lock(&harness.threads)
+            .get(&thread)
+            .and_then(|entry| entry.child.as_ref())
+            .map(|child| child.commands.clone())
+            .expect("a live child")
+    }
+
     fn opus_turn() -> TurnOverrides {
         turn_overrides(PermissionPreset::AskFirst, Mode::Build, Some(model("opus")))
     }
@@ -5159,7 +5194,7 @@ mod tests {
             .start_turn(&handle, text("go"), overrides())
             .await
             .unwrap();
-        let commands = harness.live(handle.thread).unwrap().commands;
+        let commands = child_commands(&harness, handle.thread);
         let started = Instant::now();
         let (deleted, refused) = tokio::join!(harness.delete_thread(&handle), async {
             tokio::time::sleep(Duration::from_millis(100)).await;
@@ -5201,7 +5236,7 @@ mod tests {
         let (harness, _) = harness(vec![child.ignoring_eof()]);
         let (options, _updates) = open_options(ThreadId::new(), None, "sonnet");
         let handle = harness.open_thread(options).await.unwrap();
-        let commands = harness.live(handle.thread).unwrap().commands;
+        let commands = child_commands(&harness, handle.thread);
         let (first, done_first) = oneshot::channel();
         let (second, done_second) = oneshot::channel();
         commands
@@ -6776,42 +6811,6 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    #[traced_test]
-    async fn a_turn_that_lands_in_the_reap_window_runs_on_a_fresh_child() {
-        // The first child ignores EOF, so its reap drains for the whole exit grace.
-        let (first, first_record) = scripted(handshake_steps("sonnet"), Vec::new());
-        let (second, _) = one_turn_child(resume_steps("sonnet"));
-        let (harness, _) = harness_with(reaping(), vec![first.ignoring_eof(), second]);
-        let thread = ThreadId::new();
-        let (options, _updates) = open_options(thread, None, "sonnet");
-        let handle = harness.open_thread(options).await.unwrap();
-        let mut stream = harness.subscribe(&handle);
-        // A caller that looked the child up before the reap took it.
-        let stale = harness.live(thread).unwrap();
-        tokio::time::sleep(IDLE).await;
-        reaped(&harness, &first_record).await;
-        assert!(!lock(&first_record).killed, "still draining");
-
-        let line = user_message_line("go", &[]).unwrap();
-        let turn = harness
-            .start_turn_on(&handle, Respawned::already_live(stale), line, overrides())
-            .await
-            .unwrap();
-        let events = until_completed(&mut stream).await;
-        assert_eq!(turns_started(&events), [turn]);
-        assert_eq!(completion(&events).1, TurnStatusKind::Completed);
-        tokio::time::sleep(STOP_EXIT_GRACE).await;
-        assert!(lock(&first_record).killed);
-        assert!(logs_contain("reaped under the hand-off; respawning"));
-        logs_assert(a_line_with(&["action=\"stop_kill\"", "reason=\"idle\""]));
-        logs_assert(a_line_with(&[
-            "action=\"stop_refused\"",
-            "command=\"start_turn\"",
-        ]));
-        harness.shutdown().await.unwrap();
-    }
-
-    #[tokio::test(start_paused = true)]
     async fn a_reaped_thread_is_interrupted_and_renamed_as_no_ops() {
         let (child, record) = scripted(handshake_steps("sonnet"), Vec::new());
         let (harness, spawner) = harness_with(reaping(), vec![child]);
@@ -7005,5 +7004,429 @@ mod tests {
         ]));
         harness.shutdown().await.unwrap();
         assert!(matches!(stream.recv().await, Err(EventStreamError::Closed)));
+    }
+
+    // ---- milestone 6 review: the reap window, quiet stdout, respawn gate ----------------------
+
+    #[tokio::test(start_paused = true)]
+    #[traced_test]
+    async fn a_command_queued_when_the_idle_timer_fires_cancels_the_reap() {
+        let (child, record) = one_turn_child(handshake_steps("sonnet"));
+        let (harness, spawner) = harness_with(reaping(), vec![child]);
+        let (options, _updates) = open_options(ThreadId::new(), None, "sonnet");
+        let handle = harness.open_thread(options).await.unwrap();
+        let mut stream = harness.subscribe(&handle);
+
+        tokio::time::sleep(IDLE - Duration::from_millis(1)).await;
+        let turn = harness.start_turn(&handle, text("pong?"), overrides());
+        tokio::pin!(turn);
+        // The first poll enqueues the hand-off: the child is live, nothing is awaited before.
+        assert!(futures::poll!(&mut turn).is_pending());
+        // The idle timer is due now, with the hand-off already in the queue.
+        tokio::time::advance(Duration::from_millis(1)).await;
+        let turn = turn.await.unwrap();
+        let events = until_completed(&mut stream).await;
+        assert_eq!(completion(&events).0, turn);
+        assert_eq!(spawner.spawns().len(), 1, "the turn ran on the first child");
+        assert!(!lock(&record).stdin_closed);
+        logs_assert(no_line_with("action=\"child_reaped\""));
+        logs_assert(no_line_with("action=\"stop_refused\""));
+
+        // The clock restarts when the turn ends.
+        tokio::time::sleep(IDLE - Duration::from_secs(1)).await;
+        assert_eq!(harness.live_children(), 1);
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        reaped(&harness, &record).await;
+        harness.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[traced_test]
+    async fn a_command_that_beats_the_take_cancels_the_reap() {
+        // Real time: the test holds the `threads` lock the reap needs, so the reap blocks just
+        // before its take while a command is queued, which no timing can arrange.
+        let (child, record) = scripted(
+            handshake_steps("sonnet"),
+            vec![Step::OnStdin(
+                control("interrupt"),
+                vec![Action::Respond(json!({"still_queued": []}))],
+            )],
+        );
+        let launch = ClaudeLaunchOptions {
+            idle_timeout: Some(Duration::from_millis(20)),
+            ..ClaudeLaunchOptions::default()
+        };
+        let (harness, _) = harness_with(launch, vec![child]);
+        let (options, _updates) = open_options(ThreadId::new(), None, "sonnet");
+        let handle = harness.open_thread(options).await.unwrap();
+        let commands = child_commands(&harness, handle.thread);
+        let answer = {
+            let _threads = lock(&harness.threads);
+            // The idle timer fires meanwhile, and the reap waits on this lock.
+            std::thread::sleep(Duration::from_millis(200));
+            let (reply, answer) = oneshot::channel();
+            commands
+                .try_send(ChildCommand::Interrupt { reply })
+                .unwrap();
+            answer
+        };
+        drop(commands);
+        tokio::time::timeout(Duration::from_secs(5), answer)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        logs_assert(lines_with(
+            1,
+            &["action=\"reap_cancelled\"", "command=\"interrupt\""],
+        ));
+
+        // Idle again, it is reaped: once, the cancelled attempt reaped nothing.
+        for _ in 0..500 {
+            if lock(&record).stdin_closed && harness.live_children() == 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(lock(&record).stdin_closed);
+        assert_eq!(harness.live_children(), 0);
+        logs_assert(lines_with(1, &["INFO", "action=\"child_reaped\""]));
+        harness.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    #[traced_test]
+    async fn a_control_request_queued_when_the_idle_timer_fires_rearms_it() {
+        let (child, record) = scripted(
+            handshake_steps("sonnet"),
+            vec![Step::OnStdin(
+                control("interrupt"),
+                vec![Action::Respond(json!({"still_queued": []}))],
+            )],
+        );
+        let (harness, _) = harness_with(reaping(), vec![child]);
+        let (options, _updates) = open_options(ThreadId::new(), None, "sonnet");
+        let handle = harness.open_thread(options).await.unwrap();
+
+        tokio::time::sleep(IDLE - Duration::from_millis(1)).await;
+        let (reply, answer) = oneshot::channel();
+        child_commands(&harness, handle.thread)
+            .try_send(ChildCommand::Interrupt { reply })
+            .unwrap();
+        tokio::time::advance(Duration::from_millis(1)).await;
+        answer.await.unwrap().unwrap();
+        assert_eq!(harness.live_children(), 1);
+        logs_assert(no_line_with("action=\"child_reaped\""));
+        logs_assert(a_line_with(&[
+            "action=\"idle\"",
+            "idle=false",
+            "reason=\"control_request\"",
+        ]));
+        logs_assert(lines_with(2, &["action=\"idle\"", "idle=true"]));
+
+        tokio::time::sleep(IDLE).await;
+        reaped(&harness, &record).await;
+        harness.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_stop_task_on_a_reaped_threads_sub_agent_reports_it_ended() {
+        // The child ignores EOF, so it is still draining (its exit handling not run) when the
+        // sub-agent is interrupted: the routes turned cold at the reap itself.
+        let (child, record) = scripted(
+            handshake_steps("sonnet"),
+            vec![Step::OnStdin(
+                user(),
+                vec![Action::EmitFixture {
+                    name: "delegation",
+                    skip_types: &[],
+                }],
+            )],
+        );
+        let (harness, _) = harness_with(reaping(), vec![child.ignoring_eof()]);
+        let (options, _updates) = open_options(ThreadId::new(), None, "sonnet");
+        let handle = harness.open_thread(options).await.unwrap();
+        let mut stream = harness.subscribe(&handle);
+        harness
+            .start_turn(&handle, text("delegate"), overrides())
+            .await
+            .unwrap();
+        let link = spawned_link(&mut stream).await;
+        let route = harness
+            .claim_native_thread(
+                ThreadId::new(),
+                link.harness_thread_id,
+                PathBuf::from(WORKSPACE),
+            )
+            .await
+            .unwrap();
+        until_completed(&mut stream).await;
+
+        tokio::time::sleep(IDLE).await;
+        reaped(&harness, &record).await;
+        assert!(!lock(&record).killed, "still draining");
+        assert!(matches!(
+            harness.interrupt(&route).await,
+            Err(HarnessError::Unsupported(message)) if message.contains("no longer running")
+        ));
+        harness.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    #[traced_test]
+    async fn stdout_activity_postpones_the_reap() {
+        let (child, record) = one_turn_child(handshake_steps("sonnet"));
+        let injector = child.injector();
+        let (harness, _) = harness_with(reaping(), vec![child]);
+        let (options, _updates) = open_options(ThreadId::new(), None, "sonnet");
+        let handle = harness.open_thread(options).await.unwrap();
+        let mut stream = harness.subscribe(&handle);
+        harness
+            .start_turn(&handle, text("pong?"), overrides())
+            .await
+            .unwrap();
+        until_completed(&mut stream).await;
+
+        // A frame kind the mapper does not model, every half timeout: idle, but not quiet.
+        let unknown = json!({"type": "system", "subtype": "future_thing"}).to_string();
+        for _ in 0..6 {
+            tokio::time::sleep(IDLE / 2).await;
+            injector.emit(unknown.clone());
+        }
+        tokio::time::sleep(Duration::from_millis(1)).await;
+        assert_eq!(harness.live_children(), 1);
+        assert!(!lock(&record).stdin_closed);
+        logs_assert(a_line_with(&["action=\"idle\"", "idle=true"]));
+        logs_assert(no_line_with("action=\"child_reaped\""));
+
+        tokio::time::sleep(IDLE).await;
+        reaped(&harness, &record).await;
+        harness.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    #[traced_test]
+    async fn concurrent_respawns_share_one_child() {
+        let (first, first_record) = scripted(handshake_steps("sonnet"), Vec::new());
+        let (second, _) = scripted(
+            resume_steps("sonnet"),
+            vec![
+                Step::OnStdin(user(), vec![text_turn()]),
+                Step::OnStdin(user(), vec![text_turn()]),
+            ],
+        );
+        // The respawn's handshake waits on the gate, so the second caller arrives mid-respawn.
+        let (second, gate) = second.gated();
+        gate.send_replace(false);
+        let (harness, spawner) = harness_with(reaping(), vec![first, second]);
+        let (options, _updates) = open_options(ThreadId::new(), None, "sonnet");
+        let handle = harness.open_thread(options).await.unwrap();
+        tokio::time::sleep(IDLE).await;
+        reaped(&harness, &first_record).await;
+
+        let (one, two, ()) = tokio::join!(
+            harness.start_turn(&handle, text("one"), overrides()),
+            harness.start_turn(&handle, text("two"), overrides()),
+            async {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                gate.send_replace(true);
+            }
+        );
+        // The second runs on the first's respawn: started, or `ThreadBusy` if it reached the
+        // child while the first's settings were in flight.
+        one.unwrap();
+        assert!(
+            matches!(two, Ok(_) | Err(HarnessError::ThreadBusy { .. })),
+            "{two:?}"
+        );
+        assert_eq!(spawner.spawns().len(), 2, "the open and one respawn");
+        logs_assert(lines_with(1, &["action=\"respawn\"", "resume_fallback"]));
+        logs_assert(no_line_with("already holding a live child"));
+        harness.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    #[traced_test]
+    async fn a_reaped_childs_trailing_frames_are_dropped() {
+        let (child, record) = scripted(handshake_steps("sonnet"), Vec::new());
+        let injector = child.injector();
+        let (harness, _) = harness_with(reaping(), vec![child.ignoring_eof()]);
+        let (options, _updates) = open_options(ThreadId::new(), None, "sonnet");
+        let handle = harness.open_thread(options).await.unwrap();
+        let mut stream = harness.subscribe(&handle);
+        tokio::time::sleep(IDLE).await;
+        reaped(&harness, &record).await;
+
+        // While it drains, the child starts a turn of its own: the `init` and messages of a
+        // background continuation, which would otherwise open a turn on the thread.
+        for line in &fixture_lines("background-bash")[15..20] {
+            injector.emit(line.clone());
+        }
+        // And asks for a tool: nothing is published for the user to answer.
+        injector.emit(
+            json!({"type": "control_request", "request_id": "late-1", "request": {
+                "subtype": "can_use_tool", "tool_name": "Bash", "input": {"command": "ls"},
+                "permission_suggestions": null, "tool_use_id": "toolu_late"
+            }})
+            .to_string(),
+        );
+        tokio::time::sleep(STOP_EXIT_GRACE).await;
+        assert!(lock(&record).killed);
+        assert!(stream.try_recv().is_none(), "nothing reached the thread");
+        assert_eq!(lock(&harness.pending).len(), 0, "no ask was recorded");
+        logs_assert(lines_with(1, &["WARN", "action=\"reaped_frame\""]));
+        logs_assert(a_line_with(&["action=\"child_exited\"", "reaped=true"]));
+        logs_assert(no_line_with("reaped_outputs=0"));
+        harness.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    #[traced_test]
+    async fn the_fallback_model_follows_a_confirmed_model_change() {
+        let (child, record) = scripted(
+            handshake_steps("sonnet"),
+            vec![
+                Step::OnStdin(control("set_model"), vec![Action::Respond(Value::Null)]),
+                Step::OnStdin(
+                    control("get_settings"),
+                    vec![Action::Respond(settings("opus"))],
+                ),
+                Step::OnStdin(user(), vec![text_turn()]),
+                Step::OnStdin(user(), vec![text_turn()]),
+            ],
+        );
+        let (harness, _) = harness(vec![child]);
+        let (options, _updates) = open_options(ThreadId::new(), None, "sonnet");
+        let handle = harness.open_thread(options).await.unwrap();
+        let mut stream = harness.subscribe(&handle);
+        harness
+            .start_turn(&handle, text("one"), opus_turn())
+            .await
+            .unwrap();
+        until_completed(&mut stream).await;
+        // No override: the fallback is what the CLI holds, so nothing is switched back.
+        harness
+            .start_turn(&handle, text("two"), overrides())
+            .await
+            .unwrap();
+        until_completed(&mut stream).await;
+        let set_models = subtypes_written(&record)
+            .iter()
+            .filter(|subtype| *subtype == "set_model")
+            .count();
+        assert_eq!(set_models, 1);
+        logs_assert(a_line_with(&[
+            "action=\"turn_settings\"",
+            "model=opus",
+            "model_or_effort_changed=false",
+        ]));
+        harness.shutdown().await.unwrap();
+    }
+
+    /// The text-turn frames with the `init` frame's `apiKeySource` set to an API key.
+    fn text_turn_on_an_api_key() -> Action {
+        Action::Emit(
+            fixture_lines("text-turn")
+                .into_iter()
+                .map(|line| {
+                    let mut frame: Value = serde_json::from_str(&line).unwrap();
+                    if frame["type"] == "system" && frame["subtype"] == "init" {
+                        frame["apiKeySource"] = json!("ANTHROPIC_API_KEY");
+                        return frame.to_string();
+                    }
+                    line
+                })
+                .collect(),
+        )
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn the_api_key_notice_is_not_repeated_after_a_respawn() {
+        let (first, first_record) = scripted(
+            handshake_steps("sonnet"),
+            vec![Step::OnStdin(user(), vec![text_turn_on_an_api_key()])],
+        );
+        let (second, _) = scripted(
+            resume_steps("sonnet"),
+            vec![Step::OnStdin(user(), vec![text_turn_on_an_api_key()])],
+        );
+        let (harness, _) = harness_with(reaping(), vec![first, second]);
+        let (options, _updates) = open_options(ThreadId::new(), None, "sonnet");
+        let handle = harness.open_thread(options).await.unwrap();
+        let mut stream = harness.subscribe(&handle);
+        harness
+            .start_turn(&handle, text("one"), overrides())
+            .await
+            .unwrap();
+        let mut events = until_completed(&mut stream).await;
+        tokio::time::sleep(IDLE).await;
+        reaped(&harness, &first_record).await;
+        harness
+            .start_turn(&handle, text("two"), overrides())
+            .await
+            .unwrap();
+        events.extend(until_completed(&mut stream).await);
+        let notices: Vec<_> = events
+            .iter()
+            .filter_map(|event| match event {
+                AgentEvent::Notice { message, .. } => Some(message.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(notices.len(), 1, "{notices:?}");
+        assert!(notices[0].contains("ANTHROPIC_API_KEY"));
+        harness.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn an_idle_timeout_too_large_for_the_clock_never_reaps() {
+        let (child, record) = scripted(handshake_steps("sonnet"), Vec::new());
+        let launch = ClaudeLaunchOptions {
+            idle_timeout: Some(Duration::from_secs(i64::MAX as u64)),
+            ..ClaudeLaunchOptions::default()
+        };
+        let (harness, _) = harness_with(launch, vec![child]);
+        let thread = ThreadId::new();
+        let (options, _updates) = open_options(thread, None, "sonnet");
+        harness.open_thread(options).await.unwrap();
+        tokio::time::sleep(Duration::from_secs(24 * 3600)).await;
+        assert_eq!(harness.live_children(), 1);
+        assert!(!lock(&record).stdin_closed);
+        // The supervisor is still running: an overflowing deadline would have panicked it.
+        let running = lock(&harness.threads)
+            .get(&thread)
+            .and_then(|entry| entry.child.as_ref())
+            .is_some_and(|child| !child.task.is_finished());
+        assert!(running, "the supervisor task ended");
+        harness.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    #[traced_test]
+    async fn a_full_command_queue_is_an_error_not_a_wait() {
+        // The CLI stops reading stdin: the supervisor blocks on its first write, and the queue
+        // behind it fills.
+        let (child, _) = scripted(handshake_steps("sonnet"), Vec::new());
+        let (child, gate) = child.gated();
+        let (harness, _) = harness(vec![child]);
+        let (options, _updates) = open_options(ThreadId::new(), None, "sonnet");
+        let handle = harness.open_thread(options).await.unwrap();
+        gate.send_replace(false);
+        let started = Instant::now();
+        let renames = (0..COMMAND_QUEUE + 2).map(|_| harness.set_thread_name(&handle, "x"));
+        let outcomes = futures::future::join_all(renames).await;
+        let full = outcomes
+            .iter()
+            .filter(|outcome| {
+                matches!(outcome, Err(HarnessError::Transport(message))
+                    if message.contains("command queue is full"))
+            })
+            .count();
+        assert!(full >= 1, "{outcomes:?}");
+        // The rest waited for their answer, not for room in the queue.
+        assert!(started.elapsed() <= CONTROL_TIMEOUT + Duration::from_secs(1));
+        logs_assert(a_line_with(&["WARN", "command queue full"]));
+        gate.send_replace(true);
+        harness.shutdown().await.unwrap();
     }
 }
