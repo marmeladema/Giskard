@@ -462,6 +462,16 @@ logged as a warning and only omits configured extra roots; the thread workspace
 root is still sent for Auto Approve. Ask First remains read-only, and Full
 Access does not need additional roots.
 
+## MCP status (`mcpServerStatus/list`)
+
+`list_mcp_servers` pages through `mcpServerStatus/list` on the worker queue and maps each entry with
+`map_mcp_server_status`: name, auth status, server info, tools, resources and resource templates
+carry through, and `runtimeStatus` becomes the neutral `connection` (`notStarted`, `starting`,
+`connected`, `authenticationRequired`, `failed`, `cancelled`, `disabled` onto the
+`McpConnectionState` of the same name; an absent `runtimeStatus` leaves `connection` absent).
+Codex lists resources, so `resources` and `resource_templates` are always reported (`Some`, empty
+when the server has none). The thread hint is ignored: one app-server serves the whole project.
+
 ## Model catalog (`model/list`)
 
 The adapter advertises the `model_listing` capability and implements

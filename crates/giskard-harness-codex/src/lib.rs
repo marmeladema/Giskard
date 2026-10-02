@@ -46,8 +46,8 @@ use giskard_core::error::HarnessError;
 use giskard_core::event::AgentEvent;
 use giskard_core::ids::{ApprovalId, ProjectId, ServerRequestId, ThreadId, TurnId};
 use giskard_core::mcp::{
-    McpAuthStatus, McpOauthStart, McpResource, McpResourceTemplate, McpServerInfo, McpServerStatus,
-    McpTool,
+    McpAuthStatus, McpConnection, McpConnectionState, McpOauthStart, McpResource,
+    McpResourceTemplate, McpServerInfo, McpServerStatus, McpTool,
 };
 use giskard_core::model::{ModelDescriptor, ModelRef};
 use giskard_core::server_request::ServerRequestResponse;
@@ -2629,14 +2629,34 @@ fn map_mcp_server_status(status: codex_codes::McpServerStatus) -> McpServerStatu
     McpServerStatus {
         name: status.name,
         auth_status: map_mcp_auth_status(status.auth_status),
+        connection: status.runtime_status.map(|state| McpConnection {
+            state: map_mcp_connection_state(state),
+            error: None,
+        }),
         server_info: status.server_info.map(map_mcp_server_info),
         tools: status.tools.into_values().map(map_mcp_tool).collect(),
-        resources: status.resources.into_iter().map(map_mcp_resource).collect(),
-        resource_templates: status
-            .resource_templates
-            .into_iter()
-            .map(map_mcp_resource_template)
-            .collect(),
+        resources: Some(status.resources.into_iter().map(map_mcp_resource).collect()),
+        resource_templates: Some(
+            status
+                .resource_templates
+                .into_iter()
+                .map(map_mcp_resource_template)
+                .collect(),
+        ),
+    }
+}
+
+fn map_mcp_connection_state(state: codex_codes::McpServerConnectionStatus) -> McpConnectionState {
+    match state {
+        codex_codes::McpServerConnectionStatus::NotStarted => McpConnectionState::NotStarted,
+        codex_codes::McpServerConnectionStatus::Starting => McpConnectionState::Starting,
+        codex_codes::McpServerConnectionStatus::Connected => McpConnectionState::Connected,
+        codex_codes::McpServerConnectionStatus::AuthenticationRequired => {
+            McpConnectionState::AuthenticationRequired
+        }
+        codex_codes::McpServerConnectionStatus::Failed => McpConnectionState::Failed,
+        codex_codes::McpServerConnectionStatus::Cancelled => McpConnectionState::Cancelled,
+        codex_codes::McpServerConnectionStatus::Disabled => McpConnectionState::Disabled,
     }
 }
 
@@ -5924,11 +5944,58 @@ mod tests {
         assert_eq!(mapped.server_info.unwrap().title.unwrap(), "Cloudflare MCP");
         assert_eq!(mapped.tools[0].name, "jira_search");
         assert_eq!(mapped.tools[0].description.as_deref(), Some("Search Jira"));
-        assert_eq!(mapped.resources[0].uri, "gitlab://project/group/name");
         assert_eq!(
-            mapped.resource_templates[0].uri_template,
-            "jira://issue/{key}"
+            mapped
+                .resources
+                .as_ref()
+                .map(|resources| resources[0].uri.as_str()),
+            Some("gitlab://project/group/name")
         );
+        assert_eq!(
+            mapped
+                .resource_templates
+                .as_ref()
+                .map(|templates| templates[0].uri_template.as_str()),
+            Some("jira://issue/{key}")
+        );
+        assert_eq!(mapped.connection, None, "no runtimeStatus, no connection");
+    }
+
+    #[test]
+    fn mcp_server_status_maps_the_runtime_status_onto_the_connection() {
+        for (wire, expected) in [
+            ("notStarted", McpConnectionState::NotStarted),
+            ("starting", McpConnectionState::Starting),
+            ("connected", McpConnectionState::Connected),
+            (
+                "authenticationRequired",
+                McpConnectionState::AuthenticationRequired,
+            ),
+            ("failed", McpConnectionState::Failed),
+            ("cancelled", McpConnectionState::Cancelled),
+            ("disabled", McpConnectionState::Disabled),
+        ] {
+            let status: codex_codes::McpServerStatus = serde_json::from_value(serde_json::json!({
+                "authStatus": "unsupported",
+                "runtimeStatus": wire,
+                "name": "local",
+                "tools": {},
+                "resources": [],
+                "resourceTemplates": []
+            }))
+            .unwrap();
+            let mapped = map_mcp_server_status(status);
+            assert_eq!(
+                mapped.connection,
+                Some(McpConnection {
+                    state: expected,
+                    error: None,
+                }),
+                "{wire}"
+            );
+            assert_eq!(mapped.resources, Some(Vec::new()), "reported as none");
+            assert_eq!(mapped.resource_templates, Some(Vec::new()));
+        }
     }
 
     #[test]

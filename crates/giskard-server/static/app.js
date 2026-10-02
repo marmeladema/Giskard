@@ -8924,18 +8924,33 @@ function jsonPreview(v) {
 }
 
 /* ---------- MCP servers ---------- */
+// A harness that cannot list resources omits `resources` (and `resource_templates`): absent means
+// "not reported", an empty array means "none".
+function mcpReportsResources(server) {
+  return Array.isArray(server.resources);
+}
+function mcpResourceCount(server) {
+  return (server.resources || []).length + (server.resource_templates || []).length;
+}
+function mcpConnectionState(server) {
+  return server.connection && server.connection.state ? server.connection.state : null;
+}
 function mcpCounts() {
   const servers = state.mcpServers || [];
   const tools = servers.reduce((n, s) => n + ((s.tools || []).length), 0);
-  const resources = servers.reduce((n, s) => n + ((s.resources || []).length) + ((s.resource_templates || []).length), 0);
-  const needsAuth = servers.filter(s => s.auth_status === "not_logged_in").length;
-  return { servers:servers.length, tools, resources, needsAuth };
+  const reporting = servers.filter(mcpReportsResources);
+  const resources = reporting.reduce((n, s) => n + mcpResourceCount(s), 0);
+  const needsAuth = servers.filter(s => s.auth_status === "not_logged_in"
+    || mcpConnectionState(s) === "authentication_required").length;
+  const failed = servers.filter(s => mcpConnectionState(s) === "failed").length;
+  return { servers:servers.length, tools, resources, resourcesReported:reporting.length > 0, needsAuth, failed };
 }
 function mcpOverallState() {
   if (state.mcpError) return "err";
   if (state.mcpLoading) return "";
   const counts = mcpCounts();
   if (!counts.servers) return "";
+  if (counts.failed) return "err";
   if (counts.needsAuth) return "warn";
   return "ok";
 }
@@ -9042,7 +9057,7 @@ function renderMcpMenu() {
       <button id="mcpRefresh" type="button">${reloadLabel}</button>
       <button id="mcpClose" type="button">Close</button>
     </div>
-    <div class="mcp-summary">${counts.servers} servers · ${counts.tools} tools · ${counts.resources} resources${counts.needsAuth ? ` · ${counts.needsAuth} need auth` : ""}</div>
+    <div class="mcp-summary">${counts.servers} servers · ${counts.tools} tools${counts.resourcesReported ? ` · ${counts.resources} resources` : ""}${counts.needsAuth ? ` · ${counts.needsAuth} need auth` : ""}</div>
     <div class="mcp-list">${body}</div>`;
   $("mcpRefresh").onclick = reloadMcpServers;
   $("mcpClose").onclick = () => { $("mcpMenu").hidden = true; };
@@ -9062,16 +9077,31 @@ function renderMcpServerCard(server) {
   const name = server.name || "(unnamed)";
   const expanded = state.expandedMcps.has(name);
   const tools = server.tools || [];
+  const reportsResources = mcpReportsResources(server);
   const resources = server.resources || [];
   const templates = server.resource_templates || [];
-  const auth = mcpAuthLabel(server.auth_status);
-  const chipClass = mcpAuthTone(server.auth_status);
+  const connection = mcpConnectionView(server.connection);
+  const authLabel = mcpAuthLabel(server.auth_status);
+  // With a connection state the dot and first chip say whether the server is connected; the auth
+  // chip follows only when it states something ("Unknown" does not, nor a repeated "Needs auth").
+  // Without one (a harness that does not report it) the auth status leads, as it always did.
+  const chipClass = connection ? connection.tone : mcpAuthTone(server.auth_status);
+  const leadLabel = connection ? connection.label : authLabel;
+  const authChip = connection && server.auth_status && server.auth_status !== "unknown"
+    && authLabel !== connection.label
+    ? `<span class="mcp-chip ${server.auth_status === "not_logged_in" ? "warn" : ""}">${escapeHtml(authLabel)}</span>` : "";
+  const resourceChip = reportsResources
+    ? `<span class="mcp-chip">${mcpResourceCount(server)} resources</span>` : "";
   const login = server.auth_status === "not_logged_in" && (state.mcpCapabilities || {}).oauth_login
     ? `<button type="button" data-mcp-login="${escapeAttr(name)}">Authenticate</button>` : "";
+  const connectionDetail = connection && connection.detail
+    ? `<div class="meta">${escapeHtml(connection.detail)}</div>` : "";
   const detail = expanded ? `
     <div class="mcp-card-detail">
+      ${connectionDetail}
       ${server.server_info && server.server_info.description ? `<div>${escapeHtml(server.server_info.description)}</div>` : ""}
-      <div class="meta">${tools.length} tools · ${resources.length + templates.length} resources</div>
+      <div class="meta">${tools.length} tools${reportsResources ? ` · ${mcpResourceCount(server)} resources` : ""}</div>
+      ${reportsResources ? "" : `<div class="muted">Resources: not reported by this harness</div>`}
       ${mcpListSection("Tools", tools.map(mcpToolName))}
       ${mcpListSection("Resources", resources.map(mcpResourceName))}
       ${mcpListSection("Resource templates", templates.map(mcpTemplateName))}
@@ -9081,9 +9111,10 @@ function renderMcpServerCard(server) {
     <button class="mcp-card-top" type="button" data-mcp-toggle="${escapeAttr(name)}">
       <span class="mcp-dot ${chipClass}"></span>
       <span class="mcp-name mono">${escapeHtml(name)}</span>
-      <span class="mcp-chip ${chipClass}">${auth}</span>
+      <span class="mcp-chip ${chipClass}">${escapeHtml(leadLabel)}</span>
+      ${authChip}
       <span class="mcp-chip">${tools.length} tools</span>
-      <span class="mcp-chip">${resources.length + templates.length} resources</span>
+      ${resourceChip}
       <span>${expanded ? "⌃" : "⌄"}</span>
     </button>
     ${detail}
@@ -9105,6 +9136,23 @@ function mcpResourceName(resource) {
 }
 function mcpTemplateName(template) {
   return template.title || template.name || template.uri_template;
+}
+// The harness's connection to a server as the card shows it: the dot/chip tone, the chip label,
+// and what the expanded detail adds (a failure's reason, an unrecognised state's raw name).
+function mcpConnectionView(connection) {
+  if (!connection || !connection.state) return null;
+  const error = connection.error || "";
+  switch (connection.state) {
+    case "connected": return { tone:"ok", label:"Connected", detail:"" };
+    case "starting":
+    case "not_started": return { tone:"warn", label:"Starting", detail:"" };
+    case "authentication_required": return { tone:"warn", label:"Needs auth", detail:error };
+    case "failed": return { tone:"err", label:"Failed", detail:error };
+    case "cancelled":
+    case "disabled": return { tone:"", label:"Disabled", detail:"" };
+    case "unknown": return { tone:"", label:"Unknown", detail:error ? `Status: ${error}` : "" };
+    default: return { tone:"", label:"Unknown", detail:`Status: ${connection.state}` };
+  }
 }
 function mcpAuthTone(status) {
   if (status === "not_logged_in") return "warn";

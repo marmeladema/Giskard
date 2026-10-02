@@ -384,13 +384,15 @@
     configured `codex_path`, and reports through `log`, which Giskard does not bridge into `tracing`.
   - Both Codex spellings of the extended OpenAI MCP elicitation form (`openai/form` and
     `openaiForm`) preserve request routing and MCP approval promotion.
+  - `McpServerStatus.runtimeStatus`, unused at first, is mapped onto the neutral
+    `McpServerStatus.connection` since the Claude Code harness hardening pass, so the MCP menu
+    shows whether each server is connected.
   Everything else the release adds — paginated `thread/items/list`, `thread/turns/list` and
-  `thread/revert`, `McpServerStatus.runtimeStatus`, the realtime item
-  timeline, and the newly typed `project/changed`, `thread/queue/changed`, `thread/reverted`,
-  `mcpServer/event/stream/notification`, auth-recovery notifications, asynchronous agent-message
-  questions, persisted thread model/reasoning metadata, plugin reconciliation and response-usage
-  metadata — is available but unused; Giskard keeps its own history and ignores notifications it
-  does not map.
+  `thread/revert`, the realtime item timeline, and the newly typed `project/changed`,
+  `thread/queue/changed`, `thread/reverted`, `mcpServer/event/stream/notification`, auth-recovery
+  notifications, asynchronous agent-message questions, persisted thread model/reasoning metadata,
+  plugin reconciliation and response-usage metadata — is available but unused; Giskard keeps its own
+  history and ignores notifications it does not map.
 
 **Changelog (1.74 → 1.75), collapsible reasoning rows:**
 - **RN1 (amended by 1.94/RP2):** A reasoning note is a collapsible transcript row: a one-line summary — the note's first

@@ -26,8 +26,7 @@ thread**: the mapper mints a route for it, `claim_native_thread` binds it, its f
 its transcript, its asks are published on it, and `interrupt` on it is `stop_task` (see *Sub-agent
 routes*). A child idle for `idle_shutdown_secs` is stopped and its thread respawned with
 `--resume` on its next message (see *Process control*). Still to come: synthesized diffs
-(milestone 7), and version-drift and headroom surfacing, including an MCP tool inventory from
-`init.tools` (milestone 8).
+(milestone 7), and version-drift and headroom surfacing (milestone 8).
 
 ## Runtime ownership
 
@@ -715,18 +714,40 @@ closes stdin and logs `mcp_probe` with `thread_id` (the hint, if any), `hinted`,
 `mcp_status` is `HarnessError::Protocol` with the CLI's message; a probe that exits before
 answering is the handshake error (`claude exited with … before answering mcp_status: …`).
 
-The answer is `{"mcpServers": [{name, status, error?, config, scope, source}]}` (`src/mcp.rs`).
-Each entry becomes one `McpServerStatus`: `name` verbatim; `auth_status` `NotLoggedIn` when
-`status` is `needs-auth` or `needs_auth` (the CLI's `/mcp` screen names an
-authentication-required state whose wire spelling was not observed, so both are matched) and
-`Unknown` otherwise; `server_info.description` the status, or `<status>: <error>` when the CLI
-gave an error, so the panel shows `failed: ENOENT …` for a server that did not start and `pending`
-for one still connecting (the panel's refresh asks again). An entry that does not parse is skipped
-with a `warn` naming its index; each server is logged at `debug` with its name, status, source and
-error. `mcp_status` carries **no tool inventory**: tools reach the model as
-`mcp__<server>__<tool>` names in `system/init.tools`, so `tools`, `resources` and
-`resource_templates` stay empty; listing them in the panel is milestone 8's `init.tools` work.
-`mcp_reload` and `mcp_oauth_login` stay unadvertised.
+The answer is `{"mcpServers": [...]}` (`src/mcp.rs`; recorded on 2.1.287 in the `mcp-status`
+fixture, line 2). A **connected** entry is `{name, status: "connected", serverInfo: {name, title,
+version}, config, scope, source, tools: [{name, annotations}]}`; a failed one is `{name, status:
+"failed", error, config, scope, source}`, with no `serverInfo` and no `tools`. `config.type` is
+`stdio` for a local server and `http` or `sse` for a remote one. Each entry becomes one
+`McpServerStatus`:
+
+- `name` verbatim.
+- `connection` from `status`: `connected` → `Connected`; `pending` and `reconnecting` →
+  `Starting`; `failed` → `Failed` with the CLI's `error`; `disabled` → `Disabled`; `needs-auth` →
+  `AuthenticationRequired`; anything else → `Unknown` with the raw status as the error, logged at
+  `warn` ("unrecognised MCP server status") once per status string per process. The vocabulary is
+  the 2.1.287 binary's; `needs-auth` is spelled with a hyphen there (the underscore spelling does
+  not occur).
+- `auth_status`: `NotLoggedIn` for `needs-auth`; `Unsupported` when `config.type` is `stdio` (a
+  stdio server has no authentication concept, which the browser labels "No auth"); `Unknown`
+  otherwise.
+- `server_info` from `serverInfo` (`name`, `title`, `version`; no description), absent for a
+  server that is not connected. The status no longer travels in `description`: `connection`
+  carries it.
+- `tools`: one `McpTool` per `tools` entry. The name is the bare tool name (`echo`, not
+  `mcp__<server>__<tool>`); the CLI relays neither the description nor the input schema the
+  server advertised, so `title` and `description` are `None` and `input_schema` is `null`. A tool
+  entry without a name is skipped with a `warn` naming the server and its index, and the server is
+  kept. `system/init.tools` (the `mcp__<server>__<tool>` names) adds nothing `mcp_status` lacks.
+- `resources` and `resource_templates`: `None`, "not reported". **Resources are not reachable
+  from a stdio host**: no control request lists them (the CLI's `resources/list` calls are its own
+  MCP-client calls), and the model reaches them only through the CLI's `ListMcpResourcesTool` and
+  `ReadMcpResourceTool` tools. The browser shows no resource count for such a server rather than a
+  false zero.
+
+An entry that does not parse is skipped with a `warn` naming its index; each server is logged at
+`debug` with its name, status, connection, source, tool count and error. `mcp_reload` and
+`mcp_oauth_login` stay unadvertised.
 
 ## Code and tests
 

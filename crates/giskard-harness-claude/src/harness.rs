@@ -5790,14 +5790,22 @@ mod tests {
         let names: Vec<_> = servers.iter().map(|server| server.name.as_str()).collect();
         assert_eq!(names, ["broken", "echo"]);
         assert!(servers.iter().all(|server| server.auth_status
-            == giskard_core::mcp::McpAuthStatus::Unknown
-            && server.tools.is_empty()));
+            == giskard_core::mcp::McpAuthStatus::Unsupported
+            && server.tools.is_empty()
+            && server.resources.is_none()));
         assert_eq!(
-            servers[0]
-                .server_info
+            servers[0].connection,
+            Some(giskard_core::mcp::McpConnection {
+                state: giskard_core::mcp::McpConnectionState::Failed,
+                error: Some("ENOENT: no such file or directory, posix_spawn 'stdio'".into()),
+            })
+        );
+        assert_eq!(
+            servers[1]
+                .connection
                 .as_ref()
-                .and_then(|info| info.description.as_deref()),
-            Some("failed: ENOENT: no such file or directory, posix_spawn 'stdio'")
+                .map(|connection| &connection.state),
+            Some(&giskard_core::mcp::McpConnectionState::Starting)
         );
         assert_eq!(
             spawner.spawns()[0],
@@ -5818,6 +5826,24 @@ mod tests {
             servers[0].auth_status,
             giskard_core::mcp::McpAuthStatus::NotLoggedIn
         );
+        assert_eq!(
+            servers[0]
+                .connection
+                .as_ref()
+                .map(|connection| &connection.state),
+            Some(&giskard_core::mcp::McpConnectionState::AuthenticationRequired)
+        );
+    }
+
+    /// The `mcp-status` fixture's recorded answer: a connected server with its tools and a failed
+    /// one, mapped through the façade.
+    #[tokio::test]
+    async fn list_mcp_servers_maps_the_recorded_connected_and_failed_servers() {
+        let (probe, _) =
+            mcp_probe_child(Action::Respond(crate::mcp::tests::connected_and_failed()));
+        let (harness, _) = harness(vec![probe]);
+        let servers = harness.list_mcp_servers(None).await.unwrap();
+        crate::mcp::tests::assert_connected_and_failed(&servers);
     }
 
     /// A primary thread's child that answers one `mcp_status` with `answer`.
