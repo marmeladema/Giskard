@@ -1,7 +1,8 @@
 # Recorded Claude Code protocol fixtures
 
-Stream-json transcripts recorded against **Claude Code 2.1.286** (the two `subagent-*` scenarios
-against **2.1.287**) by driving a real `claude -p` child over a stdio pipe, for the mapper tests of
+Stream-json transcripts recorded against **Claude Code 2.1.286** (the two `subagent-*`, the three
+`replay-*`, the two `background-{stop,complete}` and the `mcp-status` scenarios against
+**2.1.287**) by driving a real `claude -p` child over a stdio pipe, for the mapper tests of
 [`specs/claude-code-harness-plan.md`](../../../../specs/claude-code-harness-plan.md) (§11). They
 live in `crates/giskard-harness-claude/tests/fixtures/`, where the mapper tests read them.
 
@@ -36,6 +37,12 @@ closed stdin when the scenario's stop condition was met.
 | `resume-missing` | manual, `--resume <unknown uuid>` | the failure shape: exit 1, `No conversation found` on stderr, an `error_during_execution` result with `num_turns: 0` | 1 result |
 | `subagent-stop` | default, `--forward-subagent-text` | a **foreground** delegation whose sub-agent runs `touch marker.txt && sleep 120 && cat data.txt`: the sub-agent's `can_use_tool` (with `agent_id`, **before** the forwarded `tool_use` frame), answered allow; `stop_task` 4 s later → `task_updated` killed, the child's rejection `tool_result` and interruption marker, the parent's `Agent` `tool_result` with `is_error`, one `result` | allow; stop_task; 1 result then 6 s quiet |
 | `subagent-ask-withdrawn` | default, `--forward-subagent-text` | the same delegation with `touch marker.txt && cat data.txt`, the sub-agent's ask **left pending**; `stop_task` 3 s later → `control_cancel_request` for the ask, then the same ending | no answer; stop_task; 1 result then 6 s quiet |
+| `replay-ack` | manual, `--replay-user-messages` | two turns in one session: each prompt echoed back as a `user` frame with `isReplay: true` after that turn's `init` and before the first `assistant` frame; the second turn's `Bash` `tool_result` frame **not** replayed | 2 results |
+| `replay-image` | manual, `--replay-user-messages` | a prompt carrying a 16×16 PNG `image` block before its `text` block, echoed back verbatim with both blocks | 1 result |
+| `replay-compact` | manual, `--replay-user-messages` | a text turn, then `/compact`: the prompt replayed; the `/compact` line itself not, the compaction summary `isSynthetic: true, isReplay: false` and the `<local-command-stdout>` frame `isReplay: true`, as without the flag | 2 results |
+| `background-stop` | manual, `--replay-user-messages` | a background `Bash` command (`for i in 1 2 3 4 5 6; do echo line $i; sleep 5; done; echo finished`): the ask answered allow and **the answer echoed back on stdout** (line 9, an effect of the flag), `task_started` of type `local_bash` **before** the `tool_result` whose `tool_use_result.backgroundTaskId` names the same task, the turn's `result`; `stop_task` 7 s after `task_started` → `task_updated` killed, `task_notification` stopped with `output_file`, then the `{}` reply | allow; stop_task; 1 result |
+| `background-complete` | manual, `--replay-user-messages` | the same command left to finish: `task_updated` completed, `task_notification` completed with `summary: "… completed (exit code 0)"` and `output_file`, then the CLI's own continuation turn (`init`, text, a second `result`) | allow; 2 results |
+| `mcp-status` | manual, `--mcp-config` naming a minimal stdio server (`mini`: one tool, one resource, one template, written for the recording) and a broken one, `--strict-mcp-config` | `initialize`, then `mcp_status` answering a **connected** entry (`serverInfo`, `tools: [{name, annotations}]`) beside a failed one (`error`, no `serverInfo`, no `tools`), then one text turn whose `init` lists `mcp_servers` and the `mcp__mini__echo` tool. The recorder's stdin was reconstructed after the fact; the paths are rewritten | 1 result |
 | `autocompact-state` | — | the two top-level frames `active_goal` and `autocompact_state` a session emits before its first turn in some environments; two frames only, recorded separately with an environment that sets autocompact overrides | — |
 
 ## Sanitization

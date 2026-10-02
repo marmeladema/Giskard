@@ -1,0 +1,28 @@
+{
+ "scenario": "replay-image",
+ "argv": [
+  "claude",
+  "-p",
+  "--input-format",
+  "stream-json",
+  "--output-format",
+  "stream-json",
+  "--verbose",
+  "--permission-prompt-tool",
+  "stdio",
+  "--setting-sources",
+  "",
+  "--model",
+  "haiku",
+  "--permission-mode",
+  "manual",
+  "--replay-user-messages",
+  "--session-id",
+  "2ed874fb-95bf-4127-92d0-4b4529858698"
+ ],
+ "cwd": "/work/project",
+ "exit": 0,
+ "results": 1,
+ "asks": 0,
+ "elapsed_s": 2.2
+}
