@@ -16,7 +16,10 @@
 #   the `bypass_not_launched` error); `set_model` succeeds for a model of the `initialize` fixture's
 #   catalog, else the `catalog_unknown` error; `apply_flag_settings` succeeds and remembers
 #   `effortLevel`. A user message containing `touch` replays the `tool-allowed` frames up to its
-#   `can_use_tool` ask, and the rest once a control response answers it; any other user message
+#   `can_use_tool` ask, and the rest once a control response answers it; a user message containing
+#   `background` replays the `background-complete` turn up to its `result` (its ask left out), and
+#   a later `stop_task` emits the `killed` update and the notification of `background-stop` for
+#   that task before its `{}` answer; any other user message
 #   replays the `text-turn` frames (`FAKE_CLAUDE_EXIT_MID_TURN=<n>`: only the first n, then exit 3).
 #   EOF exits 0 (`FAKE_CLAUDE_IGNORE_EOF=1`: sleeps 30 s instead).
 # - `--replay-user-messages` (every session child carries it): each stdin `user` line is echoed
@@ -68,6 +71,8 @@ launch_mode="$mode"
 ask_line=$(grep -n '"type": "control_request"' "$fixtures/tool-allowed.out.jsonl" | cut -d: -f1)
 effort="null"
 asked=""
+# The `background-complete` task still running, if one was started.
+background=""
 
 if [ -n "$resume" ] && [ -z "$FAKE_CLAUDE_RESUME_OK" ]; then
     echo "No conversation found with session ID: $resume" >&2
@@ -126,6 +131,11 @@ while IFS= read -r line; do
             respond "$request_id" '{"still_queued":[]}'
             ;;
         *'"subtype":"stop_task"'*)
+            if [ -n "$background" ]; then
+                background=""
+                grep -E '"subtype": "(task_updated|task_notification)"' "$fixtures/background-stop.out.jsonl" \
+                    | sed 's/b93m9v2sw/bx9de5w1u/g'
+            fi
             respond "$request_id" '{}'
             ;;
         *'"subtype":"mcp_status"'*)
@@ -147,6 +157,14 @@ while IFS= read -r line; do
                     | sed 's/^{/{"isReplay":true,"uuid":"00000000-0000-4000-8000-0000000000aa","session_id":"f18693ff-2d11-4f87-9556-2b527e19e081","parent_tool_use_id":null,/'
             fi
             case "$line" in
+                *background*)
+                    background=1
+                    result_line=$(grep -n '"type": "result"' "$fixtures/background-complete.out.jsonl" | head -n 1 | cut -d: -f1)
+                    sed -n "1,${result_line}p" "$fixtures/background-complete.out.jsonl" \
+                        | grep -v -e '"type": "control_request"' -e '"type": "control_response"' \
+                            -e '"isReplay": true'
+                    continue
+                    ;;
                 *touch*)
                     asked=1
                     sed -n "1,${ask_line}p" "$fixtures/tool-allowed.out.jsonl"

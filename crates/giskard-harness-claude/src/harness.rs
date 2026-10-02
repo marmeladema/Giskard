@@ -42,7 +42,7 @@ pub(crate) use crate::session::CONTROL_TIMEOUT;
 use crate::session::{
     ChildCommand, ChildHandle, Pending, PendingRequests, RouteHandle, Routes, STOP_EXIT_GRACE,
     SupervisorParts, ThreadEntry, Threads, TurnSettings, control_line, control_outcome, lock,
-    new_request_id, spawn_supervisor, thread_counts,
+    new_request_id, no_background_command, spawn_supervisor, thread_counts,
 };
 
 /// How long the CLI has to answer `initialize`.
@@ -2155,6 +2155,49 @@ impl AgentHarness for ClaudeHarness {
             .map(|()| turn)
     }
 
+    /// `process_id` is a background command's `local_bash` task id: `stop_task` stops it. A
+    /// foreground command has no process id, and nothing in the CLI stops one alone.
+    async fn terminate_command(
+        &self,
+        thread: &ThreadHandle,
+        process_id: &str,
+    ) -> Result<(), HarnessError> {
+        if is_task_native_id(&thread.harness_thread_id) {
+            // A sub-agent's commands run in its parent's child, under the parent's thread.
+            debug!(
+                thread_id = %thread.thread,
+                harness_thread_id = %thread.harness_thread_id,
+                task_id = %process_id,
+                action = "terminate_command",
+                "terminate_command on a sub-agent thread"
+            );
+            return Err(no_background_command(process_id));
+        }
+        let sent = self.enqueue(thread.thread, "terminate_command", |_, _, reply| {
+            Ok(ChildCommand::StopBackgroundCommand {
+                task_id: process_id.to_owned(),
+                reply,
+            })
+        })?;
+        match sent {
+            Enqueued::Sent(answer) => {
+                self.answer(thread.thread, "terminate_command", CONTROL_TIMEOUT, answer)
+                    .await
+            }
+            Enqueued::NoThread | Enqueued::NoChild => {
+                // A reaped child's background commands died with it (idle means none ran).
+                debug!(
+                    thread_id = %thread.thread,
+                    harness_thread_id = %thread.harness_thread_id,
+                    task_id = %process_id,
+                    action = "terminate_command",
+                    "no live claude child; no background command to stop"
+                );
+                Err(no_background_command(process_id))
+            }
+        }
+    }
+
     async fn compact_thread(&self, thread: &ThreadHandle) -> Result<(), HarnessError> {
         let turn = TurnId::new();
         let answer = self
@@ -4249,6 +4292,140 @@ mod tests {
         logs_assert(no_line_with("nobody is waiting"));
     }
 
+    // ---- hardening: background commands ---------------------------------------------------------
+
+    fn assert_no_background_command(result: Result<(), HarnessError>) {
+        match result {
+            Err(HarnessError::Transport(message)) => {
+                assert!(message.contains("no background command"), "{message}")
+            }
+            other => panic!("expected the unmanaged Transport error, got {other:?}"),
+        }
+    }
+
+    /// `background-stop` up to its turn's `result`, without the ask (auto-approved here), then,
+    /// on `stop_task`, the `killed` update, the notification and the `{}` answer.
+    fn background_child() -> (ScriptedChild, Arc<Mutex<ScriptRecord>>) {
+        let lines = fixture_lines("background-stop");
+        let result = lines
+            .iter()
+            .position(|line| line.contains("\"type\": \"result\""))
+            .unwrap();
+        let turn: Vec<String> = lines[..=result]
+            .iter()
+            .filter(|line| !line.contains("\"control_request\""))
+            .cloned()
+            .collect();
+        scripted(
+            handshake_steps("sonnet"),
+            vec![
+                Step::OnStdin(user(), vec![Action::Emit(turn)]),
+                Step::OnStdin(
+                    control("stop_task"),
+                    vec![
+                        Action::EmitFixtureFrom {
+                            name: "background-stop",
+                            from: result + 1,
+                        },
+                        Action::Respond(json!({})),
+                    ],
+                ),
+            ],
+        )
+    }
+
+    fn command_items(events: &[AgentEvent]) -> Vec<(TurnId, giskard_core::item::Item)> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                AgentEvent::ItemCompleted { turn, item, .. }
+                    if matches!(
+                        item.payload,
+                        giskard_core::item::ItemPayload::CommandExecution { .. }
+                    ) =>
+                {
+                    Some((*turn, item.clone()))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    #[traced_test]
+    async fn terminate_command_stops_a_background_command() {
+        let (child, record) = background_child();
+        let (harness, _) = harness(vec![child]);
+        let (options, _updates) = open_options(ThreadId::new(), None, "sonnet");
+        let handle = harness.open_thread(options).await.unwrap();
+        let mut stream = harness.subscribe(&handle);
+        let turn = harness
+            .start_turn(&handle, text("run it in the background"), overrides())
+            .await
+            .unwrap();
+        let events = until_completed(&mut stream).await;
+        let running = command_items(&events);
+        assert_eq!(running.len(), 1);
+        let giskard_core::item::ItemPayload::CommandExecution {
+            status, process_id, ..
+        } = &running[0].1.payload
+        else {
+            unreachable!()
+        };
+        assert_eq!(status.as_deref(), Some("in_progress"));
+        assert_eq!(process_id.as_deref(), Some("b93m9v2sw"));
+
+        // An unknown id is refused without a write.
+        let before = lock(&record).written.len();
+        assert_no_background_command(harness.terminate_command(&handle, "nope").await);
+        assert_eq!(lock(&record).written.len(), before);
+        // A sub-agent handle has no commands of its own.
+        let mut route = handle.clone();
+        route.harness_thread_id = "task:toolu_x".into();
+        assert_no_background_command(harness.terminate_command(&route, "b93m9v2sw").await);
+        assert_eq!(lock(&record).written.len(), before);
+
+        harness
+            .terminate_command(&handle, "b93m9v2sw")
+            .await
+            .unwrap();
+        let stop = written(&record)
+            .into_iter()
+            .find(|line| line["request"]["subtype"] == "stop_task")
+            .unwrap();
+        assert_eq!(stop["request"]["task_id"], "b93m9v2sw");
+        let ended = next_matching(&mut stream, |event| match event {
+            AgentEvent::ItemCompleted { turn, item, .. }
+                if matches!(
+                    item.payload,
+                    giskard_core::item::ItemPayload::CommandExecution { .. }
+                ) =>
+            {
+                Some((*turn, item.clone()))
+            }
+            _ => None,
+        })
+        .await;
+        assert_eq!(ended.0, turn);
+        assert_eq!(ended.1.id, running[0].1.id);
+        let giskard_core::item::ItemPayload::CommandExecution { status, .. } = &ended.1.payload
+        else {
+            unreachable!()
+        };
+        assert_eq!(status.as_deref(), Some("terminated"));
+        logs_assert(a_line_with(&[
+            " INFO ",
+            "action=\"terminate_command\"",
+            "task_id=b93m9v2sw",
+        ]));
+        logs_assert(a_line_with(&[
+            " WARN ",
+            "action=\"terminate_command\"",
+            "task_id=nope",
+        ]));
+        harness.shutdown().await.unwrap();
+    }
+
     #[tokio::test]
     #[traced_test]
     async fn accept_writes_a_bare_allow() {
@@ -5949,6 +6126,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_real_child_stops_a_background_command() {
+        let (harness, workspace) = real_harness(&[]);
+        let (options, _updates) = real_options(&workspace, None);
+        let handle = harness.open_thread(options).await.unwrap();
+        let mut stream = harness.subscribe(&handle);
+        harness
+            .start_turn(&handle, text("run it in the background"), overrides())
+            .await
+            .unwrap();
+        let events = until_completed(&mut stream).await;
+        let running = command_items(&events);
+        assert_eq!(running.len(), 1);
+        harness
+            .terminate_command(&handle, "bx9de5w1u")
+            .await
+            .unwrap();
+        let (_, ended) = next_matching(&mut stream, |event| match event {
+            AgentEvent::ItemCompleted { turn, item, .. }
+                if matches!(
+                    item.payload,
+                    giskard_core::item::ItemPayload::CommandExecution { .. }
+                ) =>
+            {
+                Some((*turn, item.clone()))
+            }
+            _ => None,
+        })
+        .await;
+        assert_eq!(ended.id, running[0].1.id);
+        assert!(matches!(
+            &ended.payload,
+            giskard_core::item::ItemPayload::CommandExecution { status: Some(status), .. }
+                if status == "terminated"
+        ));
+        assert_no_background_command(harness.terminate_command(&handle, "bx9de5w1u").await);
+        harness.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn a_real_probe_lists_no_mcp_servers() {
         let (harness, _workspace) = real_harness(&[]);
         assert!(harness.list_mcp_servers(None).await.unwrap().is_empty());
@@ -6752,6 +6968,9 @@ mod tests {
             .position(|line| line.contains("\"subtype\": \"task_updated\""))
             .unwrap();
         assert!(terminal > result, "the shell outlives its turn");
+        // The command's entry ends with its notification, right after the terminal update.
+        let terminal = terminal + 1;
+        assert!(lines[terminal].contains("\"subtype\": \"task_notification\""));
         let (child, record) = scripted(
             handshake_steps("sonnet"),
             vec![Step::OnStdin(
@@ -6991,6 +7210,21 @@ mod tests {
         assert_eq!(spawner.spawns().len(), 1, "nothing respawned");
         assert_eq!(lock(&record).written.len(), before);
         assert_eq!(harness.live_children(), 0);
+        harness.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn terminate_command_on_a_reaped_thread_is_unmanaged() {
+        let (child, record) = scripted(handshake_steps("sonnet"), Vec::new());
+        let (harness, spawner) = harness_with(reaping(), vec![child]);
+        let (options, _updates) = open_options(ThreadId::new(), None, "sonnet");
+        let handle = harness.open_thread(options).await.unwrap();
+        tokio::time::sleep(IDLE).await;
+        reaped(&harness, &record).await;
+        let before = lock(&record).written.len();
+        assert_no_background_command(harness.terminate_command(&handle, "b93m9v2sw").await);
+        assert_eq!(spawner.spawns().len(), 1, "nothing respawned");
+        assert_eq!(lock(&record).written.len(), before);
         harness.shutdown().await.unwrap();
     }
 

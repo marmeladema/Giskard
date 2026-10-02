@@ -99,6 +99,12 @@ pub(crate) enum ChildCommand {
         thread: ThreadId,
         reply: oneshot::Sender<Result<(), HarnessError>>,
     },
+    /// Stop the background command of `local_bash` task `task_id` (`stop_task`):
+    /// `terminate_command`.
+    StopBackgroundCommand {
+        task_id: String,
+        reply: oneshot::Sender<Result<(), HarnessError>>,
+    },
     /// Run `/compact` as a compaction turn.
     Compact {
         turn: TurnId,
@@ -120,6 +126,7 @@ impl ChildCommand {
             ChildCommand::RespondApproval { .. } => "respond_approval",
             ChildCommand::RespondServerRequest { .. } => "respond_server_request",
             ChildCommand::StopTask { .. } => "stop_task",
+            ChildCommand::StopBackgroundCommand { .. } => "terminate_command",
             ChildCommand::Compact { .. } => "compact",
             ChildCommand::Stop { .. } => "stop",
         }
@@ -390,6 +397,12 @@ pub(crate) fn control_outcome(payload: &Value) -> Result<Value, HarnessError> {
             "unexpected control response subtype {other:?}"
         ))),
     }
+}
+
+/// `terminate_command` for a task id that names no running background command. The server reads
+/// this wording as "unmanaged" (`harness_error_means_command_unmanaged`), as it does Codex's.
+pub(crate) fn no_background_command(task_id: &str) -> HarnessError {
+    HarnessError::Transport(format!("no background command with task id {task_id}"))
 }
 
 fn child_stopped() -> HarnessError {
@@ -1445,6 +1458,9 @@ impl Supervisor {
                 reply,
             } => self.respond_server_request(id, ask, response, reply).await,
             ChildCommand::StopTask { thread, reply } => self.stop_task(thread, reply).await,
+            ChildCommand::StopBackgroundCommand { task_id, reply } => {
+                self.stop_background_command(task_id, reply).await
+            }
             ChildCommand::Compact {
                 turn,
                 notice,
@@ -2210,6 +2226,49 @@ impl Supervisor {
         Ok(())
     }
 
+    /// `terminate_command`: `stop_task` for the `local_bash` task of a background command. The
+    /// `{}` answer resolves the call; the real signal is the task's `killed` update, which the
+    /// mapper turns into the item's terminal completion. `Err` is a stdin write failure.
+    async fn stop_background_command(
+        &mut self,
+        task_id: String,
+        reply: oneshot::Sender<Result<(), HarnessError>>,
+    ) -> Result<(), HarnessError> {
+        let Some((thread, command)) = self.mapper.background_command(&task_id) else {
+            warn!(
+                thread_id = %self.thread,
+                task_id = %task_id,
+                action = "terminate_command",
+                "terminate_command for no background command of this child"
+            );
+            let _ = reply.send(Err(no_background_command(&task_id)));
+            return Ok(());
+        };
+        let command = command.to_owned();
+        let request_id = new_request_id();
+        let request = json!({"subtype": "stop_task", "task_id": task_id});
+        if let Err(error) = self
+            .child
+            .write_line(&control_line(&request_id, &request))
+            .await
+        {
+            let _ = reply.send(Err(error.clone()));
+            return Err(error);
+        }
+        info!(
+            project_id = display_opt(self.context.project_id),
+            thread_id = %thread,
+            owner_thread_id = %self.thread,
+            request_id = %request_id,
+            task_id = %task_id,
+            command = %command,
+            action = "terminate_command",
+            "stopping a background command"
+        );
+        self.waiters.insert(request_id, Waiter::Unit(reply));
+        Ok(())
+    }
+
     /// The CLI answered a `stop_task`.
     fn log_stop_task_answer(&self, stop: &StopTaskWaiter, outcome: &Result<Value, HarnessError>) {
         match outcome {
@@ -2702,6 +2761,7 @@ impl Supervisor {
             | ChildCommand::RespondApproval { reply, .. }
             | ChildCommand::RespondServerRequest { reply, .. }
             | ChildCommand::StopTask { reply, .. }
+            | ChildCommand::StopBackgroundCommand { reply, .. }
             | ChildCommand::Compact { reply, .. } => {
                 let _ = reply.send(Err(child_stopped()));
             }

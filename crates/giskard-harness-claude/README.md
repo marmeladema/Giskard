@@ -35,16 +35,16 @@ routes*). A child idle for `idle_shutdown_secs` is stopped and its thread respaw
   `ClaudeMapper`, its pending control-request waiters and the thread's retained `EventLog`. Nothing
   else touches them, and none of them sits behind a lock: the façade reaches the task only through
   its bounded command channel (`StartTurn`, `Interrupt`, `Control`, `RespondApproval`,
-  `RespondServerRequest`, `StopTask`, `Compact`, `Stop`). The façade never waits for room in it: a
-  command is enqueued with `try_send` while the façade holds the `threads` lock (the `routes` lock
-  for a sub-agent's `stop_task`), and a full queue (16 deep; the server serializes per thread, so
-  only a wedged supervisor fills it) is a `Transport` error logged at `warn`. It also owns **one
-  retained `EventLog` per sub-agent route** of its child: each event goes to the log of the thread
-  it names (the primary's or a route's). The task is an explicit state machine driven by **one**
-  `select!` loop over the child's stdout lines (first, so a frame already read is mapped before a
-  new command is accepted), its commands, the instance's shutdown signal, and the deadline of
-  whatever it is waiting on; every arm body runs to completion, so a write made from one is never
-  cancelled. It is in one of two phases:
+  `RespondServerRequest`, `StopTask`, `StopBackgroundCommand`, `Compact`, `Stop`). The façade never
+  waits for room in it: a command is enqueued with `try_send` while the façade holds the `threads`
+  lock (the `routes` lock for a sub-agent's `stop_task`), and a full queue (16 deep; the server
+  serializes per thread, so only a wedged supervisor fills it) is a `Transport` error logged at
+  `warn`. It also owns **one retained `EventLog` per sub-agent route** of its child: each event goes
+  to the log of the thread it names (the primary's or a route's). The task is an explicit state
+  machine driven by **one** `select!` loop over the child's stdout lines (first, so a frame already
+  read is mapped before a new command is accepted), its commands, the instance's shutdown signal,
+  and the deadline of whatever it is waiting on; every arm body runs to completion, so a write made
+  from one is never cancelled. It is in one of two phases:
   - **serving**: frames are mapped and commands served. At most one **turn hand-off**
     (`TurnSetup`) is in flight: a `StartTurn`'s settings requests are written one at a time, each
     response (recognised by its `request_id`) advances the hand-off to its next stage (mode,
@@ -131,7 +131,7 @@ so a block's index matches the `content_block_*.index` of the stream events for 
 | --- | --- | --- | --- |
 | `text` block | `content_block_start` (text) → `AgentMessage`; without stream events, the `assistant` frame starts it | `text_delta` → `Text` | the `assistant` frame with the block → `AgentMessage { text }`; empty text still completes |
 | `thinking` block | only once a non-empty `thinking_delta` or a non-empty block arrives → `Reasoning` | `thinking_delta` → `Text` | `assistant` frame → `Reasoning { text }`; an empty thought emits nothing at all |
-| `tool_use` `Bash` | `assistant` frame → `CommandExecution` with `command`, `cwd` = workspace root, `status: in_progress` | none (Claude streams no command output) | the `tool_result` → `CommandExecution` with `output` = `tool_use_result.stdout` then `stderr`, else the result text; `exit_code: None` |
+| `tool_use` `Bash` | `assistant` frame → `CommandExecution` with `command`, `cwd` = workspace root, `status: in_progress` | none (Claude streams no command output) | the `tool_result` → `CommandExecution` with `output` = `tool_use_result.stdout` then `stderr`, else the result text; `exit_code: None`. A **background** call (a `local_bash` task names it) completes `in_progress` with `process_id` = the task id and no output, then completes again on its original turn when the task ends (*Background commands*) |
 | `tool_use` `Write`, `Edit`, `NotebookEdit` | `FileChange` | none | `FileChange { path: input.file_path, change }`, `Created` when `tool_use_result.type == "create"`, else `Modified`; no diff |
 | `tool_use` `Agent` | `ToolCall { name: "Agent", subagent }` with the route's link (`task:<id>`, `initial_prompt` = `input.prompt`, `Spawned`, `Pending`), preceded by `MapperOutput::RouteOpened` | none | `ToolCall { output: the result content, subagent }` with the link as the route stands: `Completed` (or `Interrupted`) for an ended route, `Started` / `Running` for one still running (a backgrounded delegation) |
 | `user` frame with `isReplay: true` (not `isSynthetic`, no `tool_result`) on the primary route, in a user turn | `UserMessage` started and completed together, `text` = the frame's text blocks joined by `\n` (image and document blocks ignored): the turn's acknowledgement. A second one in the turn is dropped (`warn`); in a compaction turn it is the `/compact` output, skipped (`debug`) | | |
@@ -404,6 +404,49 @@ deduplicated away), since the server reads no handle.
   MCP status read never respawns: a reaped thread's hint is answered by the probe.
 - **Asks.** `can_use_tool` and other inbound control requests are published as events, recorded
   in `pending`, and answered by `respond_approval` / `respond_server_request` (below).
+
+### Background commands
+
+A `Bash` call with `run_in_background: true` hands its command to a CLI task: `system/task_started`
+of type `local_bash` names the call's `tool_use_id` **before** the `tool_result`, whose text
+("Command running in background with ID: …") and `tool_use_result.backgroundTaskId` name the same
+task. The mapper attaches the open command item to the task entry, and the `tool_result` completes
+the item `in_progress` with `process_id` = the task id and empty output (`background_command` at
+`info`): the command is running, and the CLI's note is not its output. The turn ends on its
+`result`; the command outlives it as a running task, which the server's running-task projection
+keeps and whose Stop the browser enables because it has a process id.
+
+- **End.** The terminal `task_updated` (`completed`, `failed`, `killed`, `stopped`) records the
+  status and `end_time`; the entry stays until the `task_notification` that follows (~70 ms),
+  which names the output file. The item then completes a second time, with the same `ItemId` and
+  `harness_item_id`, on its **original thread and turn**: `completed`, `failed`, or `terminated`
+  for `killed` / `stopped`; `output` and `exit_code` from the output file; `duration_ms` from
+  `end_time` minus the item's start; `process_id` still the task id (`task_notification` at `info`
+  with `status`, `exit_code` and `output_bytes`). A notification whose terminal update was not
+  seen completes the item from its own status, with a `warn`. The CLI then runs its own
+  continuation turn after a completion (an external turn), none after a kill.
+- **Output file.** `…/<encoded cwd>/<session id>/tasks/<task_id>.output` under the CLI's config
+  directory, on the server's machine: stdout and stderr as written, a blank line, then
+  `[exited with code N]` or `[killed]`. The read is bounded to the first and last 64 KiB (the
+  middle is replaced by an "omitted" line and the item marked truncated with the file's size); the
+  marker and the blank line are stripped. The format is the CLI's own and unversioned, so the read
+  is best-effort: an unknown last line stays output with no exit code, and a missing or unreadable
+  file is empty output with a `warn` (`background_output`), never a failure.
+- **Stop.** `terminate_command(handle, process_id)` sends `StopBackgroundCommand` to the primary
+  thread's child, which writes `stop_task {task_id}` and resolves on the `{}` answer under the 10 s
+  control timeout (`terminate_command` at `info`); the `killed` update and the notification that
+  follow complete the item `terminated`. A task id that names no background command of the child,
+  a sub-agent handle, or a thread with no live child (a reaped child's commands died with it) is
+  `Transport("no background command with task id …")`, written nothing, which the server reads as
+  "unmanaged" and clears a stale running task by.
+- **Child exit.** Every background command still running completes `terminated` with empty output,
+  and a `warn` (`background_command_lost`) names its task and the exit.
+- **Foreground commands** have no task and no process id, and the CLI offers no control request
+  that stops one tool call: only `interrupt`, which ends the turn. So their Stop stays disabled
+  ("Not supported by <harness>; stop the turn instead"), and the turn's own Stop is the way.
+- **History.** The terminal completion of a command whose turn is already persisted reaches an open
+  browser live, and the server appends it to that turn's payload file as a late item record (spec
+  LA1–LA5), so a reload or a reconnect shows the final state.
 
 ## Permission presets and plan mode
 
@@ -702,9 +745,10 @@ error. `mcp_status` carries **no tool inventory**: tools reach the model as
 - `src/catalog.rs`: the `initialize.models` catalog, its descriptors and `ANTHROPIC_PROVIDER_ID`.
 - `src/mcp.rs`: the `mcp_status` answer to `McpServerStatus`.
 - `src/frame.rs`: one stdout line to a typed `Frame`, tolerant of everything the crate cannot type.
-- `src/mapper.rs`: `ClaudeMapper`, the frame-to-event state machine and its sub-agent routes, and
-  its fixture-driven tests (the `delegation`, `delegation-interrupted`, `subagent-stop` and
-  `subagent-ask-withdrawn` recordings drive the route tests).
+- `src/mapper.rs`: `ClaudeMapper`, the frame-to-event state machine, its sub-agent routes and
+  background commands (with the output-file reader), and its fixture-driven tests (the `delegation`,
+  `delegation-interrupted`, `subagent-stop` and `subagent-ask-withdrawn` recordings drive the route
+  tests).
 - `src/ids.rs`: `NativeItemKey` and the `task:` sub-agent id prefix.
 - `src/log_fields.rs`: optional-field logging helper.
 - `src/log_checks.rs` (tests only): the line checks the `#[traced_test]` log assertions pass to
@@ -720,5 +764,7 @@ error. `mcp_status` carries **no tool inventory**: tools reach the model as
   `get_settings` (echoing the model and effort it was told), `stop_task` (`{}`) and `mcp_status`
   (no servers), treats `--resume` as the missing-transcript failure unless
   `FAKE_CLAUDE_RESUME_OK=1` makes it a successful resume, replays
-  the `tool-allowed` ask on a message containing `touch` and the rest once answered, and with
+  the `tool-allowed` ask on a message containing `touch` and the rest once answered, replays a
+  background command's turn on a message containing `background` and its `killed` pair on
+  `stop_task`, and with
   `FAKE_CLAUDE_REFUSE_BYPASS=1` refuses a bypass launch with the root sentence.

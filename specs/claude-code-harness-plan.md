@@ -158,7 +158,7 @@ decisions rather than missing protocol.
 
 | Subtype | Request / response | Why it is not in v1 |
 | --- | --- | --- |
-| `stop_task` | `{task_id}` → `{}` (`null` on 2.1.285; `{}` verified on 2.1.287) | Kills a live task. `task_started` classifies them: `local_bash` for shell commands, `local_agent` for sub-agents (§5.3) — the distinction that scopes the turn-completion rule. **The reply is not a confirmation**: it is the same whether or not anything was stopped, and the real signal is a `task_updated` frame with `patch.status: "killed"`; a pending `can_use_tool` of the killed task is withdrawn first with `control_cancel_request`, and a task already `completed` still gets a `killed` update. Milestone 5 wires it as a sub-agent thread's `interrupt`; wiring it for `local_bash` tasks is what `terminate_command` needs |
+| `stop_task` | `{task_id}` → `{}` (`null` on 2.1.285; `{}` verified on 2.1.287) | Kills a live task. `task_started` classifies them: `local_bash` for shell commands, `local_agent` for sub-agents (§5.3) — the distinction that scopes the turn-completion rule. **The reply is not a confirmation**: it is the same whether or not anything was stopped, and the real signal is a `task_updated` frame with `patch.status: "killed"`; a pending `can_use_tool` of the killed task is withdrawn first with `control_cancel_request`, and a task already `completed` still gets a `killed` update. Milestone 5 wires it as a sub-agent thread's `interrupt`; supported for `local_bash` tasks since the hardening pass: it is `terminate_command` for a background command (`claude-code-harness-plan/hardening-plan.md` §2) |
 | `background_tasks` | `{tool_use_id?}` → `null` | Backgrounds in-flight foreground tasks; without `tool_use_id`, all of them |
 | `mcp_reconnect` / `mcp_toggle` / `mcp_set_servers` | `{serverName}` / `{serverName, enabled}` | The MVP configures no MCP servers |
 | `get_workspace_diff` | `{diff:{stats, perFileStats, hunks}}`, `@internal` | Not the `structured_diffs` capability — see §6.1 |
@@ -463,7 +463,7 @@ the whole `task_started` / `task_progress` / `task_updated` / `task_notification
 | `context_compaction` | **true** | `/compact` as a user message over stream-json: `system/status` → `system/compact_boundary` → re-emitted `system/init`, with the conversation surviving and a degenerate `result` (empty text, `stop_reason: null`) that must not be persisted as an assistant turn. `autocompact_state` feeds the gauge when emitted, with `result.modelUsage[].contextWindow` as the fallback (§6) |
 | Native rename | **supported** | `set_thread_name` forwards to `rename_session` with `source: "host"` (§3.3), or returns `Ok` when no child is live |
 | Native archive / delete | **supported** | Not because the CLI has archive or delete, but because these are where a per-thread adapter stops its process: `delete_thread` and `set_thread_archived(true)` stop the child and return `Ok` (§5.2). Leaving them at the trait default would keep a 450 MB process alive for a thread the user has deleted |
-| `terminate_command` | **unsupported (v1)** — scope, not absence | `stop_task` kills a live `task_type: "local_bash"` task from a stdio host (§3.3). Supporting it means tracking `task_started` → `task_id` per item and keying completion off `task_updated` rather than the control reply. A candidate for after milestone 4 (§11) |
+| `terminate_command` | **supported for `local_bash` tasks since the hardening pass** | `stop_task` kills a live `task_type: "local_bash"` task from a stdio host (§3.3). A background `Bash` item carries its task id as `process_id`, and its completion keys off `task_updated` / `task_notification`, not the control reply (`claude-code-harness-plan/hardening-plan.md` §2). A foreground command has no task and cannot be stopped alone |
 | Linked sub-agent threads | **supported, as local child threads** | The child is not a resumable session, but its whole transcript is forwarded and is materialized as a read-only Giskard thread keyed by the Task call's `tool_use_id`. **Requires implementing `claim_native_thread`** — that is the only path by which such a thread is created, and the trait default fails every delegation into an unbounded retry (§5.3) |
 
 *Every flag above reaches the browser.* Stage 0 serializes `HarnessCapabilities` as
@@ -554,7 +554,8 @@ overlay is applied by the layer above.
 - **A `result` does not always end the turn.** A backgrounded delegation emits two (§5.3), so turn bookkeeping
   stays open until every **agent-type** task (`task_type: "local_agent"`) has a terminal
   `task_updated`. Background *command* tasks (`local_bash`) must not gate the turn — they legitimately
-  outlive it — and belong in `RunningTaskState` instead.
+  outlive it — and belong in `RunningTaskState` instead, which is where they reach it since the
+  hardening pass (`claude-code-harness-plan/hardening-plan.md` §2).
 - `discoveries()` is `DiscoveryStream::closed()`: a per-thread process produces no *unsolicited*
   native traffic, so there is nothing to discover.
 - **`claim_native_thread` must be implemented**, for `task:` ids. It cannot stay at the trait default,
@@ -1485,7 +1486,8 @@ be asked about. Under §8.3 that is a foreseeable report rather than a surprise,
 
 ## 10. Not in v1
 
-Structured diffs; MCP reload and OAuth; `terminate_command`; idle process reaping; `sdkMcpServers`;
+Structured diffs; MCP reload and OAuth; `terminate_command` for a foreground command (a background
+one is supported since the hardening pass); idle process reaping; `sdkMcpServers`;
 **hook-based approval enforcement**
 — the stdio channel is the MVP's only approval path, with the hook route deferred to a later decision
 and refactor (§9.4); and **honouring a repository's own `.claude/settings.json`** — the `project` and
@@ -1700,12 +1702,12 @@ completing a background `Bash` call as a running command whose `process_id` is t
 completing the item on its original turn with the output file's content and exit code (two
 `background-*` fixtures); a foreground command stays unstoppable on its own, as the CLI offers
 nothing for it, with the browser saying so; the durable late amendment of the persisted row is the
-server's own step there. Its §3: a connected MCP server read "Unknown" in green with 0 tools and 0
-resources, because the browser's chip is the auth status, the adapter parsed only what failed and
-pending servers carry, and resources are not exposed to a stdio host at all; fixed by a neutral
-`connection` state on `McpServerStatus` (Codex's `runtimeStatus` maps onto it), the tool list
-`mcp_status` does carry for a connected server (an `mcp-status` fixture), resources that can say
-"not reported", and a browser chip that states the connection.
+server's own step there; implemented. Its §3: a connected MCP server read "Unknown" in green with 0
+tools and 0 resources, because the browser's chip is the auth status, the adapter parsed only what
+failed and pending servers carry, and resources are not exposed to a stdio host at all; fixed by a
+neutral `connection` state on `McpServerStatus` (Codex's `runtimeStatus` maps onto it), the tool
+list `mcp_status` does carry for a connected server (an `mcp-status` fixture), resources that can
+say "not reported", and a browser chip that states the connection.
 
 ### Later, as its own decision — the hook route (§9.4)
 
