@@ -96,7 +96,8 @@ claude -p --input-format stream-json --output-format stream-json --verbose \
        --permission-prompt-tool stdio            # routes approvals to Giskard (§9)
        --setting-sources user                    # §8.3
        --disallowedTools EnterPlanMode ExitPlanMode   # Giskard owns the mode (§8.2)
-       [--resume=<uuid>] [--forward-subagent-text] [--include-partial-messages] [--replay-user-messages]
+       --replay-user-messages                    # the prompt's acknowledgement (hardening §1)
+       [--resume=<uuid>] [--forward-subagent-text] [--include-partial-messages]
 ```
 
 Stdin stays open; each user turn is one JSON line
@@ -1686,25 +1687,25 @@ returned rather than probed around. MCP status per thread is implemented; see
 
 ### After milestone 6 — hardening from real use
 
-Issues found by using the harness, fixed one commit each between milestones 6 and 7, with a
-fixture or test per issue, in `claude-code-harness-plan/hardening-plan.md`. Its §1: a turn's
-prompt was never acknowledged (the browser un-greys the prompt only on a `UserMessage` item, the
-live snapshot omits the prompt of a user turn because the harness is expected to echo it, and the
-adapter never did); fixed by passing `--replay-user-messages` and mapping the CLI's `isReplay`
-echo to the turn's `UserMessage`, verified on 2.1.287 with three recorded `replay-*` fixtures
-(the flag also echoes the adapter's own ask answers, which the supervisor learns to ignore). Its
-§2: a command could not be stopped on its own and a background command read as completed at
-once; fixed by completing a background `Bash` call as a running command whose `process_id` is the
-CLI task id, `terminate_command` as `stop_task`, and the terminal `task_updated` /
-`task_notification` pair completing the item on its original turn with the output file's content
-and exit code (two `background-*` fixtures); a foreground command stays unstoppable on its own,
-as the CLI offers nothing for it, with the browser saying so; the durable late amendment of the
-persisted row is the server's own step there. Its §3: a connected MCP server read "Unknown" in
-green with 0 tools and 0 resources, because the browser's chip is the auth status, the adapter
-parsed only what failed and pending servers carry, and resources are not exposed to a stdio host
-at all; fixed by a neutral `connection` state on `McpServerStatus` (Codex's `runtimeStatus` maps
-onto it), the tool list `mcp_status` does carry for a connected server (an `mcp-status` fixture),
-resources that can say "not reported", and a browser chip that states the connection.
+Issues found by using the harness, fixed one commit each between milestones 6 and 7, with a fixture
+or test per issue, in `claude-code-harness-plan/hardening-plan.md`. Its §1: a turn's prompt was
+never acknowledged (the browser un-greys the prompt only on a `UserMessage` item, the live snapshot
+omits the prompt of a user turn because the harness is expected to echo it, and the adapter never
+did); fixed by passing `--replay-user-messages` and mapping the CLI's `isReplay` echo to the turn's
+`UserMessage`, verified on 2.1.287 with three recorded `replay-*` fixtures (the flag also echoes the
+adapter's own ask answers, which the supervisor learns to ignore); implemented. Its §2: a command
+could not be stopped on its own and a background command read as completed at once; fixed by
+completing a background `Bash` call as a running command whose `process_id` is the CLI task id,
+`terminate_command` as `stop_task`, and the terminal `task_updated` / `task_notification` pair
+completing the item on its original turn with the output file's content and exit code (two
+`background-*` fixtures); a foreground command stays unstoppable on its own, as the CLI offers
+nothing for it, with the browser saying so; the durable late amendment of the persisted row is the
+server's own step there. Its §3: a connected MCP server read "Unknown" in green with 0 tools and 0
+resources, because the browser's chip is the auth status, the adapter parsed only what failed and
+pending servers carry, and resources are not exposed to a stdio host at all; fixed by a neutral
+`connection` state on `McpServerStatus` (Codex's `runtimeStatus` maps onto it), the tool list
+`mcp_status` does carry for a connected server (an `mcp-status` fixture), resources that can say
+"not reported", and a browser chip that states the connection.
 
 ### Later, as its own decision — the hook route (§9.4)
 
