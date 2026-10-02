@@ -1,0 +1,28 @@
+{
+ "scenario": "background-taskstop",
+ "argv": [
+  "claude",
+  "-p",
+  "--input-format",
+  "stream-json",
+  "--output-format",
+  "stream-json",
+  "--verbose",
+  "--permission-prompt-tool",
+  "stdio",
+  "--setting-sources",
+  "",
+  "--model",
+  "haiku",
+  "--permission-mode",
+  "manual",
+  "--replay-user-messages",
+  "--session-id",
+  "7d8733ef-d8c2-4ac0-adc2-875999e402f6"
+ ],
+ "cwd": "/work/project",
+ "exit": 0,
+ "results": 1,
+ "asks": 1,
+ "elapsed_s": 28.5
+}
