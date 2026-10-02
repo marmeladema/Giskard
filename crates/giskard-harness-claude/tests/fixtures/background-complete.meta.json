@@ -1,0 +1,28 @@
+{
+ "scenario": "background-complete",
+ "argv": [
+  "claude",
+  "-p",
+  "--input-format",
+  "stream-json",
+  "--output-format",
+  "stream-json",
+  "--verbose",
+  "--permission-prompt-tool",
+  "stdio",
+  "--setting-sources",
+  "",
+  "--model",
+  "haiku",
+  "--permission-mode",
+  "manual",
+  "--replay-user-messages",
+  "--session-id",
+  "b165dba9-9a0d-4bf2-8b84-571a76a03e06"
+ ],
+ "cwd": "/work/project",
+ "exit": 0,
+ "results": 2,
+ "asks": 1,
+ "elapsed_s": 41.7
+}

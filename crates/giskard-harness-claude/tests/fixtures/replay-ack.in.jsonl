@@ -1,0 +1,2 @@
+{"type": "user", "message": {"role": "user", "content": [{"type": "text", "text": "Reply with the single word pong."}]}}
+{"type": "user", "message": {"role": "user", "content": [{"type": "text", "text": "Run `cat data.txt` with the Bash tool and reply with its output verbatim."}]}}

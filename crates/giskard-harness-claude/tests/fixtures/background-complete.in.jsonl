@@ -1,0 +1,2 @@
+{"type": "user", "message": {"role": "user", "content": [{"type": "text", "text": "Run exactly this with the Bash tool in the background (run_in_background: true): `for i in 1 2 3 4 5 6; do echo line $i; sleep 5; done; echo finished`. Then reply with the single word started and stop."}]}}
+{"type": "control_response", "response": {"subtype": "success", "request_id": "00d4dda5-a0ed-4cb9-be34-4c23a90e9292", "response": {"behavior": "allow"}}}

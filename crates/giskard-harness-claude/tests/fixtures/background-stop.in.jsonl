@@ -1,0 +1,3 @@
+{"type": "user", "message": {"role": "user", "content": [{"type": "text", "text": "Run exactly this with the Bash tool in the background (run_in_background: true): `for i in 1 2 3 4 5 6; do echo line $i; sleep 5; done; echo finished`. Then reply with the single word started and stop."}]}}
+{"type": "control_response", "response": {"subtype": "success", "request_id": "9c9ac24a-7ceb-4f69-a663-5e280b6d98dc", "response": {"behavior": "allow"}}}
+{"type": "control_request", "request_id": "a9eefcaa-9e05-44e9-9d73-eb2b7d117cf3", "request": {"subtype": "stop_task", "task_id": "b93m9v2sw"}}

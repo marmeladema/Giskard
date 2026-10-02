@@ -1,0 +1,30 @@
+{
+ "scenario": "mcp-status",
+ "argv": [
+  "claude",
+  "-p",
+  "--input-format",
+  "stream-json",
+  "--output-format",
+  "stream-json",
+  "--verbose",
+  "--permission-prompt-tool",
+  "stdio",
+  "--setting-sources",
+  "",
+  "--model",
+  "haiku",
+  "--permission-mode",
+  "manual",
+  "--mcp-config",
+  "/work/project/mcp.json",
+  "--strict-mcp-config",
+  "--session-id",
+  "6ddcc218-b3db-48cf-a021-4878916f997b"
+ ],
+ "cwd": "/work/project",
+ "exit": 0,
+ "results": 1,
+ "asks": 0,
+ "elapsed_s": 7.9
+}
