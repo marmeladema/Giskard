@@ -7303,7 +7303,7 @@ mod tests {
         logs_assert(a_line_with(&[
             " WARN ",
             "action=\"task_notification\"",
-            "reason=\"grace\"",
+            "no notification followed",
         ]));
         // Nothing keeps the child busy any more: it is reaped like any idle child.
         tokio::time::sleep(IDLE).await;

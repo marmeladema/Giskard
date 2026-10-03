@@ -237,8 +237,8 @@ struct BackgroundCommand {
     /// completion that no `task_notification` carries a path for.
     output_file: Option<PathBuf>,
     /// Set by the terminal `task_updated`; the item completes on the `task_notification` that
-    /// follows, else on the next `result` or the supervisor's grace (`settle_background_commands`),
-    /// or on child exit.
+    /// follows, else when the supervisor's grace runs out (`settle_background_commands`), or on
+    /// child exit.
     terminal: Option<TaskStatus>,
     /// `task_updated.patch.end_time` of the terminal update.
     end_time_ms: Option<u64>,
@@ -1464,9 +1464,10 @@ impl ClaudeMapper {
     /// not, from the update and the output file its `tool_result` named. The notification has
     /// followed the update within milliseconds in every recording (a completion, a failure, a
     /// kill by `stop_task` or by the model's `TaskStop`), but nothing promises it, and without it
-    /// the item would stay running and the task keep the child busy. Called at the next `result`
-    /// and by the supervisor's grace timer.
-    pub fn settle_background_commands(&mut self, reason: &'static str) -> Vec<MapperOutput> {
+    /// the item would stay running and the task keep the child busy. Called by the supervisor's
+    /// grace timer only: no frame settles it, since the notification can still be on its way when
+    /// any other frame (a `result` among them) arrives, and it would then be dropped.
+    pub fn settle_background_commands(&mut self) -> Vec<MapperOutput> {
         let mut out = Vec::new();
         let settled: Vec<String> = self
             .session
@@ -1503,7 +1504,6 @@ impl ClaudeMapper {
                 status,
                 exit_code = display_opt(output.exit_code),
                 output_bytes = output.text.len(),
-                reason,
                 action = "task_notification",
                 "no notification followed a background command's terminal update; completing it \
                  from the update"
@@ -1613,8 +1613,6 @@ impl ClaudeMapper {
     }
 
     fn on_result(&mut self, result: Box<ResultMessage>, out: &mut Out) {
-        // A terminal update still without its notification by the next `result` gets none.
-        out.extend(self.settle_background_commands("result"));
         let turn_id = self.ensure_turn("result", out);
         self.record_model_usage(&result, turn_id);
         let Some(turn) = self.turn.as_mut() else {
@@ -3118,7 +3116,7 @@ impl ClaudeMapper {
             terminal: None,
             end_time_ms: None,
         });
-        adopted.output_file = background_output_path(result_text);
+        adopted.output_file = background_output_path(result_text, &task_id);
         Some(task_id)
     }
 
@@ -3633,12 +3631,14 @@ fn command_status(status: &TaskStatus) -> &'static str {
 }
 
 /// The output file a background `Bash` call's `tool_result` names: "Command running in
-/// background with ID: <id>. Output is being written to: <path>.output. …". Matched up to the
-/// file's `.output` extension, so a path with spaces survives; `None` for any other text.
-fn background_output_path(text: &str) -> Option<PathBuf> {
+/// background with ID: <id>. Output is being written to: <path>/<id>.output. …". Matched up to
+/// the task's own `<id>.output`, so a path with spaces, or another `.output` earlier in it,
+/// survives; `None` for any other text.
+fn background_output_path(text: &str, task_id: &str) -> Option<PathBuf> {
     const MARKER: &str = "Output is being written to: ";
     let rest = &text[text.find(MARKER)? + MARKER.len()..];
-    let end = rest.find(".output")? + ".output".len();
+    let file = format!("{task_id}.output");
+    let end = rest.find(&file)? + file.len();
     Some(PathBuf::from(&rest[..end]))
 }
 
@@ -4616,13 +4616,7 @@ mod tests {
     /// `name`'s stdout lines with every `output_file` pointing at a temp file holding `content`.
     /// `name`'s stdout lines with the recorded output file (in the notification's `output_file`
     /// and the `tool_result` text alike) replaced by a temp file holding `content`.
-    fn with_output_file(name: &str, content: &str) -> (Vec<String>, tempfile::NamedTempFile) {
-        let file = tempfile::Builder::new()
-            .suffix(".output")
-            .tempfile()
-            .unwrap();
-        std::fs::write(file.path(), content).unwrap();
-        let path = file.path().display().to_string();
+    fn with_output_file(name: &str, content: &str) -> (Vec<String>, tempfile::TempDir) {
         let lines = out_lines(name);
         let recorded = lines
             .iter()
@@ -4634,11 +4628,16 @@ mod tests {
                     .map(str::to_owned)
             })
             .unwrap();
+        // Named `<task_id>.output`, as the CLI names it.
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join(Path::new(&recorded).file_name().unwrap());
+        std::fs::write(&file, content).unwrap();
+        let path = file.display().to_string();
         let lines = lines
             .into_iter()
             .map(|line| line.replace(&recorded, &path))
             .collect();
-        (lines, file)
+        (lines, dir)
     }
 
     /// Every `CommandExecution` completion: `(turn, item)`.
@@ -4893,11 +4892,13 @@ mod tests {
 
     #[test]
     #[traced_test]
-    fn a_terminal_update_without_a_notification_settles_at_the_next_result() {
+    fn a_result_never_settles_a_command_awaiting_its_notification() {
+        // The notification arrives after the continuation's `result`: that result must not
+        // settle the command early, or the real notification would be dropped.
         let (mut lines, _file) =
             with_output_file("background-complete", "finished\n\n[exited with code 0]\n");
         let notification = line_index(&lines, r#""subtype": "task_notification""#);
-        lines.remove(notification);
+        let late = lines.remove(notification);
         let continuation = lines
             .iter()
             .rposition(|line| line.contains(r#""type": "result""#))
@@ -4905,7 +4906,7 @@ mod tests {
         let mut mapper = new_mapper();
         let before: Vec<MapperOutput> = drive_lines(
             &mut mapper,
-            &lines[..continuation],
+            &lines[..=continuation],
             1,
             TurnKind::User,
             false,
@@ -4913,32 +4914,19 @@ mod tests {
         .into_iter()
         .flatten()
         .collect();
-        assert_eq!(
-            command_completions(&before).len(),
-            1,
-            "still running before the result"
-        );
+        let commands = command_completions(&before);
+        assert_eq!(commands.len(), 1, "still running after the result");
         assert!(mapper.awaiting_notification());
-        let at_result = mapper.map_line(&lines[continuation]);
-        let commands = command_completions(&at_result);
-        assert_eq!(commands.len(), 1);
+        let ended = mapper.map_line(&late);
+        let completed = command_completions(&ended);
+        assert_eq!(completed.len(), 1);
+        assert_eq!(completed[0].0, commands[0].0);
         assert_eq!(
-            command_fields(commands[0].1),
+            command_fields(completed[0].1),
             ("finished", Some("completed"), Some(0), Some("bx9de5w1u"))
         );
-        // On its own turn, not the continuation the result completes.
-        assert_eq!(commands[0].0, command_completions(&before)[0].0);
         assert!(!mapper.has_tasks());
-        assert!(!mapper.awaiting_notification());
-        logs_assert(lines_with(
-            1,
-            &[
-                " WARN ",
-                r#"action="task_notification""#,
-                r#"reason="result""#,
-                "no notification followed",
-            ],
-        ));
+        logs_assert(no_line_with("no notification followed"));
     }
 
     #[test]
@@ -4950,7 +4938,7 @@ mod tests {
         drive_lines(&mut mapper, &lines, 1, TurnKind::User, false);
         assert!(mapper.has_tasks());
         assert!(mapper.awaiting_notification());
-        let outputs = mapper.settle_background_commands("grace");
+        let outputs = mapper.settle_background_commands();
         let commands = command_completions(&outputs);
         assert_eq!(commands.len(), 1);
         assert_eq!(
@@ -4958,7 +4946,7 @@ mod tests {
             ("line 1", Some("terminated"), None, Some("b93m9v2sw"))
         );
         assert!(!mapper.has_tasks());
-        assert!(mapper.settle_background_commands("grace").is_empty());
+        assert!(mapper.settle_background_commands().is_empty());
     }
 
     #[test]
@@ -4991,15 +4979,19 @@ mod tests {
         assert_eq!(
             background_output_path(
                 "Command running in background with ID: b1. Output is being written to: \
-                 /tmp/claude-1000/-work-project/s 1/tasks/b1.output. You will be notified."
+                 /tmp/x.output dir/-work-project/s 1/tasks/b1.output. You will be notified.",
+                "b1"
             ),
             Some(PathBuf::from(
-                "/tmp/claude-1000/-work-project/s 1/tasks/b1.output"
+                "/tmp/x.output dir/-work-project/s 1/tasks/b1.output"
             ))
         );
-        assert_eq!(background_output_path("the magic number is 4271"), None);
         assert_eq!(
-            background_output_path("Output is being written to: nowhere"),
+            background_output_path("the magic number is 4271", "b1"),
+            None
+        );
+        assert_eq!(
+            background_output_path("Output is being written to: /tmp/b2.output", "b1"),
             None
         );
     }

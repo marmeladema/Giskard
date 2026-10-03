@@ -979,7 +979,7 @@ impl Supervisor {
                 () = tokio::time::sleep_until(notification_deadline.unwrap_or_else(Instant::now)),
                     if notification_deadline.is_some() => {
                     self.awaiting_notification_since = None;
-                    let outputs = self.mapper.settle_background_commands("grace");
+                    let outputs = self.mapper.settle_background_commands();
                     if let Err(error) = self.dispatch_all(outputs).await {
                         self.broken("write_stdin", "a stdin write failed", &error);
                         return self.end_broken();

@@ -433,10 +433,12 @@ keeps and whose Stop the browser enables because it has a process id.
   (`background-fail`), a `stop_task` and the model's own `TaskStop` tool (`background-taskstop`).
 - **No notification.** Nothing promises it, and without it the item would stay running and the
   open task keep the child busy, so never reaped. So a terminal update still waiting for its
-  notification is settled at the next `result` frame, or by the supervisor after a 2 s grace
-  (`NOTIFICATION_GRACE`), whichever comes first: the item completes from the update's status and
-  the output path the `tool_result` named, with a `warn` (`task_notification`, `reason` = `result`
-  or `grace`). A notification arriving after that finds no command and is logged at `debug`.
+  notification is settled by the supervisor after a 2 s grace (`NOTIFICATION_GRACE`): the item
+  completes from the update's status and the output path the `tool_result` named (cut at the
+  task's own `<task_id>.output`), with a `warn` (`task_notification`). No frame settles it, not
+  even a `result`: one landing between the update and the notification would settle the item
+  early and drop the real notification. A notification arriving after the grace finds no command
+  and is logged at `debug`.
 - **Output file.** `<tmp>/claude-<uid>/<encoded cwd>/<session id>/tasks/<task_id>.output` (the CLI's
   temporary directory, `/tmp/claude-1000/…` in the recordings), on the server's machine: stdout and
   stderr as written, a blank line, then `[exited with code N]` or `[killed]`. The notification's
