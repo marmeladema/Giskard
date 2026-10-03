@@ -1,5 +1,5 @@
 {
- "scenario": "replay-ack",
+ "scenario": "background-stop-next-turn",
  "argv": [
   "claude",
   "-p",
@@ -18,11 +18,11 @@
   "manual",
   "--replay-user-messages",
   "--session-id",
-  "35604a18-8858-4374-afce-4e309c8edaf8"
+  "ccd040f1-99a1-40d2-958b-399cea8961c7"
  ],
  "cwd": "/work/project",
  "exit": 0,
  "results": 2,
  "asks": 0,
- "elapsed_s": 5.6
+ "elapsed_s": 21.4
 }

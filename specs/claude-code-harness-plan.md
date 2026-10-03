@@ -96,16 +96,18 @@ claude -p --input-format stream-json --output-format stream-json --verbose \
        --permission-prompt-tool stdio            # routes approvals to Giskard (§9)
        --setting-sources user                    # §8.3
        --disallowedTools EnterPlanMode ExitPlanMode   # Giskard owns the mode (§8.2)
-       --replay-user-messages                    # the prompt's acknowledgement (hardening §1)
        [--resume=<uuid>] [--forward-subagent-text] [--include-partial-messages]
+       # no --replay-user-messages: see the adapter README, *Process control*
 ```
 
 Stdin stays open; each user turn is one JSON line
 (`{"type":"user","message":{"role":"user","content":[{"type":"text","text":"…"}]}}`). The process
-keeps serving turns until stdin closes. `--replay-user-messages` is on for every session child
-since the hardening pass after milestone 6 (`claude-code-harness-plan/hardening-plan.md` §1): the
-CLI echoes each stdin prompt as a `user` frame with `isReplay: true`, which the adapter maps to the
-turn's `UserMessage` item, the acknowledgement the browser and the live snapshot wait for.
+keeps serving turns until stdin closes. The CLI emits `system/init` at the top of every prompt it
+takes, before any answer; since the hardening pass after milestone 6
+(`claude-code-harness-plan/hardening-plan.md` §1) that frame makes the text the adapter wrote the
+turn's `UserMessage` item, the acknowledgement the browser and the live snapshot wait for, with the
+turn's first answer frame as a backstop. `--replay-user-messages` was tried for this and dropped
+(the adapter README, *Process control*, says why).
 
 ### 3.2 Output messages observed
 
@@ -1558,12 +1560,12 @@ not a milestone; it needs a direct-provider machine and §6 does not depend on i
 
 ### Milestone 2 — child supervisor and thread lifecycle
 
-`ClaudeHarness` as the façade over `HashMap<ThreadId, ChildSession>`, one supervisor task per
-child owning its stdin, its raw-line reader, its mapper and its retained `EventLog` (created at
-open, so `subscribe` answers before the first frame). Giskard owns argv: the full §3.1 invocation is
-built on `tokio::process::Command` directly, because `ClaudeCliBuilder` cannot emit
-`--setting-sources`, `--effort`, `--forward-subagent-text`, `--include-partial-messages` or
-`--replay-user-messages` (§3.7.1). The `initialize` handshake, `open_thread` for a fresh id and for
+`ClaudeHarness` as the façade over `HashMap<ThreadId, ChildSession>`, one supervisor task per child
+owning its stdin, its raw-line reader, its mapper and its retained `EventLog` (created at open, so
+`subscribe` answers before the first frame). Giskard owns argv: the full §3.1 invocation is built on
+`tokio::process::Command` directly, because `ClaudeCliBuilder` cannot emit `--setting-sources`,
+`--effort`, `--forward-subagent-text` or `--include-partial-messages` (§3.7.1). No `--add-dir` or
+`--replay-user-messages`. The `initialize` handshake, `open_thread` for a fresh id and for
 `--resume`, the same-id respawn when resume fails (§5.2), `start_turn` with inline attachments and
 the encoded-size ceilings (§3.6), `interrupt`, `shutdown` that interrupts before it stops, and the
 three lifecycle methods that stop a child. `list_models` from the freshest `initialize` or the probe
@@ -1571,11 +1573,11 @@ three lifecycle methods that stop a child. `list_models` from the freshest `init
 `plan_build_modes`, `per_turn_model`, `reasoning_effort` and `context_compaction` are reported only
 from milestone 3, and `mcp_status` only from milestone 4, which wires `list_mcp_servers` over the
 `mcp_status` control request. Verified while planning it: nothing reaches stdout before the first
-user message, so the open handshake is the `initialize` control response; a missing transcript
-makes `--resume` exit before answering it, so the fallback is decided at open; closing stdin lets
-a running turn finish and exits the idle CLI; `get_context_usage` answers `maxTokens` at open, which
-a resumed thread reports through `ThreadUpdate::ContextWindowRestored`. Milestone 2 is implemented
-in `crates/giskard-harness-claude` (`ClaudeHarness`, `ClaudeLaunchOptions`).
+user message, so the open handshake is the `initialize` control response; a missing transcript makes
+`--resume` exit before answering it, so the fallback is decided at open; closing stdin lets a
+running turn finish and exits the idle CLI; `get_context_usage` answers `maxTokens` at open, which a
+resumed thread reports through `ThreadUpdate::ContextWindowRestored`. Milestone 2 is implemented in
+`crates/giskard-harness-claude` (`ClaudeHarness`, `ClaudeLaunchOptions`).
 
 Tested without a real CLI: a scripted fake `claude` (a small test binary in the crate that replays a
 milestone-1 fixture and answers control requests) drives the supervisor in CI, the way the Codex
@@ -1693,23 +1695,23 @@ Issues found by using the harness, fixed one commit each between milestones 6 an
 or test per issue, in `claude-code-harness-plan/hardening-plan.md`. Its §1: a turn's prompt was
 never acknowledged (the browser un-greys the prompt only on a `UserMessage` item, the live snapshot
 omits the prompt of a user turn because the harness is expected to echo it, and the adapter never
-did); fixed by passing `--replay-user-messages` and mapping the CLI's `isReplay` echo to the turn's
-`UserMessage`, verified on 2.1.287 with three recorded `replay-*` fixtures (the flag also echoes the
-adapter's own ask answers, which the supervisor learns to ignore); implemented. Its §2: a command
-could not be stopped on its own and a background command read as completed at once; fixed by
-completing a background `Bash` call as a running command whose `process_id` is the CLI task id,
-`terminate_command` as `stop_task`, and the terminal `task_updated` / `task_notification` pair
-completing the item on its original turn with the output file's content and exit code (two
-`background-*` fixtures); a foreground command stays unstoppable on its own, as the CLI offers
-nothing for it, with the browser saying so; the durable late amendment of the persisted row is the
-server's own step there; implemented. Its §3: a connected MCP server read "Unknown" in green with 0
-tools and 0 resources, because the browser's chip is the auth status, the adapter parsed only what
-failed and pending servers carry, and resources are not exposed to a stdio host at all; fixed by a
-neutral `connection` state on `McpServerStatus` (Codex's `runtimeStatus` maps onto it), the tool
-list `mcp_status` does carry for a connected server (an `mcp-status` fixture), resources that can
-say "not reported", and a browser chip that states the connection. This retires the tool inventory
-from `init.tools` once planned for milestone 8: `init.tools` adds nothing `mcp_status` lacks;
-implemented, see the adapter README's *MCP servers*.
+did); first fixed with `--replay-user-messages` and the CLI's `isReplay` echo, then, since the CLI
+does not echo every prompt and echoes more than prompts, by acknowledging the prompt at the turn's
+`system/init` from the text the adapter wrote, with the first answer frame as a backstop;
+implemented (*Decision revised* there). Its §2: a command could not be stopped on its own and a
+background command read as completed at once; fixed by completing a background `Bash` call as a
+running command whose `process_id` is the CLI task id, `terminate_command` as `stop_task`, and the
+terminal `task_updated` / `task_notification` pair completing the item on its original turn with the
+output file's content and exit code (two `background-*` fixtures); a foreground command stays
+unstoppable on its own, as the CLI offers nothing for it, with the browser saying so; the durable
+late amendment of the persisted row is the server's own step there; implemented. Its §3: a connected
+MCP server read "Unknown" in green with 0 tools and 0 resources, because the browser's chip is the
+auth status, the adapter parsed only what failed and pending servers carry, and resources are not
+exposed to a stdio host at all; fixed by a neutral `connection` state on `McpServerStatus` (Codex's
+`runtimeStatus` maps onto it), the tool list `mcp_status` does carry for a connected server (an
+`mcp-status` fixture), resources that can say "not reported", and a browser chip that states the
+connection. This retires the tool inventory from `init.tools` once planned for milestone 8:
+`init.tools` adds nothing `mcp_status` lacks; implemented, see the adapter README's *MCP servers*.
 
 ### Later, as its own decision — the hook route (§9.4)
 

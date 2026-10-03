@@ -50,163 +50,96 @@ like every other recording).
 | The content is echoed verbatim, image blocks included, in the order the adapter wrote them (attachments first, then the text block: `user_message_line`, `attachments.rs:27`): `replay-image` line 2 is `[image, text]` | The mapper takes the text block(s) and ignores the rest; the browser's attachment path matches the row. A replayed message is at most the adapter's own 10 MiB stdin line, under the 64 MiB stdout line cap (`MAX_STDOUT_LINE_BYTES`) |
 | `tool_result` user frames, which the CLI writes itself, are not replayed: `replay-ack` line 11 has no `isReplay` | No double completion of tool calls. `on_user`'s tool-result path is untouched |
 | A `/compact` line is not replayed as such. What comes back is what the CLI already emits **without** the flag: the compaction summary (`isSynthetic: true, isReplay: false`) and the local command's stdout `<local-command-stdout>Compacted </local-command-stdout>` with `isReplay: true` (`replay-compact` lines 11–12; the existing `compact` fixture lines 10–11 are identical in shape) | `is_replay` already appears in a compaction turn today, and the mapper skips it as bookkeeping. The new rule distinguishes by turn kind: a replay in a `User` turn is the prompt; in a `Compaction` turn it is the command's stdout |
+| Found in use after this section shipped: a background task stopped by `stop_task` gets no continuation turn, so the CLI queues its `<task-notification>` and, at the next message, replays it **before** that message, as a user frame with `isReplay: true`, a string `content` and `origin: {"kind": "task-notification"}` (`background-stop-next-turn` lines 19 and 22) | Taken as the first replay, it became the turn's `UserMessage` and the real prompt was dropped as a second replay: the prompt stayed grey and the notification showed as the user's message. A replay with an `origin` is skipped (`queued_input_replay` at `debug`) and never acknowledges the turn |
+| Found in use too: the CLI replays **nothing** for a prompt containing, anywhere, one of five exact opening tags: `<task-notification>`, `<local-command-stdout>`, `<local-command-stderr>`, `<bash-stdout>`, `<bash-stderr>`. Checked on 2.1.287 against 38 variants: HTML (`<script>`, `<img>`, `<div>`), made-up tags, unterminated tags (no `>`), the same names with an attribute, in uppercase or self-closed, and the CLI's other tags (`<bash-input>`, `<command-name>`, `<system-reminder>`) are all replayed. Recorded as `prompt-not-replayed` | Such a prompt was never acknowledged. The adapter now notes the text it wrote and, when the turn's first answer frame arrives without a replay, emits the `UserMessage` from it (`prompt_acknowledged`, `replayed = false`, at `info`): the replay stays the acknowledgement, and this fallback covers any suppression |
 | A `--resume` with the flag replays nothing at startup; only the new message comes back, after that turn's `init` (live probe on the recorded session) | Safe on every respawn; no flood of "user frame with no active turn" warnings |
 | The replayed frame has no `isSynthetic`; the compaction summary has `isSynthetic: true` and `isReplay: false` | The two flags are independent and the mapper must test them separately, not as one `bookkeeping` bit |
-| **The flag also echoes every `control_response` line the adapter writes** (its answer to a `can_use_tool` or other ask) back on stdout, verbatim, with no marker: `background-stop` line 9 and `background-complete` line 9 are the recorder's own `{"behavior":"allow"}` answers; the same probe without the flag echoes nothing. A stdin `control_request` is not echoed, and its reply still arrives (`background-stop` line 19 is the `stop_task` reply; `initialize`, `get_settings` and `set_permission_mode` were answered in a live probe with the flag on) | Without handling, every answered ask would log `warn` "control response for a request nobody is waiting on" (`session.rs`, the `ControlResponse` arm of `dispatch`). The supervisor must recognise the echo of its own answer (Step 2b) |
+| **The flag also echoes every `control_response` line the adapter writes** (its answer to a `can_use_tool` or other ask) back on stdout, verbatim, with no marker: `background-stop` line 9 and `background-complete` line 9 are the recorder's own `{"behavior":"allow"}` answers; the same probe without the flag echoes nothing. A stdin `control_request` is not echoed, and its reply still arrives (`background-stop` line 19 is the `stop_task` reply; `initialize`, `get_settings` and `set_permission_mode` were answered in a live probe with the flag on) | Without handling, every answered ask would log `warn` "control response for a request nobody is waiting on" (`session.rs`, the `ControlResponse` arm of `dispatch`). The first version had the supervisor recognise the echo of its own answer; the revised decision drops the flag, so nothing echoes |
 
-### Step 1: the flag (`crates/giskard-harness-claude/src/process.rs`)
+### Decision revised: acknowledge at `system/init`, no `--replay-user-messages`
 
-`session_argv` (`:122`) adds `"--replay-user-messages"` after the launch mode. It is a session
-flag, not a protocol flag: `protocol_argv` and the probe stay as they are, since a probe never
-writes a `user` line. The real-process tests see the flag in the argv `fake-claude.sh` receives
-(Step 3).
+The steps below first shipped with the flag: the CLI's `isReplay` echo of the prompt was the turn's
+`UserMessage`. Use showed the CLI does not echo every prompt and echoes more than prompts (the last
+rows of the table above), so the decision was revised on PR #295, verified against the 2.1.288
+source and live probes. The flag is gone; the turn's `UserMessage` is emitted from the text the
+adapter wrote, triggered by the turn's `system/init`, with the turn's first answer frame as a
+backstop that warns. The rationale is the adapter README's **Why not `--replay-user-messages`**
+paragraph (*Process control*). The table above stays as the record of what was tried; the
+`replay-ack` and `replay-image` fixtures it cites were deleted with the revision.
+
+### Step 1: no flag (`crates/giskard-harness-claude/src/process.rs`)
+
+`session_argv` passes no `--replay-user-messages`; the tests assert the flag is absent from session
+and probe argv alike.
 
 ### Step 2: the mapper (`crates/giskard-harness-claude/src/mapper.rs`)
 
-- `TurnState` (`:286`) gains `prompt_acknowledged: bool` (turn-lifetime: dropped with the turn),
-  `false` from `TurnState::new`.
-- `on_user` (`:2341`) replaces the single `bookkeeping` bit with two: `synthetic =
-  message.is_synthetic == Some(true)` and `replay = message.is_replay == Some(true)`. Before the
-  block loop, when `replay && !synthetic` and the route is `Primary` and no block is a
-  `tool_result`:
-  - turn kind `User`, `prompt_acknowledged == false`: emit the `UserMessage` item through the
-    existing `user_message` helper (`:2420`) with `text` = the text blocks' text joined by `"\n"`
-    (the adapter writes one; the join is defensive and an attachments-only message yields `""`),
-    `harness_item_id` = `user:<uuid>:0` as the helper's callers already do, then set
-    `prompt_acknowledged = true` and log at `debug` (`action = "prompt_acknowledged"`, `turn_id`,
-    `frame_uuid`, `bytes`). Return: no block of this frame is mapped further (an image block would
-    otherwise reach the "skipping a user block" `debug`).
-  - turn kind `User`, already acknowledged: `warn` (`action = "prompt_acknowledged"`, "a second
-    replayed user message in one turn; dropping it") and return. The adapter writes exactly one
-    user line per turn, so this is a protocol surprise worth seeing.
-  - turn kind `Compaction`: `debug` (`action = "compaction_replay"`) and return. This is the
-    `<local-command-stdout>` frame; it was skipped before and stays skipped.
-- Everything else is unchanged: no active turn keeps today's `warn`; a synthetic frame's text is
-  skipped; a non-replay text block on the primary route is still an `Activity` (`cancel` fixture,
-  "[Request interrupted by user for tool use]"); sub-agent routes are untouched, since a forwarded
-  frame is never a replay of stdin and `take_delegated_prompt` keeps its path.
+- `TurnState` carries `prompt: Option<String>` (the text the adapter wrote, set by `note_prompt`
+  right after `begin_turn`; the supervisor gets it from the façade as `UserLine.prompt`) and
+  `prompt_acknowledged: bool`, both turn-lifetime.
+- `acknowledge_prompt(trigger, frame_type, out)`: for an active `TurnKind::User` turn not yet
+  acknowledged and with a prompt, emit the `UserMessage` item through `user_message`, with
+  `harness_item_id` = `user:<turn_id>:sent`. `trigger = "init"` logs `prompt_acknowledged` at
+  `info`; any other trigger logs it at `warn` with the frame type ("no system/init preceded the
+  answer; acknowledged from the first answer frame").
+- `on_init` calls it with `"init"` before the mode and API-key checks. A mid-turn re-emitted `init`
+  (auto-compaction), a compaction turn's `init` and one outside any turn are covered by the gate.
+- The backstop: `map` calls it with the frame type for a primary `assistant`, `stream_event`,
+  non-replayed `user`, `result` or `can_use_tool` frame.
+- `on_user` ignores every `isReplay` frame on the primary route (no tool result): `debug`,
+  `action = "replay_ignored"`, with `origin.kind` when present, and no item. Without the flag the
+  CLI still marks the `<local-command-stdout>` after `/compact` so; recordings made with the flag
+  carry prompts and queued inputs. `bookkeeping = synthetic || replay` stays for the rest.
 
-The façade does not change: `TurnStarted` is still appended before the line is written, and the
-item follows from the stream like any other.
+### Step 3: the supervisor (`session.rs`)
 
-### Step 2b: the supervisor ignores the echo of its own answers (`session.rs`)
+No record of answered asks: without the flag nothing echoes them, and an unexpected
+`control_response` is the existing "nobody is waiting" `warn`.
 
-With the flag the CLI echoes each `control_response` the adapter writes (facts table). The
-mapper turns such a line into `MapperOutput::ControlResponse { request_id, payload }` like any
-other, and today the `dispatch` arm finds no waiter and warns. So:
+### Step 4: tests
 
-- `Supervisor` gains `answered_asks: HashSet<String>` (an `ENTITY-AUTHORITY-EXCEPTION` beside
-  `withdrawn`, same lifetime: cleared where `withdrawn` is, at the next turn's start). Every
-  place the supervisor writes an answer records the ask's `request_id` first: `respond_approval`,
-  `respond_server_request`, and the `MapperOutput::Reply` arm of `dispatch` (the mapper's own
-  `ExitPlanMode` deny; read `response.request_id` from the value).
-- In the `ControlResponse` arm, after the `TurnSetup` check and before `waiters`: a `request_id`
-  found in `answered_asks` is removed and logged at `debug` (`action = "control_response"`,
-  `echo = true`, "the CLI echoed the adapter's own answer; ignored"). The order matters: the
-  adapter's own request ids are fresh UUIDs and never collide with the CLI's ask ids, but checking
-  the echo set first keeps the `abandoned` and "nobody is waiting" paths meaning what they say.
-- The echo arrives within milliseconds of the write (2 ms in the recordings), so clearing the set
-  at the next turn start cannot drop a live entry.
+- Mapper: `a_turn_is_acknowledged_at_init` (`text-turn`: one `UserMessage`, the noted text, emitted
+  by the `init` line, before the first assistant item); `a_compaction_turn_is_not_acknowledged`
+  (`compact`); `a_mid_turn_init_acknowledges_once`; `an_init_outside_a_turn_acknowledges_nothing`;
+  `the_backstop_acknowledges_when_init_is_missing` (the item at the first stream event, the
+  `warn`); `replayed_frames_are_ignored` (`background-stop-next-turn` and `prompt-not-replayed`:
+  one `UserMessage` per turn, the sent text, the `origin` frame yields nothing);
+  `a_compaction_replay_is_not_a_user_message` (`replay-compact`).
+- Façade, scripted child: `a_turn_is_acknowledged_at_init` (the item precedes the first assistant
+  item) and `a_turn_without_init_is_acknowledged_by_its_answer` (the `warn`). The scripted child has
+  no echo actions; the fixture feed drops `control_response` lines, among them the flag's echoes of
+  the adapter's answers in the `background-*` recordings.
+- Real process: `a_real_child_acknowledges_at_init`; `fake-claude.sh` echoes nothing.
+- Fixtures: `replay-compact`, `prompt-not-replayed` and `background-stop-next-turn` stay, marked as
+  recorded with a flag the adapter no longer passes.
 
-### Step 3: tests
+### Step 5: documentation
 
-Mapper tests, with the existing helpers (`run_fixture`, `drive`, `completed_items`, `events`,
-`on_thread`):
-
-1. `a_replayed_prompt_is_the_turns_user_message`, on `replay-ack`: two turns; in each, exactly
-   one `ItemCompleted` with `ItemPayload::UserMessage`, its text equal to the recorded prompt
-   (`in.jsonl` line 1 and 2), its `harness_item_id` starting with `user:`, and its position after
-   that turn's `TurnStarted` and before the turn's first `AgentMessage` or `ToolCall` item; the
-   `tool_result` frame of the second turn (line 11) completes the `Bash` tool call and adds no
-   `UserMessage`.
-2. `an_attachment_replay_yields_the_text_only`, on `replay-image`: one `UserMessage` with text
-   `Say pong.`; no item for the image block; no "skipping a user block" line (`#[traced_test]`,
-   `logs_assert` with `no_line_with`).
-3. `a_compaction_replay_is_not_a_user_message`, on `replay-compact` driven with
-   `TurnKind::Compaction` for the last turn: the first turn has its `UserMessage`; the compaction
-   turn's completed items are exactly the one `Context compacted` activity that
-   `compaction_emits_an_activity_and_no_agent_message` already checks on `compact`, and the
-   `compaction_replay` `debug` line is logged once.
-4. `a_second_replay_in_a_turn_is_dropped`: synthetic lines (a `replay-ack` turn with its replay
-   frame emitted twice): one `UserMessage`, the `warn` logged once.
-5. The existing `cancel` and `compact` fixture tests pass unchanged, which proves that the
-   interjection and the compaction frames keep their mapping.
-
-6. `the_echo_of_an_answered_ask_is_ignored` (façade, scripted child): the `tool-allowed` ask
-   answered through `respond_approval`; the script then `Emit`s the answer line back (as the CLI
-   does; `EmitFixture` strips `control_response` lines on purpose, so this one is explicit); the
-   turn completes and `logs_assert` finds the `echo = true` `debug` line and no "nobody is waiting"
-   `warn`. The same for an `AskUserQuestion` answered through `respond_server_request`, and for
-   the mapper's own `ExitPlanMode` deny (`plan-exit-denied`).
-
-Façade test (`harness.rs`, scripted child): `a_turn_is_acknowledged_by_its_replay`: the script's
-`OnStdin(user(), …)` emits the replayed user frame (the stdin line with `"isReplay": true` and a
-`uuid` added) before the `text-turn` frames; the subscribed stream shows `TurnStarted`, then
-`ItemStarted` and `ItemCompleted` of kind `UserMessage` with the sent text, then the turn's
-events, then `TurnCompleted`.
-
-`tests/fake-claude.sh`: when `--replay-user-messages` is in its argv (always, from Step 1), it
-echoes each stdin `user` line back before replaying that turn's frames, with `"isReplay":true`
-inserted after the opening brace (a `sed` on the line; no JSON parsing needed) and a fixed
-`"uuid"`, and echoes each stdin `control_response` line back verbatim, as the CLI does.
-`a_real_child_handshakes_and_completes_a_turn` then asserts the `UserMessage` item on the stream,
-so the real process path (spawn, argv, stdin, stdout) covers the acknowledgement.
-
-No server, browser or end-to-end test changes: the Playwright suite runs against the replay
-harness, and the browser's un-grey path is the one Codex already exercises.
-
-### Step 4: documentation
-
-- `crates/giskard-harness-claude/README.md`: *Launch* lists the flag with the others and the
-  sentence "No `--add-dir` or `--replay-user-messages`" keeps only `--add-dir`; *Process
-  control* / *Turns* says what acknowledges a turn (the replayed prompt as the turn's
-  `UserMessage` item, arriving with the first assistant frame) and that a second replay or one in
-  a compaction turn is dropped; *Approvals* says the CLI echoes the adapter's answer and the
-  supervisor ignores it; *Mapping keys* gains the `user` + `isReplay` row; *Code and tests* says
-  `fake-claude.sh` echoes the prompt and the answers.
-- `crates/giskard-harness-claude/tests/fixtures/README.md`: the three `replay-*` rows are added by
-  this plan's commit; the implementer keeps them accurate if a re-recording changes a line number
-  cited above.
-- `specs/claude-code-harness-plan.md`: §3.1's invocation shows the flag as always on, with a
-  pointer here; §11's hardening entry says this section is implemented.
+The adapter README (*Launch*, *Process control* with the rationale, *Mapping keys*, the identifier
+table, *Code and tests*), the fixtures README, and the harness plan's §3.1, milestone 2 and §11.
 
 ### Logging
 
-Stable fields: `thread_id`, `harness_thread_id`, `turn_id`, `frame_uuid`, `request_id`,
-`action`. Actions introduced: `prompt_acknowledged` (`debug` on the item, `warn` on a second
-replay), `compaction_replay` (`debug`); `control_response` gains `echo = true` (`debug`).
-Unchanged: the `warn` for a user frame with no active turn, the `debug` for a skipped synthetic
-block, the `warn` for a response nobody waits on (now only for a genuinely unknown id).
+`prompt_acknowledged` at `info` with `trigger`, `turn_id`, `bytes`; the backstop at `warn` with
+`frame_type`; `replay_ignored` at `debug` with `frame_uuid` and `origin`. Stable fields:
+`thread_id`, `harness_thread_id`, `turn_id`.
 
 ### Verification
 
-Before pushing: `cargo fmt --all --check`, `cargo clippy --workspace --all-targets --locked -- -D
-warnings`, `cargo test --workspace --locked`.
-
-Then, on a shell with a logged-in `claude`, a `claude-code` declaration and a project:
-
-1. Send a message. The bubble turns from grey to normal as the first words of the answer appear,
-   not when the answer ends.
-2. Send a message, switch to another thread while it runs, come back: the prompt is above the
-   agent's output, not greyed.
-3. Send a message with an image attached: same, and the attachment row is kept.
-4. Compact the thread (`/compact` from the UI): the compaction turn shows the "Context compacted"
-   row and no user bubble, as before.
-5. `RUST_LOG=giskard_harness_claude=debug`: one `prompt_acknowledged` line per turn, no `warn`
-   from `on_user`.
+`cargo fmt --all --check`, `cargo clippy --workspace --all-targets --locked -- -D warnings`,
+`cargo test --workspace --locked`. Then against a logged-in `claude` with
+`RUST_LOG=giskard_harness_claude=debug`: a plain prompt un-greys before any assistant text and logs
+`trigger="init"`; a prompt quoting `<task-notification>` and one quoting `<tick>` behave the same; a
+background command stopped from the UI followed by a new prompt shows only that prompt; no backstop
+`warn` anywhere in the run.
 
 ### Acceptance
 
-- Every session child carries `--replay-user-messages`; the probe does not.
-- Every user turn on a primary thread emits exactly one `UserMessage` item, from the CLI's replay,
-  with the text that was sent, before the turn's first output item.
-- A replay in a compaction turn, a second replay in one turn, a synthetic frame and an
-  interjection are each handled as this section says, with the log line it names.
-- The echo of an answered ask is recognised and logged at `debug`; answering an ask produces no
-  `warn`.
-- The three new fixtures are exercised by the mapper tests, the scripted-child and
-  `fake-claude.sh` tests cover the stream, and every existing test passes.
-- The adapter README, the fixtures README and the harness plan say what the code does.
+- No session or probe argv carries `--replay-user-messages`.
+- Every user turn yields exactly one `UserMessage`, equal to the sent text, emitted at `init`; a
+  compaction turn yields none.
+- The supervisor holds no record of answered asks.
+- The adapter README states the rationale and the backstop; the tests above pass.
 
 ## 2. Commands: no individual stop, and background commands shown as completed at once
 
@@ -647,8 +580,8 @@ status, once per status string; `warn` for a tool entry without a name). Fields:
 
 ## Observed while recording, not yet an issue
 
-- `system/thinking_tokens` frames appeared between assistant frames in the `replay-image`
-  recording (two of them, lines 4–5 of the first, discarded take; the shipped take has none). The
-  mapper logs an unknown `(type, subtype)` once at `warn` and skips it, so this costs one log line
-  per session where it occurs. Worth a mapping (or an explicit skip) in a later section once its
-  content is understood.
+- `system/thinking_tokens` frames appear between assistant frames (two in the first, discarded
+  take of the since-deleted `replay-image` recording), and `system/post_turn_summary` is emitted
+  before every `result` on 2.1.288. Both are known: they are in `IGNORED_SYSTEM_SUBTYPES`
+  (`frame.rs`) and skipped at `debug`, so they cost no `warn`. A mapping for either waits until
+  their content is needed.

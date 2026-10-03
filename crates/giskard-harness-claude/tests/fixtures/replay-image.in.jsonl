@@ -1,1 +1,0 @@
-{"type": "user", "message": {"role": "user", "content": [{"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": "iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAIAAACQkWg2AAAAFklEQVR4nGM4ISdHEmIY1TCqYfhqAADkYgQQ60fIxgAAAABJRU5ErkJggg=="}}, {"type": "text", "text": "Say pong."}]}}

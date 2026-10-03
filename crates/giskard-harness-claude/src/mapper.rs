@@ -344,8 +344,11 @@ struct TurnState {
     // Synchronization: The single adapter task that owns the child process owns the mapper.
     // Invalidation/removal: Turn completion drops the set.
     denied_tool_use_ids: HashSet<String>,
-    /// The CLI replayed this turn's prompt (`isReplay`), which became its `UserMessage` item.
+    /// The turn's `UserMessage` item was emitted from `prompt`: at the turn's `system/init`, or
+    /// at its first answer frame when no `init` came first.
     prompt_acknowledged: bool,
+    /// The text the adapter wrote for this turn (`note_prompt`), which the `UserMessage` says.
+    prompt: Option<String>,
     items: TurnItems,
 }
 
@@ -426,6 +429,7 @@ impl TurnState {
             interrupt_sent: false,
             denied_tool_use_ids: HashSet::new(),
             prompt_acknowledged: false,
+            prompt: None,
             items: TurnItems::default(),
         }
     }
@@ -823,6 +827,11 @@ impl ClaudeMapper {
 
     pub fn map(&mut self, frame: Frame) -> Vec<MapperOutput> {
         let mut out = Vec::new();
+        // The backstop: `system/init` acknowledges the prompt, and an answer that comes without one
+        // still must.
+        if let Some(frame_type) = answers_the_prompt(&frame) {
+            self.acknowledge_prompt(frame_type, frame_type, &mut out);
+        }
         match frame {
             Frame::Init(init, _raw) => self.on_init(&init, &mut out),
             Frame::Status(status) => self.on_status(&status, &mut out),
@@ -901,6 +910,10 @@ impl ClaudeMapper {
             claude_code_version = display_opt(init.claude_code_version.as_deref()),
             "session initialized"
         );
+        // The CLI emits `init` at the top of every prompt it takes, before it decides whether a
+        // model call is needed: the prompt is in. A re-emitted `init` mid-turn, a compaction
+        // turn's and one outside any turn acknowledge nothing (`acknowledge_prompt`'s gate).
+        self.acknowledge_prompt("init", "system", out);
         // A re-emitted `init` (after a backgrounded task, after `/compact`) is the frame most
         // likely to show a mode Giskard did not set.
         if let Some(mode) = &init.permission_mode {
@@ -2720,12 +2733,24 @@ impl ClaudeMapper {
             .then_some(message.tool_use_result.as_ref())
             .flatten();
         let meta = message.tool_result_meta.as_deref().unwrap_or_default();
-        // The two flags are independent: a replay (`--replay-user-messages`) echoes a line the
-        // adapter wrote, a synthetic frame (a compaction summary) is the CLI's own.
+        // The two flags are independent: `isReplay` marks a frame the CLI echoes of its input,
+        // `isSynthetic` one it wrote itself (a compaction summary).
         let synthetic = message.is_synthetic == Some(true);
         let replay = message.is_replay == Some(true);
-        if replay && !synthetic && route == Route::Primary && results == 0 {
-            self.on_replayed_prompt(turn, message, out);
+        if replay && route == Route::Primary && results == 0 {
+            // The adapter does not pass `--replay-user-messages`, yet the CLI marks some of its own
+            // frames `isReplay` (the `<local-command-stdout>` after `/compact`), and a recording
+            // made with the flag carries prompts and queued inputs (`origin`). None is an item:
+            // the prompt is acknowledged at `system/init` from the text the adapter wrote.
+            debug!(
+                thread_id = %self.thread,
+                harness_thread_id = %self.harness_thread_id,
+                turn_id = %turn,
+                frame_uuid = display_opt(message.uuid.as_deref()),
+                origin = display_opt(message.origin.as_ref().map(|origin| origin.kind.as_str())),
+                action = "replay_ignored",
+                "ignoring a replayed user frame"
+            );
             return;
         }
         // A synthetic or replayed user message (a compaction summary, a slash command's output) is
@@ -2761,62 +2786,53 @@ impl ClaudeMapper {
         }
     }
 
-    /// A user frame the CLI replayed from stdin on the primary route. In a user turn the first
-    /// one is the prompt, acknowledged: the turn's `UserMessage`. In a compaction turn it is the
-    /// `/compact` command's stdout, bookkeeping.
-    fn on_replayed_prompt(&mut self, turn: TurnId, message: UserMessage, out: &mut Out) {
-        let frame_uuid = message.uuid.as_deref().unwrap_or("unknown").to_owned();
-        let Some(state) = self.turn_of_mut(&Route::Primary) else {
+    /// The text the adapter wrote for the active user turn, called right after `begin_turn`.
+    pub fn note_prompt(&mut self, text: String) {
+        if let Some(turn) = self.turn.as_mut() {
+            turn.prompt = Some(text);
+        }
+    }
+
+    /// Acknowledge the active user turn's prompt: its `UserMessage` item, from the text the
+    /// adapter wrote. `trigger` is `"init"` for the turn's `system/init`, the CLI's per-prompt
+    /// frame; any other trigger is the backstop, the first answer frame of a turn that had no
+    /// `init`, which is observed behaviour the CLI does not document.
+    fn acknowledge_prompt(&mut self, trigger: &'static str, frame_type: &str, out: &mut Out) {
+        let Some(state) = self.turn.as_mut() else {
             return;
         };
-        match (state.kind, state.prompt_acknowledged) {
-            (TurnKind::Compaction, _) => {
-                debug!(
-                    thread_id = %self.thread,
-                    harness_thread_id = %self.harness_thread_id,
-                    turn_id = %turn,
-                    frame_uuid = %frame_uuid,
-                    action = "compaction_replay",
-                    "skipping the replayed output of /compact"
-                );
-            }
-            (TurnKind::User, true) => {
-                warn!(
-                    thread_id = %self.thread,
-                    harness_thread_id = %self.harness_thread_id,
-                    turn_id = %turn,
-                    frame_uuid = %frame_uuid,
-                    action = "prompt_acknowledged",
-                    "a second replayed user message in one turn; dropping it"
-                );
-            }
-            (TurnKind::User, false) => {
-                state.prompt_acknowledged = true;
-                // The adapter writes one text block (after any attachment block); the join is
-                // defensive, and an attachments-only message yields "".
-                let text = message
-                    .message
-                    .content
-                    .iter()
-                    .filter_map(|block| match block {
-                        ContentBlock::Text(text) => Some(text.text.as_str()),
-                        _ => None,
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                debug!(
-                    thread_id = %self.thread,
-                    harness_thread_id = %self.harness_thread_id,
-                    turn_id = %turn,
-                    frame_uuid = %frame_uuid,
-                    bytes = text.len(),
-                    action = "prompt_acknowledged",
-                    "the CLI replayed the turn's prompt"
-                );
-                let harness_item_id = format!("user:{frame_uuid}:0");
-                self.user_message(&Route::Primary, turn, harness_item_id, text, out);
-            }
+        if state.kind != TurnKind::User || state.prompt_acknowledged {
+            return;
         }
+        let Some(text) = state.prompt.take() else {
+            return;
+        };
+        state.prompt_acknowledged = true;
+        let turn = state.id;
+        if trigger == "init" {
+            info!(
+                thread_id = %self.thread,
+                harness_thread_id = %self.harness_thread_id,
+                turn_id = %turn,
+                trigger,
+                bytes = text.len(),
+                action = "prompt_acknowledged",
+                "the CLI took the turn's prompt"
+            );
+        } else {
+            warn!(
+                thread_id = %self.thread,
+                harness_thread_id = %self.harness_thread_id,
+                turn_id = %turn,
+                trigger,
+                frame_type,
+                bytes = text.len(),
+                action = "prompt_acknowledged",
+                "no system/init preceded the answer; acknowledged from the first answer frame"
+            );
+        }
+        let harness_item_id = format!("user:{turn}:sent");
+        self.user_message(&Route::Primary, turn, harness_item_id, text, out);
     }
 
     /// Whether `text` is the route's delegated prompt, seen for the first time.
@@ -2834,8 +2850,7 @@ impl ClaudeMapper {
         true
     }
 
-    /// The user message of a turn: a primary turn's replayed prompt, or a sub-agent's delegated
-    /// prompt.
+    /// The user message of a turn: a primary turn's prompt, or a sub-agent's delegated prompt.
     fn user_message(
         &mut self,
         route: &Route,
@@ -3619,6 +3634,24 @@ struct BackgroundOutput {
     exit_code: Option<i32>,
     /// The file's size, when only its head and tail were read.
     original_bytes: Option<u64>,
+}
+
+/// The frame type, when `frame` is the CLI answering the primary thread's turn: the backstop
+/// that acknowledges a prompt no `system/init` acknowledged. A replayed user frame is not an
+/// answer, nor is a sub-agent's frame.
+fn answers_the_prompt(frame: &Frame) -> Option<&'static str> {
+    match frame {
+        Frame::Assistant(message) if message.parent_tool_use_id.is_none() => Some("assistant"),
+        Frame::Stream(stream) if stream.parent_tool_use_id.is_none() => Some("stream_event"),
+        Frame::User(message)
+            if message.is_replay != Some(true) && message.parent_tool_use_id.is_none() =>
+        {
+            Some("user")
+        }
+        Frame::Result(_) => Some("result"),
+        Frame::CanUseTool { agent_id: None, .. } => Some("control_request"),
+        _ => None,
+    }
 }
 
 /// The item status of a background command that ended with the task status `status`.
@@ -4503,74 +4536,12 @@ mod tests {
 
     #[test]
     #[traced_test]
-    fn a_replayed_prompt_is_the_turns_user_message() {
-        let outputs = run_fixture("replay-ack", TurnKind::User);
-        let sent = sent_texts("replay-ack");
-        let turns = per_turn(&outputs);
-        assert_eq!(turns.len(), 2);
-        for (turn, sent) in turns.iter().zip(&sent) {
-            let messages = user_messages(turn);
-            assert_eq!(messages.len(), 1, "{turn:?}");
-            assert_eq!(
-                messages[0].payload,
-                ItemPayload::UserMessage { text: sent.clone() }
-            );
-            assert!(messages[0].harness_item_id.starts_with("user:"));
-            // After `TurnStarted`, before the turn's first agent message or tool call.
-            let at = |wanted: &dyn Fn(&AgentEvent) -> bool| turn.iter().position(|e| wanted(e));
-            let started = at(&|event| {
-                matches!(event, AgentEvent::ItemStarted { item, .. }
-                    if item.kind == ItemKind::UserMessage)
-            })
-            .unwrap();
-            let first_output = at(&|event| {
-                matches!(event, AgentEvent::ItemStarted { item, .. }
-                    if matches!(item.kind, ItemKind::AgentMessage | ItemKind::ToolCall
-                        | ItemKind::CommandExecution))
-            })
-            .unwrap();
-            assert!(started > 0 && started < first_output, "{turn:?}");
-        }
-        // The second turn's `tool_result` frame completes the `Bash` call and adds no message.
-        assert_eq!(
-            command_statuses(&outputs),
-            vec![("cat data.txt".to_owned(), Some("completed".to_owned()))]
-        );
-        logs_assert(lines_with(
-            2,
-            &[" DEBUG ", r#"action="prompt_acknowledged""#],
-        ));
-        logs_assert(no_line_with(" WARN "));
-    }
-
-    #[test]
-    #[traced_test]
-    fn an_attachment_replay_yields_the_text_only() {
-        let outputs = run_fixture("replay-image", TurnKind::User);
-        let items = completed_items(&outputs);
-        let messages: Vec<_> = items
-            .iter()
-            .filter(|item| matches!(item.payload, ItemPayload::UserMessage { .. }))
-            .collect();
-        assert_eq!(messages.len(), 1);
-        assert_eq!(
-            messages[0].payload,
-            ItemPayload::UserMessage {
-                text: "Say pong.".into()
-            }
-        );
-        assert!(
-            !items
-                .iter()
-                .any(|item| matches!(item.payload, ItemPayload::Activity { .. }))
-        );
-        logs_assert(no_line_with("skipping a user block"));
-    }
-
-    #[test]
-    #[traced_test]
     fn a_compaction_replay_is_not_a_user_message() {
-        let outputs = run_fixture("replay-compact", TurnKind::Compaction);
+        let outputs: Vec<MapperOutput> =
+            drive_noting(&mut new_mapper(), "replay-compact", TurnKind::Compaction)
+                .into_iter()
+                .flatten()
+                .collect();
         let turns = per_turn(&outputs);
         assert_eq!(turns.len(), 2);
         assert_eq!(user_messages(&turns[0]).len(), 1);
@@ -4586,34 +4557,207 @@ mod tests {
             &compaction[0].payload,
             ItemPayload::Activity { title, .. } if title == "Context compacted"
         ));
-        logs_assert(lines_with(1, &[" DEBUG ", r#"action="compaction_replay""#]));
+        // The first turn's prompt and the `<local-command-stdout>` of `/compact` (the recording
+        // was made with `--replay-user-messages`).
+        logs_assert(lines_with(2, &[" DEBUG ", r#"action="replay_ignored""#]));
+    }
+
+    /// `drive`, noting each user turn's prompt (the text the recorder wrote) as the supervisor
+    /// does with `note_prompt` right after `begin_turn`.
+    fn drive_noting(
+        mapper: &mut ClaudeMapper,
+        name: &str,
+        kind: TurnKind,
+    ) -> Vec<Vec<MapperOutput>> {
+        let mut prompts = sent_texts(name).into_iter();
+        let mut left = prompts.len();
+        out_lines(name)
+            .iter()
+            .map(|line| {
+                let mut outputs = Vec::new();
+                if mapper.active_turn().is_none() && left > 0 {
+                    left -= 1;
+                    let turn_kind = if left == 0 { kind } else { TurnKind::User };
+                    outputs.extend(mapper.begin_turn(TurnId::new(), turn_kind));
+                    if let Some(prompt) = prompts.next() {
+                        mapper.note_prompt(prompt);
+                    }
+                }
+                outputs.extend(mapper.map_line(line));
+                outputs
+            })
+            .collect()
+    }
+
+    fn is_user_message_start(event: &AgentEvent) -> bool {
+        matches!(event, AgentEvent::ItemStarted { item, .. } if item.kind == ItemKind::UserMessage)
     }
 
     #[test]
     #[traced_test]
-    fn a_second_replay_in_a_turn_is_dropped() {
-        // The first turn of `replay-ack`, its replayed prompt (line 2) emitted twice.
-        let lines = out_lines("replay-ack");
-        let end = lines
+    fn a_turn_is_acknowledged_at_init() {
+        let mut mapper = new_mapper();
+        let per_line = drive_noting(&mut mapper, "text-turn", TurnKind::User);
+        let lines = out_lines("text-turn");
+        let init = line_index(&lines, r#""subtype": "init""#);
+        // Emitted by the `init` line itself.
+        assert_eq!(user_messages(&events(&per_line[init])).len(), 1);
+        let outputs: Vec<MapperOutput> = per_line.into_iter().flatten().collect();
+        let all = events(&outputs);
+        let messages = user_messages(&all);
+        assert_eq!(messages.len(), 1);
+        assert_eq!(
+            messages[0].payload,
+            ItemPayload::UserMessage {
+                text: sent_texts("text-turn").remove(0)
+            }
+        );
+        let started = all
             .iter()
-            .position(|line| line.contains(r#""type": "result""#))
+            .position(|event| is_user_message_start(event))
             .unwrap();
-        let mut turn: Vec<String> = lines[..=end].to_vec();
-        assert!(turn[1].contains(r#""isReplay": true"#));
-        turn.insert(2, turn[1].clone());
+        let answer = all
+            .iter()
+            .position(|event| {
+                matches!(event, AgentEvent::ItemStarted { item, .. }
+                    if item.kind == ItemKind::AgentMessage)
+            })
+            .unwrap();
+        assert!(started < answer);
+        logs_assert(lines_with(
+            1,
+            &[
+                " INFO ",
+                r#"action="prompt_acknowledged""#,
+                r#"trigger="init""#,
+            ],
+        ));
+        logs_assert(no_line_with(" WARN "));
+    }
+
+    #[test]
+    fn a_compaction_turn_is_not_acknowledged() {
         let outputs: Vec<MapperOutput> =
-            drive_lines(&mut new_mapper(), &turn, 1, TurnKind::User, false)
+            drive_noting(&mut new_mapper(), "compact", TurnKind::Compaction)
                 .into_iter()
                 .flatten()
                 .collect();
+        let turns = per_turn(&outputs);
+        assert_eq!(turns.len(), 2);
+        assert_eq!(user_messages(&turns[0]).len(), 1);
+        assert!(user_messages(&turns[1]).is_empty());
+    }
+
+    #[test]
+    fn a_mid_turn_init_acknowledges_once() {
+        // A re-emitted `init` inside the turn (as after an auto-compaction).
+        let mut lines = out_lines("text-turn");
+        let init = line_index(&lines, r#""subtype": "init""#);
+        lines.insert(init + 3, lines[init].clone());
+        let mut mapper = new_mapper();
+        let mut outputs = mapper.begin_turn(TurnId::new(), TurnKind::User);
+        mapper.note_prompt("pong?".into());
+        for line in &lines {
+            outputs.extend(mapper.map_line(line));
+        }
         assert_eq!(user_messages(&events(&outputs)).len(), 1);
+    }
+
+    #[test]
+    fn an_init_outside_a_turn_acknowledges_nothing() {
+        let lines = out_lines("text-turn");
+        let init = &lines[line_index(&lines, r#""subtype": "init""#)];
+        let mut mapper = new_mapper();
+        // No turn: nothing to note, nothing to acknowledge.
+        mapper.note_prompt("pong?".into());
+        assert!(user_messages(&events(&mapper.map_line(init))).is_empty());
+        // A turn whose prompt was acknowledged, then an `init` of the CLI's own continuation.
+        let mut outputs = mapper.begin_turn(TurnId::new(), TurnKind::User);
+        mapper.note_prompt("pong?".into());
+        for line in &lines {
+            outputs.extend(mapper.map_line(line));
+        }
+        assert_eq!(user_messages(&events(&outputs)).len(), 1);
+        assert!(mapper.active_turn().is_none());
+        assert!(user_messages(&events(&mapper.map_line(init))).is_empty());
+    }
+
+    #[test]
+    #[traced_test]
+    fn the_backstop_acknowledges_when_init_is_missing() {
+        let mut lines = out_lines("text-turn");
+        lines.remove(line_index(&lines, r#""subtype": "init""#));
+        let answer = line_index(&lines, r#""type": "stream_event""#);
+        let mut mapper = new_mapper();
+        let mut outputs = mapper.begin_turn(TurnId::new(), TurnKind::User);
+        mapper.note_prompt("pong?".into());
+        for line in &lines[..answer] {
+            outputs.extend(mapper.map_line(line));
+        }
+        assert!(
+            user_messages(&events(&outputs)).is_empty(),
+            "nothing before the answer"
+        );
+        let at = mapper.map_line(&lines[answer]);
+        let messages: Vec<ItemPayload> = user_messages(&events(&at))
+            .into_iter()
+            .map(|item| item.payload.clone())
+            .collect();
+        assert_eq!(
+            messages,
+            [ItemPayload::UserMessage {
+                text: "pong?".into()
+            }]
+        );
         logs_assert(lines_with(
             1,
-            &[" WARN ", "a second replayed user message in one turn"],
+            &[
+                " WARN ",
+                r#"action="prompt_acknowledged""#,
+                r#"trigger="stream_event""#,
+                "no system/init preceded the answer",
+            ],
         ));
     }
 
-    /// `name`'s stdout lines with every `output_file` pointing at a temp file holding `content`.
+    #[test]
+    #[traced_test]
+    fn replayed_frames_are_ignored() {
+        // Recorded with `--replay-user-messages`: the prompts' own echoes, a prompt the CLI did
+        // not echo, and a stopped task's queued `<task-notification>` replayed with an `origin`
+        // before the next prompt.
+        for name in ["background-stop-next-turn", "prompt-not-replayed"] {
+            let outputs: Vec<MapperOutput> = drive_noting(&mut new_mapper(), name, TurnKind::User)
+                .into_iter()
+                .flatten()
+                .collect();
+            let sent = sent_texts(name);
+            let turns = per_turn(&outputs);
+            assert_eq!(turns.len(), sent.len(), "{name}");
+            for (turn, sent) in turns.iter().zip(&sent) {
+                let messages = user_messages(turn);
+                assert_eq!(messages.len(), 1, "{name}: {turn:?}");
+                assert_eq!(
+                    messages[0].payload,
+                    ItemPayload::UserMessage { text: sent.clone() }
+                );
+            }
+        }
+        logs_assert(lines_with(
+            1,
+            &[
+                " DEBUG ",
+                r#"action="replay_ignored""#,
+                "origin=task-notification",
+            ],
+        ));
+        // The backstop never fired: every prompt was acknowledged at its `init`.
+        logs_assert(lines_with(
+            0,
+            &[" WARN ", r#"action="prompt_acknowledged""#],
+        ));
+    }
+
     /// `name`'s stdout lines with the recorded output file (in the notification's `output_file`
     /// and the `tool_result` text alike) replaced by a temp file holding `content`.
     fn with_output_file(name: &str, content: &str) -> (Vec<String>, tempfile::TempDir) {

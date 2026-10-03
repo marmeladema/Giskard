@@ -1,5 +1,5 @@
 {
- "scenario": "replay-image",
+ "scenario": "prompt-not-replayed",
  "argv": [
   "claude",
   "-p",
@@ -18,11 +18,11 @@
   "manual",
   "--replay-user-messages",
   "--session-id",
-  "2ed874fb-95bf-4127-92d0-4b4529858698"
+  "2307352e-b6b8-44e9-b882-e1893ff71897"
  ],
  "cwd": "/work/project",
  "exit": 0,
  "results": 1,
  "asks": 0,
- "elapsed_s": 2.2
+ "elapsed_s": 7.0
 }

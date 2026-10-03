@@ -22,18 +22,13 @@
 #   that task before its `{}` answer; any other user message
 #   replays the `text-turn` frames (`FAKE_CLAUDE_EXIT_MID_TURN=<n>`: only the first n, then exit 3).
 #   EOF exits 0 (`FAKE_CLAUDE_IGNORE_EOF=1`: sleeps 30 s instead).
-# - `--replay-user-messages` (every session child carries it): each stdin `user` line is echoed
-#   back with `"isReplay":true` and a fixed `uuid` before that turn's frames, and each stdin
-#   `control_response` line is echoed back verbatim, as the CLI does.
 
 fixtures="$(dirname "$0")/fixtures"
 model=""
 resume=""
 mode=""
-replay=""
 previous=""
 for argument in "$@"; do
-    [ "$argument" = "--replay-user-messages" ] && replay=1
     case "$previous" in
         --model) model="$argument" ;;
         --resume) resume="$argument" ;;
@@ -145,21 +140,18 @@ while IFS= read -r line; do
             printf '{"type":"control_response","response":{"subtype":"success","request_id":"%s"}}\n' "$request_id"
             ;;
         *'"type":"control_response"'*)
-            [ -n "$replay" ] && printf '%s\n' "$line"
             if [ -n "$asked" ]; then
                 asked=""
                 sed -n "$((ask_line + 1)),\$p" "$fixtures/tool-allowed.out.jsonl"
             fi
             ;;
         *'"type":"user"'*)
-            if [ -n "$replay" ]; then
-                printf '%s\n' "$line" \
-                    | sed 's/^{/{"isReplay":true,"uuid":"00000000-0000-4000-8000-0000000000aa","session_id":"f18693ff-2d11-4f87-9556-2b527e19e081","parent_tool_use_id":null,/'
-            fi
             case "$line" in
                 *background*)
                     background=1
                     result_line=$(grep -n '"type": "result"' "$fixtures/background-complete.out.jsonl" | head -n 1 | cut -d: -f1)
+                    # Without the ask, and without the recording's `--replay-user-messages`
+                    # echoes, which the adapter's children never produce.
                     sed -n "1,${result_line}p" "$fixtures/background-complete.out.jsonl" \
                         | grep -v -e '"type": "control_request"' -e '"type": "control_response"' \
                             -e '"isReplay": true'

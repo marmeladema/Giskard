@@ -1,0 +1,3 @@
+{"type": "user", "message": {"role": "user", "content": [{"type": "text", "text": "Run exactly `sleep 60` with the Bash tool in the background (run_in_background: true). Then reply with the single word started and stop."}]}}
+{"type": "control_request", "request_id": "3b9f0221-cb5f-47aa-b5a5-8c51ac2cf53b", "request": {"subtype": "stop_task", "task_id": "bs6twkdqg"}}
+{"type": "user", "message": {"role": "user", "content": [{"type": "text", "text": "What happened?"}]}}
