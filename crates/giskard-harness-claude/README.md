@@ -117,7 +117,7 @@ routes*). A child idle for `idle_shutdown_secs` is stopped and its thread respaw
 | `ThreadId` of a sub-agent thread | minted by the mapper when the `Agent` block is mapped, and adopted by `claim_native_thread` whatever id the server proposed; a route whose session is gone is bound cold under the proposed id |
 | `TurnId` | minted by Giskard at `start_turn` (`begin_turn`), or by the mapper for a continuation turn the CLI started on its own |
 | `ItemId` | minted on first sight of a native key: a `tool_use` block's `id`, or `(message.id, block index)` for a text or thinking block; reused for the item's start, deltas and completion within the turn |
-| `Item.harness_item_id` | the tool-use id, `<message_id>:<index>`, `compact_boundary:<uuid>`, `user:<uuid>:<index>` for a user-frame activity, a primary turn's replayed prompt or a sub-agent's delegated prompt, or `task_updated:<task_id>` for a backgrounded sub-agent's outcome |
+| `Item.harness_item_id` | the tool-use id, `<message_id>:<index>`, `compact_boundary:<uuid>`, `user:<uuid>:<index>` for a user-frame activity or a sub-agent's delegated prompt, `user:<turn_id>:sent` for a primary turn's prompt, or `task_updated:<task_id>` for a backgrounded sub-agent's outcome |
 | `ApprovalId`, `ServerRequestId` | the `control_request`'s `request_id`, a UUID the CLI mints and the reply must carry; the trait's instance-wide uniqueness across children rests on the CLI minting UUIDs |
 
 `assistant` frames arrive **one content block per frame**, each repeating the whole message
@@ -133,7 +133,8 @@ so a block's index matches the `content_block_*.index` of the stream events for 
 | `tool_use` `Bash` | `assistant` frame → `CommandExecution` with `command`, `cwd` = workspace root, `status: in_progress` | none (Claude streams no command output) | the `tool_result` → `CommandExecution` with `output` = `tool_use_result.stdout` then `stderr`, else the result text; `exit_code: None`. A **background** call (a `local_bash` task names it) completes `in_progress` with `process_id` = the task id and no output, then completes again on its original turn when the task ends (*Background commands*) |
 | `tool_use` `Write`, `Edit`, `NotebookEdit` | `FileChange` | none | `FileChange { path: input.file_path, change }`, `Created` when `tool_use_result.type == "create"`, else `Modified`; no diff |
 | `tool_use` `Agent` | `ToolCall { name: "Agent", subagent }` with the route's link (`task:<id>`, `initial_prompt` = `input.prompt`, `Spawned`, `Pending`), preceded by `MapperOutput::RouteOpened` | none | `ToolCall { output: the result content, subagent }` with the link as the route stands: `Completed` (or `Interrupted`) for an ended route, `Started` / `Running` for one still running (a backgrounded delegation) |
-| `user` frame with `isReplay: true` (not `isSynthetic`, no `tool_result`) on the primary route, in a user turn | `UserMessage` started and completed together, `text` = the frame's text blocks joined by `\n` (image and document blocks ignored): the turn's acknowledgement. A second one in the turn is dropped (`warn`); in a compaction turn it is the `/compact` output, skipped (`debug`) | | |
+| the turn's `system/init` (else, as a backstop, its first answer frame: a primary `assistant`, `stream_event`, non-replayed `user`, `result` or `can_use_tool`) | `UserMessage` started and completed together, `text` = the text the adapter wrote for the turn (`note_prompt`): the turn's acknowledgement. Not for a compaction turn, and once per turn | | |
+| `user` frame with `isReplay: true` | ignored, bookkeeping (`replay_ignored` at `debug`, with `origin.kind` when present): the CLI marks some of its own frames so (the `<local-command-stdout>` after `/compact`), and recordings made with `--replay-user-messages` carry prompts and queued inputs | | |
 | a sub-agent's first `user` text block equal to its delegated prompt | on the route: `UserMessage` started and completed together, `text` = the prompt | | |
 | terminal `system/task_updated` of a route's `local_agent` task | | | on the route: open tool calls `interrupted`, then `TurnCompleted`; for a backgrounded delegation, on the spawning thread: `Activity { title: description, detail: completed / killed / failed, subagent: the link }` |
 | `tool_use` `mcp__<server>__<tool>` | `ToolCall { server: <server>, name: <tool> }` | none | `ToolCall` |
@@ -199,7 +200,8 @@ naming `parent_tool_use_id` and the frame type, never attributed to the primary 
 - **Compaction turn.** A `TurnKind::Compaction` turn (the `/compact` `compact_thread` writes) emits
   the compact-boundary `Activity` and completes on the degenerate `result` as `Completed` with no
   agent message. The CLI's synthetic summary (`isSynthetic`) and the replayed command output
-  (`<local-command-stdout>`, `isReplay`) are bookkeeping and produce no item.
+  (`<local-command-stdout>`, `isReplay`) are bookkeeping and produce no item. A compaction turn
+  has no `UserMessage`.
 
 ## Runtime context window
 
@@ -247,7 +249,6 @@ Each primary thread's child runs, in this order:
 | `--include-partial-messages` | `stream_event`s, so text streams as `ItemDelta`s |
 | `--forward-subagent-text` | a sub-agent's text and thinking reach stdout as `assistant` / `user` frames with `parent_tool_use_id`, its route's transcript |
 | `--permission-mode bypassPermissions`, or `manual` after a refused bypass launch | the launch mode is only the *ceiling* (see below); never `--permission-prompts none`, which would deny every ask silently |
-| `--replay-user-messages` | the CLI echoes each user line back (`isReplay`), which acknowledges the turn's prompt (*Process control*); a session flag only, since a probe never writes a user line. It also echoes every `control_response` the adapter writes (*Approvals*) |
 | `--model <ModelRef.model>` | an alias or a full id, verbatim |
 | `--effort <ModelRef.reasoning_effort>` | only when the model ref carries one; the CLI tolerates a level the model ignores |
 | `--session-id <uuid>` or `--resume <uuid>` | a fresh session (or the same-id respawn), or a resume |
@@ -270,7 +271,7 @@ session flag and `--permission-mode manual`; later opens launch standard childre
 standard child still sends `set_permission_mode default` in its handshake (a failure there is
 logged and ignored).
 
-No `--add-dir`. The child's working directory is
+No `--add-dir` or `--replay-user-messages` (see *Process control*). The child's working directory is
 `OpenThreadOptions.workspace_root`. The declaration's environment overlay is applied **over** the
 inherited environment, never in place of it, so an `ANTHROPIC_API_KEY`, `ANTHROPIC_BASE_URL` or
 other `ANTHROPIC_*` variable in Giskard's own environment reaches every child (plan §7); the
@@ -333,18 +334,45 @@ deduplicated away), since the server reads no handle.
   would queue the second message, and the adapter never queues. `TurnStarted` is in the log before
   the line is written. A `start_turn` whose caller timed out (its reply channel closed) before the
   supervisor reached it is dropped unwritten and logged at `warn`, so the user's message never runs
-  under a turn the server did not admit. **Acknowledgement:** the CLI replays the prompt
-  (`--replay-user-messages`) after the turn's `system/init` and before its first stream event or
-  `assistant` frame, so it arrives as the answer starts; the mapper makes it the turn's
-  `UserMessage` item (`prompt_acknowledged` at `debug`), which is what un-greys the browser's
-  pending prompt. Attachments ride in the same frame and are not items of their own. A second replay
-  in one turn is dropped with a `warn`, and a replay in a compaction turn is the `/compact` output,
-  skipped at `debug` (`compaction_replay`). Before `TurnStarted`, the hand-off applies the turn's
-  settings (below); any failure there fails `start_turn` with no turn started. The settings share
-  one 25 s budget (each request at most 10 s of it), so the supervisor's own timeout, naming the
-  request left unanswered, ends a slow hand-off before the façade's 30 s `start_turn` limit; that
-  deadline is an input of the supervisor's loop, and the CLI's late answer to a request that timed
-  out is logged at `debug` and ignored.
+  under a turn the server did not admit. **Acknowledgement:** the supervisor hands the mapper the
+  text it wrote with the turn (`note_prompt`), and the turn's `system/init`, which the CLI emits at
+  the top of every prompt it takes, makes it the turn's `UserMessage` item (`prompt_acknowledged`
+  at `info`, `trigger = "init"`, `harness_item_id` = `user:<turn_id>:sent`). That item is what
+  un-greys the browser's pending prompt; it arrives 0.02 s after the write on a warm child, well
+  before the answer. A re-emitted `init` mid-turn (an auto-compaction), a compaction turn's `init`
+  and one outside any turn acknowledge nothing. The per-prompt `init` is observed behaviour, not a
+  documented contract, so a backstop remains: a user turn's first answer frame (a primary
+  `assistant`, `stream_event`, non-replayed `user`, `result` or `can_use_tool`) arriving with no
+  acknowledgement yet emits the same item and logs `prompt_acknowledged` at `warn` with the frame
+  type ("no system/init preceded the answer"). Inline attachments ride in the line and are not
+  items of their own. Before `TurnStarted`, the hand-off applies the turn's settings
+  (below); any failure there fails `start_turn` with no turn started. The settings share one 25 s
+  budget (each request at most 10 s of it), so the supervisor's own timeout, naming the request left
+  unanswered, ends a slow hand-off before the façade's 30 s `start_turn` limit; that deadline is an
+  input of the supervisor's loop, and the CLI's late answer to a request that timed out is logged at
+  `debug` and ignored.
+
+  **Why not `--replay-user-messages`.** The flag was the acknowledgement until the hardening pass
+  (`specs/claude-code-harness-plan/hardening-plan.md` §1, *Decision revised*), and was dropped:
+  - The CLI replays a prompt only if it passes its "human-typed prompt" heuristic, the predicate
+    behind `/rewind` and the file-history checkpoints. It rejects `isMeta` messages, tool results,
+    compact summaries, transcript-only messages, and any text containing one of six exact opening
+    tags anywhere (`<local-command-stdout>`, `<local-command-stderr>`, `<bash-stdout>`,
+    `<bash-stderr>`, `<task-notification>`, `<tick>`) or starting with `<teammate-message `
+    (2.1.288 source and live probes; `prompt-not-replayed`). The list is internal, undocumented
+    and will drift.
+  - The flag also echoes every `control_response` the adapter writes, and replays inputs the CLI
+    merged itself (a stopped task's queued `<task-notification>`, with `origin`) before the
+    prompt's own echo (`background-stop-next-turn`).
+  - The mapper never compared the echo with what it sent, so the echo confirmed nothing Giskard
+    used. No frame acknowledges inline attachments either way.
+  - `system/init` is yielded unconditionally at the top of the CLI's per-prompt entry point,
+    before it decides whether a model call is needed, so a slash command gets one too. Measured on
+    2.1.288: 0.02 s after the write on a warm child, against 0.76 s for the first `assistant`
+    frame. On a cold child it follows `active_goal`, `autocompact_state` and `rate_limit_event`,
+    none of which is an answer.
+  - Per-prompt `init` re-emission is observed behaviour, not documented. That is what the backstop
+    is for.
 - **Interrupt** writes the `interrupt` control request and resolves on its response, within 10 s.
   With no active turn the CLI answers at once and nothing else happens. On a sub-agent thread it is
   `stop_task` instead (see *Sub-agent routes*).
@@ -557,14 +585,6 @@ answer logs `respond_approval` at `info` with the decision, the tool name and th
 echoed, never the rule content. The CLI sends no acknowledgement: the browser's card is cleared by
 the live snapshot and by the turn's end. A caller that gave up before the supervisor wrote the
 answer leaves the ask pending.
-
-**Echoed answers.** With `--replay-user-messages` the CLI writes every `control_response` the
-adapter sends back on stdout, verbatim and unmarked, where it reads as a response to a request of
-the adapter's own. So the supervisor records the `request_id` of every answer it writes
-(`respond_approval`, `respond_server_request`, and the mapper's own `ExitPlanMode` deny) until the
-next turn starts; the echo of one is removed from that set and logged at `debug`
-(`action = "control_response"`, `echo = true`), checked before the waiters, so the `warn` for a
-response nobody is waiting on still means an unknown id.
 
 **Cancellation.** On `interrupt` the CLI withdraws its own pending asks: it writes
 `control_cancel_request` for each, then the interrupt's response and a result whose
@@ -801,9 +821,7 @@ An entry that does not parse is skipped with a `warn` naming its index; each ser
 - [`tests/fixtures/README.md`](tests/fixtures/README.md): the recorded scenarios, the recorder's
   argv and the sanitization.
 - `tests/fake-claude.sh`: a POSIX `sh` stand-in for `claude` that replays the fixtures, so the real
-  process path (spawn, stderr tail, exit codes, kill) is tested without the CLI. With
-  `--replay-user-messages` it echoes each user line back with `isReplay` before the turn's frames
-  and each answer it is written back verbatim, as the CLI does. It answers
+  process path (spawn, stderr tail, exit codes, kill) is tested without the CLI. It answers
   `set_permission_mode` (`bypass_not_launched` for `bypassPermissions` on a child not launched
   with it), `set_model` (`catalog_unknown` outside the `initialize` catalog), `apply_flag_settings`,
   `get_settings` (echoing the model and effort it was told), `stop_task` (`{}`) and `mcp_status`

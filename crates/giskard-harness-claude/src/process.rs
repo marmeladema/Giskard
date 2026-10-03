@@ -134,9 +134,6 @@ pub(crate) fn session_argv(options: &ClaudeLaunchOptions, session: &SessionArgs)
         LaunchMode::Standard => "manual",
     };
     argv.extend(["--permission-mode".into(), mode.into()]);
-    // Echo each user line back (`isReplay`): the turn's acknowledgement, its `UserMessage` item.
-    // A session flag only: a probe never writes a user line.
-    argv.push("--replay-user-messages".into());
     argv.extend(["--model".into(), session.model.model.clone()]);
     if let Some(effort) = &session.model.reasoning_effort {
         argv.extend(["--effort".into(), effort.0.clone()]);
@@ -693,7 +690,6 @@ pub(crate) mod tests {
         expected.extend(strings(&[
             "--permission-mode",
             "bypassPermissions",
-            "--replay-user-messages",
             "--model",
             "sonnet",
             "--session-id",
@@ -715,7 +711,6 @@ pub(crate) mod tests {
         expected.extend(strings(&[
             "--permission-mode",
             "manual",
-            "--replay-user-messages",
             "--model",
             "sonnet",
             "--effort",
@@ -728,6 +723,14 @@ pub(crate) mod tests {
         let mut expected = strings(PROTOCOL);
         expected.extend(strings(&["--debug", "api"]));
         assert_eq!(probe_argv(&options), expected);
+
+        // No child echoes its prompts: the turn is acknowledged at its `system/init`.
+        for argv in [&fresh, &resume, &probe_argv(&options)] {
+            assert!(
+                !argv.iter().any(|arg| arg == "--replay-user-messages"),
+                "{argv:?}"
+            );
+        }
     }
 
     #[test]

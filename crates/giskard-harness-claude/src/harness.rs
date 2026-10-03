@@ -41,8 +41,8 @@ use crate::process::{
 pub(crate) use crate::session::CONTROL_TIMEOUT;
 use crate::session::{
     ChildCommand, ChildHandle, Pending, PendingRequests, RouteHandle, Routes, STOP_EXIT_GRACE,
-    SupervisorParts, ThreadEntry, Threads, TurnSettings, control_line, control_outcome, lock,
-    new_request_id, no_background_command, spawn_supervisor, thread_counts,
+    SupervisorParts, ThreadEntry, Threads, TurnSettings, UserLine, control_line, control_outcome,
+    lock, new_request_id, no_background_command, spawn_supervisor, thread_counts,
 };
 
 /// How long the CLI has to answer `initialize`.
@@ -2088,7 +2088,10 @@ impl AgentHarness for ClaudeHarness {
         overrides: TurnOverrides,
     ) -> Result<TurnId, HarnessError> {
         let UserInput::Text { text, attachments } = input;
-        let line = user_message_line(&text, &attachments)?;
+        let line = UserLine {
+            line: user_message_line(&text, &attachments)?,
+            prompt: text,
+        };
         let turn = TurnId::new();
         let mode = turn_mode(&overrides);
         // Read before the `threads` lock, so `enqueue` nests no other lock.
@@ -2580,32 +2583,47 @@ mod tests {
 
     // ---- turns ---------------------------------------------------------------------------------
 
+    /// The `UserMessage` items of `events`, with their position.
+    fn prompt_items(events: &[AgentEvent]) -> Vec<(usize, String)> {
+        events
+            .iter()
+            .enumerate()
+            .filter_map(|(at, event)| match event {
+                AgentEvent::ItemCompleted { item, .. } => match &item.payload {
+                    giskard_core::item::ItemPayload::UserMessage { text } => {
+                        Some((at, text.clone()))
+                    }
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The position of the first assistant item of `events`.
+    fn first_answer(events: &[AgentEvent]) -> usize {
+        events
+            .iter()
+            .position(|event| {
+                matches!(event, AgentEvent::ItemStarted { item, .. }
+                    if item.kind == giskard_core::item::ItemKind::AgentMessage)
+            })
+            .expect("no assistant item")
+    }
+
     #[tokio::test]
     #[traced_test]
-    async fn a_turn_is_acknowledged_by_its_replay() {
+    async fn a_turn_is_acknowledged_at_init() {
         let (child, _) = scripted(
             handshake_steps("sonnet"),
-            // After `init` and `status`, before the first stream event, as the CLI does.
-            vec![Step::OnStdin(
-                user(),
-                vec![
-                    Action::EmitFixturePrefix {
-                        name: "text-turn",
-                        count: 2,
-                    },
-                    Action::Replay,
-                    Action::EmitFixtureFrom {
-                        name: "text-turn",
-                        from: 2,
-                    },
-                ],
-            )],
+            vec![Step::OnStdin(user(), vec![text_turn()])],
         );
         let (harness, _) = harness(vec![child]);
         let (options, _updates) = open_options(ThreadId::new(), None, "sonnet");
         let handle = harness.open_thread(options).await.unwrap();
         let mut stream = harness.subscribe(&handle);
-        let sent = "Reply with exactly one word: pong";
+        // A prompt the CLI would not echo makes no difference.
+        let sent = "Why did the thread show a <task-notification> block?";
         let turn = harness
             .start_turn(&handle, text(sent), overrides())
             .await
@@ -2614,29 +2632,51 @@ mod tests {
         assert!(
             matches!(events[0], AgentEvent::TurnStarted { turn: started, .. } if started == turn)
         );
-        let AgentEvent::ItemStarted { item: started, .. } = &events[1] else {
-            panic!("not an item start: {:?}", events[1]);
-        };
-        assert_eq!(started.kind, giskard_core::item::ItemKind::UserMessage);
-        let AgentEvent::ItemCompleted { item, turn: on, .. } = &events[2] else {
-            panic!("not an item completion: {:?}", events[2]);
-        };
-        assert_eq!(*on, turn);
-        assert_eq!(item.id, started.id);
-        assert_eq!(
-            item.payload,
-            giskard_core::item::ItemPayload::UserMessage { text: sent.into() }
-        );
+        let prompts = prompt_items(&events);
+        assert_eq!(prompts.len(), 1);
+        assert_eq!(prompts[0].1, sent);
+        assert!(prompts[0].0 < first_answer(&events));
         assert_eq!(completion(&events).1, TurnStatusKind::Completed);
-        let messages = events
-            .iter()
-            .filter(|event| {
-                matches!(event, AgentEvent::ItemCompleted { item, .. }
-                    if matches!(item.payload, giskard_core::item::ItemPayload::UserMessage { .. }))
-            })
-            .count();
-        assert_eq!(messages, 1);
-        logs_assert(a_line_with(&["action=\"prompt_acknowledged\""]));
+        logs_assert(a_line_with(&[
+            " INFO ",
+            "action=\"prompt_acknowledged\"",
+            "trigger=\"init\"",
+        ]));
+        harness.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    #[traced_test]
+    async fn a_turn_without_init_is_acknowledged_by_its_answer() {
+        // The `text-turn` frames without their leading `system/init`.
+        let (child, _) = scripted(
+            handshake_steps("sonnet"),
+            vec![Step::OnStdin(
+                user(),
+                vec![Action::EmitFixtureFrom {
+                    name: "text-turn",
+                    from: 1,
+                }],
+            )],
+        );
+        let (harness, _) = harness(vec![child]);
+        let (options, _updates) = open_options(ThreadId::new(), None, "sonnet");
+        let handle = harness.open_thread(options).await.unwrap();
+        let mut stream = harness.subscribe(&handle);
+        harness
+            .start_turn(&handle, text("pong?"), overrides())
+            .await
+            .unwrap();
+        let events = until_completed(&mut stream).await;
+        let prompts = prompt_items(&events);
+        assert_eq!(prompts.len(), 1);
+        assert_eq!(prompts[0].1, "pong?");
+        assert!(prompts[0].0 < first_answer(&events));
+        logs_assert(a_line_with(&[
+            " WARN ",
+            "action=\"prompt_acknowledged\"",
+            "no system/init preceded the answer",
+        ]));
         harness.shutdown().await.unwrap();
     }
 
@@ -4195,101 +4235,6 @@ mod tests {
             },
             _ => None,
         })
-    }
-
-    /// `asking`, with the CLI's echo of the adapter's answer before the rest of the fixture.
-    fn asking_with_echo(name: &'static str) -> (ScriptedChild, Arc<Mutex<ScriptRecord>>) {
-        let (index, _) = ask_of(name);
-        scripted(
-            handshake_steps("sonnet"),
-            vec![
-                Step::OnStdin(
-                    user(),
-                    vec![Action::EmitFixturePrefix {
-                        name,
-                        count: index + 1,
-                    }],
-                ),
-                Step::OnStdin(
-                    answered(),
-                    vec![
-                        Action::Echo,
-                        Action::EmitFixtureFrom {
-                            name,
-                            from: index + 1,
-                        },
-                    ],
-                ),
-            ],
-        )
-    }
-
-    #[tokio::test]
-    #[traced_test]
-    async fn the_echo_of_an_answered_ask_is_ignored() {
-        // An approval answered through `respond_approval`.
-        let (child, _) = asking_with_echo("tool-allowed");
-        let (approving, _, mut stream, approval) = ask_pending(child).await;
-        approving
-            .respond_approval(approval, ApprovalDecision::Accept)
-            .await
-            .unwrap();
-        let events = until_completed(&mut stream).await;
-        assert_eq!(completion(&events).1, TurnStatusKind::Completed);
-        approving.shutdown().await.unwrap();
-
-        // An `AskUserQuestion` answered through `respond_server_request`.
-        let (question, _) = ask_user_question("q1");
-        let (child, _) = scripted(
-            handshake_steps("sonnet"),
-            vec![
-                Step::OnStdin(user(), vec![Action::Emit(vec![question])]),
-                Step::OnStdin(answered(), vec![Action::Echo, text_turn()]),
-            ],
-        );
-        let (asking, _) = harness(vec![child]);
-        let (options, _updates) = open_options(ThreadId::new(), None, "sonnet");
-        let handle = asking.open_thread(options).await.unwrap();
-        let mut stream = asking.subscribe(&handle);
-        asking
-            .start_turn(&handle, text("ask me"), overrides())
-            .await
-            .unwrap();
-        let (id, _, _) = server_request_received(&mut stream).await;
-        asking
-            .respond_server_request(
-                id,
-                ServerRequestResponse::result(json!({"answers": {"0": {"answers": ["Cats"]}}})),
-            )
-            .await
-            .unwrap();
-        until_completed(&mut stream).await;
-        asking.shutdown().await.unwrap();
-
-        // The mapper's own `ExitPlanMode` deny.
-        let (child, record) = asking_with_echo("plan-exit-denied");
-        let (planning, _) = harness(vec![child]);
-        let (options, _updates) = open_options(ThreadId::new(), None, "sonnet");
-        let handle = planning.open_thread(options).await.unwrap();
-        let mut stream = planning.subscribe(&handle);
-        planning
-            .start_turn(&handle, text("plan it"), overrides())
-            .await
-            .unwrap();
-        until_completed(&mut stream).await;
-        assert_eq!(answers_written(&record).len(), 1);
-        planning.shutdown().await.unwrap();
-
-        logs_assert(lines_with(
-            3,
-            &[
-                " DEBUG ",
-                "action=\"control_response\"",
-                "echo=true",
-                "the CLI echoed the adapter's own answer; ignored",
-            ],
-        ));
-        logs_assert(no_line_with("nobody is waiting"));
     }
 
     // ---- hardening: background commands ---------------------------------------------------------
@@ -6133,7 +6078,7 @@ mod tests {
             .unwrap();
         let events = until_completed(&mut stream).await;
         assert_eq!(completion(&events), (turn, TurnStatusKind::Completed, None));
-        // The CLI's replay of the prompt (`--replay-user-messages`) acknowledges the turn.
+        // The turn's `system/init` acknowledges the prompt.
         let messages: Vec<_> = events
             .iter()
             .filter_map(|event| match event {
@@ -6187,6 +6132,29 @@ mod tests {
                 if status == "terminated"
         ));
         assert_no_background_command(harness.terminate_command(&handle, "bx9de5w1u").await);
+        harness.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    #[traced_test]
+    async fn a_real_child_acknowledges_at_init() {
+        let (harness, workspace) = real_harness(&[]);
+        let (options, _updates) = real_options(&workspace, None);
+        let handle = harness.open_thread(options).await.unwrap();
+        let mut stream = harness.subscribe(&handle);
+        harness
+            .start_turn(&handle, text("pong?"), overrides())
+            .await
+            .unwrap();
+        let events = until_completed(&mut stream).await;
+        let prompts = prompt_items(&events);
+        assert_eq!(prompts.len(), 1);
+        assert_eq!(prompts[0].1, "pong?");
+        assert!(prompts[0].0 < first_answer(&events));
+        logs_assert(a_line_with(&[
+            "action=\"prompt_acknowledged\"",
+            "trigger=\"init\"",
+        ]));
         harness.shutdown().await.unwrap();
     }
 
