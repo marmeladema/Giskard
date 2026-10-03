@@ -453,8 +453,9 @@ keeps and whose Stop the browser enables because it has a process id.
   a sub-agent handle, or a thread with no live child (a reaped child's commands died with it) is
   `Transport("no background command with task id …")`, written nothing, which the server reads as
   "unmanaged" and clears a stale running task by.
-- **Child exit.** Every background command still running completes `terminated` with empty output,
-  and a `warn` (`background_command_lost`) names its task and the exit.
+- **Child exit.** Every background command still running completes `terminated` with what its
+  output file holds so far (no marker, so no exit code), and a `warn` (`background_command_lost`)
+  names its task and the exit.
 - **Foreground commands** have no process id, and the CLI offers no control request known to stop
   one tool call: only `interrupt`, which ends the turn. So their Stop stays disabled ("Not
   supported by <harness>; stop the turn instead"), and the turn's own Stop is the way. A
