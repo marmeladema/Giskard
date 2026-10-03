@@ -369,6 +369,8 @@ pub(crate) mod tests {
     #[traced_test]
     #[test]
     fn an_unrecognised_status_is_unknown_and_warned_about_once() {
+        // A status no other test uses: `UNRECOGNISED_STATUSES` is process-global, so a shared or
+        // real status would let parallel tests suppress each other's warning.
         let payload = json!({"mcpServers": [
             {"name": "odd", "status": "hibernating-test-only"},
             {"name": "odder", "status": "hibernating-test-only"}

@@ -664,13 +664,10 @@ impl ClaudeMapper {
                 exit,
                 "Claude Code exited while a background command ran; completing it as terminated"
             );
-            self.complete_background_command(
-                &task_id,
-                command,
-                "terminated",
-                BackgroundOutput::default(),
-                &mut out,
-            );
+            // What it wrote before the CLI went; with no marker line, no exit code.
+            let output =
+                self.read_background_output(&task_id, &command, command.output_file.as_deref());
+            self.complete_background_command(&task_id, command, "terminated", output, &mut out);
         }
         // Every open route turn ends with the child: no `task_updated` will come for it.
         let primary_interrupted = self.turn.as_ref().is_some_and(|turn| turn.interrupt_sent);
@@ -4773,7 +4770,8 @@ mod tests {
     #[test]
     #[traced_test]
     fn a_background_command_dies_with_the_child() {
-        let lines = out_lines("background-complete");
+        // The output written so far, and no marker: the CLI went before the command ended.
+        let (lines, _file) = with_output_file("background-complete", "line 1\nline 2\n");
         let result = line_index(&lines, r#""type": "result""#);
         let mut mapper = new_mapper();
         drive_lines(&mut mapper, &lines[..=result], 1, TurnKind::User, false);
@@ -4782,7 +4780,12 @@ mod tests {
         assert_eq!(commands.len(), 1);
         assert_eq!(
             command_fields(commands[0].1),
-            ("", Some("terminated"), None, Some("bx9de5w1u"))
+            (
+                "line 1\nline 2\n",
+                Some("terminated"),
+                None,
+                Some("bx9de5w1u")
+            )
         );
         assert!(!mapper.has_tasks());
         logs_assert(lines_with(
