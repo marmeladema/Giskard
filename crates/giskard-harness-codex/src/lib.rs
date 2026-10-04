@@ -843,6 +843,7 @@ fn build_initialize_params() -> codex_codes::InitializeParams {
         },
         capabilities: Some(codex_codes::InitializeCapabilities {
             experimental_api: Some(true),
+            explicit_gateway_oauth: None,
             extensions: None,
             mcp_server_openai_form_elicitation: None,
             opt_out_notification_methods: None,
@@ -2398,6 +2399,7 @@ async fn handle_list_mcp_servers(
             cursor: cursor.clone(),
             detail: Some(codex_codes::McpServerStatusDetail::Full),
             limit: None,
+            server_name: None,
             thread_id: None,
         };
         let page: codex_codes::ListMcpServerStatusResponse = codex_request(
@@ -5904,6 +5906,7 @@ mod tests {
 
         let mapped = map_mcp_server_status(codex_codes::McpServerStatus {
             auth_status: codex_codes::McpAuthStatus::NotLoggedIn,
+            http_origin: None,
             runtime_status: None,
             server_capabilities: None,
             tools_error: None,
