@@ -601,7 +601,7 @@ configured `codex_path`, and reports through the `log` crate, which Giskard does
 notifications and requests — but it is the first thing to check when Codex behavior looks
 truncated.
 
-The adapter is pinned to `codex-codes` 0.155.1, tested against Codex CLI 0.155.1. Giskard uses the
+The adapter is pinned to `codex-codes` 0.160.1, tested against Codex CLI 0.160.0. Giskard uses the
 new explicit inline image-reference shape but does not yet expose the release's thread-attachment,
 plugin-selection, MCP App UI, MCP capability, model access-program, or plugin-onboarding metadata.
 The crate's cancellation-safe `AsyncClient` framing does not replace Giskard's transport, whose

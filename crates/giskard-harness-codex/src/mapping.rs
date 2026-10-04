@@ -432,7 +432,7 @@ impl CodexMapper {
                 let completed_turn = self.resolve_turn(thread, &turn.id);
                 self.file_change_previews
                     .retain(|key, _| key.thread_id != thread || key.turn_id != completed_turn);
-                let status = map_turn_status(&turn.status);
+                let status = map_turn_status(turn);
                 Some(AgentEvent::TurnCompleted {
                     thread,
                     turn: completed_turn,
@@ -2429,19 +2429,25 @@ fn format_permissions_detail(permissions: &Value) -> String {
     }
 }
 
-fn map_turn_status(status: &codex_codes::TurnStatus) -> TurnStatus {
-    match status {
-        codex_codes::TurnStatus::Completed => TurnStatus {
-            kind: TurnStatusKind::Completed,
-            message: None,
-        },
+/// Map a finished Codex turn to the neutral status, keeping `turn.error` as the message.
+///
+/// Codex fills `turn.error` on failed turns and, since Guardian's `tooManyDenials` circuit breaker,
+/// on interrupted ones too; without it an auto-review stop looks like a plain user interrupt.
+/// A completed turn's message stays empty even if Codex attached an error to it.
+fn map_turn_status(turn: &codex_codes::Turn) -> TurnStatus {
+    let message = || {
+        turn.error
+            .as_ref()
+            .map(|err| compose_turn_error(err, false))
+    };
+    match turn.status {
         codex_codes::TurnStatus::Interrupted => TurnStatus {
             kind: TurnStatusKind::Interrupted,
-            message: None,
+            message: message(),
         },
         codex_codes::TurnStatus::Failed => TurnStatus {
             kind: TurnStatusKind::Failed,
-            message: None,
+            message: message(),
         },
         _ => TurnStatus {
             kind: TurnStatusKind::Completed,
@@ -3394,6 +3400,58 @@ mod tests {
             fallback_field.as_str(),
         ]));
         logs_assert(no_line_with("sensitive delta payload"));
+    }
+
+    #[test]
+    fn turn_completed_keeps_turn_error_on_interrupted_and_failed_turns() {
+        let fallback = ThreadId::new();
+        let mut mapper = CodexMapper::new(PathBuf::new());
+        mapper.register_thread("th1".into(), fallback);
+        let mut status_of = |turn: serde_json::Value| {
+            let completed = Notification::TurnCompleted(
+                serde_json::from_value(serde_json::json!({ "threadId": "th1", "turn": turn }))
+                    .unwrap(),
+            );
+            match mapper.map_notification(&completed, fallback).unwrap() {
+                AgentEvent::TurnCompleted { status, .. } => status,
+                other => panic!("expected TurnCompleted, got {other:?}"),
+            }
+        };
+
+        // Guardian's circuit breaker interrupts the turn and says why in `turn.error`.
+        let denied = status_of(serde_json::json!({
+            "id": "t1",
+            "status": "interrupted",
+            "error": { "message": "too many denied actions", "codexErrorInfo": "tooManyDenials" }
+        }));
+        assert_eq!(denied.kind, TurnStatusKind::Interrupted);
+        assert_eq!(
+            denied.message.as_deref(),
+            Some("tooManyDenials: too many denied actions")
+        );
+
+        let failed = status_of(serde_json::json!({
+            "id": "t2",
+            "status": "failed",
+            "error": { "message": "stream failed", "codexErrorInfo": { "responseStreamDisconnected": { "httpStatusCode": 502 } } }
+        }));
+        assert_eq!(failed.kind, TurnStatusKind::Failed);
+        assert_eq!(
+            failed.message.as_deref(),
+            Some("responseStreamDisconnected (HTTP 502): stream failed")
+        );
+
+        // A plain user interrupt carries no error, and a completed turn never gets a message.
+        let interrupted = status_of(serde_json::json!({ "id": "t3", "status": "interrupted" }));
+        assert_eq!(interrupted.kind, TurnStatusKind::Interrupted);
+        assert_eq!(interrupted.message, None);
+        let completed = status_of(serde_json::json!({
+            "id": "t4",
+            "status": "completed",
+            "error": { "message": "ignored" }
+        }));
+        assert_eq!(completed.kind, TurnStatusKind::Completed);
+        assert_eq!(completed.message, None);
     }
 
     #[test]
