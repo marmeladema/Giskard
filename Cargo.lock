@@ -283,9 +283,9 @@ dependencies = [
 
 [[package]]
 name = "claude-codes"
-version = "2.1.286"
+version = "2.1.306"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "92846f06e8ba75f6a86a95bebdd90defc56421df76e64730ec5a0b10ac82e01b"
+checksum = "49b5a93ddd07edac79e304b3869f2112c941ff68a9e3e8093aa4d0fd272bfb94"
 dependencies = [
  "anyhow",
  "chrono",
