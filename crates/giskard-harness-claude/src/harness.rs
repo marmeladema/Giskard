@@ -7280,6 +7280,66 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    #[traced_test]
+    async fn an_interrupt_releases_a_turn_held_by_an_agent_task_that_never_ends() {
+        // The turn's `result` arrives while an agent task is open, and nothing ever ends that
+        // task; the CLI already ended its turn, so it answers the interrupt and says no more.
+        let result = fixture_lines("text-turn")
+            .into_iter()
+            .find(|line| line.contains("\"type\": \"result\""))
+            .unwrap();
+        let task = r#"{"type":"system","subtype":"task_started","session_id":"s","task_id":"a1","tool_use_id":"toolu_gone","task_type":"local_agent","is_backgrounded":false,"description":"/review","uuid":"u1"}"#;
+        let (child, record) = scripted(
+            handshake_steps("sonnet"),
+            vec![
+                Step::OnStdin(user(), vec![Action::Emit(vec![task.into(), result])]),
+                Step::OnStdin(
+                    control("interrupt"),
+                    vec![Action::Respond(json!({"still_queued": []}))],
+                ),
+            ],
+        );
+        let (harness, _) = harness_with(reaping(), vec![child]);
+        let (options, _updates) = open_options(ThreadId::new(), None, "sonnet");
+        let handle = harness.open_thread(options).await.unwrap();
+        let mut stream = harness.subscribe(&handle);
+        let turn = harness
+            .start_turn(&handle, text("review the change"), overrides())
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_secs(60)).await;
+        assert!(
+            harness
+                .start_turn(&handle, text("next"), overrides())
+                .await
+                .is_err(),
+            "the held turn is still active"
+        );
+
+        let interrupted = Instant::now();
+        harness.interrupt(&handle).await.unwrap();
+        let events = until_completed(&mut stream).await;
+        let (completed, status, _) = completion(&events);
+        assert_eq!(completed, turn);
+        assert_eq!(status, TurnStatusKind::Interrupted);
+        assert!(
+            interrupted.elapsed() >= crate::session::INTERRUPTED_HOLD_GRACE,
+            "{:?}",
+            interrupted.elapsed()
+        );
+        logs_assert(a_line_with(&[" WARN ", "action=\"release_held_result\""]));
+        logs_assert(a_line_with(&[
+            " WARN ",
+            "action=\"agent_task_abandoned\"",
+            "task_id=a1 ",
+        ]));
+        // The task the turn waited on is no longer tracked: the child is reaped like any idle one.
+        tokio::time::sleep(IDLE).await;
+        reaped(&harness, &record).await;
+        harness.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn terminate_command_on_a_reaped_thread_is_unmanaged() {
         let (child, record) = scripted(handshake_steps("sonnet"), Vec::new());
         let (harness, spawner) = harness_with(reaping(), vec![child]);

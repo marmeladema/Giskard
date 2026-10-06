@@ -147,7 +147,8 @@ pub enum MapperOutput {
 /// - one session, as long as the mapper lives: [`SessionState`] (the session model and permission
 ///   mode, the effective window, tasks, the notices and unknown frames already reported, the
 ///   sub-agent routes and the routes already dropped);
-/// - one sub-agent route, from its `Agent` call until its spawning turn ends or the child exits:
+/// - one sub-agent route, from its `Agent` call (or a forked skill's `task_started`) until its
+///   spawning turn ends or the child exits:
 ///   [`RouteState`] (its minted thread, its task, its link status, its own [`TurnState`]);
 /// - one turn, dropped when the turn completes: [`TurnState`] (the turn id and kind, its model,
 ///   usage, open agent tasks, a held `result`, the interrupt flag, denied tool uses);
@@ -187,12 +188,16 @@ struct SessionState {
     //   turn completion and its route receives the ask.
     // Synchronization: The single adapter task that owns the child process owns the mapper.
     // Invalidation/removal: A terminal `task_updated` removes the entry (a background command's
-    //   entry waits for its `task_notification`, or child exit); dropping a route clears the
-    //   entry's route; shutdown drops the rest.
+    //   entry waits for its `task_notification`, or child exit), and so does the terminal
+    //   `task_notification` of an agent task that got no update (a forked skill that completed);
+    //   an agent task no turn waits for any more is evicted (`abandon_agent_task`); dropping a
+    //   route clears the entry's route; shutdown drops the rest.
     tasks: HashMap<String, TaskEntry>,
     // ENTITY-AUTHORITY-EXCEPTION:
-    // Role: One sub-agent route per `Agent` call of this session, keyed by the call's tool-use id.
-    // Source of truth: The `assistant` frame carrying the `Agent` tool_use block mints the entry.
+    // Role: One sub-agent route per delegating call of this session (an `Agent` call, or the
+    //   `Skill` call of a forked skill), keyed by the call's tool-use id.
+    // Source of truth: The `assistant` frame carrying the `Agent` tool_use block mints the entry;
+    //   for any other call, the `local_agent` task's `task_started` naming it.
     // Structural reason: Forwarded frames name the call (`parent_tool_use_id`), asks name the task
     //   (`agent_id`), and the server names the thread; the entry joins the three.
     // Synchronization: The single adapter task that owns the child process owns the mapper.
@@ -215,7 +220,7 @@ struct SessionState {
 /// One Claude Code task the session reported.
 struct TaskEntry {
     kind: TaskType,
-    /// The sub-agent route of a `local_agent` task whose `tool_use_id` names a minted route.
+    /// The sub-agent route of a `local_agent` task: the route its `tool_use_id` names.
     route: Option<String>,
     /// The command item of a `local_bash` task behind a background `Bash` call.
     command: Option<BackgroundCommand>,
@@ -244,7 +249,16 @@ struct BackgroundCommand {
     end_time_ms: Option<u64>,
 }
 
-/// One sub-agent route: an `Agent` call of this session and the thread its frames map onto.
+/// What a new route takes from the call or task that delegates.
+struct RouteSeed {
+    prompt: Option<String>,
+    subagent_type: Option<String>,
+    description: Option<String>,
+    is_backgrounded: bool,
+}
+
+/// One sub-agent route: an `Agent` call (or a forked skill's `Skill` call) of this session and
+/// the thread its frames map onto.
 struct RouteState {
     /// Minted here; the server adopts it through `claim_native_thread`.
     thread: ThreadId,
@@ -328,10 +342,13 @@ struct TurnState {
     emitted_usage: Option<(TokenUsage, Option<u32>)>,
     // ENTITY-AUTHORITY-EXCEPTION:
     // Role: Gate turn completion on the `local_agent` tasks the turn started.
-    // Source of truth: `task_started` adds a task, a terminal `task_updated` removes it.
+    // Source of truth: `task_started` adds a task, a terminal `task_updated` removes it, and so
+    //   does the terminal `task_notification` of a task that got no update (a forked skill that
+    //   completed).
     // Structural reason: A backgrounded delegation's first `result` is not the turn's end.
     // Synchronization: The single adapter task that owns the child process owns the mapper.
-    // Invalidation/removal: Terminal task updates remove entries; turn completion drops the set.
+    // Invalidation/removal: Terminal task updates (or notifications) remove entries; turn
+    //   completion drops the set, evicting any task still in it from the session's tasks.
     open_agent_tasks: HashSet<String>,
     /// A `result` that arrived while agent tasks were open.
     held_result: Option<Box<ResultMessage>>,
@@ -513,6 +530,45 @@ impl ClaudeMapper {
                 "interrupt noted with no active turn"
             ),
         }
+    }
+
+    /// The adapter interrupted a turn that holds its `result`. The CLI already ended that turn,
+    /// so the interrupt brings no `result` of its own: only the end of the agent tasks the turn
+    /// waits on can finish it, and the supervisor's grace bounds that wait.
+    pub fn holds_interrupted_result(&self) -> bool {
+        self.turn
+            .as_ref()
+            .is_some_and(|turn| turn.interrupt_sent && turn.held_result.is_some())
+    }
+
+    /// Finish an interrupted turn still holding its `result` once the supervisor's grace ran out:
+    /// `Interrupted`, whatever agent tasks it still waits on (one the CLI never reports ended
+    /// would otherwise hold it for good). Called by the supervisor's timer only.
+    pub fn release_interrupted_hold(&mut self) -> Vec<MapperOutput> {
+        let mut out = Vec::new();
+        let Some(turn) = self.turn.as_mut() else {
+            return out;
+        };
+        if !turn.interrupt_sent || turn.held_result.take().is_none() {
+            return out;
+        }
+        warn!(
+            thread_id = %self.thread,
+            harness_thread_id = %self.harness_thread_id,
+            turn_id = %turn.id,
+            open_agent_tasks = turn.open_agent_tasks.len(),
+            action = "release_held_result",
+            "the interrupted turn still holds its result; finishing it as interrupted"
+        );
+        self.emit_usage(&Route::Primary, &mut out);
+        self.finish_turn(
+            TurnStatus {
+                kind: TurnStatusKind::Interrupted,
+                message: None,
+            },
+            &mut out,
+        );
+        out
     }
 
     /// The model the adapter asked for on this turn, so `TurnUsageUpdated.model` can be set.
@@ -882,7 +938,7 @@ impl ClaudeMapper {
                 });
             }
             Frame::TaskNotification(task) => self.on_task_notification(task, &mut out),
-            frame @ (Frame::SessionTitleChanged(_) | Frame::SystemIgnored { .. }) => {
+            frame @ (Frame::SessionTitleChanged(_) | Frame::Ignored { .. }) => {
                 let (frame_type, subtype) = frame.kind();
                 debug!(
                     thread_id = %self.thread,
@@ -1135,12 +1191,13 @@ impl ClaudeMapper {
             .clone()
             .unwrap_or_else(|| TaskType::Unknown(String::new()));
         let gates = matches!(task_type, TaskType::LocalAgent);
-        // A `local_agent` task names the `Agent` call that minted its route.
-        let route = task
-            .tool_use_id
-            .as_ref()
-            .filter(|id| gates && self.session.routes.contains_key(*id))
-            .cloned();
+        // A `local_agent` task names the `Agent` call that minted its route, or another open call
+        // that runs a sub-agent (a forked skill's `Skill` call), whose route is minted now.
+        let route = match &task.tool_use_id {
+            Some(id) if gates && self.session.routes.contains_key(id) => Some(id.clone()),
+            Some(id) if gates => self.mint_task_route(id, &task, out),
+            _ => None,
+        };
         // A backgrounded `local_bash` task names the background `Bash` call it runs. A foreground
         // `Bash` call that runs a while gets a task too (`is_backgrounded: false`), which ends with
         // a notification and no update; its item completes on its own `tool_result`.
@@ -1233,10 +1290,7 @@ impl ClaudeMapper {
             );
             return;
         };
-        let terminal = matches!(
-            status,
-            TaskStatus::Completed | TaskStatus::Failed | TaskStatus::Killed | TaskStatus::Stopped
-        );
+        let terminal = is_terminal(&status);
         // A background command's entry stays until its notification, which carries the output.
         let background = terminal
             && self
@@ -1283,10 +1337,11 @@ impl ClaudeMapper {
             }
             return;
         }
+        let error = task.patch.error.as_deref();
         match entry {
             Some(TaskEntry {
                 route: Some(id), ..
-            }) => self.end_route(&id, &task, &status, out),
+            }) => self.end_route(&id, &task.task_id, error, &status, out),
             Some(_) => {}
             // `stop_task` on a task already terminal still emits `killed` for it.
             None => debug!(
@@ -1298,10 +1353,23 @@ impl ClaudeMapper {
                 "terminal update for an unknown or already ended task; ignored"
             ),
         }
+        self.close_agent_task(&task.task_id, &status, error, out);
+    }
+
+    /// Agent task `task_id` ended with `status`: it no longer gates the primary turn. When it was
+    /// the last one and a result is held, `completed` keeps holding for the CLI's continuation
+    /// `result`, and any other status finishes the turn from the held result now.
+    fn close_agent_task(
+        &mut self,
+        task_id: &str,
+        status: &TaskStatus,
+        error: Option<&str>,
+        out: &mut Out,
+    ) {
         let Some(turn) = self.turn.as_mut() else {
             return;
         };
-        if !turn.open_agent_tasks.remove(&task.task_id)
+        if !turn.open_agent_tasks.remove(task_id)
             || !turn.open_agent_tasks.is_empty()
             || turn.held_result.is_none()
         {
@@ -1314,7 +1382,7 @@ impl ClaudeMapper {
                 thread_id = %self.thread,
                 harness_thread_id = %self.harness_thread_id,
                 turn_id = %turn.id,
-                task_id = %task.task_id,
+                task_id = %task_id,
                 action = "hold_result",
                 "last agent task completed; holding the turn for the continuation result"
             );
@@ -1327,7 +1395,7 @@ impl ClaudeMapper {
             thread_id = %self.thread,
             harness_thread_id = %self.harness_thread_id,
             turn_id = %turn.id,
-            task_id = %task.task_id,
+            task_id = %task_id,
             status = %status,
             interrupted,
             action = "release_held_result",
@@ -1341,11 +1409,10 @@ impl ClaudeMapper {
         } else {
             TurnStatus {
                 kind: TurnStatusKind::Failed,
-                message: Some(
-                    task.patch
-                        .error
-                        .unwrap_or_else(|| format!("agent task {} ended {status}", task.task_id)),
-                ),
+                message: Some(error.map_or_else(
+                    || format!("agent task {task_id} ended {status}"),
+                    str::to_owned,
+                )),
             }
         };
         self.emit_usage(&Route::Primary, out);
@@ -1383,9 +1450,34 @@ impl ClaudeMapper {
         })
     }
 
-    /// `task_notification`: for a background command, its end, with the output file to read.
+    /// `task_notification`: for a background command, its end, with the output file to read; for
+    /// an agent task still open (a forked skill's, which gets no terminal update), its end.
     fn on_task_notification(&mut self, task: TaskNotificationMessage, out: &mut Out) {
         let entry = self.session.tasks.get(&task.task_id);
+        if is_terminal(&task.status)
+            && entry.is_some_and(|entry| entry.kind == TaskType::LocalAgent)
+        {
+            let route = self
+                .session
+                .tasks
+                .remove(&task.task_id)
+                .and_then(|entry| entry.route);
+            info!(
+                thread_id = %self.thread,
+                harness_thread_id = %self.harness_thread_id,
+                turn_id = display_opt(self.active_turn()),
+                task_id = %task.task_id,
+                status = %task.status,
+                route = display_opt(route.as_ref().map(|id| format!("{TASK_ID_PREFIX}{id}"))),
+                action = "task_notification",
+                "an agent task ended on its notification, with no terminal update"
+            );
+            if let Some(id) = route {
+                self.end_route(&id, &task.task_id, None, &task.status, out);
+            }
+            self.close_agent_task(&task.task_id, &task.status, None, out);
+            return;
+        }
         let command = entry.is_some_and(|entry| entry.command.is_some());
         if !command && entry.is_some_and(|entry| entry.kind == TaskType::LocalBash) {
             // A foreground command's task: no terminal update comes for it, so this ends it.
@@ -1740,9 +1832,35 @@ impl ClaudeMapper {
             usage: turn.completed_usage(),
             status,
         }));
+        // The gate holds a turn until every agent task it started (a nested route's included) is
+        // terminal, so one still open here ended the turn some other way (an interrupted hold
+        // released after its grace, a superseded turn), and its route, if any, is failed below:
+        // nothing waits for it any more, and tracking it would keep the child busy for good.
+        let mut abandoned: Vec<String> = turn.open_agent_tasks.into_iter().collect();
+        abandoned.sort();
+        for task_id in abandoned {
+            self.abandon_agent_task(&task_id, turn.id);
+        }
         // The primary turn's gate holds it until every agent task it started is terminal, so the
         // routes it spawned have normally ended by now.
         self.drop_spawned_routes(&Route::Primary, out);
+    }
+
+    /// Stop tracking agent task `task_id`, whose end no turn waits for any more: its entry would
+    /// keep the child busy, so never reaped, until the CLI reports an end it may never report. A
+    /// later terminal update or notification for it is ignored as for an unknown task.
+    fn abandon_agent_task(&mut self, task_id: &str, turn: TurnId) {
+        if self.session.tasks.remove(task_id).is_none() {
+            return;
+        }
+        warn!(
+            thread_id = %self.thread,
+            harness_thread_id = %self.harness_thread_id,
+            turn_id = %turn,
+            task_id = %task_id,
+            action = "agent_task_abandoned",
+            "the turn waiting on an agent task ended before the task did; no longer tracking it"
+        );
     }
 
     fn on_compact_boundary(&mut self, boundary: &CompactBoundaryMessage, out: &mut Out) {
@@ -1891,6 +2009,108 @@ impl ClaudeMapper {
             return None;
         }
         let text = |key: &str| input.get(key).and_then(Value::as_str).map(str::to_owned);
+        let seed = RouteSeed {
+            prompt: text("prompt"),
+            subagent_type: text("subagent_type"),
+            description: text("description"),
+            is_backgrounded: input.get("run_in_background").and_then(Value::as_bool) == Some(true),
+        };
+        Some(self.open_route(parent, tool_use_id, seed, out))
+    }
+
+    /// Mint the route of a `local_agent` task whose `tool_use_id` names an open call that is no
+    /// `Agent` call: a forked skill (`context: fork`) runs its sub-agent behind a `Skill` call,
+    /// and nothing before its `task_started` says the call delegates. The call's item started
+    /// without a link, so an `Activity` carrying the route's link announces the sub-agent on the
+    /// call's turn, and the server links it while it runs. `None` when no open tool call has
+    /// that id.
+    fn mint_task_route(
+        &mut self,
+        tool_use_id: &str,
+        task: &TaskStartedMessage,
+        out: &mut Out,
+    ) -> Option<String> {
+        let parent = if self
+            .turn
+            .as_ref()
+            .is_some_and(|turn| turn.items.tools.contains_key(tool_use_id))
+        {
+            Route::Primary
+        } else {
+            self.route_with_open_tool(tool_use_id)?
+        };
+        let turn = self.turn_of(&parent)?;
+        let turn_id = turn.id;
+        let ToolKind::Call { name, .. } = &turn.items.tools.get(tool_use_id)?.call else {
+            debug!(
+                thread_id = %self.thread_of(&parent),
+                harness_thread_id = %self.harness_thread_id,
+                task_id = %task.task_id,
+                native_item_id = %tool_use_id,
+                "an agent task names a command or file call; no sub-agent route"
+            );
+            return None;
+        };
+        let name = name.clone();
+        let description = Some(task.description.clone()).filter(|text| !text.is_empty());
+        let seed = RouteSeed {
+            prompt: task.prompt.clone(),
+            subagent_type: task.subagent_type.clone(),
+            description: description.clone(),
+            is_backgrounded: task.is_backgrounded == Some(true),
+        };
+        info!(
+            thread_id = %self.thread_of(&parent),
+            harness_thread_id = %self.harness_thread_id,
+            turn_id = %turn_id,
+            task_id = %task.task_id,
+            native_item_id = %tool_use_id,
+            tool_name = %name,
+            action = "task_route",
+            "a tool call runs a sub-agent; minting its route"
+        );
+        let link = self.open_route(&parent, tool_use_id, seed, out);
+        let thread = self.thread_of(&parent);
+        let id = ItemId::new();
+        let harness_item_id = format!("task_started:{}", task.task_id);
+        out.push(self.event(AgentEvent::ItemStarted {
+            thread,
+            turn: turn_id,
+            item: ItemStart {
+                id,
+                harness_item_id: harness_item_id.clone(),
+                kind: ItemKind::Activity,
+                command: None,
+                tool: None,
+            },
+        }));
+        out.push(self.event(AgentEvent::ItemCompleted {
+            thread,
+            turn: turn_id,
+            item: Item {
+                id,
+                harness_item_id,
+                payload: ItemPayload::Activity {
+                    title: description.unwrap_or_else(|| "Sub-agent".to_owned()),
+                    detail: Some(format!("{name} sub-agent")),
+                    metadata: None,
+                    subagent: Some(link),
+                },
+                created_at: Utc::now(),
+            },
+        }));
+        Some(tool_use_id.to_owned())
+    }
+
+    /// Record a new route for the call `tool_use_id` made on `parent` and announce it
+    /// (`RouteOpened`). Returns the link the call's item carries.
+    fn open_route(
+        &mut self,
+        parent: &Route,
+        tool_use_id: &str,
+        seed: RouteSeed,
+        out: &mut Out,
+    ) -> SubagentLink {
         let parent_harness_thread_id = match parent {
             Route::Primary => self.harness_thread_id.clone(),
             Route::Task(outer) => format!("{TASK_ID_PREFIX}{outer}"),
@@ -1899,15 +2119,15 @@ impl ClaudeMapper {
             thread: ThreadId::new(),
             harness_thread_id: format!("{TASK_ID_PREFIX}{tool_use_id}"),
             parent: parent.clone(),
-            prompt: text("prompt"),
+            prompt: seed.prompt,
             prompt_delivered: false,
-            subagent_type: text("subagent_type"),
+            subagent_type: seed.subagent_type,
             task_id: None,
-            is_backgrounded: input.get("run_in_background").and_then(Value::as_bool) == Some(true),
+            is_backgrounded: seed.is_backgrounded,
             stop_sent: false,
             call_open: true,
             status: SubagentStatus::Pending,
-            description: text("description"),
+            description: seed.description,
             turn: None,
             counted_messages: HashSet::new(),
         };
@@ -1929,7 +2149,7 @@ impl ClaudeMapper {
         });
         let link = route.link(SubagentAction::Spawned);
         self.session.routes.insert(tool_use_id.to_owned(), route);
-        Some(link)
+        link
     }
 
     /// The route's turn, opened here when a routed frame arrives before (or without) its
@@ -1969,12 +2189,14 @@ impl ClaudeMapper {
         Some(turn)
     }
 
-    /// A terminal `task_updated` of route `id`'s task: its turn ends now, and a backgrounded
+    /// The end of route `id`'s task `task_id` (its terminal `task_updated`, or the
+    /// `task_notification` of a task that got none): its turn ends now, and a backgrounded
     /// delegation's outcome is reported on the spawning route.
     fn end_route(
         &mut self,
         id: &str,
-        task: &TaskUpdatedMessage,
+        task_id: &str,
+        error: Option<&str>,
         status: &TaskStatus,
         out: &mut Out,
     ) {
@@ -1986,7 +2208,7 @@ impl ClaudeMapper {
                 thread_id = %route.thread,
                 harness_thread_id = %self.harness_thread_id,
                 route = %route.harness_thread_id,
-                task_id = %task.task_id,
+                task_id = %task_id,
                 status = %status,
                 action = "task_updated",
                 "terminal update for a sub-agent whose turn already ended; ignored"
@@ -1997,46 +2219,60 @@ impl ClaudeMapper {
             || self
                 .turn_of(&route.parent)
                 .is_some_and(|t| t.interrupt_sent);
-        let (subagent, turn_status) =
-            match status {
-                TaskStatus::Completed => (
-                    SubagentStatus::Completed,
-                    TurnStatus {
-                        kind: TurnStatusKind::Completed,
-                        message: None,
-                    },
-                ),
-                TaskStatus::Killed if interrupted => (
-                    SubagentStatus::Interrupted,
-                    TurnStatus {
-                        kind: TurnStatusKind::Interrupted,
-                        message: None,
-                    },
-                ),
-                TaskStatus::Killed => (
-                    SubagentStatus::Failed,
-                    TurnStatus {
-                        kind: TurnStatusKind::Failed,
-                        message: Some(format!("agent task {} was killed", task.task_id)),
-                    },
-                ),
-                other => (
-                    SubagentStatus::Failed,
-                    TurnStatus {
-                        kind: TurnStatusKind::Failed,
-                        message: Some(task.patch.error.clone().unwrap_or_else(|| {
-                            format!("agent task {} ended {other}", task.task_id)
-                        })),
-                    },
-                ),
-            };
+        let (subagent, turn_status) = match status {
+            TaskStatus::Completed => (
+                SubagentStatus::Completed,
+                TurnStatus {
+                    kind: TurnStatusKind::Completed,
+                    message: None,
+                },
+            ),
+            // A stop reads `killed` on the update and `stopped` on the notification that follows
+            // (a stopped forked skill's included, `forked-skill-stop`). A `stopped` notification
+            // with no update before it was never recorded; it maps as the update would.
+            TaskStatus::Killed | TaskStatus::Stopped if interrupted => (
+                SubagentStatus::Interrupted,
+                TurnStatus {
+                    kind: TurnStatusKind::Interrupted,
+                    message: None,
+                },
+            ),
+            TaskStatus::Killed | TaskStatus::Stopped => (
+                SubagentStatus::Failed,
+                TurnStatus {
+                    kind: TurnStatusKind::Failed,
+                    message: Some(format!("agent task {task_id} was {status}")),
+                },
+            ),
+            // Only terminal statuses end a route; the rest are listed so a new one is a choice.
+            other @ (TaskStatus::Failed
+            | TaskStatus::Pending
+            | TaskStatus::Running
+            | TaskStatus::Paused
+            | TaskStatus::Unknown(_)) => (
+                SubagentStatus::Failed,
+                TurnStatus {
+                    kind: TurnStatusKind::Failed,
+                    message: Some(error.map_or_else(
+                        || format!("agent task {task_id} ended {other}"),
+                        str::to_owned,
+                    )),
+                },
+            ),
+        };
         self.finish_route_turn(id, subagent, turn_status, out);
-        self.report_background_outcome(id, task, out);
+        self.report_background_outcome(id, task_id, error, out);
     }
 
     /// A route whose parent's `Agent` call already completed (a backgrounded delegation) reports
     /// its outcome as one `Activity` on the spawning route, carrying the link.
-    fn report_background_outcome(&mut self, id: &str, task: &TaskUpdatedMessage, out: &mut Out) {
+    fn report_background_outcome(
+        &mut self,
+        id: &str,
+        task_id: &str,
+        error: Option<&str>,
+        out: &mut Out,
+    ) {
         let Some(route) = self.session.routes.get(id) else {
             return;
         };
@@ -2051,11 +2287,7 @@ impl ClaudeMapper {
         let detail = match route.status {
             SubagentStatus::Completed => "completed".to_owned(),
             SubagentStatus::Interrupted => "killed".to_owned(),
-            _ => task
-                .patch
-                .error
-                .clone()
-                .unwrap_or_else(|| "failed".to_owned()),
+            _ => error.unwrap_or("failed").to_owned(),
         };
         let link = route.link(route.outcome_action());
         let Some(turn) = self.turn_of(&parent).map(|turn| turn.id) else {
@@ -2063,7 +2295,7 @@ impl ClaudeMapper {
                 thread_id = %self.thread_of(&parent),
                 harness_thread_id = %self.harness_thread_id,
                 route = %link.harness_thread_id,
-                task_id = %task.task_id,
+                task_id = %task_id,
                 action = "subagent_outcome",
                 "no active turn on the spawning thread; the sub-agent's outcome has no row"
             );
@@ -2071,7 +2303,7 @@ impl ClaudeMapper {
         };
         let thread = self.thread_of(&parent);
         let id = ItemId::new();
-        let harness_item_id = format!("task_updated:{}", task.task_id);
+        let harness_item_id = format!("task_updated:{task_id}");
         out.push(self.event(AgentEvent::ItemStarted {
             thread,
             turn,
@@ -3427,6 +3659,14 @@ fn ask_user_question_params(input: &Value) -> Value {
         })
         .collect();
     json!({ "questions": questions })
+}
+
+/// Whether a task in `status` has ended.
+fn is_terminal(status: &TaskStatus) -> bool {
+    matches!(
+        status,
+        TaskStatus::Completed | TaskStatus::Failed | TaskStatus::Killed | TaskStatus::Stopped
+    )
 }
 
 /// One child API message's usage, the same three-summand input as `token_usage`.
@@ -5804,6 +6044,358 @@ mod tests {
         logs_assert(a_line_with(&[" INFO ", r#"action="route_closed""#]));
     }
 
+    const FORKED_SKILL_CALL: &str = "toolu_01RAGxZFrkYotPgFPKQwJLEc";
+    const FORKED_SKILL_PROMPT: &str = "Base directory for this skill: \
+        /work/project/.claude/skills/magic\n\nRead data.txt in the current directory with the \
+        Read tool and reply with the magic number only.\n";
+
+    #[test]
+    #[traced_test]
+    fn a_forked_skill_is_a_sub_agent_route() {
+        let lines = out_lines("forked-skill");
+        let mut mapper = new_mapper();
+        let primary = mapper.thread;
+        let per_line = drive(&mut mapper, "forked-skill", TurnKind::User);
+        let outputs = per_line.concat();
+
+        // The route is minted at the task's start: nothing earlier says the call delegates.
+        let started = position(&lines, |frame| frame["subtype"] == "task_started");
+        let opened = routes_opened(&per_line[started]);
+        assert_eq!(opened.len(), 1);
+        assert_eq!(routes_opened(&outputs).len(), 1);
+        let (child, native, parent, name) = opened[0].clone();
+        assert_eq!(native, format!("task:{FORKED_SKILL_CALL}"));
+        assert_eq!(parent, SESSION);
+        assert_eq!(name.as_deref(), Some("/magic"));
+
+        // The `Skill` item starts once, with no link: nothing then says it delegates.
+        let primary_outputs = on_thread(&outputs, primary);
+        let skill_starts: Vec<_> = started_items(&primary_outputs)
+            .into_iter()
+            .filter(|item| item.harness_item_id == FORKED_SKILL_CALL)
+            .collect();
+        assert_eq!(skill_starts.len(), 1);
+        assert!(skill_starts[0].tool.as_ref().unwrap().subagent.is_none());
+
+        // At the task's start, an activity on the spawning turn carries the link.
+        let announced = on_thread(&per_line[started], primary);
+        let activity_starts = started_items(&announced);
+        assert_eq!(activity_starts.len(), 1);
+        assert_eq!(activity_starts[0].kind, ItemKind::Activity);
+        let activities = completed_items(&announced);
+        assert_eq!(activities.len(), 1);
+        let activity = activities[0];
+        assert_eq!(activity.id, activity_starts[0].id);
+        assert_eq!(activity.harness_item_id, "task_started:ab74653d91e526513");
+        let ItemPayload::Activity {
+            title,
+            detail,
+            subagent: Some(link),
+            ..
+        } = &activity.payload
+        else {
+            panic!("no linked activity: {:?}", activity.payload);
+        };
+        assert_eq!(title, "/magic");
+        assert_eq!(detail.as_deref(), Some("Skill sub-agent"));
+        assert_eq!(link.harness_thread_id, native);
+        assert_eq!(link.initial_prompt.as_deref(), Some(FORKED_SKILL_PROMPT));
+        assert_eq!(link.action, SubagentAction::Spawned);
+        assert_eq!(link.status, Some(SubagentStatus::Pending));
+        // Every item is started at most once.
+        let mut ids: Vec<_> = started_items(&outputs).iter().map(|item| item.id).collect();
+        let starts = ids.len();
+        ids.sort_unstable_by_key(|id| id.to_string());
+        ids.dedup();
+        assert_eq!(ids.len(), starts);
+
+        // The child's transcript: the skill's prompt, its tool calls and its answer.
+        let child_outputs = on_thread(&outputs, child);
+        assert!(matches!(
+            events(&child_outputs)[0],
+            AgentEvent::TurnStarted { .. }
+        ));
+        let items = completed_items(&child_outputs);
+        assert_eq!(
+            items[0].payload,
+            ItemPayload::UserMessage {
+                text: FORKED_SKILL_PROMPT.into()
+            }
+        );
+        assert!(items.iter().any(|item| matches!(
+            &item.payload,
+            ItemPayload::ToolCall { name, status, .. }
+                if name == "Read" && status.as_deref() == Some("completed")
+        )));
+        assert!(items.iter().any(|item| matches!(
+            &item.payload,
+            ItemPayload::CommandExecution { command, .. } if command.starts_with("find ")
+        )));
+        assert!(items.iter().any(|item| matches!(
+            &item.payload,
+            ItemPayload::AgentMessage { text } if text == "4271"
+        )));
+        // None of it lands on the primary thread.
+        assert!(started_items(&primary_outputs).iter().all(|item| {
+            item.tool.as_ref().is_none_or(|tool| tool.name != "Read") && item.command.is_none()
+        }));
+
+        // The notification ends the sub-agent: no terminal update comes for a forked skill.
+        assert!(!lines.iter().any(|line| line.contains("task_updated")));
+        let notified = position(&lines, |frame| frame["subtype"] == "task_notification");
+        let completions = turn_completions(&on_thread(&per_line[notified], child));
+        assert_eq!(completions.len(), 1);
+        assert_eq!(completions[0].2.kind, TurnStatusKind::Completed);
+        assert_eq!(turn_completions(&child_outputs).len(), 1);
+
+        // The `Skill` completion carries the ended link, like an `Agent` call's.
+        let (status, link) = completed_items(&primary_outputs)
+            .into_iter()
+            .find_map(|item| match &item.payload {
+                ItemPayload::ToolCall {
+                    name,
+                    status,
+                    subagent: Some(link),
+                    ..
+                } if name == "Skill" => Some((status.clone(), link.clone())),
+                _ => None,
+            })
+            .expect("no completed Skill call with a link");
+        assert_eq!(status.as_deref(), Some("completed"));
+        assert_eq!(link.action, SubagentAction::Completed);
+        assert_eq!(link.status, Some(SubagentStatus::Completed));
+
+        // The single `result` completes the primary turn: the task no longer holds it.
+        let result = position(&lines, |frame| frame["type"] == "result");
+        let completions = turn_completions(&on_thread(&per_line[result], primary));
+        assert_eq!(completions.len(), 1);
+        assert_eq!(completions[0].2.kind, TurnStatusKind::Completed);
+        assert_eq!(routes_closed(&per_line[result]), vec![child]);
+        assert!(!mapper.has_tasks());
+        logs_assert(a_line_with(&[" INFO ", r#"action="task_route""#]));
+        logs_assert(a_line_with(&[" INFO ", r#"action="task_notification""#]));
+        logs_assert(no_line_with(r#"action="hold_result""#));
+    }
+
+    #[test]
+    #[traced_test]
+    fn a_stopped_forked_skill_is_interrupted_and_its_turn_goes_on() {
+        // `stop_task` on the forked task while its sub-agent's command ran; the model then ran
+        // the skill again, and that run completed.
+        let lines = out_lines("forked-skill-stop");
+        let mut mapper = new_mapper();
+        let primary = mapper.thread;
+        let mut per_line = vec![mapper.begin_turn(TurnId::new(), TurnKind::User)];
+        let mut routes = Vec::new();
+        for line in &lines {
+            let outputs = mapper.map_line(line);
+            for (thread, ..) in routes_opened(&outputs) {
+                // The adapter notes its `stop_task` on the first route only.
+                if routes.is_empty() {
+                    mapper.note_stop_sent(thread);
+                }
+                routes.push(thread);
+            }
+            per_line.push(outputs);
+        }
+        // `per_line[0]` is the turn's start: line `i` of the fixture is `per_line[i + 1]`.
+        let at = |test: &dyn Fn(&Value) -> bool| &per_line[position(&lines, test) + 1];
+        let outputs = per_line.concat();
+        assert_eq!(routes.len(), 2);
+        let (stopped, rerun) = (routes[0], routes[1]);
+
+        // A stopped forked task gets the usual pair: `killed`, then a `stopped` notification. The
+        // update ends the route as interrupted; the notification finds nothing left to end.
+        let killed = at(&|frame| {
+            frame["subtype"] == "task_updated" && frame["task_id"] == "ac449741b86a05952"
+        });
+        let completions = turn_completions(&on_thread(killed, stopped));
+        assert_eq!(completions.len(), 1);
+        assert_eq!(completions[0].2.kind, TurnStatusKind::Interrupted);
+        assert_eq!(turn_completions(&on_thread(&outputs, stopped)).len(), 1);
+        let notified = at(&|frame| {
+            frame["subtype"] == "task_notification" && frame["task_id"] == "ac449741b86a05952"
+        });
+        assert!(events(notified).is_empty());
+        // The sub-agent's interruption marker trails its end and is dropped.
+        let marker = at(&|frame| {
+            frame["parent_tool_use_id"].is_string()
+                && frame.pointer("/message/content/0/text")
+                    == Some(&json!("[Request interrupted by user]"))
+        });
+        assert!(events(marker).is_empty());
+
+        // The sub-agent's own background command, killed with it, completes after the route's
+        // turn ended: on that turn, which the server amends late, while the route still stands.
+        let stopped_turn = completions[0].0;
+        let command_update =
+            at(&|frame| frame["subtype"] == "task_updated" && frame["task_id"] == "b7jfr5o7a");
+        assert!(events(command_update).is_empty());
+        let command_end =
+            at(&|frame| frame["subtype"] == "task_notification" && frame["task_id"] == "b7jfr5o7a");
+        let late: Vec<_> = events(command_end)
+            .into_iter()
+            .filter_map(|event| match event {
+                AgentEvent::ItemCompleted {
+                    thread, turn, item, ..
+                } => Some((*thread, *turn, item.payload.clone())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(late.len(), 1);
+        assert_eq!((late[0].0, late[0].1), (stopped, stopped_turn));
+        assert!(matches!(
+            &late[0].2,
+            ItemPayload::CommandExecution { status: Some(status), .. } if status == "terminated"
+        ));
+        assert!(routes_closed(command_end).is_empty());
+
+        // The stopped `Skill` call reads as the interrupted `Agent` call does.
+        let skill_completions: Vec<_> = completed_items(&on_thread(&outputs, primary))
+            .into_iter()
+            .filter_map(|item| match &item.payload {
+                ItemPayload::ToolCall {
+                    name,
+                    status,
+                    error,
+                    subagent: Some(link),
+                    ..
+                } if name == "Skill" => Some((status.clone(), error.clone(), link.clone())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(skill_completions.len(), 2);
+        let (status, error, link) = &skill_completions[0];
+        assert_eq!(status.as_deref(), Some("declined"));
+        assert!(
+            error
+                .as_deref()
+                .unwrap()
+                .contains("[Request interrupted by user for tool use]")
+        );
+        assert_eq!(link.status, Some(SubagentStatus::Interrupted));
+        let (status, _, link) = &skill_completions[1];
+        assert_eq!(status.as_deref(), Some("completed"));
+        assert_eq!(link.status, Some(SubagentStatus::Completed));
+
+        // The rerun is a second sub-agent, ended by its notification alone.
+        let completions = turn_completions(&on_thread(&outputs, rerun));
+        assert_eq!(completions.len(), 1);
+        assert_eq!(completions[0].2.kind, TurnStatusKind::Completed);
+
+        // The stop does not end the primary turn: its single `result` does, held by nothing.
+        let result = at(&|frame| frame["type"] == "result");
+        let completions = turn_completions(&on_thread(result, primary));
+        assert_eq!(completions.len(), 1);
+        assert_eq!(completions[0].2.kind, TurnStatusKind::Completed);
+        assert_eq!(turn_completions(&on_thread(&outputs, primary)).len(), 1);
+        assert!(!mapper.has_tasks());
+        logs_assert(no_line_with(r#"action="hold_result""#));
+        logs_assert(no_line_with(r#"action="agent_task_abandoned""#));
+        // Its `tool_progress` heartbeats are read and ignored, not unknown.
+        logs_assert(no_line_with(
+            "skipping a frame kind this adapter does not know",
+        ));
+    }
+
+    #[test]
+    fn a_notification_only_stop_is_interrupted_only_when_the_adapter_stopped_it() {
+        // No recording ends an agent task with a `stopped` notification alone: a stopped forked
+        // skill gets its `killed` update first (`forked-skill-stop`). Should one come, as for a
+        // task orphaned by a worker restart, it maps as that update would.
+        let lines: Vec<String> = out_lines("forked-skill")
+            .into_iter()
+            .map(|line| match frame_of(&line)["subtype"].as_str() {
+                Some("task_notification") => rewrite(&line, "/status", json!("stopped")),
+                _ => line,
+            })
+            .collect();
+        for stop in [true, false] {
+            let mut mapper = new_mapper();
+            let mut outputs = mapper.begin_turn(TurnId::new(), TurnKind::User);
+            let mut child = None;
+            for line in &lines {
+                let mapped = mapper.map_line(line);
+                if let Some((thread, ..)) = routes_opened(&mapped).first() {
+                    child = Some(*thread);
+                    if stop {
+                        mapper.note_stop_sent(*thread);
+                    }
+                }
+                outputs.extend(mapped);
+            }
+            let completions = turn_completions(&on_thread(&outputs, child.unwrap()));
+            assert_eq!(completions.len(), 1);
+            let status = &completions[0].2;
+            if stop {
+                assert_eq!(status.kind, TurnStatusKind::Interrupted);
+                assert_eq!(status.message, None);
+            } else {
+                assert_eq!(status.kind, TurnStatusKind::Failed);
+                assert_eq!(
+                    status.message.as_deref(),
+                    Some("agent task ab74653d91e526513 was stopped")
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_notification_ends_an_agent_task_that_got_no_terminal_update() {
+        // A `local_agent` task with no route, ended by its notification alone, then the result.
+        let mut mapper = new_mapper();
+        let turn = TurnId::new();
+        mapper.begin_turn(turn, TurnKind::User);
+        mapper.map_line(r#"{"type":"system","subtype":"task_started","session_id":"s","task_id":"a1","tool_use_id":"toolu_unknown","task_type":"local_agent","is_backgrounded":false,"description":"/review","uuid":"u1"}"#);
+        assert!(mapper.has_tasks());
+        let notified = mapper.map_line(r#"{"type":"system","subtype":"task_notification","session_id":"s","task_id":"a1","tool_use_id":"toolu_unknown","status":"completed","summary":"/review","uuid":"u2"}"#);
+        assert!(turn_completions(&notified).is_empty());
+        assert!(!mapper.has_tasks());
+        let completions = turn_completions(&mapper.map_line(&line_of("text-turn", "result")));
+        assert_eq!(completions.len(), 1);
+        assert_eq!(completions[0].0, turn);
+        assert_eq!(completions[0].2.kind, TurnStatusKind::Completed);
+    }
+
+    #[test]
+    #[traced_test]
+    fn an_interrupted_turn_holding_its_result_is_released() {
+        let mut mapper = new_mapper();
+        let turn = TurnId::new();
+        mapper.begin_turn(turn, TurnKind::User);
+        for task in ["a1", "a2"] {
+            mapper.map_line(&format!(r#"{{"type":"system","subtype":"task_started","session_id":"s","task_id":"{task}","task_type":"local_agent","is_backgrounded":true,"description":"d","uuid":"u-{task}"}}"#));
+        }
+        assert!(turn_completions(&mapper.map_line(&line_of("text-turn", "result"))).is_empty());
+        // Held, but not interrupted: the release is the supervisor's only after an interrupt.
+        assert!(!mapper.holds_interrupted_result());
+        assert!(mapper.release_interrupted_hold().is_empty());
+        assert_eq!(mapper.active_turn(), Some(turn));
+
+        mapper.note_interrupt_sent();
+        assert!(mapper.holds_interrupted_result());
+        let outputs = mapper.release_interrupted_hold();
+        let completions = turn_completions(&outputs);
+        assert_eq!(completions.len(), 1);
+        assert_eq!(completions[0].0, turn);
+        assert_eq!(completions[0].2.kind, TurnStatusKind::Interrupted);
+        assert_eq!(completions[0].1, TokenUsage::new(21_970, 53));
+        assert_eq!(mapper.active_turn(), None);
+        assert!(!mapper.holds_interrupted_result());
+        // The tasks it waited on are no longer tracked, so they cannot keep the child busy.
+        assert!(!mapper.has_tasks());
+        logs_assert(a_line_with(&[" WARN ", r#"action="release_held_result""#]));
+        for task in ["task_id=a1 ", "task_id=a2 "] {
+            logs_assert(lines_with(
+                1,
+                &[" WARN ", r#"action="agent_task_abandoned""#, task],
+            ));
+        }
+        // A late end for an abandoned task is ignored like an unknown task's.
+        let late = mapper.map_line(r#"{"type":"system","subtype":"task_updated","session_id":"s","task_id":"a1","patch":{"status":"completed"},"uuid":"u3"}"#);
+        assert!(events(&late).is_empty());
+    }
+
     #[test]
     #[traced_test]
     fn a_backgrounded_delegation_reports_its_outcome_on_the_parent() {
@@ -6183,5 +6775,11 @@ mod tests {
         );
         assert_eq!(routes_closed(&outputs), vec![child]);
         logs_assert(a_line_with(&[" WARN ", r#"action="route_still_open""#]));
+        // Its agent task is no longer waited for, so it no longer keeps the child busy.
+        assert!(!mapper.has_tasks());
+        logs_assert(lines_with(
+            1,
+            &[" WARN ", r#"action="agent_task_abandoned""#],
+        ));
     }
 }

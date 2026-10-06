@@ -122,6 +122,7 @@ turn's first answer frame as a backstop. `--replay-user-messages` was tried for 
 | `rate_limit_event` | `rateLimitType: "five_hour"`, `resetsAt`, `overageStatus` → **subscription-plan headroom**; surface as `Notice` |
 | `system/status`, `system/task_summary`, `system/post_turn_summary` | activity/labels; `post_turn_summary` carries `status_category` (`review_ready`, `blocked`, …), `status_detail` and `needs_action` |
 | `system/thinking_tokens` | running reasoning-token estimate during a turn |
+| `tool_progress` | **A top-level frame type, not a `system` subtype**: a running tool's progress, `{tool_use_id, tool_name, parent_tool_use_id, elapsed_time_seconds, task_id?, heartbeat?, subagent_type?, subagent_retry?}` (`claude-codes`' `ToolProgressMessage`). Recorded on 2.1.289 as 30 s heartbeats of a running forked skill: `tool_name: "Skill"`, `tool_use_id` = the `Skill` call's id plus `-heartbeat-<n>`, `parent_tool_use_id` = the call, `heartbeat: true`. Read and ignored, like `thinking_tokens`; `subagent_retry` (a sub-agent's API retry) is a candidate for a `Notice` later |
 | `thinking` content blocks | carry an opaque `signature`; map to `Reasoning` items and never re-send the text as input |
 | `tool_result_meta` | `non_execution_kind` (e.g. `"permission-rule"`) distinguishes "tool ran and failed" from "tool never ran" |
 | `system/permission_denied` | a denial with `decision_reason_type` (`rule`/`mode`/`classifier`/…) → `Notice` |
@@ -752,7 +753,22 @@ for what was an interrupt (§9.3), so it must not be mapped as a denial.
    the condition is *permanent* here rather than recoverable, and the wording should not imply
    otherwise. The `--resume` invariant that enforces it lives in `open_thread`, above.
 3. **The mapper keys off the tool named `Agent`.** The stream names the tool `Agent` in its `tool_use`
-   block even though the CLI and its documentation call it `Task`.
+   block even though the CLI and its documentation call it `Task`. A forked skill is the exception
+   (below).
+
+**A forked skill that completes ends without a terminal `task_updated`** (recorded on 2.1.289, the
+`forked-skill` fixture). A skill with `context: fork` runs a sub-agent behind its `Skill` call: the call's input
+names only the skill, `task_started` (`local_agent`, `tool_use_id` = the `Skill` call) is the first
+frame that says a sub-agent runs, its forwarded frames carry the `Skill` call's id, and the task ends
+with a `task_notification` and **no** `task_updated`, before the call's `tool_result` and the turn's
+single `result`. Stopped with `stop_task` (`forked-skill-stop`), it ends like any stopped
+delegation: `task_updated` `killed`, then `task_notification` `stopped`, and the parent's turn goes
+on. So the mapper also mints a route at a `local_agent` `task_started` that names an
+open call other than `Agent`, and a terminal `task_notification` ends an agent task no terminal update
+ended. Gating on the update alone held such a turn's `result` forever, and an interrupt could not end
+it either: the CLI had already finished its turn, so it answers the interrupt and sends nothing else.
+An interrupted turn that still holds its `result` after a short grace is therefore finished as
+interrupted by the adapter.
 
 The CLI's own transcript format is documented as internal and unstable — *"the entry format is
 internal to Claude Code and changes between versions"* — so this design's reliance on the **stream**

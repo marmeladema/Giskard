@@ -2,7 +2,8 @@
 
 Stream-json transcripts recorded against **Claude Code 2.1.286** (the two `subagent-*`, the
 `replay-compact`, the five `background-{stop,complete,taskstop,fail,stop-next-turn}`, the
-`prompt-not-replayed` and the `mcp-status` scenarios against **2.1.287**) by driving a real
+`prompt-not-replayed` and the `mcp-status` scenarios against **2.1.287**, the two `forked-skill*`
+against **2.1.289**) by driving a real
 `claude -p` child over a stdio pipe, for the mapper tests of
 [`specs/claude-code-harness-plan.md`](../../../../specs/claude-code-harness-plan.md) (§11). They
 live in `crates/giskard-harness-claude/tests/fixtures/`, where the mapper tests read them.
@@ -16,7 +17,8 @@ Each scenario has up to four files:
 | `<name>.meta.json` | the exact argv, the exit code, how many `result` frames arrived, how many `can_use_tool` asks were answered, and the wall time |
 | `<name>.stderr.txt` | stderr, present only when the CLI wrote any |
 
-Every scenario ran with `--model haiku`, `--permission-prompt-tool stdio`, `--setting-sources ""`,
+Every scenario ran with `--model haiku`, `--permission-prompt-tool stdio`, `--setting-sources ""`
+(the `forked-skill*` scenarios: `project`, since the CLI loads no project skill without it),
 a fresh `--session-id`, a throwaway working directory holding one file `data.txt` whose content is
 `the magic number is 4271`, and an environment reduced to `PATH`, `HOME` and the variables that
 carry authentication. The recorder answered every `can_use_tool` per the scenario's policy below and
@@ -46,6 +48,8 @@ closed stdin when the scenario's stop condition was met.
 | `background-stop-next-turn` | manual, `--replay-user-messages` | a background `sleep 60`, `stop_task` once the turn ended (`killed`, `stopped`, `{}`; no continuation turn), then a second message: after its `init`, the CLI first replays the queued `<task-notification>` as a user frame with `isReplay: true`, a string `content` and `origin: {"kind": "task-notification"}` (line 19), then the message itself (line 22). Recorded with `--replay-user-messages`, which the adapter no longer passes: the mapper ignores its `isReplay` frames. | 2 results |
 | `prompt-not-replayed` | manual, `--replay-user-messages` | a prompt quoting `` `<task-notification>` `` inline: the CLI answers it but replays nothing (no `isReplay` frame); which prompts the CLI does not replay is in the adapter README, *Process control*, **Why not `--replay-user-messages`** ([`../../README.md`](../../README.md)). Recorded with `--replay-user-messages`, which the adapter no longer passes: the mapper ignores its `isReplay` frames. | 1 result |
 | `mcp-status` | manual, `--mcp-config` naming a minimal stdio server (`mini`: one tool, one resource, one template, written for the recording) and a broken one, `--strict-mcp-config` | `initialize`, then `mcp_status` answering a **connected** entry (`serverInfo`, `tools: [{name, annotations}]`) beside a failed one (`error`, no `serverInfo`, no `tools`), then one text turn whose `init` lists `mcp_servers` and the `mcp__mini__echo` tool. The recorder's stdin was reconstructed after the fact; the paths are rewritten | 1 result |
+| `forked-skill` | default, `--forward-subagent-text`, `--setting-sources project`; the working directory also holds `.claude/skills/magic/SKILL.md` (`context: fork`: "Read data.txt in the current directory with the Read tool and reply with the magic number only.") | a skill run as a **forked** sub-agent: the `Skill` call, `task_started` of type `local_agent` naming it (`description: "/magic"`, the skill's text as `prompt`), the sub-agent's prompt, `Read` and `Bash` calls and answer tagged with the `Skill` call's id, then `task_notification` completed and **no** `task_updated`, the call's `tool_result` (`tool_use_result.status: "forked"`) and one `result` | no asks; 1 result then 8 s quiet |
+| `forked-skill-stop` | as `forked-skill`, the skill telling the sub-agent to run `sleep 60 && cat data.txt` | `stop_task` on the forked task while its sub-agent's command ran (the CLI blocked the `sleep` chain and the sub-agent ran it in the background): `task_updated` killed then `task_notification` stopped for the forked task (lines 17–18), the `{}` answer, the sub-agent's trailing `[Request interrupted by user]`, its background command killed too, the `Skill` `tool_result` with `is_error` and `non_execution_kind: interrupted` (line 24); then the model ran the skill again, a second forked task that completed on its notification alone, and one `result` | stop_task 3 s after the sub-agent's first `Bash` call; 1 result then 8 s quiet |
 | `autocompact-state` | — | the two top-level frames `active_goal` and `autocompact_state` a session emits before its first turn in some environments; two frames only, recorded separately with an environment that sets autocompact overrides | — |
 
 ## Sanitization
