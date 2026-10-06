@@ -142,6 +142,13 @@ pub(crate) fn session_argv(options: &ClaudeLaunchOptions, session: &SessionArgs)
         SessionFlag::Fresh(id) => argv.extend(["--session-id".into(), id.clone()]),
         SessionFlag::Resume(id) => argv.extend(["--resume".into(), id.clone()]),
     }
+    // Appended, never `--system-prompt`, which would replace Claude Code's own prompt. Passed on
+    // resume too: the CLI snapshots the rendered prompt on a conversation's first request and reuses
+    // that record on resume, but renders it afresh after a compaction, from this launch's flags.
+    argv.extend([
+        "--append-system-prompt".into(),
+        giskard_harness::GISKARD_FRONTEND_INSTRUCTIONS.into(),
+    ]);
     argv.extend(options.args.iter().cloned());
     argv
 }
@@ -694,6 +701,8 @@ pub(crate) mod tests {
             "sonnet",
             "--session-id",
             "uuid-1",
+            "--append-system-prompt",
+            giskard_harness::GISKARD_FRONTEND_INSTRUCTIONS,
             "--debug",
             "api",
         ]));
@@ -717,6 +726,8 @@ pub(crate) mod tests {
             "high",
             "--resume",
             "uuid-2",
+            "--append-system-prompt",
+            giskard_harness::GISKARD_FRONTEND_INSTRUCTIONS,
         ]));
         assert_eq!(resume, expected);
 
@@ -747,6 +758,7 @@ pub(crate) mod tests {
             "--model",
             "--permission-mode",
             "--replay-user-messages",
+            "--append-system-prompt",
         ] {
             assert!(!argv.iter().any(|arg| arg == flag), "{flag} in {argv:?}");
         }

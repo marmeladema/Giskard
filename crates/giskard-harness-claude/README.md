@@ -101,7 +101,7 @@ routes*). A child idle for `idle_shutdown_secs` is stopped and its thread respaw
   `list_mcp_servers` when the call names no thread with a live child, is owned by the call: it is
   not in `threads` and does not count as a live child. It must never become a Claude Code session
   (`AGENTS.md`): it is launched with the protocol flags only (no `--session-id`, `--resume`,
-  `--model`, `--permission-mode`), it is written only control requests through `control_line`,
+  `--model`, `--permission-mode`, `--append-system-prompt`), it is written only control requests through `control_line`,
   never a `user` line, and its stdin is closed after the last answer. Verified on 2.1.287:
   `initialize` alone, or `initialize` then `mcp_status`, on a probe leaves no `projects/<cwd>/`
   directory, no session `.jsonl`, no `sessions/` entry and no project entry in `.claude.json`;
@@ -269,6 +269,7 @@ Each primary thread's child runs, in this order:
 | `--model <ModelRef.model>` | an alias or a full id, verbatim |
 | `--effort <ModelRef.reasoning_effort>` | only when the model ref carries one; the CLI tolerates a level the model ignores |
 | `--session-id <uuid>` or `--resume <uuid>` | a fresh session (or the same-id respawn), or a resume |
+| `--append-system-prompt <GISKARD_FRONTEND_INSTRUCTIONS>` | tells the agent its output is read in Giskard's web UI (a hardcoded constant in `giskard-harness`, shared with the Codex adapter). Appended to Claude Code's own prompt, never `--system-prompt`, which replaces it. Passed on every launch, resume included: the CLI snapshots the rendered prompt on a conversation's first request and replays that record on resume until a compaction re-renders it, so a conversation started before the flag existed only picks it up after compacting |
 | the declaration's `args` | last, so an operator can append to, never override, the protocol flags |
 
 **Launch mode.** `bypassPermissions` can only be *set* on a child *launched* with it (otherwise

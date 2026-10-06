@@ -2429,7 +2429,7 @@ The `CodexHarness` maps the Codex app-server JSON-RPC protocol onto the above. K
 | Codex app-server | Giskard |
 |------------------|---------|
 | `initialize` + `initialized` handshake | **once per process** (per project), during process spawn — not per thread (S1) |
-| `thread/start`, `thread/resume` | `open_thread` (S1: this is the per-thread call, distinct from the handshake) |
+| `thread/start`, `thread/resume` | `open_thread` (S1: this is the per-thread call, distinct from the handshake); both carry `developerInstructions` = `GISKARD_FRONTEND_INSTRUCTIONS` |
 | `turn/start` (with model/effort/permissions per turn) | `start_turn` + `TurnOverrides` (P1: effort lives in `ModelRef`, not `TurnOverrides`) |
 | `turn/steer` (with exact `expectedTurnId`) | `steer_turn` on the existing Giskard turn; emitted user messages stay in that turn |
 | `item/started`, `item/*/delta`, `item/completed` | `ItemStarted` / `ItemDelta` / `ItemCompleted` |
@@ -2456,6 +2456,7 @@ verified protocol is recorded in [`claude-code-harness-plan.md`](claude-code-har
 |-------------|---------|
 | `initialize` control request | **once per process**, in the handshake at `open_thread`: one `claude` process per open thread (§4.7) |
 | `--session-id <uuid>` / `--resume <uuid>` | `open_thread`; a resume whose transcript is gone respawns with `--session-id` and the same id (the C5 fallback) |
+| `--append-system-prompt <GISKARD_FRONTEND_INSTRUCTIONS>` | every session child (never the probe) |
 | `set_permission_mode`, `set_model`, `apply_flag_settings` and a `get_settings` read-back, then a `user` stdin line | `start_turn` + `TurnOverrides` |
 | `stream_event`, `assistant`, `user` tool results | `ItemStarted` / `ItemDelta` / `ItemCompleted` |
 | `can_use_tool` control request | `ApprovalRequested`, answered with the decision shapes of the harness plan §9.3 |

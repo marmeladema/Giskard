@@ -1600,6 +1600,9 @@ async fn resume_thread(
         model: Some(model.model.clone()),
         model_provider: Some(model.provider.clone()),
         exclude_turns: Some(true),
+        // A resumed session's config comes from these params, so the instructions are sent again
+        // here or a thread reopened after a restart would run without them.
+        developer_instructions: Some(giskard_harness::GISKARD_FRONTEND_INSTRUCTIONS.to_owned()),
         ..Default::default()
     };
     let resp: codex_codes::ThreadResumeResponse = codex_request(
@@ -1647,6 +1650,8 @@ async fn start_thread(
         cwd: Some(cwd.to_owned()),
         model: Some(initial_model.model.clone()),
         model_provider: Some(initial_model.provider.clone()),
+        // `developerInstructions` adds to Codex's base prompt; `baseInstructions` would replace it.
+        developer_instructions: Some(giskard_harness::GISKARD_FRONTEND_INSTRUCTIONS.to_owned()),
         ..Default::default()
     };
     let resp: codex_codes::ThreadStartResponse = codex_request(
@@ -4026,6 +4031,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn thread_start_adds_giskard_frontend_developer_instructions() {
+        let (harness, controller) = spawn_fake_harness();
+        harness
+            .open_thread(open_opts(ThreadId::new(), None))
+            .await
+            .unwrap();
+
+        let requests = controller.requests().await;
+        let start = requests
+            .iter()
+            .find(|req| req.method == codex_codes::protocol::methods::THREAD_START)
+            .expect("thread/start was sent");
+        assert_eq!(
+            start.params["developerInstructions"],
+            giskard_harness::GISKARD_FRONTEND_INSTRUCTIONS
+        );
+        assert!(
+            start
+                .params
+                .get("baseInstructions")
+                .is_none_or(Value::is_null),
+            "Codex's base prompt must be kept, not replaced"
+        );
+    }
+
+    #[tokio::test]
     async fn codex_worker_ignores_non_json_stdout_during_an_active_turn() {
         let (harness, controller) = spawn_fake_harness();
         let thread = harness
@@ -4156,6 +4187,8 @@ mod tests {
                 && req.params["model"] == "gpt-5.5"
                 && req.params["modelProvider"] == "openai"
                 && req.params["excludeTurns"] == true
+                && req.params["developerInstructions"]
+                    == giskard_harness::GISKARD_FRONTEND_INSTRUCTIONS
         }));
         assert_eq!(
             resumed.resumed_model,
