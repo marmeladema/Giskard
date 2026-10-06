@@ -1,6 +1,7 @@
 "use strict";
 const $ = (id) => document.getElementById(id);
 const PROJECT_COLLAPSE_KEY = "giskard.collapsedProjects";
+const ARCHIVED_EXPAND_KEY = "giskard.expandedArchivedProjects";
 const WS_RECONNECT_BASE_MS = 600;
 const WS_RECONNECT_MAX_MS = 8000;
 const WS_PROBLEM_NOTICE_INTERVAL_MS = 30000;
@@ -196,6 +197,7 @@ let state = {
   lastNotificationPromptNoticeAt:0, swRegistration:null, pendingAttachments:[],
   attachmentGeneration:0, pendingAttachmentOperations:new Map(),
   collapsedProjects:new Set(loadCollapsedProjects()), pendingRemoveProject:null,
+  expandedArchivedProjects:new Set(loadExpandedArchivedProjects()),
   pendingRemoveThread:null, removeThreadRequestSeq:0, projectDirs:{}
 };
 const RELOAD_DRAFT_KEY = "giskard.reloadDraft";
@@ -1281,11 +1283,26 @@ function renderProjectThreads(pid) {
     t => t.archived && t.kind !== "subagent"
   );
   if (archived.length) {
-    const label = document.createElement("div");
-    label.className = "thread-section-label";
-    label.textContent = "Archived";
-    box.append(label);
-    appendThreadRows(box, pid, archived);
+    // Archived threads fold away by default; the header keeps their count in view.
+    const toggle = document.createElement("button");
+    toggle.type = "button"; toggle.className = "thread-section-label archived-toggle";
+    const caret = document.createElement("span"); caret.className = "archived-caret";
+    const label = document.createElement("span");
+    label.textContent = `Archived (${archived.length})`;
+    toggle.append(caret, label);
+    // Toggle from what is shown: the open thread may be holding the section expanded over a saved
+    // "collapsed", and collapsing must save that, not flip the hidden preference.
+    toggle.onclick = (e) => {
+      e.stopPropagation();
+      setArchivedExpanded(pid, toggle.getAttribute("aria-expanded") !== "true");
+    };
+    const archivedBox = document.createElement("div");
+    archivedBox.className = "archived-threads";
+    appendThreadRows(archivedBox, pid, archived);
+    const section = document.createElement("div");
+    section.className = "archived-section"; section.dataset.pid = pid;
+    section.append(toggle, archivedBox);
+    box.append(section);
   }
   if (quarantined.length) {
     const warning = document.createElement("div");
@@ -1459,6 +1476,46 @@ function saveCollapsedProjects() {
   try {
     localStorage.setItem(PROJECT_COLLAPSE_KEY, JSON.stringify([...state.collapsedProjects]));
   } catch {}
+}
+
+function loadExpandedArchivedProjects() {
+  try {
+    const ids = JSON.parse(localStorage.getItem(ARCHIVED_EXPAND_KEY) || "[]");
+    return Array.isArray(ids) ? ids.filter(Boolean).map(String) : [];
+  } catch {
+    return [];
+  }
+}
+
+function saveExpandedArchivedProjects() {
+  try {
+    localStorage.setItem(ARCHIVED_EXPAND_KEY, JSON.stringify([...state.expandedArchivedProjects]));
+  } catch {}
+}
+
+function setArchivedExpanded(pid, expanded) {
+  if (!pid) return;
+  if (expanded) state.expandedArchivedProjects.add(String(pid));
+  else state.expandedArchivedProjects.delete(String(pid));
+  saveExpandedArchivedProjects();
+  document.querySelectorAll(".archived-section").forEach(syncArchivedSection);
+  closeThreadMenus();
+}
+
+// The open thread is never folded out of sight: a section holding it shows expanded without
+// changing the saved preference, and folds back once the selection moves elsewhere.
+function syncArchivedSection(section) {
+  const holdsActive = !!section.querySelector(".thread.active");
+  const expanded = holdsActive || state.expandedArchivedProjects.has(String(section.dataset.pid));
+  const rows = section.querySelector(".archived-threads");
+  if (rows) rows.hidden = !expanded;
+  const toggle = section.querySelector(".archived-toggle");
+  if (toggle) {
+    toggle.setAttribute("aria-expanded", String(expanded));
+    toggle.title = expanded ? "Collapse archived threads" : "Expand archived threads";
+    const caret = toggle.querySelector(".archived-caret");
+    if (caret) caret.textContent = expanded ? "v" : ">";
+  }
 }
 
 function setProjectCollapsed(pid, collapsed) {
@@ -1846,6 +1903,7 @@ function syncActiveThreadHighlight() {
     const project = el.closest(".proj");
     markSidebarRowActive(el, draftPid !== null && project && String(project.dataset.pid) === draftPid);
   });
+  document.querySelectorAll(".archived-section").forEach(syncArchivedSection);
 }
 
 function normalizeThreadTitleInput(value) {
@@ -2208,6 +2266,9 @@ function clearThreadView(tid) {
   $("transcript").innerHTML="";
   restoreComposerDraft();
   setWsStatus("closed", "No thread selected.");
+  // The row that was open is no longer selected; a stale highlight would also hold an archived
+  // section open around it.
+  syncActiveThreadHighlight();
 }
 
 function clearStoredLastThreadForProject(pid) {

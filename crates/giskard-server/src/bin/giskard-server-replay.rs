@@ -1035,6 +1035,15 @@ impl AgentHarness for ScriptedHarness {
         Ok(())
     }
 
+    /// Archive state lives in Giskard's thread metadata; the scripted harness has nothing to move.
+    async fn set_thread_archived(
+        &self,
+        _thread: &ThreadHandle,
+        _archived: bool,
+    ) -> Result<(), HarnessError> {
+        Ok(())
+    }
+
     async fn shutdown(&self) -> Result<(), HarnessError> {
         Ok(())
     }
