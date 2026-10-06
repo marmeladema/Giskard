@@ -361,7 +361,7 @@
      still yields the whole note and re-expanding costs no re-render. The right padding keeps that
      one-line summary clear of the row's hover copy button. */
   .reasoning-toggle {
-    display:flex; align-items:baseline; gap:6px; width:100%; padding:0 58px 0 0;
+    display:flex; align-items:baseline; gap:6px; width:100%; min-width:0; padding:0 58px 0 0;
     border:0; background:transparent; color:inherit; font:inherit; text-align:left;
     white-space:nowrap; cursor:pointer;
   }
@@ -374,7 +374,8 @@
   /* The IDE/Terminal appearances lay a row out as a grid (role gutter + content column). Both the
      summary and the body belong in the content column, on their own rows. The negative line
      numbers resolve to the last column either way, so this holds for the two-column desktop grid
-     and for the single-column phone grid below. */
+     and for the single-column phone grid below. The toggle's `min-width:0` lets the one-line
+     summary ellipsize instead of widening that column to the summary's full length. */
   [data-appearance="ide"] .msg.reasoning-collapsible > .reasoning-toggle,
   [data-appearance="ide"] .msg.reasoning-collapsible > .body,
   [data-appearance="terminal"] .msg.reasoning-collapsible > .reasoning-toggle,
@@ -785,7 +786,7 @@
   .mp-popover {
     position:absolute; bottom:calc(100% + 6px); z-index:45;
     width:min(380px, calc(100vw - 24px)); padding:10px;
-    display:grid; grid-template-columns:1fr 1fr; gap:6px 10px;
+    display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:6px 10px;
     border:1px solid var(--border); border-radius:8px; background:var(--panel);
     box-shadow:0 20px 48px rgba(0,0,0,.45);
   }
@@ -878,7 +879,7 @@
   .task-group-entry > .msg pre.out { font-size:12px; }
 
   /* usage stat tiles (context menu) */
-  .stats { display:grid; grid-template-columns:repeat(3,1fr); gap:8px; }
+  .stats { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:8px; }
   .stat { background:var(--panel2); border:1px solid var(--border); border-radius:8px; padding:8px 10px; }
   .statlabel { font-size:11px; text-transform:uppercase; letter-spacing:.04em; color:var(--muted); }
   .statval { font-size:16px; font-variant-numeric:tabular-nums; margin-top:2px; }
@@ -1154,9 +1155,11 @@
     /* The IDE/Terminal themes render each row as a fixed role gutter + content. That gutter
        (~80px + gap) is a big bite out of a phone's width, so on narrow screens collapse the grid
        to a single column: the role becomes a small label above full-width content. Desktop keeps
-       the two-column gutter. */
+       the two-column gutter. The column is `minmax(0,1fr)`, not `1fr`: a bare `1fr` cannot shrink
+       below its widest item's min-content, so one unwrappable line (a reasoning summary, a long
+       path) would push the whole row off the right edge of the screen. */
     [data-appearance="ide"] .msg,
-    [data-appearance="terminal"] .msg { grid-template-columns:1fr; }
+    [data-appearance="terminal"] .msg { grid-template-columns:minmax(0,1fr); }
     [data-appearance="ide"] .msg .role,
     [data-appearance="terminal"] .msg .role { text-align:left; margin-bottom:2px; }
     [data-appearance="ide"] .msg,

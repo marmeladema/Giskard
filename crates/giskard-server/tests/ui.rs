@@ -3936,3 +3936,83 @@ fn browser_gates_controls_on_harness_capabilities() {
         "the ask-first preset option has a stable hook to disable"
     );
 }
+
+/// A grid track sized `1fr` is `minmax(auto, 1fr)`: it cannot shrink below the min-content width of
+/// its widest item, so a single unwrappable line (a one-line summary, a long path) widens the track
+/// and pushes the row off the right edge of a phone screen. Every flexible track must state its
+/// minimum explicitly — `minmax(0,1fr)`, or another deliberate floor such as `minmax(360px,1fr)`.
+#[test]
+fn css_flexible_grid_tracks_state_their_minimum() {
+    let css = strip_css_comments(include_str!("../static/app.css"));
+    let mut offenders = Vec::new();
+    for property in [
+        "grid-template-columns",
+        "grid-template-rows",
+        "grid-auto-columns",
+        "grid-auto-rows",
+    ] {
+        let mut rest = css.as_str();
+        while let Some(at) = rest.find(property) {
+            rest = &rest[at + property.len()..];
+            let Some(value) = rest.trim_start().strip_prefix(':') else {
+                continue;
+            };
+            let end = value.find([';', '}']).unwrap_or(value.len());
+            let value = &value[..end];
+            if has_bare_fr_track(value) {
+                offenders.push(format!("{property}:{}", value.trim()));
+            }
+        }
+    }
+    assert!(
+        offenders.is_empty(),
+        "flexible grid tracks must be wrapped in minmax(<min>, <n>fr), e.g. minmax(0,1fr): {offenders:?}"
+    );
+}
+
+fn strip_css_comments(css: &str) -> String {
+    let mut out = String::with_capacity(css.len());
+    let mut rest = css;
+    while let Some(start) = rest.find("/*") {
+        out.push_str(&rest[..start]);
+        rest = rest[start + 2..]
+            .find("*/")
+            .map_or("", |end| &rest[start + 2 + end + 2..]);
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Whether `value` has an `<n>fr` track outside any `minmax(...)`.
+fn has_bare_fr_track(value: &str) -> bool {
+    let mut outside = String::new();
+    let mut rest = value;
+    while let Some(start) = rest.find("minmax(") {
+        outside.push_str(&rest[..start]);
+        let mut depth = 0usize;
+        let mut close = rest.len();
+        for (i, c) in rest[start..].char_indices() {
+            match c {
+                '(' => depth += 1,
+                ')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        close = start + i + 1;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        outside.push(' ');
+        rest = &rest[close..];
+    }
+    outside.push_str(rest);
+    outside
+        .split(|c: char| !(c.is_ascii_alphanumeric() || c == '.'))
+        .any(|token| {
+            token
+                .strip_suffix("fr")
+                .is_some_and(|n| !n.is_empty() && n.chars().all(|c| c.is_ascii_digit() || c == '.'))
+        })
+}

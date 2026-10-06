@@ -203,3 +203,11 @@ Cargo workspace with 9 crates under `crates/`:
 - When adding a recovery path, timeout, idempotent close, deduplication rule, fallback completion,
   or lifecycle cleanup, add focused tests for the failure path and make sure logs or browser-visible
   errors explain what happened.
+- Web UI layout must never widen the page past a phone screen. In `app.css`, a flexible grid track
+  states its minimum: `minmax(0,1fr)` (or another deliberate floor such as `minmax(360px,1fr)`),
+  never a bare `1fr`, which cannot shrink below its widest item's min-content width. A flex or grid
+  item that holds `white-space:nowrap` / ellipsized text gets `min-width:0`. A static test in
+  `crates/giskard-server/tests/ui.rs` rejects bare `fr` tracks, and
+  `tests/e2e/tests/mobile-overflow.spec.ts` checks that no transcript row runs past the right edge
+  at phone width in every appearance. When you add a row kind or a new direct child of `.msg`, add
+  it to that spec.
