@@ -780,10 +780,24 @@ async fn index_page_is_served_and_public() {
     );
     assert!(
         body.contains("function renderProjectThreads(pid) {")
-            && body.contains("appendThreadRows(box, pid, archived);")
+            && body.contains("appendThreadRows(archivedBox, pid, archived);")
             && body.contains("syncActiveThreadHighlight();"),
         "reloading a project's threads re-derives the selection highlight, so a reload not driven \
          by opening a thread cannot leave the sidebar with nothing selected"
+    );
+    assert!(
+        body.contains("const ARCHIVED_EXPAND_KEY = \"giskard.expandedArchivedProjects\";")
+            && body.contains("label.textContent = `Archived (${archived.length})`;")
+            && body.contains("const holdsActive = !!section.querySelector(\".thread.active\");")
+            && body.contains(
+                "setArchivedExpanded(pid, toggle.getAttribute(\"aria-expanded\") !== \"true\");"
+            )
+            && body.contains(
+                "document.querySelectorAll(\".archived-section\").forEach(syncArchivedSection);"
+            ),
+        "a project's archived threads start folded under a counted header, remember an explicit \
+         expansion, and unfold while the open thread is one of them; the header toggles from the \
+         shown state, so collapsing a section the open thread holds open saves \"collapsed\""
     );
     assert!(
         body.contains("function renderTaskCards")
