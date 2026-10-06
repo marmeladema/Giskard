@@ -21,8 +21,8 @@ inline attachments, `respond_approval` and `respond_server_request` answer the C
 from the freshest handshake or a probe child, `list_mcp_servers` asks the hinted thread's child or
 a probe for `mcp_status`, and `list_providers` reports `anthropic`. `capabilities()` reports the
 plan §4 matrix, with `live_approvals`, `plan_build_modes`, `per_turn_model`, `reasoning_effort`,
-`context_compaction` and `mcp_status` true. A delegation (an `Agent` tool call) is a **sub-agent
-thread**: the mapper mints a route for it, `claim_native_thread` binds it, its forwarded frames are
+`context_compaction` and `mcp_status` true. A delegation (an `Agent` tool call, or the `Skill` call
+of a forked skill) is a **sub-agent thread**: the mapper mints a route for it, `claim_native_thread` binds it, its forwarded frames are
 its transcript, its asks are published on it, and `interrupt` on it is `stop_task` (see *Sub-agent
 routes*). A child idle for `idle_shutdown_secs` is stopped and its thread respawned with
 `--resume` on its next message (see *Process control*). Still to come: synthesized diffs
@@ -113,11 +113,11 @@ routes*). A child idle for `idle_shutdown_secs` is stopped and its thread respaw
 | Giskard identity | Claude Code source |
 | --- | --- |
 | `harness_thread_id` of a primary thread | the session UUID Giskard mints and passes as `--session-id` |
-| `harness_thread_id` of a sub-agent thread | `task:<tool_use_id>` of the parent's `Agent` call (`ids::TASK_ID_PREFIX`): a sub-agent runs inside its parent's session and has no session of its own |
-| `ThreadId` of a sub-agent thread | minted by the mapper when the `Agent` block is mapped, and adopted by `claim_native_thread` whatever id the server proposed; a route whose session is gone is bound cold under the proposed id |
+| `harness_thread_id` of a sub-agent thread | `task:<tool_use_id>` of the parent's `Agent` call, or of a forked skill's `Skill` call (`ids::TASK_ID_PREFIX`): a sub-agent runs inside its parent's session and has no session of its own |
+| `ThreadId` of a sub-agent thread | minted by the mapper when the `Agent` block is mapped (a forked skill's at its `task_started`), and adopted by `claim_native_thread` whatever id the server proposed; a route whose session is gone is bound cold under the proposed id |
 | `TurnId` | minted by Giskard at `start_turn` (`begin_turn`), or by the mapper for a continuation turn the CLI started on its own |
 | `ItemId` | minted on first sight of a native key: a `tool_use` block's `id`, or `(message.id, block index)` for a text or thinking block; reused for the item's start, deltas and completion within the turn |
-| `Item.harness_item_id` | the tool-use id, `<message_id>:<index>`, `compact_boundary:<uuid>`, `user:<uuid>:<index>` for a user-frame activity or a sub-agent's delegated prompt, `user:<turn_id>:sent` for a primary turn's prompt, or `task_updated:<task_id>` for a backgrounded sub-agent's outcome |
+| `Item.harness_item_id` | the tool-use id, `<message_id>:<index>`, `compact_boundary:<uuid>`, `user:<uuid>:<index>` for a user-frame activity or a sub-agent's delegated prompt, `user:<turn_id>:sent` for a primary turn's prompt, `task_started:<task_id>` for the activity announcing a forked skill's sub-agent, or `task_updated:<task_id>` for a backgrounded sub-agent's outcome |
 | `ApprovalId`, `ServerRequestId` | the `control_request`'s `request_id`, a UUID the CLI mints and the reply must carry; the trait's instance-wide uniqueness across children rests on the CLI minting UUIDs |
 
 `assistant` frames arrive **one content block per frame**, each repeating the whole message
@@ -135,8 +135,9 @@ so a block's index matches the `content_block_*.index` of the stream events for 
 | `tool_use` `Agent` | `ToolCall { name: "Agent", subagent }` with the route's link (`task:<id>`, `initial_prompt` = `input.prompt`, `Spawned`, `Pending`), preceded by `MapperOutput::RouteOpened` | none | `ToolCall { output: the result content, subagent }` with the link as the route stands: `Completed` (or `Interrupted`) for an ended route, `Started` / `Running` for one still running (a backgrounded delegation) |
 | the turn's `system/init` (else, as a backstop, its first answer frame: a primary `assistant`, `stream_event`, non-replayed `user`, `result` or `can_use_tool`) | `UserMessage` started and completed together, `text` = the text the adapter wrote for the turn (`note_prompt`): the turn's acknowledgement. Not for a compaction turn, and once per turn | | |
 | `user` frame with `isReplay: true` | ignored, bookkeeping (`replay_ignored` at `debug`, with `origin.kind` when present): the CLI marks some of its own frames so (the `<local-command-stdout>` after `/compact`), and recordings made with `--replay-user-messages` carry prompts and queued inputs | | |
+| `system/task_started` of a `local_agent` task naming an open call that is no `Agent` call (a forked skill's `Skill`) | `Activity`, started and completed together on the call's turn: `title` = the task's `description`, `detail` = `<tool> sub-agent`, `subagent` = the route's link (`task:<id>`, `initial_prompt` = the task's `prompt`, `Spawned`, `Pending`), `harness_item_id = task_started:<task_id>`; preceded by `MapperOutput::RouteOpened`. The call's own item keeps its single start; its `tool_result` completes it with the link as for an `Agent` call | | |
 | a sub-agent's first `user` text block equal to its delegated prompt | on the route: `UserMessage` started and completed together, `text` = the prompt | | |
-| terminal `system/task_updated` of a route's `local_agent` task | | | on the route: open tool calls `interrupted`, then `TurnCompleted`; for a backgrounded delegation, on the spawning thread: `Activity { title: description, detail: completed / killed / failed, subagent: the link }` |
+| terminal `system/task_updated` of a route's `local_agent` task, or the terminal `system/task_notification` of one that got no update (a forked skill that completed) | | | on the route: open tool calls `interrupted`, then `TurnCompleted`; for a backgrounded delegation, on the spawning thread: `Activity { title: description, detail: completed / killed / failed, subagent: the link }` |
 | `tool_use` `mcp__<server>__<tool>` | `ToolCall { server: <server>, name: <tool> }` | none | `ToolCall` |
 | any other `tool_use` | `ToolCall { name, input }` | `input_json_delta` is ignored; the `assistant` frame has the final input | `ToolCall`, with `error` = the result text when `is_error` |
 | `user` frame with a text block and no `tool_result` | `Activity` started and completed together, `title` = the text (the `[Request interrupted by user for tool use]` marker) | | |
@@ -188,12 +189,24 @@ naming `parent_tool_use_id` and the frame type, never attributed to the primary 
   frame with no active turn opens one: the mapper mints a `TurnId`, emits `TurnStarted` and logs at
   `info` with `action = "external_turn"`. The server claims such a turn as an external turn.
 - **Agent-task gate.** A `result` completes the turn unless a `local_agent` task the turn started is
-  still open; then the result is held. A terminal `task_updated` removes its task; when the last one
-  goes and a result is held: `completed` keeps holding (the CLI's continuation `result` completes
+  still open; then the result is held. A terminal `task_updated` removes its task, and so does the
+  terminal `task_notification` of a task that got no update: a forked skill's task that completes
+  ends with the notification alone (recorded on 2.1.289, `forked-skill`), and gating on the update
+  held that turn's `result` for good. A stopped one gets the usual `killed` update first
+  (`forked-skill-stop`). When the last task goes and a result is held: `completed` keeps holding (the CLI's continuation `result` completes
   the turn), while `killed`, `failed` or `stopped` completes it now from the held result, as
   `Interrupted` if the adapter sent an interrupt, else `Failed`, because no second `result` comes.
   A `local_bash` task never gates completion; a foreground delegation never holds, since its task
-  completes before the single `result`.
+  completes before the single `result`. An **interrupted** turn that still holds its result
+  `INTERRUPTED_HOLD_GRACE` (5 s) after the hold and the interrupt both stand is finished
+  `Interrupted` by the supervisor (`release_held_result` at `warn`, with `open_agent_tasks`): the
+  CLI already ended that turn, so the interrupt brings no `result`, and only the tasks' own ends
+  (an interrupt makes the CLI kill them) could release it. Without this, a task whose end the
+  adapter never sees would make the turn impossible to stop. A turn that ends while agent tasks
+  it waited on are still open (that release, or a superseded turn; every agent task, a nested
+  route's included, joins the primary turn's set) stops tracking them: each leaves the task map
+  with one `warn` naming it (`action = "agent_task_abandoned"`), so it no longer keeps the child
+  busy and the child can be reaped, and a later end for it is ignored as an unknown task's.
 - **Status.** `is_error: false` is `Completed`. An error result is `Interrupted` when the adapter
   called `note_interrupt_sent` or `terminal_reason` is `aborted_streaming` / `aborted_tools`, else
   `Failed` with the result text, else the joined `errors`, else the subtype.
@@ -232,8 +245,12 @@ variant: an unknown top-level `type` (`autocompact_state` and `active_goal` are 
 untyped control-request subtype, or a missing required field would fail the whole line. So
 `Frame::parse` peeks at `type` (and `subtype`) first and deserializes only the named struct. A
 `type` it does not know is `Frame::Unknown`, logged at `warn` the first time each `(type, subtype)`
-pair is seen and at `debug` after; a known kind that fails to convert is `FrameError::Untyped`,
-logged at `warn`; a non-JSON line is logged with its byte length. No log line carries frame
+pair is seen and at `debug` after. Kinds it knows and deliberately ignores are `Frame::Ignored`,
+logged at `debug` only: the `system` subtypes `background_tasks_changed`, `task_progress`,
+`thinking_tokens` and `post_turn_summary`, and the top-level `tool_progress` (a running tool's
+elapsed time; recorded as 30 s heartbeats of a forked skill's `Skill` call, whose `tool_use_id`
+is the call's id plus `-heartbeat-<n>`). A known kind that fails to convert is
+`FrameError::Untyped`, logged at `warn`; a non-JSON line is logged with its byte length. No log line carries frame
 content: serde errors have their quoted values redacted.
 
 ## Launch
@@ -374,7 +391,9 @@ deduplicated away), since the server reads no handle.
   - Per-prompt `init` re-emission is observed behaviour, not documented. That is what the backstop
     is for.
 - **Interrupt** writes the `interrupt` control request and resolves on its response, within 10 s.
-  With no active turn the CLI answers at once and nothing else happens. On a sub-agent thread it is
+  With no active turn the CLI answers at once and nothing else happens; nor does it for a turn
+  whose `result` the agent-task gate holds, which the supervisor finishes after a grace (*Turn
+  completion*). On a sub-agent thread it is
   `stop_task` instead (see *Sub-agent routes*).
 - **Rename.** `set_thread_name` sends `rename_session` (`source: "host"`) to a live child; a cold,
   reaped or `task:` thread is a no-op, since Giskard keeps its own name. `interrupt` on a reaped
@@ -427,9 +446,11 @@ deduplicated away), since the server reads no handle.
   seconds) before its `TurnStarted`; the server's forwarder has no timeout of its own on
   `start_turn`, so nothing fails, it just waits. A failed respawn fails that turn and keeps the
   thread, so the next message tries again. A task whose terminal update never comes keeps its child
-  alive for good (`idle` with `reason = "tasks"`), the right failure: the CLI believes it runs. A
+  alive for good (`idle` with `reason = "tasks"`), the right failure: the CLI believes it runs,
+  unless it is an agent task whose turn ends first, which stops tracking it (*Turn completion*). A
   background command's missing *notification* does not: its terminal update is settled after a grace
-  (*Background commands*), and a foreground command's task ends on its notification. An MCP status
+  (*Background commands*), and a foreground command's task, like an agent task that gets no
+  update, ends on its notification. An MCP status
   read never respawns: a reaped thread's hint is answered by the probe.
 - **Asks.** `can_use_tool` and other inbound control requests are published as events, recorded
   in `pending`, and answered by `respond_approval` / `respond_server_request` (below).
@@ -483,6 +504,15 @@ keeps and whose Stop the browser enables because it has a process id.
   a sub-agent handle, or a thread with no live child (a reaped child's commands died with it) is
   `Transport("no background command with task id …")`, written nothing, which the server reads as
   "unmanaged" and clears a stale running task by.
+- **A sub-agent's command.** A background command a sub-agent started completes on the
+  sub-agent's thread and turn, even when that turn already ended. Recorded in `forked-skill-stop`:
+  `stop_task` ended the forked sub-agent (line 17) and killed its background `Bash` task just
+  after (lines 22–23), so the command's terminal completion lands on the sub-agent's finished
+  turn, which the server applies as a late item (*History*). That holds while the route stands,
+  until the turn that spawned it ends. Once that turn has dropped the route (`RouteClosed`), its
+  log takes no more events: a later completion is dropped with `route_log_missing` at `warn`, and
+  the item keeps its `in_progress` completion. A sub-agent's command outliving its spawning turn
+  is not recorded.
 - **Child exit.** Every background command still running completes `terminated` with what its
   output file holds so far (no marker, so no exit code), and a `warn` (`background_command_lost`)
   names its task and the exit.
@@ -616,6 +646,29 @@ route's thread and turn and recorded with the route's thread and the primary as 
   the block's `ItemStarted`, so the supervisor has created and published the route's retained log
   before the server's forwarder sends the link, and every child frame is retained for the claim.
   Logged at `info` with `action = "route_opened"`.
+- **Forked skills.** A skill with `context: fork` runs a sub-agent behind its `Skill` call, and
+  nothing before the task says so (the call's `input` is just `{"skill": …}`). So a `local_agent`
+  `task_started` whose `tool_use_id` names an open call that is no `Agent` call, on any route, mints
+  the route there (`info`, `action = "task_route"`): the task's `description` (`/<skill>`) is the
+  name, its `prompt` the delegated prompt, its `subagent_type` the type. The call's item already
+  started without a link, and an item starts once, so an `Activity` on the call's turn carries the
+  link instead (`harness_item_id = task_started:<task_id>`, title the task's `description`,
+  detail `<tool> sub-agent`), started and completed together like a backgrounded delegation's
+  outcome. The server links the sub-agent from it while the sub-agent runs, which a link arriving
+  only with the call's `tool_result` would not: the sub-agent's asks are published on its own
+  thread, which nothing reads until the link, so an ask would wait for good. The call's
+  completion carries the link too, as an `Agent` call's does. The task's `task_started` then opens
+  the route's turn as for an `Agent` call. A task naming a command
+  or file call, or no open call, gets no route (it still gates the turn). Recorded on 2.1.289
+  (`forked-skill`): the skill's prompt, its tool calls and its answer arrive tagged with the
+  `Skill` call's id, then `task_notification` `completed` with **no** `task_updated`, then the
+  call's `tool_result` (`tool_use_result.status: "forked"`) and the turn's single `result`.
+  Stopped (`forked-skill-stop`, `stop_task` while the sub-agent's command ran), it ends like a
+  stopped `Agent` sub-agent: `task_updated` `killed`, `task_notification` `stopped`, the `{}`
+  answer, the sub-agent's trailing `[Request interrupted by user]`, and the `Skill` call's
+  `tool_result` with `is_error` and `non_execution_kind: interrupted` (`declined`). The parent's
+  turn goes on: there the model ran the skill again, a second `Skill` call and a second route,
+  which completed, and the turn ended on its single `result`.
 - **Turn.** `system/task_started` of the `local_agent` task naming the route records its task id
   and opens the route's turn (`TurnStarted` on the route's thread). A routed frame arriving with no
   route turn opens one, at `info` with `action = "external_turn"`. The child's frames (forwarded
@@ -623,11 +676,16 @@ route's thread and turn and recorded with the route's thread and the primary as 
   primary's, on the route's thread and turn; the delegated prompt is a `UserMessage`. Usage comes
   from each child API message's `message.usage`, counted once per `message.id` though every
   one-block frame repeats it.
-- **End.** A terminal `task_updated` of the route's task completes its turn **at once**: open tool
+- **End.** A terminal `task_updated` of the route's task (or, when none came, its terminal
+  `task_notification`, logged at `info` with `action = "task_notification"`) completes its turn
+  **at once**: open tool
   calls complete `interrupted` with no output, then `TurnCompleted`: `completed` → `Completed`;
-  `killed` → `Interrupted` when the adapter sent `stop_task` for the route or the spawning turn was
-  interrupted, else `Failed("agent task <id> was killed")`; `failed` / `stopped` → `Failed` with the
-  patch's `error`. A terminal update for a task already ended or unknown is ignored at `debug`
+  `killed`, or `stopped` (what a stop reads on the notification; every recorded stop, a forked
+  skill's included, is an update `killed` then a notification `stopped`, so a `stopped`
+  notification with no update before it is unrecorded and only mapped alike) → `Interrupted`
+  when the adapter sent `stop_task` for the route or the spawning turn was interrupted, else
+  `Failed("agent task <id> was killed")` (or `was stopped`); `failed` → `Failed` with the patch's
+  `error` (a notification carries none). A terminal update for a task already ended or unknown is ignored at `debug`
   (`stop_task` on a completed task still emits `killed`). The primary turn's agent-task gate is
   unchanged.
 - **Trailing frames.** A killed sub-agent's rejection `tool_result` and its `[Request interrupted by
@@ -643,7 +701,8 @@ route's thread and turn and recorded with the route's thread and the primary as 
   would end that owner as failed), and a claim that lands after the parent's turn ended still adopts
   the route and reads its retained events. A route still running there (an agent task the gate let
   through because the turn failed or was superseded) is first completed `Failed("parent turn
-  ended")` at `warn` (`action = "route_still_open"`). Nested routes are dropped with their parent
+  ended")` at `warn` (`action = "route_still_open"`), and its task, which the ended turn no longer
+  waits for, leaves the task map (`agent_task_abandoned`). Nested routes are dropped with their parent
   route. Child exit completes every open route turn (`Interrupted` after an interrupt or a
   `stop_task`, else `Failed` naming the exit) and drops every route; the supervisor then turns its
   published routes cold (logged as `routes_cooled` on the exit line). A route's mapper state never
@@ -812,8 +871,8 @@ An entry that does not parse is skipped with a `warn` naming its index; each ser
 - `src/frame.rs`: one stdout line to a typed `Frame`, tolerant of everything the crate cannot type.
 - `src/mapper.rs`: `ClaudeMapper`, the frame-to-event state machine, its sub-agent routes and
   background commands (with the output-file reader), and its fixture-driven tests (the `delegation`,
-  `delegation-interrupted`, `subagent-stop` and `subagent-ask-withdrawn` recordings drive the route
-  tests).
+  `delegation-interrupted`, `subagent-stop`, `subagent-ask-withdrawn` and `forked-skill` recordings
+  drive the route tests).
 - `src/ids.rs`: `NativeItemKey` and the `task:` sub-agent id prefix.
 - `src/log_fields.rs`: optional-field logging helper.
 - `src/log_checks.rs` (tests only): the line checks the `#[traced_test]` log assertions pass to

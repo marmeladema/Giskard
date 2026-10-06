@@ -32,6 +32,10 @@ use crate::process::{ChildExit, ChildLogContext, ClaudeChild, LaunchMode};
 /// that carries its output file before the mapper completes it from the update alone. The
 /// notification followed within ~70 ms in every recording.
 pub(crate) const NOTIFICATION_GRACE: Duration = Duration::from_secs(2);
+/// How long an interrupted turn that holds its `result` may wait for the agent tasks it waits on
+/// to end (an interrupt makes the CLI kill them) before it is finished as interrupted anyway. The
+/// CLI already ended that turn, so the interrupt itself brings no `result`.
+pub(crate) const INTERRUPTED_HOLD_GRACE: Duration = Duration::from_secs(5);
 /// How long one request of a turn's settings may take (each stage of the hand-off).
 pub(crate) const CONTROL_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long a turn's settings (mode, model, effort, read-back) may take in all. It stays under the
@@ -785,6 +789,7 @@ pub(crate) fn spawn_supervisor(parts: SupervisorParts) -> JoinHandle<()> {
         busy_reason: None,
         last_line: Instant::now(),
         awaiting_notification_since: None,
+        interrupted_hold_since: None,
         reaped: false,
         reaped_outputs: 0,
         // The handshake set `default` on both launch modes.
@@ -890,6 +895,8 @@ struct Supervisor {
     last_line: Instant,
     /// Since when a background command's terminal update has waited for its notification.
     awaiting_notification_since: Option<Instant>,
+    /// Since when an interrupted turn has held its `result`.
+    interrupted_hold_since: Option<Instant>,
     /// The child was reaped: whatever it still says is dropped, never published on the thread
     /// a respawned child now serves.
     reaped: bool,
@@ -944,6 +951,7 @@ impl Supervisor {
             let stage_deadline = self.stage_deadline();
             let idle_deadline = self.idle_deadline();
             let notification_deadline = self.notification_deadline();
+            let interrupted_hold_deadline = self.interrupted_hold_deadline();
             let stopping = self.stopping();
             tokio::select! {
                 biased;
@@ -979,6 +987,16 @@ impl Supervisor {
                     if notification_deadline.is_some() => {
                     self.awaiting_notification_since = None;
                     let outputs = self.mapper.settle_background_commands();
+                    if let Err(error) = self.dispatch_all(outputs).await {
+                        self.broken("write_stdin", "a stdin write failed", &error);
+                        return self.end_broken();
+                    }
+                }
+                () = tokio::time::sleep_until(
+                    interrupted_hold_deadline.unwrap_or_else(Instant::now)
+                ), if interrupted_hold_deadline.is_some() => {
+                    self.interrupted_hold_since = None;
+                    let outputs = self.mapper.release_interrupted_hold();
                     if let Err(error) = self.dispatch_all(outputs).await {
                         self.broken("write_stdin", "a stdin write failed", &error);
                         return self.end_broken();
@@ -2426,6 +2444,18 @@ impl Supervisor {
         self.awaiting_notification_since
             .get_or_insert_with(Instant::now)
             .checked_add(NOTIFICATION_GRACE)
+    }
+
+    /// When an interrupted turn stops waiting for its agent tasks: the grace after it was first
+    /// seen holding its `result` with the interrupt sent, while it does.
+    fn interrupted_hold_deadline(&mut self) -> Option<Instant> {
+        if !self.mapper.holds_interrupted_result() {
+            self.interrupted_hold_since = None;
+            return None;
+        }
+        self.interrupted_hold_since
+            .get_or_insert_with(Instant::now)
+            .checked_add(INTERRUPTED_HOLD_GRACE)
     }
 
     /// When the idle child is reaped: only while serving, with reaping on, once it has been idle

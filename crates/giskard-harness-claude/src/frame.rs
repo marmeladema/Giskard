@@ -31,9 +31,11 @@ pub enum Frame {
     ApiRetry(ApiRetryMessage),
     PermissionDenied(PermissionDeniedMessage),
     SessionTitleChanged(SessionTitleChangedMessage),
-    /// `system` subtypes this milestone reads but does not act on, kept for the debug log.
-    SystemIgnored {
-        subtype: String,
+    /// Frame kinds this milestone reads but does not act on (`system` subtypes and top-level
+    /// types), kept for the debug log.
+    Ignored {
+        r#type: String,
+        subtype: Option<String>,
     },
     Assistant(Box<AssistantMessage>),
     User(Box<UserMessage>),
@@ -108,6 +110,10 @@ const IGNORED_SYSTEM_SUBTYPES: &[&str] = &[
     "post_turn_summary",
 ];
 
+/// Top-level types kept for the debug log only. `tool_progress` reports a running tool's elapsed
+/// time; recorded (2.1.289) as 30 s heartbeats of a forked skill's `Skill` call.
+const IGNORED_TYPES: &[&str] = &["tool_progress"];
+
 impl Frame {
     /// Classify one stdout line.
     pub fn parse(line: &str) -> Result<Frame, FrameError> {
@@ -135,13 +141,22 @@ impl Frame {
                     }
                 })
             }
-            _ => Ok(Frame::Unknown {
-                subtype: value
+            _ => {
+                let subtype = value
                     .get("subtype")
                     .and_then(Value::as_str)
-                    .map(str::to_owned),
-                r#type: frame_type,
-            }),
+                    .map(str::to_owned);
+                if IGNORED_TYPES.contains(&frame_type.as_str()) {
+                    return Ok(Frame::Ignored {
+                        r#type: frame_type,
+                        subtype,
+                    });
+                }
+                Ok(Frame::Unknown {
+                    subtype,
+                    r#type: frame_type,
+                })
+            }
         }
     }
 
@@ -157,7 +172,7 @@ impl Frame {
             Frame::ApiRetry(_) => ("system", Some("api_retry")),
             Frame::PermissionDenied(_) => ("system", Some("permission_denied")),
             Frame::SessionTitleChanged(_) => ("system", Some("session_title_changed")),
-            Frame::SystemIgnored { subtype } => ("system", Some(subtype)),
+            Frame::Ignored { r#type, subtype } => (r#type, subtype.as_deref()),
             Frame::Assistant(_) => ("assistant", None),
             Frame::User(_) => ("user", None),
             Frame::Stream(_) => ("stream_event", None),
@@ -202,9 +217,10 @@ impl Frame {
             "api_retry" => typed(value, "system", sub).map(Frame::ApiRetry),
             "permission_denied" => typed(value, "system", sub).map(Frame::PermissionDenied),
             "session_title_changed" => typed(value, "system", sub).map(Frame::SessionTitleChanged),
-            ignored if IGNORED_SYSTEM_SUBTYPES.contains(&ignored) => {
-                Ok(Frame::SystemIgnored { subtype })
-            }
+            ignored if IGNORED_SYSTEM_SUBTYPES.contains(&ignored) => Ok(Frame::Ignored {
+                r#type: "system".into(),
+                subtype: Some(subtype),
+            }),
             _ => Ok(Frame::Unknown {
                 r#type: "system".into(),
                 subtype: Some(subtype),
@@ -539,9 +555,25 @@ mod tests {
     #[test]
     fn ignored_system_subtypes_are_kept_for_the_debug_log() {
         let frame = Frame::parse(r#"{"type":"system","subtype":"task_progress","task_id":"t"}"#);
-        assert!(
-            matches!(frame, Ok(Frame::SystemIgnored { ref subtype }) if subtype == "task_progress")
-        );
+        assert!(matches!(
+            frame,
+            Ok(Frame::Ignored { ref r#type, subtype: Some(ref subtype) })
+                if r#type == "system" && subtype == "task_progress"
+        ));
+    }
+
+    #[test]
+    fn tool_progress_is_ignored_not_unknown() {
+        let heartbeats: Vec<Frame> = fixture_lines("forked-skill-stop")
+            .iter()
+            .filter(|line| line.contains(r#""type": "tool_progress""#))
+            .map(|line| Frame::parse(line).unwrap())
+            .collect();
+        assert_eq!(heartbeats.len(), 2);
+        for frame in heartbeats {
+            assert_eq!(frame.kind(), ("tool_progress", None));
+            assert!(matches!(frame, Frame::Ignored { .. }));
+        }
     }
 
     #[test]
