@@ -631,6 +631,18 @@ requested one. `thread/start` reports none, so there the request is the only sou
 reports an empty model or provider, the adapter logs and returns no effective model rather than
 guessing.
 
+## Frontend instructions
+
+`thread/start` and `thread/resume` both carry `developerInstructions` set to
+`giskard_harness::GISKARD_FRONTEND_INSTRUCTIONS`, a hardcoded note (shared with the Claude Code
+adapter) telling the agent that its output is read in Giskard's web UI rather than a terminal. It is
+a developer message added to Codex's own prompt; `baseInstructions`, which would replace that
+prompt, is never sent. A resumed session's configuration comes from that call's params (over
+the user's config), so the instructions are sent there too, or a thread reopened after a restart
+would run without them. This is unrelated to
+the `collaborationMode.settings.developer_instructions: null` a `turn/start` carries, which selects
+the collaboration mode's built-in template.
+
 ## Runtime context window
 
 Codex includes the effective context capacity in

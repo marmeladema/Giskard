@@ -22,6 +22,14 @@ use giskard_core::server_request::ServerRequestResponse;
 use giskard_core::turn::TurnOverrides;
 use giskard_core::user_input::UserInput;
 
+/// Instructions every harness adds to its agent's own system prompt, so the agent knows its output
+/// is read in Giskard's web UI rather than a terminal. Appended, never a replacement: each CLI keeps
+/// its own base prompt and tool guidance. Hardcoded for now; not an operator setting.
+pub const GISKARD_FRONTEND_INSTRUCTIONS: &str = "\
+You are running behind Giskard, a web UI. The user reads your Markdown-rendered replies in a \
+browser, possibly on a phone, and already sees command output and diffs, so don't repeat them. \
+Never start interactive programs: nobody can type into them.";
+
 /// What a harness can do (spec §4.2). Different harnesses advertise different capabilities;
 /// the UI adapts accordingly (§13.5).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
