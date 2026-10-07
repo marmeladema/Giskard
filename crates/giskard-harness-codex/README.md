@@ -575,6 +575,23 @@ skipped without hiding valid providers; a malformed table fails provider listing
 - **Empty is absence** — Codex defaults an omitted `name` to `""`; the adapter
   normalizes empty strings to `None`.
 
+## Client identity (`initialize`)
+
+`clientInfo.name` is `codex_giskard_rs`. Codex does more with it than log it: the app-server makes
+it the process-wide **originator**, which becomes the `originator` header and the first token of
+the `User-Agent` on every request Codex sends upstream, and appends `({name}; {version})` to that
+user agent. The result reads `codex_giskard_rs/<codex version> (<os>; <arch>) <terminal>
+(codex_giskard_rs; <giskard version>)`: the first version is Codex's, the last is Giskard's.
+
+The name says "Codex" so the traffic is identifiable as the Codex harness at the network level, and
+it is deliberately none of the names Codex reserves for its own clients (`codex_cli_rs`,
+`codex-tui`, `codex_vscode`, or a `"Codex "` prefix). Being outside that set has one functional
+effect, checked on Codex `main` at 5b0b253: `is_first_party_originator` gates only the prompt that
+offers to install the MCP servers a mentioned skill declares, which is skipped for this client.
+Codex's metrics bucket an unlisted originator as `other`. Codex stores the originator with each
+thread and a resume keeps the stored one, so threads created under an earlier name keep reporting
+it. `clientInfo.title` (`Giskard`) is accepted and discarded by Codex.
+
 ## Version, for `/models` discovery
 
 `initialize` answers with a `user_agent` like `codex_cli_rs/0.58.0 (Linux …) …`. The adapter keeps

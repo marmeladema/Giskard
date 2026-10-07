@@ -834,10 +834,17 @@ fn codex_version_from_user_agent(user_agent: &str) -> Option<String> {
     Some(format!("{major}.{minor}.{patch}"))
 }
 
+/// `clientInfo.name` Giskard identifies itself with. Codex makes it the process-wide originator: the
+/// `originator` header and first user-agent token on every request it sends upstream, and the
+/// `({name}; {version})` user-agent suffix. Naming Codex in it keeps the traffic identifiable as the
+/// Codex harness at the network level. It is deliberately not one of the names Codex treats as its
+/// own first-party clients (`codex_cli_rs`, `codex-tui`, `codex_vscode`, or a `"Codex "` prefix).
+const CODEX_CLIENT_NAME: &str = "codex_giskard_rs";
+
 fn build_initialize_params() -> codex_codes::InitializeParams {
     codex_codes::InitializeParams {
         client_info: codex_codes::ClientInfo {
-            name: "giskard".into(),
+            name: CODEX_CLIENT_NAME.into(),
             version: env!("CARGO_PKG_VERSION").into(),
             title: Some("Giskard".into()),
         },
@@ -6129,7 +6136,9 @@ mod tests {
     fn initialize_params_enable_experimental_app_server_api() {
         let params = serde_json::to_value(build_initialize_params()).unwrap();
 
-        assert_eq!(params["clientInfo"]["name"], "giskard");
+        assert_eq!(params["clientInfo"]["name"], "codex_giskard_rs");
+        // Codex rejects a name that is not a valid HTTP header value at initialize.
+        assert!(CODEX_CLIENT_NAME.bytes().all(|b| b.is_ascii_graphic()));
         assert_eq!(params["capabilities"]["experimentalApi"], true);
         assert!(params["capabilities"].get("extensions").is_none());
     }
