@@ -682,6 +682,7 @@ impl AgentHarness for ScriptedHarness {
                                 "id": "branch",
                                 "header": "Branch",
                                 "question": SCRIPTED_SERVER_REQUEST_QUESTION,
+                                "isOther": true,
                                 "options": [
                                     { "label": "main", "description": "The default branch" },
                                     { "label": "develop", "description": "The integration branch" }
