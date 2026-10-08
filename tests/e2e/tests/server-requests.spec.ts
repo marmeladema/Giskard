@@ -40,12 +40,12 @@ test.describe("server requests", () => {
     await expect(request).toContainText(SCRIPTED_SERVER_REQUEST_QUESTION);
 
     // Actionable before it is answered: a question control and both actions.
-    const answer = request.locator("select.server-request-answer");
+    const answer = request.getByRole("radio", { name: /develop/ });
     await expect(answer).toBeVisible();
     const continueBtn = request.getByRole("button", { name: "Continue", exact: true });
     await expect(continueBtn).toBeEnabled();
 
-    await answer.selectOption("develop");
+    await answer.check();
     await continueBtn.click();
 
     // Answering disables the controls and records what was sent. The harness never emits a resolved
@@ -93,7 +93,7 @@ test.describe("server requests", () => {
     await expect(status).toHaveAttribute("title", /Waiting for your input/);
 
     // Answering hands the turn back to the agent, so the row drops to plain running.
-    await request.locator("select.server-request-answer").selectOption("main");
+    await request.getByRole("radio", { name: /main/ }).check();
     await request.getByRole("button", { name: "Continue", exact: true }).click();
     await expect(request.locator(".server-request-sent")).toBeVisible();
     await expect(row).not.toHaveClass(/\bactivity-waiting\b/);
@@ -147,7 +147,7 @@ test.describe("server requests", () => {
     const tid = await page.locator(".thread.active").getAttribute("data-tid");
     expect(tid).toBeTruthy();
 
-    await request.locator("select.server-request-answer").selectOption("main");
+    await request.getByRole("radio", { name: /main/ }).check();
     await request.getByRole("button", { name: "Continue", exact: true }).click();
     await expect(request.locator(".server-request-sent")).toBeVisible();
 
@@ -168,6 +168,48 @@ test.describe("server requests", () => {
     ).toEqual([]);
   });
 
+  // Every option is listed with its description, and the free-text box belongs to "Other" alone:
+  // it used to sit under the dropdown at all times while being read only for "Other", so anything
+  // typed with a real option selected was silently dropped.
+  test("lists the options, and the free-text box appears only for Other", async ({ page }) => {
+    const project = page.locator(".proj", { hasText: "Demo" });
+    await project.locator(".project-add").click();
+    await page.locator("#input").fill(SCRIPTED_SERVER_REQUEST_TRIGGER);
+    await page.locator("#sendBtn").click();
+
+    const request = page.locator("#transcript .msg.server-request");
+    await expect(request).toBeVisible();
+    await expect(request.getByRole("radio")).toHaveCount(3);
+    await expect(request.getByRole("radio", { name: /main/ })).toBeChecked();
+    await expect(request).toContainText("The default branch");
+    await expect(request).toContainText("The integration branch");
+
+    const other = request.getByRole("textbox", { name: "Other answer" });
+    await expect(other).toBeHidden();
+    await request.getByRole("radio", { name: "Other" }).check();
+    await expect(other).toBeVisible();
+    await expect(other).toBeFocused();
+    await other.fill("half-typed");
+    await request.getByRole("radio", { name: /develop/ }).check();
+    await expect(other).toBeHidden();
+
+    // Trying another option and coming back does not lose what was typed.
+    await request.getByRole("radio", { name: "Other" }).check();
+    await expect(other).toBeVisible();
+    await expect(other).toHaveValue("half-typed");
+
+    // An empty "Other" is not an answer: Continue refuses rather than sending nothing.
+    await other.fill("");
+    const continueBtn = request.getByRole("button", { name: "Continue", exact: true });
+    await continueBtn.click();
+    await expect(request.locator(".server-request-sent")).toHaveCount(0);
+    await expect(continueBtn).toBeEnabled();
+
+    await other.fill("release/1.2");
+    await continueBtn.click();
+    await expect(request.locator(".server-request-sent")).toHaveText("Sent: Continue");
+  });
+
   test("an unanswered request survives a reload as actionable", async ({ page }) => {
     const project = page.locator(".proj", { hasText: "Demo" });
     await project.locator(".project-add").click();
@@ -186,7 +228,7 @@ test.describe("server requests", () => {
     await expect(after).toBeVisible();
     await expect(after).not.toHaveClass(/\bresolved\b/);
     await expect(after.getByRole("button", { name: "Continue", exact: true })).toBeEnabled();
-    await expect(after.locator("select.server-request-answer")).toBeEnabled();
+    await expect(after.getByRole("radio", { name: /main/ })).toBeEnabled();
   });
 });
 

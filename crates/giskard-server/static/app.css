@@ -449,11 +449,28 @@
   .server-request-detail { font-family:var(--mono); font-size:12.5px; color:#d8c7ff; margin-top:6px; }
   .server-request-actions { display:flex; flex-wrap:wrap; gap:6px; margin-top:10px; }
   .server-request-actions button { font-size:12px; padding:4px 8px; }
-  .server-request-fields { display:grid; gap:10px; margin-top:10px; }
-  .server-request-field label { display:block; font-size:12px; color:var(--muted); margin-bottom:4px; }
-  .server-request-field input,
+  .server-request-fields { display:grid; gap:14px; margin-top:10px; white-space:normal; }
+  .server-request-field > label { display:block; font-size:12px; color:var(--muted); margin-bottom:4px; }
+  .server-request-field input:not([type=radio]):not([type=checkbox]),
   .server-request-field select,
   .server-request-field textarea { width:100%; }
+  /* Agent questions: the question reads like message text; the header is only a short tag. */
+  .server-request-header { font-size:11px; font-weight:600; text-transform:uppercase; letter-spacing:.05em; color:#b9a3f0; margin-bottom:2px; }
+  .server-request-prompt { color:var(--fg); font-weight:500; margin-bottom:8px; }
+  .server-request-options { display:grid; gap:6px; }
+  .server-request-option {
+    display:flex; align-items:flex-start; gap:10px; padding:8px 10px; cursor:pointer;
+    border:1px solid var(--border); border-radius:6px; background:rgba(255,255,255,.02);
+  }
+  .server-request-option:hover { border-color:#8a63d2; }
+  .server-request-option:has(input:checked) { border-color:#8a63d2; background:rgba(110,64,201,.16); }
+  .server-request-option input { flex:none; margin:3px 0 0; accent-color:#8a63d2; cursor:inherit; }
+  .server-request-option-text { display:flex; flex-direction:column; gap:2px; min-width:0; }
+  .server-request-option-label { color:var(--fg); }
+  .server-request-option-desc { color:#a8b1bd; font-size:13px; line-height:1.45; }
+  .server-request-option:has(input:disabled) { cursor:default; }
+  .server-request-option:has(input:disabled):hover:not(:has(input:checked)) { border-color:var(--border); }
+  .server-request-field .server-request-options input.server-request-other { margin-left:30px; width:calc(100% - 30px); }
   .server-request-field textarea { min-height:84px; resize:vertical; font-family:var(--mono); }
   pre.out {
     max-width:100%; margin:0; overflow-x:hidden; font-family:var(--mono); font-size:12.5px;

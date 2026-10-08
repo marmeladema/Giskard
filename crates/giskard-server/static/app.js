@@ -5175,7 +5175,9 @@ function renderToolUserInputRequest(body, id, request) {
   const questions = Array.isArray(p.questions) ? p.questions.map(objectValue).filter(Boolean) : [];
   const fields = document.createElement("div");
   fields.className = "server-request-fields";
-  for (const q of questions) fields.append(toolQuestionField(q));
+  // Claude Code always lets the user type their own answer; its questions carry no `isOther`.
+  const alwaysOther = String(request.method || "") === "claude/ask_user_question";
+  questions.forEach((q, index) => fields.append(toolQuestionField(q, `${id}:${index}`, alwaysOther)));
   if (questions.length) body.append(fields);
   const actions = serverRequestActions();
   addServerRequestButton(actions, id, "Continue", "primary", () => ({
@@ -5189,56 +5191,83 @@ function renderToolUserInputRequest(body, id, request) {
   }));
   body.append(actions);
 }
-function toolQuestionField(q) {
+/* One question of a user-input request. Options are listed as radio rows (checkboxes for a
+   multi-select question) so every choice and its description can be compared at a glance; the
+   free-text box belongs to the "Other" row only and is shown only while that row is checked.
+   `groupName` keeps each question's radio group apart from every other card's. */
+function toolQuestionField(q, groupName, alwaysOther) {
   const field = document.createElement("div");
   field.className = "server-request-field server-request-question";
   field.dataset.questionId = stringValue(q.id);
-  const label = document.createElement("label");
-  label.textContent = stringValue(q.header) || stringValue(q.question) || stringValue(q.id) || "Question";
-  field.append(label);
+  const header = stringValue(q.header);
   const prompt = stringValue(q.question);
-  if (prompt && prompt !== label.textContent) {
-    const hint = document.createElement("div");
-    hint.className = "meta";
-    hint.textContent = prompt;
-    field.append(hint);
+  if (header && header !== prompt) {
+    const tag = document.createElement("div");
+    tag.className = "server-request-header";
+    tag.textContent = header;
+    field.append(tag);
   }
+  const promptEl = document.createElement("div");
+  promptEl.className = "server-request-prompt";
+  promptEl.textContent = prompt || header || stringValue(q.id) || "Question";
+  field.append(promptEl);
   const options = Array.isArray(q.options) ? q.options.map(objectValue).filter(Boolean) : [];
   if (options.length) {
-    const select = document.createElement("select");
-    select.className = "server-request-answer";
-    for (const option of options) {
-      const opt = document.createElement("option");
-      opt.value = stringValue(option.label);
-      opt.textContent = stringValue(option.label);
-      select.append(opt);
-    }
-    if (q.isOther === true) {
-      const opt = document.createElement("option");
-      opt.value = "__other__";
-      opt.textContent = "Other";
-      select.append(opt);
-    }
-    field.append(select);
-    const desc = document.createElement("div");
-    desc.className = "meta";
-    const updateDesc = () => {
-      const chosen = options.find(option => stringValue(option.label) === select.value);
-      desc.textContent = chosen ? stringValue(chosen.description) : "";
+    const multi = q.multiSelect === true;
+    const list = document.createElement("div");
+    list.className = "server-request-options";
+    list.setAttribute("role", multi ? "group" : "radiogroup");
+    list.setAttribute("aria-label", promptEl.textContent);
+    const addRow = (value, labelText, descText) => {
+      const row = document.createElement("label");
+      row.className = "server-request-option";
+      const input = document.createElement("input");
+      input.type = multi ? "checkbox" : "radio";
+      input.name = groupName;
+      input.value = value;
+      input.className = "server-request-choice";
+      const text = document.createElement("span");
+      text.className = "server-request-option-text";
+      const name = document.createElement("span");
+      name.className = "server-request-option-label";
+      name.textContent = labelText;
+      text.append(name);
+      if (descText) {
+        const desc = document.createElement("span");
+        desc.className = "server-request-option-desc";
+        desc.textContent = descText;
+        text.append(desc);
+      }
+      row.append(input, text);
+      list.append(row);
+      return input;
     };
-    select.onchange = updateDesc;
-    updateDesc();
-    field.append(desc);
-    if (q.isOther === true) {
+    const choices = options.map(option =>
+      addRow(stringValue(option.label), stringValue(option.label), stringValue(option.description)));
+    // Agents list their recommended option first, so a single choice starts there.
+    if (!multi) choices[0].checked = true;
+    field.append(list);
+    if (q.isOther === true || alwaysOther) {
+      const otherChoice = addRow("__other__", "Other", "");
       const other = document.createElement("input");
+      other.type = "text";
       other.className = "server-request-other";
-      other.placeholder = "Other answer";
-      field.append(other);
+      other.placeholder = "Type your answer";
+      other.setAttribute("aria-label", "Other answer");
+      other.hidden = true;
+      otherChoice.closest(".server-request-option").after(other);
+      list.addEventListener("change", () => {
+        const show = otherChoice.checked;
+        if (show === !other.hidden) return;
+        other.hidden = !show;
+        if (show) other.focus();
+      });
     }
   } else {
     const input = document.createElement("input");
     input.className = "server-request-answer";
     input.type = q.isSecret === true ? "password" : "text";
+    input.setAttribute("aria-label", promptEl.textContent);
     field.append(input);
   }
   return field;
@@ -5248,11 +5277,27 @@ function collectToolQuestionAnswers(fields) {
   fields.querySelectorAll(".server-request-question").forEach(field => {
     const id = field.dataset.questionId || "";
     if (!id) return;
-    const answerEl = field.querySelector(".server-request-answer");
-    const otherEl = field.querySelector(".server-request-other");
-    let value = answerEl ? answerEl.value : "";
-    if (value === "__other__") value = otherEl ? otherEl.value : "";
-    result[id] = { answers: value ? [value] : [] };
+    const choices = field.querySelectorAll(".server-request-choice");
+    if (!choices.length) {
+      const answerEl = field.querySelector(".server-request-answer");
+      const value = answerEl ? answerEl.value : "";
+      result[id] = { answers: value ? [value] : [] };
+      return;
+    }
+    const answers = [];
+    for (const choice of choices) {
+      if (!choice.checked) continue;
+      if (choice.value !== "__other__") { answers.push(choice.value); continue; }
+      const otherEl = field.querySelector(".server-request-other");
+      const text = otherEl ? otherEl.value.trim() : "";
+      if (!text) {
+        notice("Type your answer for Other, or pick another option.", "warning");
+        if (otherEl) otherEl.focus();
+        throw new Error("empty Other answer");
+      }
+      answers.push(text);
+    }
+    result[id] = { answers };
   });
   return result;
 }
