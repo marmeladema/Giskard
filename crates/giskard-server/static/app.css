@@ -465,12 +465,12 @@
   .server-request-option:hover { border-color:#8a63d2; }
   .server-request-option:has(input:checked) { border-color:#8a63d2; background:rgba(110,64,201,.16); }
   .server-request-option input { flex:none; margin:3px 0 0; accent-color:#8a63d2; cursor:inherit; }
-  .server-request-option-text { display:flex; flex-direction:column; gap:2px; min-width:0; }
+  .server-request-option-text { flex:1; display:flex; flex-direction:column; gap:2px; min-width:0; }
   .server-request-option-label { color:var(--fg); }
   .server-request-option-desc { color:#a8b1bd; font-size:13px; line-height:1.45; }
   .server-request-option:has(input:disabled) { cursor:default; }
   .server-request-option:has(input:disabled):hover:not(:has(input:checked)) { border-color:var(--border); }
-  .server-request-field .server-request-options input.server-request-other { margin-left:30px; width:calc(100% - 30px); }
+  .server-request-field .server-request-option input.server-request-other { margin:4px 0 0; cursor:text; }
   .server-request-field textarea { min-height:84px; resize:vertical; font-family:var(--mono); }
   pre.out {
     max-width:100%; margin:0; overflow-x:hidden; font-family:var(--mono); font-size:12.5px;

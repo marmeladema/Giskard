@@ -5255,7 +5255,9 @@ function toolQuestionField(q, groupName, alwaysOther) {
       other.placeholder = "Type your answer";
       other.setAttribute("aria-label", "Other answer");
       other.hidden = true;
-      otherChoice.closest(".server-request-option").after(other);
+      // Inside the row, under its label, so the box reads as part of the "Other" choice. A click
+      // on the box focuses it rather than toggling the radio: it is interactive content.
+      otherChoice.closest(".server-request-option").querySelector(".server-request-option-text").append(other);
       list.addEventListener("change", () => {
         const show = otherChoice.checked;
         if (show === !other.hidden) return;
