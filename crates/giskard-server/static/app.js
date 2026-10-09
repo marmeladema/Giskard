@@ -9747,6 +9747,13 @@ function commandOutputIdentity(itemId) {
 function commandOutputUrl(projectId, threadId, turnId, itemId) {
   return `/api/projects/${encodeURIComponent(projectId)}/threads/${encodeURIComponent(threadId)}/turns/${encodeURIComponent(turnId)}/items/${encodeURIComponent(itemId)}/command-output`;
 }
+/* The output version a response carries in its ETag. The server sends a strong tag, but a proxy that
+   compresses the body — Cloudflare, nginx with gzip — downgrades it to weak (`W/"…"`) without
+   touching the value. Compare and send back the value alone, or every load through such a proxy
+   reads as an output that changed while it was loading. */
+function responseOutputVersion(response) {
+  return (response.headers.get("etag") || "").replace(/^W\//, "");
+}
 function toolOutputUrl(projectId, threadId, turnId, itemId) {
   return `/api/projects/${encodeURIComponent(projectId)}/threads/${encodeURIComponent(threadId)}/turns/${encodeURIComponent(turnId)}/items/${encodeURIComponent(itemId)}/tool-output`;
 }
@@ -9830,7 +9837,7 @@ async function loadCommandOutputOverlay(overlay) {
         state.commandPayloadsByItemId.get(overlay.itemId) !== payload) return;
     overlay.loadedText = text;
     overlay.loadedPayload = payload;
-    overlay.outputVersion = response.headers.get("etag") || "";
+    overlay.outputVersion = responseOutputVersion(response);
     overlay.loading = false;
     overlay.loadingPayload = null;
     overlay.controller = null;
@@ -9880,7 +9887,7 @@ async function loadToolOutputOverlay(overlay) {
         throw new Error("Tool output response had an invalid Content-Type.");
       }
       const value = await response.json();
-      const responseVersion = response.headers.get("etag") || "";
+      const responseVersion = responseOutputVersion(response);
       const currentDescriptor = toolOutputDescriptor(state.toolPayloadsByItemId.get(overlay.itemId));
       const selected = state.outputOverlay === overlay && requestId === state.outputOverlayRequestSeq &&
         state.activeViewGeneration === generation && state.projectId === projectId && state.threadId === threadId &&

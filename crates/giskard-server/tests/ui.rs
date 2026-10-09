@@ -2930,7 +2930,7 @@ fn browser_loads_completed_command_output_only_in_the_overlay() {
         "state.commandPayloadsByItemId.get(overlay.itemId) !== payload",
         "overlay.loadedText = text;",
         "overlay.loadedPayload = payload;",
-        "overlay.outputVersion = response.headers.get(\"etag\")",
+        "overlay.outputVersion = responseOutputVersion(response);",
     ] {
         assert!(
             load.contains(expected),
@@ -3013,7 +3013,7 @@ fn browser_loads_completed_tool_json_only_in_the_overlay() {
         "new AbortController()",
         "toolOutputUrl(projectId, threadId, identity.turnId, identity.itemId)",
         "for (let attempt = 0; attempt < 2; attempt++)",
-        "response.headers.get(\"etag\")",
+        "const responseVersion = responseOutputVersion(response);",
         "response.headers.get(\"content-type\")",
         "responseVersion === currentDescriptor.version",
         "state.outputOverlay === overlay",

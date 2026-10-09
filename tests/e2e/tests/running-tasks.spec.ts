@@ -578,6 +578,80 @@ test("completed tool JSON is fetched lazily, validated, and copied with input", 
   )).toContain('# Input\n{\n  "query": "weather"\n}\n\n# Output\nnull');
 });
 
+// A proxy that compresses the body (Cloudflare, nginx with gzip) turns the server's strong ETag weak:
+// same value, `W/` in front. Compared verbatim, every tool output read as changed while loading,
+// and every command-output link lookup was refused as stale.
+test("output overlays accept the weak ETag a compressing proxy hands back", async ({ page }) => {
+  const toolVersion = '"sha256_tool_behind_proxy"';
+  await page.route("**/items/tool-weak-etag/tool-output", route => route.fulfill({
+    status: 200,
+    contentType: "application/json",
+    headers: { ETag: `W/${toolVersion}` },
+    body: '"answered"',
+  }));
+  const commandVersion = '"sha256_command_behind_proxy"';
+  let outputMatch: string | undefined;
+  await page.route("**/items/command-weak-etag/command-output-links", async route => {
+    outputMatch = route.request().headers()["if-output-match"];
+    await route.fulfill({ status:200, contentType:"application/json", body:'{"links":[]}' });
+  });
+  await page.route("**/items/command-weak-etag/command-output", route => route.fulfill({
+    status: 200,
+    contentType: "text/plain; charset=utf-8",
+    headers: {
+      "ETag": `W/${commandVersion}`,
+      "X-Giskard-Output-Truncated": "false",
+      "X-Giskard-Output-Original-Bytes": "11",
+      "X-Giskard-Output-Original-Lines": "1",
+    },
+    body: "full output",
+  }));
+  await openCommandOutputTestThread(page);
+
+  await addCompletedTool(page, "tool-weak-etag", "turn-weak-etag", toolVersion, 10);
+  const tool = page.locator('[data-tool-item-id="turn-weak-etag:tool-weak-etag"]');
+  await tool.locator(".output-overlay-btn").evaluate((button: HTMLButtonElement) => button.click());
+  await expect(page.locator("#codeView pre.out").last()).toHaveText('"answered"');
+  await expect(page.locator("#codeView")).not.toContainText("changed while it was loading");
+  await page.locator("#codeClose").click();
+
+  await page.evaluate(() => {
+    const app = window as unknown as {
+      addItem: (item: unknown, turnId: string, fromHistory: boolean) => void;
+    };
+    app.addItem({
+      id: "command-weak-etag",
+      harness_item_id: "native-command-weak-etag",
+      payload: {
+        kind: "command_execution",
+        command: "printf output",
+        cwd: "/tmp/project",
+        output: {
+          preview: "full output",
+          preview_truncated: true,
+          durable_truncated: false,
+          original_bytes: 11,
+          original_lines: 1,
+          durable_bytes: 11,
+          durable_lines: 1,
+          preview_bytes: 11,
+          preview_lines: 1,
+          output_available: true,
+        },
+        exit_code: 0,
+        status: "completed",
+        process_id: null,
+        duration_ms: 10,
+      },
+    }, "turn-weak-etag", false);
+  });
+  const command = page.locator('[data-command-item-id="turn-weak-etag:command-weak-etag"]');
+  await command.locator(".output-overlay-btn").evaluate((button: HTMLButtonElement) => button.click());
+  await expect(page.locator("#codeView")).toContainText("full output");
+  // The server matches the version it issued, so the link lookup must send it back without `W/`.
+  await expect.poll(() => outputMatch).toBe(commandVersion);
+});
+
 test("authoritative tool completion replaces progress without leaking JSON", async ({ page }) => {
   const version = '"tool_sha256_done"';
   await page.route("**/items/tool-progress/tool-output", async route => {
