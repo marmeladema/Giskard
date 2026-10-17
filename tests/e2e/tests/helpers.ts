@@ -71,6 +71,14 @@ export const SCRIPTED_REASONING_TRIGGER = "Think out loud before replying.";
 export const SCRIPTED_REASONING_SUMMARY = "Weighing the scripted options";
 export const SCRIPTED_REASONING_DETAIL = "Then answering with the deterministic scripted reply.";
 
+/**
+ * Prompt that makes the scripted replay harness stream and complete the canned reply, then stream
+ * `SCRIPTED_REASONING_DETAIL` into a reasoning note it never completes, holding the turn open. Kept
+ * in sync with `SCRIPTED_STREAMING_HOLD_TRIGGER` in
+ * `crates/giskard-server/src/bin/giskard-server-replay.rs`.
+ */
+export const SCRIPTED_STREAMING_HOLD_TRIGGER = "Stream a note, then hold this turn open.";
+
 /** One entry recorded by the notification stub installed by {@link stubNotifications}. */
 export type RecordedNotification = {
   title: string;

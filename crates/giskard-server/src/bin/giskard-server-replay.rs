@@ -110,6 +110,11 @@ const SCRIPTED_REASONING_DETAIL: &str = "Then answering with the deterministic s
 /// text is echoed as a same-turn user-message item before the deterministic reply and completion.
 const SCRIPTED_STEERING_TRIGGER: &str = "Hold this turn open for scripted steering.";
 const SCRIPTED_STEERING_REPLY: &str = "Scripted steering accepted on the active turn.";
+/// Streams and completes the canned reply, then starts a reasoning note, streams
+/// `SCRIPTED_REASONING_DETAIL` into it word by word, and holds the turn open with the note
+/// unfinished, so browser tests can reload mid-stream and check the coalesced live snapshot.
+/// Interrupting it ends the turn.
+const SCRIPTED_STREAMING_HOLD_TRIGGER: &str = "Stream a note, then hold this turn open.";
 /// A harness that speaks the neutral protocol but has no backend: every turn streams the same
 /// canned agent message, so the browser-visible transcript is fully deterministic.
 struct ScriptedHarness {
@@ -579,8 +584,9 @@ impl AgentHarness for ScriptedHarness {
         let raise_lazy_diffs = input_text == Some(SCRIPTED_DIFF_TRIGGER);
         let stream_reasoning = input_text == Some(SCRIPTED_REASONING_TRIGGER);
         let wait_for_steering = input_text == Some(SCRIPTED_STEERING_TRIGGER);
+        let stream_then_hold = input_text == Some(SCRIPTED_STREAMING_HOLD_TRIGGER);
 
-        if wait_for_steering {
+        if wait_for_steering || stream_then_hold {
             self.active_steering_turns
                 .lock()
                 .await
@@ -891,6 +897,32 @@ impl AgentHarness for ScriptedHarness {
                 },
             });
             tokio::task::yield_now().await;
+            if stream_then_hold {
+                let reasoning_id = ItemId::new();
+                let _ = sender.append(AgentEvent::ItemStarted {
+                    thread: thread_id,
+                    turn,
+                    item: ItemStart {
+                        id: reasoning_id,
+                        harness_item_id: "scripted_held_reasoning_1".into(),
+                        kind: ItemKind::Reasoning,
+                        command: None,
+                        tool: None,
+                    },
+                });
+                tokio::task::yield_now().await;
+                for chunk in SCRIPTED_REASONING_DETAIL.split_inclusive(' ') {
+                    let _ = sender.append(AgentEvent::ItemDelta {
+                        thread: thread_id,
+                        turn,
+                        item_id: reasoning_id,
+                        delta: ItemDelta::Text { text: chunk.into() },
+                    });
+                    tokio::task::yield_now().await;
+                }
+                // No completion and no `TurnCompleted`: the turn stays open until interrupted.
+                return;
+            }
             let _ = sender.append(AgentEvent::TurnCompleted {
                 thread: thread_id,
                 turn,
@@ -1016,11 +1048,27 @@ impl AgentHarness for ScriptedHarness {
         Ok(())
     }
 
+    /// A held turn (steering or streaming hold) ends as interrupted, the way a real harness reports
+    /// an interrupt, so a browser test can stop it and leave no turn running behind it.
     async fn interrupt(&self, thread: &ThreadHandle) -> Result<(), HarnessError> {
-        self.active_steering_turns
+        let held = self
+            .active_steering_turns
             .lock()
             .await
             .remove(&thread.thread);
+        if let Some(turn) = held
+            && let Some(sender) = self.sender_for(thread.thread).await
+        {
+            let _ = sender.append(AgentEvent::TurnCompleted {
+                thread: thread.thread,
+                turn,
+                usage: TokenUsage::new(0, 0),
+                status: TurnStatus {
+                    kind: TurnStatusKind::Interrupted,
+                    message: None,
+                },
+            });
+        }
         Ok(())
     }
 
