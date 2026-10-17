@@ -11,6 +11,28 @@ replaces the live buffer's flat event log with a per-item structure so that a re
 carries one or two events per item instead of every text chunk ever streamed, and so that the
 per-event cost of maintaining the buffer stops growing with the turn.
 
+## Amendments after review
+
+Recorded after the review of [PR #306](https://github.com/marmeladema/Giskard/pull/306); the
+sections below are kept as written, and these points override them.
+
+- **D1, where an item sits.** "An item sits where it was first seen" reorders a request card: the
+  browser draws a row at `item_started` only for a command with `command` metadata or a tool call
+  with `tool` metadata (`app.js:4557-4561`); every other row appears at its first delta or
+  completion. A start that draws no row is therefore held in `pending_starts` instead of taking a
+  slot, and the item's first delta or completion creates its entry and takes the start over, so
+  the start still expands before the delta. A start still waiting expands after the entries and
+  before the usage, where it only registers a kind; `live_item` and `item_events` consult it.
+- **D9, the single scroll.** Scrolling to the bottom unconditionally pulled a scrolled-up reader
+  down on an incremental resync. `renderLiveTurnSnapshot` decides once, before removing the stale
+  live block, whether the reader follows the bottom (`state.resyncStickBottom ||
+  transcriptShouldStickToBottom()`), stamps replayed rows with that answer instead of `true`, and
+  scrolls at the end only if it is yes. A streaming reasoning note's summary is applied once after
+  the replay too (the overall plan's companion fix).
+- **D4, persistence blocked.** The latest usage replays after a buffered `TurnCompleted`; the
+  browser ignores it, since `turn_completed` carries the usage.
+- **Tests 3 and 5** below are corrected in place.
+
 ## What lands
 
 1. `LiveTurn` in `crates/giskard-server/src/thread_runtime/live.rs` keeps an ordered list of
@@ -338,14 +360,18 @@ so the harness does not complete it.
 2. *Open item.* An item started and streamed but not completed yields `[ItemStarted,
    ItemDelta::Text]` with the concatenation of every chunk, in order.
 3. *Tool progress join rule.* A `ToolCall` start followed by chunks `["a", "", "b"]` yields one
-   `ItemDelta::Text { text: "a\nb" }`; the same chunks on an entry with no start yield `"ab"`.
+   `ItemDelta::Text { text: "a\n\nb" }` (the empty chunk still earns its separator, as at
+   `app.js:7759`); the same chunks on an entry with no start yield `"ab"`.
 4. *Slot stability.* Items A (started), B (started), A (completed), B (completed) expand as
    `A.start, A.completed, B.start, B.completed`; a delta for A after its completion expands after
    `A.completed` and before B.
-5. *Interleaved requests keep their place.* `[ItemStarted A, ApprovalRequested, ItemCompleted A,
-   ServerRequestReceived]` expands with the approval between A's events and the server request
-   after them; `outstanding_approvals` / `outstanding_server_requests` (the existing test mirrors)
-   return the same ids as before.
+5. *Interleaved requests keep their place.* With A a command whose start carries its metadata,
+   `[ItemStarted A, ApprovalRequested, ItemCompleted A, ServerRequestReceived]` expands as
+   `[A.start, A.completed, approval, server request]`: A's start and completion expand together at
+   A's slot, and the DOM is the same because A's row exists from its start.
+   `outstanding_approvals` / `outstanding_server_requests` (the existing test mirrors) return the
+   same ids as before. With A an agent message, whose row appears at its first delta, the approval
+   expands *before* A (see "Amendments after review").
 6. *Delayed TurnStarted.* `[ItemStarted A, TurnStarted]` expands as `[TurnStarted, A.start]` and
    `turn_id` is re-stamped.
 7. *Usage.* Port `live_snapshot_keeps_only_the_latest_usage_event_at_the_end`: still three events

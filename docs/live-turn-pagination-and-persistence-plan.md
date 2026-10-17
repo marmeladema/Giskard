@@ -117,6 +117,8 @@ These are the existing rules the milestones must keep, from `AGENTS.md` and spec
 
 ### L1 — An item-centric live buffer (server only, no wire change)
 
+**Status: implemented in [PR #306](https://github.com/marmeladema/Giskard/pull/306)** (spec 1.100, LB1–LB3); landed once it merges.
+
 Detailed plan: [`live-turn-pagination-and-persistence-plan/l1-item-centric-live-buffer.md`](live-turn-pagination-and-persistence-plan/l1-item-centric-live-buffer.md).
 
 Replace `LiveTurn.events: Vec<AgentEvent>` with a structure keyed the way everything downstream

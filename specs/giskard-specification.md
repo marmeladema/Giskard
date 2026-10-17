@@ -9,7 +9,14 @@
 
 **Document status:** Implementation-ready specification.
 **Audience:** An AI coding agent (and its human reviewer) implementing the system.
-**Version:** 1.99
+**Version:** 1.100
+
+> **Amendment — item-centric live buffer (1.100).** The live buffer of an in-flight turn (§13.6)
+> keeps one entry per item instead of every event: the item's start, its latest completion, and the
+> deltas received since that completion, coalesced into one text and one output string. Text deltas
+> are discarded when the item completes, because the completion carries the canonical text. A
+> reconnect snapshot therefore carries one or two events per item instead of every chunk ever
+> streamed, and replays to the same transcript. No wire type, route or on-disk format changes.
 
 > **Amendment — late item completion (1.99).** A terminal command or tool that settles after its
 > turn was persisted is recorded durably: the settled item is appended to that turn's payload file
@@ -246,6 +253,28 @@
 > the intended frontend for the foreseeable future; treat every Dioxus/WASM/`giskard-ui` reference
 > below as historical design context, not a current requirement. The wire contract (`giskard-proto`)
 > and all backend design remain authoritative.
+
+**Changelog (1.99 → 1.100), item-centric live buffer:**
+- **LB1:** The live buffer is keyed by item: one entry per item holding its start, its latest
+  completion, and the deltas received since that completion, coalesced into one text and one output
+  string; non-item events keep their arrival position. A tool call's text deltas are joined with a
+  newline and every other item's are concatenated, the way the browser joins them. Text deltas are
+  discarded when the item completes because `ItemCompleted` carries the canonical text (§7.3).
+- **LB2:** `LiveTurnSnapshot.accumulated` is expanded from the entries: `TurnStarted` first, then
+  each entry in arrival order (start, completion, remaining text, remaining output), then the
+  starts still waiting for a row, then the latest `TurnUsageUpdated`. An item sits where the browser
+  draws its row: at its start when that start draws one (a command with its `command` metadata, a
+  tool call with its `tool` metadata), otherwise at its first delta or completion, so a request that
+  arrived between a start and the item's first delta replays above the item's row, as it was drawn
+  live. A start whose item has had neither registers only a kind, and replays after the entries. A
+  replayed transcript is unchanged; the wire types are unchanged. When the buffer still holds a
+  `TurnCompleted` (persistence blocked), the latest usage now replays after it rather than before;
+  the browser ignores that usage, since `turn_completed` carries the turn's usage itself.
+- **LB3:** The browser suppresses per-event scroll measurement and writes while replaying a
+  snapshot. It decides once, before the replay, whether the reader follows the bottom (the
+  incremental resync's saved answer, else a measurement), stamps replayed rows with that answer, and
+  scrolls to the bottom at the end only if it is yes. A streaming reasoning note's summary is
+  likewise applied once, after the replay.
 
 **Changelog (1.98 → 1.99), late item completion:**
 - **LA1:** A terminal item completing after its turn persisted is appended to that turn's payload
@@ -4197,13 +4226,16 @@ events through the same event handler used for live WebSocket events.
 - **Reconnect & live-turn resync.** Persisted thread state only advances on `TurnCompleted`
   (§5.4), so a client that reconnects **during** an in-flight turn cannot reconstruct the live
   turn from disk alone. To close this gap the server keeps, **per active turn**, an in-memory
-  **live buffer**: the ordered `AgentEvent`s accumulated since `TurnStarted` (agent-text so
-  far, command output so far, pending approval/server requests, current diffs). This buffer is
-  discarded on `TurnCompleted` (the finalized items are then on disk). On `Subscribe`, the
+  **live buffer** keyed by item (LB1): one entry per item, in the order the browser drew each item's
+  row (LB2), holding its start, its latest completion and the text and output streamed since that
+  completion;
+  every other event (approval/server requests, errors, notices, diffs) keeps its arrival position
+  between them, and only the latest usage is kept. This buffer is discarded on `TurnCompleted` (the
+  finalized items are then on disk). On `Subscribe`, the
   server sends a **snapshot** first:
   1. the persisted thread state (all completed turns) from disk, then
   2. if a turn is currently live, a `LiveTurnSnapshot` reconstructed from the live buffer
-     (accumulated text/output + any pending approval/server request), then
+     (`TurnStarted`, then each entry expanded in order, then the latest usage — LB2), then
   3. subsequent deltas as normal.
 
   The browser treats this subscribe/resubscribe snapshot as authoritative for the active thread.
@@ -4228,9 +4260,11 @@ events through the same event handler used for live WebSocket events.
   an explicitly present runtime-liveness value independently of metadata staleness.
 
   This means a reconnected client sees the full in-progress turn, including still-pending
-  approval and server-request prompts. The live buffer is bounded
-  (coalesced/truncated for very long command output, keeping head+tail) to cap memory; the
-  authoritative full output still lands on disk at `TurnCompleted`.
+  approval and server-request prompts. The live buffer is bounded per item: an open item's text
+  deltas are coalesced into one string and dropped when the item completes, and very long command
+  output is coalesced and truncated, keeping head+tail; the authoritative full output still lands
+  on disk at `TurnCompleted`. The browser replays the snapshot without measuring or scrolling per
+  event, and scrolls once at the end only for a reader who was following the bottom (LB3).
 - **Running-task resync (TK1).** Commands can outlive an interrupted turn even after the live
   projection is discarded. The server therefore keeps running tasks in the process-local thread
   runtime entry, keyed by
