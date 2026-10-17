@@ -180,6 +180,13 @@ let state = {
   threadAuthorities:new Map(), pendingDetailConflictResyncs:new Set(),
   pendingMetadataActions:new Map(), threadListRefreshes:new Map(),
   pendingLiveSnapshotReconcile:false,
+  // True only while renderLiveTurnSnapshot replays `accumulated`: rows skip their per-event
+  // scroll writes and take `replayStickBottom` as their follow state instead of measuring, streaming
+  // reasoning rows wait in `replayReasoningRows` for their summary, and the replay settles both once
+  // at the end.
+  replayingLiveSnapshot:false,
+  replayStickBottom:false,
+  replayReasoningRows:null,
   diffOverlayText:null, diffSelectionToken:0,
   gitStatus:null, gitLoading:false, gitError:null, gitRequestSeq:0,
   draftGitStrategy:"shared",
@@ -4671,6 +4678,10 @@ function errorText(e) {
 }
 
 function renderLiveTurnSnapshot(snap) {
+  // Whether the reader is following the bottom, decided once for the whole replay. Measure before
+  // the stale live block is removed below; an incremental resync measured before its history delta
+  // shifted the content, and a full resync has just scrolled its history page to the bottom.
+  const stick = state.resyncStickBottom || transcriptShouldStickToBottom();
   if (state.pendingLiveSnapshotReconcile) {
     state.pendingLiveSnapshotReconcile = false;
     reconcileInFlightTurn();
@@ -4697,21 +4708,38 @@ function renderLiveTurnSnapshot(snap) {
   for (const answered of (snap.answered_server_requests || [])) {
     if (answered !== undefined && answered !== null) state.answeredServerRequests.add(String(answered));
   }
-  for (const ev of (snap.accumulated||[])) handleEvent(ev);
-  // Then re-assert what the turn is still waiting on the user for, approvals first. The replay
-  // above already drew these cards, but later events speak for the thread too — an `error` in
-  // particular overwrites the thread's activity and clears the active turn. Whatever is still
-  // outstanding gets the last word, so a turn blocked on an approval that then errored still reads
-  // as waiting on the user rather than "errored, idle". A turn can be blocked on several approvals
-  // at once, so every unanswered approval is re-armed, not just one.
-  for (const approval of outstandingApprovals(snap)) {
-    handleIncomingApprovalRequest(approval, snap.thread_id || state.threadId, {
-      source: "live_turn_snapshot_outstanding_approval"
-    });
+  // A replay is one burst of rows, so measuring and scrolling per event only forces a layout per
+  // event. Measure once above, and scroll once below if the reader was following the bottom.
+  try {
+    state.replayingLiveSnapshot = true;
+    state.replayStickBottom = stick;
+    state.replayReasoningRows = new Set();
+    for (const ev of (snap.accumulated||[])) handleEvent(ev);
+    // Then re-assert what the turn is still waiting on the user for, approvals first. The replay
+    // above already drew these cards, but later events speak for the thread too — an `error` in
+    // particular overwrites the thread's activity and clears the active turn. Whatever is still
+    // outstanding gets the last word, so a turn blocked on an approval that then errored still
+    // reads as waiting on the user rather than "errored, idle". A turn can be blocked on several
+    // approvals at once, so every unanswered approval is re-armed, not just one.
+    for (const approval of outstandingApprovals(snap)) {
+      handleIncomingApprovalRequest(approval, snap.thread_id || state.threadId, {
+        source: "live_turn_snapshot_outstanding_approval"
+      });
+    }
+    for (const request of outstandingServerRequests(snap)) {
+      renderServerRequest(request);
+    }
+    // A note still streaming gets its summary and open state once, now that every row it may sit
+    // above exists. A completed note (it has `copyText`) was already settled by its completion.
+    for (const row of state.replayReasoningRows) {
+      const body = row.querySelector(":scope > .body");
+      if (row.isConnected && body && row.dataset.copyText == null) applyReasoningRow(row, body.textContent);
+    }
+  } finally {
+    state.replayingLiveSnapshot = false;
+    state.replayReasoningRows = null;
   }
-  for (const request of outstandingServerRequests(snap)) {
-    renderServerRequest(request);
-  }
+  if (stick) scrollTranscriptToBottom();
 }
 
 // Every approval the replayed turn is still waiting on the user for, oldest first. An approval is
@@ -5501,7 +5529,7 @@ function keepTranscriptRowAnchored(el) {
   keepTranscriptAtBottom(!!(msg && msg.dataset.followBottom === "true"));
 }
 function appendBubble(cls, role) {
-  const followBottom = transcriptShouldStickToBottom();
+  const followBottom = state.replayingLiveSnapshot ? state.replayStickBottom : transcriptShouldStickToBottom();
   const el = document.createElement("div"); el.className="msg "+cls;
   // Tag every transcript row with the turn it belongs to. Persisted and live turns supply a real id
   // via `currentRenderTurnId`; optimistic rows created before `turn_started` (the pending user
@@ -5519,7 +5547,7 @@ function appendBubble(cls, role) {
   t.append(el);
   // This row now stands below any open reasoning note, which is what folds the note away.
   collapseSupersededReasoningRows(t);
-  keepTranscriptAtBottom(followBottom);
+  if (!state.replayingLiveSnapshot) keepTranscriptAtBottom(followBottom);
   return body;
 }
 // Give a transcript row a small copy button. It copies the row's raw source when we have it
@@ -7748,7 +7776,7 @@ function appendToolProgress(turnId, itemId, text) {
     payload.output = current ? current + "\n" + chunk : chunk;
     state.toolPayloadsByItemId.set(key, payload);
     renderItemBody(body, payload);
-    $("transcript").scrollTop = $("transcript").scrollHeight;
+    if (!state.replayingLiveSnapshot) $("transcript").scrollTop = $("transcript").scrollHeight;
     return;
   }
   let progress = body.querySelector(".tool-progress");
@@ -7758,7 +7786,7 @@ function appendToolProgress(turnId, itemId, text) {
     body.append(progress);
   }
   progress.textContent += (progress.textContent ? "\n" : "") + chunk;
-  $("transcript").scrollTop = $("transcript").scrollHeight;
+  if (!state.replayingLiveSnapshot) $("transcript").scrollTop = $("transcript").scrollHeight;
 }
 function appendStream(turnId, text, itemId, deltaType) {
   const key = scopedItemKey(turnId, itemId);
@@ -7802,10 +7830,11 @@ function appendStream(turnId, text, itemId, deltaType) {
     // A streaming reasoning note keeps its summary line in step with the text arriving under it.
     const row = body.parentElement;
     if (row && row.classList.contains("reasoning")) {
-      applyReasoningRow(row, body.textContent);
+      if (state.replayingLiveSnapshot) state.replayReasoningRows.add(row);
+      else applyReasoningRow(row, body.textContent);
     }
   }
-  $("transcript").scrollTop = $("transcript").scrollHeight;
+  if (!state.replayingLiveSnapshot) $("transcript").scrollTop = $("transcript").scrollHeight;
 }
 function finalizeStreamedItem(item, turnId) {
   if (!item || !item.payload) return false;
@@ -7845,7 +7874,7 @@ function finalizeStreamedItem(item, turnId) {
     state.streamEl = null;
     state.streamItemId = null;
   }
-  $("transcript").scrollTop = $("transcript").scrollHeight;
+  if (!state.replayingLiveSnapshot) $("transcript").scrollTop = $("transcript").scrollHeight;
   return true;
 }
 function addItem(item, turnId, fromHistory) {

@@ -1498,6 +1498,39 @@ async fn index_page_is_served_and_public() {
             && !append_stream.contains("state.streamElsByItemId.get(key) || state.streamEl"),
         "identified streamed items must not share the global fallback row"
     );
+    let live_replay = between(
+        &body,
+        "function renderLiveTurnSnapshot(snap) {",
+        "function transcriptShouldStickToBottom() {",
+    );
+    assert!(
+        live_replay.contains("try {\n    state.replayingLiveSnapshot = true;")
+            && live_replay.contains("} finally {\n    state.replayingLiveSnapshot = false;")
+            && live_replay.contains("  if (stick) scrollTranscriptToBottom();\n}"),
+        "a live snapshot replay suppresses per-event scrolling inside a try whose finally clears \
+         the flag, then scrolls once, and only for a reader who was following the bottom"
+    );
+    assert_order(
+        live_replay,
+        "const stick = state.resyncStickBottom || transcriptShouldStickToBottom();",
+        "reconcileInFlightTurn();",
+    );
+    assert!(
+        live_replay.contains("state.replayStickBottom = stick;"),
+        "replayed rows take the measured follow state instead of assuming the reader follows"
+    );
+    assert!(
+        append_stream
+            .contains("if (state.replayingLiveSnapshot) state.replayReasoningRows.add(row);")
+            && live_replay.contains("applyReasoningRow(row, body.textContent);"),
+        "a streaming reasoning note's summary is applied once after the replay, not per delta"
+    );
+    assert!(
+        append_stream.contains(
+            "if (!state.replayingLiveSnapshot) $(\"transcript\").scrollTop = $(\"transcript\").scrollHeight;"
+        ),
+        "a streamed delta does not force a layout per event while a snapshot replays"
+    );
     assert!(
         body.contains("function wireCodeCopy")
             && body.contains("wireCodeCopy(el)")
@@ -2425,7 +2458,7 @@ fn browser_keeps_appended_transcript_rows_anchored_to_bottom() {
     );
     assert_order(
         append,
-        "const followBottom = transcriptShouldStickToBottom();",
+        "const followBottom = state.replayingLiveSnapshot ? state.replayStickBottom : transcriptShouldStickToBottom();",
         "t.append(el);",
     );
     assert_order(
