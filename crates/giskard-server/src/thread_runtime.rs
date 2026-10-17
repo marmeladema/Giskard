@@ -59,8 +59,8 @@ pub(crate) struct ThreadRuntimeSupport {
 /// Per-thread runtime state, grouped by lifetime:
 /// - the in-flight turn, cleared for the completed turn in `settle_completed_turn`:
 ///   `diffs` (per turn, slot model: turn-level and per-item paths evolve independently),
-///   `outputs` (per item, one command and one tool output at most), `live`, and the
-///   resolved records inside `requests`;
+///   `outputs` (per item, one command and one tool output at most), `live` (one entry per
+///   item, see `live.rs`), and the resolved records inside `requests`;
 /// - the thread's owner and clocks, cleared only with the entry: `gate` (the active owner
 ///   and the lifecycle revision it numbers), `event_sequence`, and the task revision
 ///   inside `tasks`;
