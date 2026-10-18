@@ -196,25 +196,34 @@ server requests derived identically to `outstandingApprovals`/`outstandingServer
 
 ### L2 — Bounded live snapshot and live-item paging (wire + browser)
 
-**Wire.** `LiveTurnSnapshot` gains:
+Detailed plan: [`live-turn-pagination-and-persistence-plan/l2-bounded-live-snapshot-and-item-paging.md`](live-turn-pagination-and-persistence-plan/l2-bounded-live-snapshot-and-item-paging.md).
+Where it refines what follows, it wins.
+
+**Wire.** `LiveTurnSnapshot` gains one optional field; the UI and server are paired by the
+`ui_version` handshake, so its shape is chosen for the type, not for an older client:
 
 ```rust
-/// Completed items of this turn that precede `accumulated` and were not sent. 0 is omitted.
-omitted_items: u32,
-/// Cursor for `GET …/items?before=`: the oldest item id that *is* in `accumulated`.
-oldest_item_id: Option<ItemId>,
+/// Present exactly when settled items older than the tail were left out.
+omitted: Option<OmittedItems>,
+struct OmittedItems {
+    count: u32,      // settled items that precede the tail and were not sent
+    before: ItemId,  // where paging starts: the first item at or after the cut
+}
 ```
 
-`accumulated` carries the last `[history] turn_items` entries in order, then usage/diffs/other as in
-L1. Two kinds of entry ride along even when older than the tail, appended after it in their own
-arrival order: every **open** item, because it is what is still changing and a reconnecting client
-must see it to keep receiving its deltas; and every **outstanding** request, because the user still
-has to act on it. An answered or resolved request outside the tail is not sent. This is the one
-place a card can render somewhere other than where the live transcript drew it: an approval raised
-before the tail replays after the tail's items. Within the tail, order is preserved.
+`accumulated` carries the last `[history] turn_items` items (default 100) and every event among
+them, in order, as L1 expands them. Entries older than that are classified: a **settled** completed
+item is omitted and counted; everything else rides along, expanded **before** the tail in arrival
+order: every open item, because it is still changing and a reconnecting client must see it to keep
+receiving its deltas; every completed item whose status is still running (a background command, a
+running tool, a file change in progress), because a later completion will upsert it and the browser
+can only upsert a row it has; every outstanding approval and server request, because the user still
+has to act on it; and errors and notices. Answered approvals, resolved server requests and diffs
+older than the tail are not sent. Within the tail, order is exactly L1's.
 
 Spec §13.6.1 requires every new wire read to name its authority, clock and delivery class: this is
-the **Active transcript** authority read through a bootstrap/page lane, like completed history is.
+the first HTTP read of the **Active transcript** authority; its clock is entry position (the slot
+order L1 made stable) and its delivery class is bootstrap/page, like completed history.
 
 **HTTP.** New authenticated route, mirroring the history page:
 
@@ -223,47 +232,50 @@ GET /api/projects/{id}/threads/{thread_id}/turns/{turn_id}/items?before=<ItemId>
 → { turn_id, items: [WireItem], has_more }   // oldest-first, limit clamped 1–100
 ```
 
-Resolution follows the item endpoint (IE2): the live runtime first (page `entries` by slot, completed
-entries only), then the persisted payload (page `items` by index), then the runtime again across the
-commit race; unknown turn or cursor → 404. Pages use the history projection
-(`WireItem::from_persisted_item`: reasoning as 1 KiB preview, outputs as descriptors), because a
-paged item is scrollback, the same thing a history page delivers.
+Resolution follows the item endpoint (IE2): the live runtime first (settled completed items by
+entry position), then the persisted payload (items by display index), then the runtime again across
+the commit race; unknown turn → 404, and unlike the history route an unknown cursor → 404 too, since
+an item cursor can only come from this turn's own snapshot or page. Pages use the history
+projection (reasoning as the 1 KiB preview, outputs as descriptors), because a paged item is
+scrollback, the same thing a history page delivers.
 
-**Reasoning preview in the snapshot.** The tail's *completed* reasoning items use the same 1 KiB
-head preview (RP1, `WireItem::from_persisted_item`) as history pages and paged items, so a completed
-note costs the same inline whether it is read from the tail, a page, or history. An *open* reasoning
-note keeps its full coalesced text: it is still streaming and the browser appends to it. This
-amends RP1, which today says live events and reconnect snapshots retain full text: after L2, live
-`ItemCompleted` events and the item endpoint keep full text, reconnect snapshots carry the preview.
-A row's copy button then yields the preview for a note that arrived by snapshot, exactly as it does
-for one that arrived by history (RN1); a later milestone can make the full note fetchable through
-the item endpoint if that matters. Agent message text stays inline in full: it has no preview or
-fetch route anywhere, and introducing one is a separate decision the plan does not take.
+**Reasoning preview in the snapshot.** The tail's *completed* reasoning items carry the same 1 KiB
+head preview (RP1) as history pages and paged items, so a completed note costs the same inline
+wherever it is read from. An *open* note keeps its full coalesced text: it is still streaming and
+the browser appends to it. This amends RP1, which says reconnect snapshots retain full text; live
+`ItemCompleted` events and the item endpoint still do. Nothing is lost to the reader: the browser
+already fetches a previewed note's full text from the item endpoint when it is expanded or copied
+(RP2), and the item endpoint serves live items in full. Agent message text stays inline in full: it
+has no preview or fetch route anywhere, and introducing one is a separate decision the plan does
+not take.
 
-Because items are appended at the tail and `before` walks backward from a cursor, a page is stable
-against the turn continuing. An in-place upsert of an already-paged item reaches the browser as a
-live `ItemCompleted` and lands on the existing row through the existing upsert path.
+Because entries never move and new items only land after the cursor, a page is stable against the
+turn continuing. An in-place upsert of an already-paged item reaches the browser as a live
+`ItemCompleted` and lands on the existing row through the existing upsert path. A live completion
+for a settled item that was omitted and never paged in would draw a new row at the bottom instead;
+the running-status rule above keeps the known producers of repeat completions out of the omitted
+set, and an id list inside `OmittedItems` is the fallback if a new producer appears.
 
-**Browser.** `renderLiveTurnSnapshot`: when `omitted_items > 0`, render the user bubble, then a
-marker row ("N earlier items in this turn", a new row kind — add it to
-`mobile-overflow.spec.ts`), then the tail. The scroll-up path (`onTranscriptScroll`) checks a new
-`state.partialTurn = { turnId, oldestItemId, hasMore }` **before** paging older turns: while the
-topmost turn is partial, it pages its items; when `has_more` is false it clears the marker and the
-next scroll-up resumes `loadHistoryPage`. Paged rows render into a detached container, as history
-pages do, and are inserted after the turn's user bubble and before its first item row; reasoning
-rows prepended this way are collapsed (they are superseded by construction). `maybeAutoFillHistory`
-treats a partial turn the same way so a short tail still fills two screens.
+**Browser.** `renderLiveTurnSnapshot`: when `omitted` is present, render the prompt row, then a
+marker row ("N earlier items in this turn are not shown", with a button; a new row kind — add it to
+`mobile-overflow.spec.ts`), then the riders and the tail. The scroll-up path (`onTranscriptScroll`)
+and the open-time autofill check `state.partialTurn = { turnId, oldestItemId, remaining, hasMore }`
+**before** paging older turns: while the topmost turn is partial, they page its items; when
+`has_more` is false the marker goes and the next scroll-up resumes `loadHistoryPage`. Paged rows
+render into a detached container, as history pages do, and are inserted directly under the marker;
+a `user_message` item that matches the turn's existing prompt row is registered onto that row rather
+than drawn again; reasoning rows paged in are collapsed (they are superseded by construction). The
+partial state survives the turn's completion, since the route then serves the rest from the payload.
 
-`[history] turn_items` (default 100) is the one new config key; name it for reuse by L3. Document
-it in `README.md`, `config.example.toml`, and the route in `docs/api-endpoints.md`.
+`[history] turn_items` (default 100, minimum 1) is the one new config key; name it for reuse by L3.
+Document it in `README.md`, `config.example.toml`, and the route in `docs/api-endpoints.md`.
 
-Tests: store/runtime tests for the items route (live page, persisted page, the commit race,
-cursor at the oldest item, unknown cursor); WS test that a turn with more than `turn_items`
-completed items yields `omitted_items` and a tail that still includes every open item; e2e: a
-scripted replay prompt that emits more items than the tail and then holds the turn open (the replay
-bin already has a "hold this turn open" scenario at `giskard-server-replay.rs:111`), reload, assert
-the marker and tail, scroll up, assert every item present once and in order, then let the turn
-complete and assert the persisted rendering matches.
+Tests: unit tests on the cut, the riders, settledness and the live page; store tests for the
+persisted item list; an integration test that seeds a long turn over the real WebSocket and HTTP
+and asserts the snapshot shape and every page; e2e: a scripted replay prompt that emits twenty
+items and then holds the turn open, reload, assert the marker and tail, page by button and by
+scroll, assert every item present once and in order, then let the turn complete and assert the
+persisted rendering matches.
 
 ### P1 — The live payload file (durable format change, own review)
 
@@ -350,7 +362,7 @@ reopens with the recovered turn.
 ### L3 — Bounded persisted turns (optional, extends L2)
 
 The same turn, once completed, still arrives whole. Give `WireTurn` the same shape as the snapshot:
-`items` capped at `[history] turn_items` from the tail, `omitted_items`, `oldest_item_id`, with
+`items` capped at `[history] turn_items` from the tail and the same `omitted` field, with
 the L2 route serving the rest from the payload. `renderPersistedTurn` renders the same marker row
 and shares `state.partialTurn` handling. Independent of P1.
 
