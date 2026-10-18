@@ -154,7 +154,7 @@ Then open **http://127.0.0.1:8787**, log in, and:
    single Stop control. Active-turn steering is text-only, so attachments become available again
    after the turn completes. Existing threads show the **Tasks** menu for running
    commands/tools, **Sub-agents** monitor, **MCP** status menu, and **Context** usage button;
-   scrolling the transcript to the top lazy-loads older history. Completed command rows carry only
+   scrolling the transcript to the top lazy-loads older history, and the earlier items of a long turn. Completed command rows carry only
    a bounded preview; opening one fetches its retained output and resolves path links by command
    identity, without uploading that potentially large output from the browser. A command that
    finishes after its turn has ended is recorded with that turn, so it still reads as finished
@@ -281,6 +281,7 @@ service does not silently run with an empty provider list.
 | `[tokens]` | `cost_estimation` | `false` | Show an estimated € cost from `[tokens.rates."provider/model"]`. |
 | `[viz]` | `max_highlight_size` | `10485760` (10 MiB) | Files larger than this aren't syntax-highlighted. |
 | `[history]` | `initial` / `page` | `5` / `5` | Turns fetched on open (topped up client-side to ~2 screens) / per scroll-up page. |
+| | `turn_items` | `100` | Newest items of a running turn sent when a browser (re)connects; older settled items load on scroll-up or from the "Load earlier items" row, this many per page. Items still running or waiting on you are always sent. |
 | `[retention]` | `max_command_output_bytes` | `134217728` (128 MiB) | Maximum durable completed-command output. Must be at least `32768` (32 KiB); larger output retains a UTF-8-safe head and tail. |
 | `[harnesses.<name>]` | `kind` | — | **Optional.** A named harness declaration; the whole table defaults to one harness named `codex` of kind `codex`. `kind` is the adapter: `codex` or `claude-code`. |
 | | `default` | first declared | At most one declaration may be `true`; new projects use it when no harness is chosen, and a project's declaration is what a new thread preselects. |

@@ -9,7 +9,18 @@
 
 **Document status:** Implementation-ready specification.
 **Audience:** An AI coding agent (and its human reviewer) implementing the system.
-**Version:** 1.100
+**Version:** 1.101
+
+> **Amendment — bounded live snapshot (1.101).** A reconnect snapshot carries at most
+> `[history] turn_items` (default 100) of the live turn's newest items. Older items still changing
+> or still waiting on the user, the turn's prompt echo, and outstanding requests, errors and notices
+> ride along above that tail; the settled items left out are counted in a new optional `omitted`
+> field that names where paging starts. A new route,
+> `GET /api/projects/{id}/threads/{thread_id}/turns/{turn_id}/items`, pages a turn's items
+> oldest-first from the live runtime or, once the turn is persisted, from its payload. The browser
+> draws a marker row under the turn's prompt and pages the items in before older turns. A completed
+> reasoning note in the snapshot carries the head preview history already uses. No on-disk format
+> changes.
 
 > **Amendment — item-centric live buffer (1.100).** The live buffer of an in-flight turn (§13.6)
 > keeps one entry per item instead of every event: the item's start, its latest completion, and the
@@ -254,6 +265,51 @@
 > below as historical design context, not a current requirement. The wire contract (`giskard-proto`)
 > and all backend design remain authoritative.
 
+**Changelog (1.100 → 1.101), bounded live snapshot:**
+- **LP1:** A `LiveTurnSnapshot` carries the newest `N = max(1, turn_items)` item entries of the
+  live turn as its tail, expanded exactly as LB2. Entries older than the tail **ride along** when
+  they are still changing or still waiting on the user, expanded in arrival order right after
+  `TurnStarted` and before the tail: an item without a completion, an item whose completion still
+  reports a running status (a command or tool call that went to the background, a file change in
+  progress), the turn's first `UserMessage` item (an ordinary user turn's snapshot carries no
+  `user_input`, so that echo is its prompt row), an approval not yet answered, a server request
+  neither answered nor closed by a later resolved event, and every `Error`, `Notice`,
+  `ThreadOpened` and `TurnCompleted`. Everything else older than the tail is left out: settled
+  items, answered approvals, closed server requests (their received and resolved events alike),
+  and `DiffUpdated`. Pending starts and the latest usage keep their LB2 positions, last.
+- **LP2:** `LiveTurnSnapshot.omitted: { count, before }?` is present exactly when settled items
+  were left out. `count` is how many (riders are never counted); `before` is the first completed
+  item of the tail, else its first item — a position for paging, not a content reference. A
+  completed item is in the payload once the turn is persisted, so the cursor still resolves after
+  the commit. A turn with at most `turn_items` items is sent whole, events ahead of its first item
+  included.
+- **LP3:** `GET /api/projects/{project_id}/threads/{thread_id}/turns/{turn_id}/items?before?&limit?`
+  returns `{ turn_id, items, has_more }`, oldest-first, the `limit` items preceding `before` (or
+  ending at the newest item when it is absent). `limit` defaults to `turn_items` and is clamped to
+  1–100. Resolution mirrors the item endpoint (IE2): the live runtime, then the payload, then the
+  runtime again across the persistence race. A live page holds only settled items and never the
+  prompt echo; a persisted page holds the payload's items in display order with reasoning
+  previewed (RP1). A missing thread or turn is a 404, and so is a `before` naming no item of the
+  turn: an item cursor comes from this turn's own snapshot or page. Entries never move, so a page
+  stays valid while the turn continues and new items only land after the cursor.
+- **LP4:** The browser inserts a marker row ("N earlier items in this turn are not shown", with a
+  "Load earlier items" button) after replaying the snapshot, directly under the turn's prompt row,
+  or as the turn's first row when it has none. Pressing it, or scrolling to the top, fetches the
+  page before the oldest loaded item and inserts its rows directly under the marker. What the
+  reader sees does not move: the view shifts by the page's height only when the marker is above or
+  inside it. A 404 removes the marker, since retrying cannot succeed. While the live turn is
+  partial, scrolling to the top and the autofill page its items; only when the turn is whole do
+  they resume paging older turns. The autofill runs again once the snapshot has drawn the marker
+  and after each page lands, until the transcript fills its screens. The history page that
+  precedes the snapshot in the bootstrap has already run it with no turn partial, so the first
+  screenful may hold older turns paged before the live turn's items. The marker survives
+  `turn_completed`, since the route then serves the rest from the payload. A page's echo of a
+  provisional prompt row (a turn that carried `user_input`) is registered onto that row rather
+  than drawn twice.
+- **LP5:** A completed reasoning note in a snapshot or a live page carries the 1 KiB head preview
+  (RP1); a note still streaming keeps its full text. The item endpoint still returns full text.
+- **LP6:** `[history] turn_items` (default 100) sets the snapshot tail and the default page size.
+
 **Changelog (1.99 → 1.100), item-centric live buffer:**
 - **LB1:** The live buffer is keyed by item: one entry per item holding its start, its latest
   completion, and the deltas received since that completion, coalesced into one text and one output
@@ -325,8 +381,9 @@
   runtime-entry component, or persisted-format change.
 - **RP1:** Completed turns in history and bootstrap deltas carry reasoning text as a 1 KiB head
   prefix with `preview { prefix_bytes, total_bytes, total_lines }` when cut. Cuts occur on line
-  boundaries and keep the first non-blank line whole. Live events, reconnect snapshots, item reads,
-  and persistence retain full text.
+  boundaries and keep the first non-blank line whole. Live events, item reads, and persistence
+  retain full text; a reconnect snapshot carries the preview for a completed note and the full
+  text for one still streaming (LP5).
 - **RP2:** Expanding a previewed reasoning row fetches its item; copying yields the complete note or
   nothing. A browser that watched the turn live keeps its longer text when history arrives.
 - **RP3:** Agent text is not previewed.
@@ -3967,6 +4024,10 @@ than claiming that the current transitional stores already provide those clocks.
 | Direct action result | action handler | domain identity | direct control response |
 | Background notice | notice authority | notice identity/revision | revisioned replacement |
 
+The turn items route (LP3) is the first HTTP read of the Active transcript authority. It needs no
+row of its own: its clock is the entry position the live buffer keeps stable (LB1), and its
+delivery class is bootstrap/page, as for the Completed transcript's history route.
+
 Live turn usage is an Active transcript event. Its persisted per-model context window remains part
 of the Persisted thread metadata authority.
 
@@ -4010,6 +4071,13 @@ latest persisted turn timestamp; it never uses the repair time.
   response if its active-view generation changed while the request was in flight, including an
   A → B → A navigation back to the same IDs. Pagination has no
   WebSocket ordering semantics; `LoadHistory` and `HistoryPage` do not exist in the wire protocol.
+
+- **A turn's items are paged over REST (LP3):**
+  `GET /api/projects/{project_id}/threads/{thread_id}/turns/{turn_id}/items?before?&limit?`
+  returns `{ turn_id, items, has_more }`, oldest-first, from the live runtime while the turn is
+  live and from its payload once persisted. The server clamps `limit` to 1–100 (default
+  `[history] turn_items`); an unknown turn or cursor is a 404. The browser discards a page whose
+  active-view generation changed in flight, as for history.
 
   A transcript link is opened through
   `POST /api/projects/{project_id}/threads/{parent_thread_id}/subagent-links/{item_id}/open`.
@@ -4110,9 +4178,10 @@ different authority and clock),
 action, including a no-op),
 `ThreadCatalogChanged` (coalescible invalidation for authoritative HTTP thread-list refetches),
 `LiveTurnSnapshot { thread_id, turn_id, user_input?, accumulated,
-answered_approvals, answered_server_requests }` (in-flight turn reconstruction on reconnect,
-carrying the turn input when the server synthesized the turn context, the `WireAgentEvent`s of the
-turn so far. Every `ApprovalRequested` and `ServerRequestReceived` rides along in `accumulated`,
+answered_approvals, answered_server_requests, omitted? }` (in-flight turn reconstruction on
+reconnect, carrying the turn input when the server synthesized the turn context, the
+`WireAgentEvent`s of the turn so far — its newest `turn_items` items and what older still rides
+along (LP1), with `omitted { count, before }` naming the settled items left out (LP2). Every `ApprovalRequested` and `ServerRequestReceived` rides along in `accumulated`,
 answered ones included; the client derives what is still outstanding while replaying, with no
 companion pending list. A request is outstanding unless the user answered it (named in
 `answered_approvals` / `answered_server_requests`) or, for server requests, the harness closed it
@@ -4235,7 +4304,8 @@ events through the same event handler used for live WebSocket events.
   server sends a **snapshot** first:
   1. the persisted thread state (all completed turns) from disk, then
   2. if a turn is currently live, a `LiveTurnSnapshot` reconstructed from the live buffer
-     (`TurnStarted`, then each entry expanded in order, then the latest usage — LB2), then
+     (`TurnStarted`, then the older entries that ride along, then the newest `turn_items` items,
+     each expanded in order, then the latest usage — LB2, LP1), then
   3. subsequent deltas as normal.
 
   The browser treats this subscribe/resubscribe snapshot as authoritative for the active thread.
@@ -4259,12 +4329,15 @@ events through the same event handler used for live WebSocket events.
   fields only when its revision is newer, but always applies subscribe/resync bootstrap effects and
   an explicitly present runtime-liveness value independently of metadata staleness.
 
-  This means a reconnected client sees the full in-progress turn, including still-pending
+  This means a reconnected client sees the in-progress turn, including every still-pending
   approval and server-request prompts. The live buffer is bounded per item: an open item's text
   deltas are coalesced into one string and dropped when the item completes, and very long command
   output is coalesced and truncated, keeping head+tail; the authoritative full output still lands
-  on disk at `TurnCompleted`. The browser replays the snapshot without measuring or scrolling per
-  event, and scrolls once at the end only for a reader who was following the bottom (LB3).
+  on disk at `TurnCompleted`. The snapshot is bounded per turn as well: it carries the newest
+  `turn_items` items and leaves older settled ones to the turn items route (LP1–LP3), so a reader
+  of a turn with thousands of items receives a tail and pages the rest on demand (LP4). The browser
+  replays the snapshot without measuring or scrolling per event, and scrolls once at the end only
+  for a reader who was following the bottom (LB3).
 - **Running-task resync (TK1).** Commands can outlive an interrupted turn even after the live
   projection is discarded. The server therefore keeps running tasks in the process-local thread
   runtime entry, keyed by

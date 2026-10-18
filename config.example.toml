@@ -75,6 +75,10 @@ max_highlight_size = 10485760   # 10 MiB
 # batch for loading older history (infinite scroll).
 initial = 5
 page = 5
+# Newest items of the running turn sent when a browser (re)connects. Older settled items are left
+# out and load when the reader scrolls up or presses "Load earlier items", this many per page;
+# anything still running or waiting on the user is always sent.
+turn_items = 100
 
 [retention]
 # Maximum UTF-8 bytes retained for a completed command's output. Output above the limit keeps a

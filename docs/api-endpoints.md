@@ -14,6 +14,7 @@ WebSocket. Highlights: `POST /api/login`, `POST /api/logout`, `GET /api/ws-ticke
 `GET /api/projects/{id}/threads/{thread_id}/turns/{turn_id}/items/{item_id}/command-output-links`,
 `GET /api/projects/{id}/threads/{thread_id}/turns/{turn_id}/items/{item_id}/tool-output`,
 `GET /api/projects/{id}/threads/{thread_id}/turns/{turn_id}/items/{item_id}`,
+`GET /api/projects/{id}/threads/{thread_id}/turns/{turn_id}/items`,
 `GET /api/projects/{id}/threads/{thread_id}/deletion-impact`,
 `GET /api/projects/{id}/models`,
 `GET /api/tokens`, `GET /api/projects/{id}/tokens`,
@@ -209,6 +210,20 @@ event. A `completed` response carries the item with command or tool output descr
 the output or diff body. Lookup checks the active runtime first, then the immutable turn payload,
 then runtime again across the persistence race. Missing threads, turns, items, cross-container
 identities, mismatched live turn ids, and items that have not started all return 404.
+
+`GET /api/projects/{id}/threads/{thread_id}/turns/{turn_id}/items?before=<ItemId>&limit=N` pages a
+turn's items and returns `{ turn_id, items, has_more }`, oldest-first: the `limit` items before
+`before`, or ending at the newest item when `before` is absent. `limit` defaults to `[history]
+turn_items` (100) and is clamped to 1–100. It is how the browser loads the items a live turn's
+reconnect snapshot left out (that snapshot's `omitted { count, before }` names the first cursor).
+Lookup mirrors the item endpoint: the live runtime, then the turn's payload, then runtime again
+across the persistence race. A live page holds only settled items (never one still open or still
+running, and never the turn's prompt echo, all of which the snapshot always carries), each with
+command or tool output descriptors only; a persisted page holds the payload's items in display
+order. In both, a completed reasoning note carries the 1 KiB head preview that history uses, and
+the item endpoint above returns its full text. A missing thread or turn is a 404, and so is a
+`before` naming no item of the turn — unlike the history route, which treats an unknown cursor as
+the newest page — since a cursor only ever comes from this turn's snapshot or an earlier page.
 
 Process-local thread state is published separately: `ThreadRuntimeOverview { revision, threads }`
 is a global replacement snapshot (including an empty `threads` list), `RequestState` carries a
