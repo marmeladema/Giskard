@@ -79,6 +79,17 @@ export const SCRIPTED_REASONING_DETAIL = "Then answering with the deterministic 
  */
 export const SCRIPTED_STREAMING_HOLD_TRIGGER = "Stream a note, then hold this turn open.";
 
+/**
+ * Prompt that makes the scripted replay harness echo the prompt as a user-message item, complete
+ * twenty agent messages reading `Scripted reply K of 20`, then hold the turn open on the same
+ * unfinished note as {@link SCRIPTED_STREAMING_HOLD_TRIGGER}. The replay server runs with
+ * `[history] turn_items = 8`, so a reload leaves the oldest items out of the live snapshot. Kept in
+ * sync with `SCRIPTED_LONG_TURN_*` in `crates/giskard-server/src/bin/giskard-server-replay.rs`.
+ */
+export const SCRIPTED_LONG_TURN_TRIGGER = "Stream twenty replies, then hold this turn open.";
+export const SCRIPTED_LONG_TURN_REPLIES = 20;
+export const REPLAY_TURN_ITEMS = 8;
+
 /** One entry recorded by the notification stub installed by {@link stubNotifications}. */
 export type RecordedNotification = {
   title: string;

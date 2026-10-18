@@ -161,6 +161,10 @@ let state = {
   // streamed); `newestPersistedTurnId` is the id of the newest turn known to have completed — the
   // high-water mark a future resync will use as its "give me turns after this" cursor.
   currentRenderTurnId:null, newestPersistedTurnId:null,
+  // The live turn whose reconnect snapshot left its older settled items out (spec §13.6, LP4):
+  // `{ turnId, oldestItemId, remaining, hasMore }`. Those items page in under the turn's marker row
+  // before any older turn does.
+  partialTurn:null, loadingTurnItems:false,
   models:[], modelsProject:null, modelsLoadingProject:null, streamEl:null, streamItemId:null, pendingUserEl:null, pendingUserText:null,
   streamElsByItemId:new Map(), renderedItemIds:new Set(), renderedHarnessItemIds:new Set(), renderedItemBodyByKey:new Map(), itemKindsByItemId:new Map(),
   pendingApprovals:new Map(), answeredApprovals:new Map(), answeredApprovalsById:new Map(), renderedApprovalStateKeys:new Set(), pendingServerRequests:new Map(), answeredServerRequests:new Set(), requestStates:new Map(), runtimeOverviewRevision:-1,
@@ -2741,6 +2745,7 @@ function openDraftThread(pid) {
   setTurnActive(false);
   state.historyLoaded = false; state.oldestTurnId = null; state.hasMoreHistory = false;
   state.loadingHistory = false; state.pendingOlder = false; state.autoFilledTurns = 0;
+  state.partialTurn = null; state.loadingTurnItems = false;
   state.currentRenderTurnId = null; state.newestPersistedTurnId = null;
   state.contextUsed = null; state.contextWindow = 0; state.tokenLedger = null;
   updateGauge(null, 0);
@@ -2827,6 +2832,7 @@ async function openThread(pid, tid, title, opts) {
   setTurnActive(false);
   state.historyLoaded = false; state.oldestTurnId = null; state.hasMoreHistory = false;
   state.loadingHistory = false; state.pendingOlder = false; state.autoFilledTurns = 0;
+  state.partialTurn = null; state.loadingTurnItems = false;
   state.currentRenderTurnId = null; state.newestPersistedTurnId = null;
   state.contextUsed = null; state.contextWindow = 0; state.tokenLedger = null;
   updateGauge(null, 0);
@@ -4096,6 +4102,8 @@ function resetTranscriptForAuthoritativeSnapshot() {
   state.oldestTurnId = null;
   state.hasMoreHistory = false;
   state.autoFilledTurns = 0;
+  state.partialTurn = null;
+  state.loadingTurnItems = false;
   // The transcript is being rebuilt from an authoritative snapshot, so drop the in-flight stamp;
   // the incoming history page re-establishes the persisted high-water mark.
   state.currentRenderTurnId = null;
@@ -4329,6 +4337,9 @@ function reconcileInFlightTurn() {
     ? String(state.currentRenderTurnId)
     : null;
   if (liveId) removeTurnRows(liveId);
+  // The marker row went with the live rows; the snapshot that follows says again what it left out.
+  state.partialTurn = null;
+  state.loadingTurnItems = false;
   // The in-flight turn's rows are gone. Rebuild render bookkeeping from the rows that survived
   // (the DOM is the source of truth) so the live snapshot creates fresh rows for the removed turn
   // instead of deduping against stale maps or updating detached bodies.
@@ -4454,6 +4465,13 @@ function maybeAutoFillHistory() {
   if (state.taskHistoryLoading) return;
   const t = $("transcript");
   if (!t || !state.threadId) return;
+  // The live turn's earlier items come first: older turns belong above them.
+  if (state.partialTurn && state.partialTurn.hasMore) {
+    if (state.loadingTurnItems) return;
+    if (t.scrollHeight >= t.clientHeight * HISTORY_FILL_SCREENS) return;
+    loadTurnItemsPage();
+    return;
+  }
   if (!state.hasMoreHistory || state.loadingHistory || !state.oldestTurnId) return;
   if ((state.autoFilledTurns || 0) >= HISTORY_FILL_MAX_TURNS) return;
   if (t.scrollHeight >= t.clientHeight * HISTORY_FILL_SCREENS) return;
@@ -4527,9 +4545,179 @@ function skippedRecordsNotice(count) {
   return records + " of this turn could not be read and were skipped; the turn may be incomplete.";
 }
 
+// A live turn's settled items older than its reconnect snapshot's tail (spec §13.6, LP4). The
+// marker row sits under the turn's prompt; each page lands directly beneath it, since pages walk
+// backwards and every page is older than the rows already below.
+function turnGapRow(turnId) {
+  const t = $("transcript");
+  if (!t) return null;
+  return Array.from(t.querySelectorAll(".msg.turn-gap")).find(
+    row => String(row.dataset.turn || "") === String(turnId)
+  ) || null;
+}
+function turnPromptRow(turnId) {
+  const t = $("transcript");
+  if (!t) return null;
+  return Array.from(t.querySelectorAll(".msg.user")).find(
+    row => String(row.dataset.turn || "") === String(turnId)
+  ) || null;
+}
+function turnGapText(remaining) {
+  return remaining === 1
+    ? "1 earlier item in this turn is not shown"
+    : `${remaining} earlier items in this turn are not shown`;
+}
+function renderTurnGapRow(partial) {
+  const t = $("transcript");
+  if (!t) return;
+  const existing = turnGapRow(partial.turnId);
+  if (existing) existing.remove();
+  const row = document.createElement("div");
+  row.className = "msg turn-gap";
+  row.dataset.turn = partial.turnId;
+  // Labelled like every row: the IDE and terminal appearances lay rows out as a role/body grid.
+  const role = document.createElement("div");
+  role.className = "role";
+  role.textContent = "earlier";
+  const body = document.createElement("div");
+  body.className = "body";
+  row.append(role, body);
+  // Under the turn's prompt row, or as the turn's first row when it has none.
+  const prompt = turnPromptRow(partial.turnId);
+  const first = Array.from(t.querySelectorAll(".msg")).find(
+    candidate => String(candidate.dataset.turn || "") === partial.turnId
+  );
+  if (prompt) prompt.after(row);
+  else if (first) first.before(row);
+  else t.append(row);
+  const text = document.createElement("span");
+  text.className = "turn-gap-text";
+  text.textContent = turnGapText(partial.remaining);
+  const actions = document.createElement("div");
+  actions.className = "turn-gap-actions";
+  const button = document.createElement("button");
+  button.type = "button";
+  button.textContent = "Load earlier items";
+  button.addEventListener("click", () => loadTurnItemsPage());
+  actions.append(button);
+  body.append(text, actions);
+}
+
+async function loadTurnItemsPage() {
+  const partial = state.partialTurn;
+  if (!partial || !partial.hasMore || state.loadingTurnItems) return;
+  const view = captureActiveViewIdentity();
+  const projectId = view.projectId;
+  const threadId = view.threadId;
+  if (!projectId || !threadId) return;
+  state.loadingTurnItems = true;
+  const query = new URLSearchParams({ before: partial.oldestItemId });
+  try {
+    const page = await api(
+      "GET",
+      `/api/projects/${projectId}/threads/${threadId}/turns/${partial.turnId}/items?${query}`
+    );
+    if (!activeViewIdentityIsCurrent(view)) return;
+    state.loadingTurnItems = false;
+    // A reconnect rebuilt the live block while this page was in flight; its snapshot decides anew.
+    if (state.partialTurn !== partial) return;
+    renderTurnItemsPage(partial, page);
+  } catch (e) {
+    if (!activeViewIdentityIsCurrent(view)) return;
+    state.loadingTurnItems = false;
+    if (e && e.status === 404 && state.partialTurn === partial) {
+      // Nothing left to page from (the turn or its cursor is gone). Drop the marker, or every
+      // scroll to the top would retry this instead of paging older turns.
+      const marker = turnGapRow(partial.turnId);
+      if (marker) marker.remove();
+      state.partialTurn = null;
+    }
+    notice(`Could not load earlier items: ${apiFailureMessage(e)}`, "error");
+  }
+}
+
+function renderTurnItemsPage(partial, page) {
+  const t = $("transcript");
+  const marker = turnGapRow(partial.turnId);
+  if (!t || !marker) {
+    state.partialTurn = null;
+    return;
+  }
+  const items = (page && page.items) || [];
+  const hasMore = !!(page && page.has_more) && items.length > 0;
+  const turnId = partial.turnId;
+  // A sub-agent or orphan turn's prompt row is provisional, drawn from the snapshot's `user_input`.
+  const prompt = turnPromptRow(turnId);
+  const provisional = prompt && prompt.dataset.liveUserInput === "true" ? prompt : null;
+  const promptBody = provisional && provisional.querySelector(":scope > .body");
+  const container = document.createElement("div");
+  const prevTarget = state.renderTarget;
+  const prevTurnId = state.currentRenderTurnId;
+  const prevTaskGroup = state.activeTaskGroup;
+  state.renderTarget = container;
+  state.currentRenderTurnId = turnId;
+  state.activeTaskGroup = null;
+  try {
+    for (const item of items) {
+      const p = item.payload || item;
+      // The echo of a provisional prompt. `addItem` looks for that row in the render target, which
+      // is the detached container here, so it would draw a second prompt; register the echo onto
+      // the row the transcript already has instead. A user turn's echo rode along in the snapshot,
+      // so a persisted page returning it is an ordinary upsert.
+      const isPromptEcho = p.kind === "user_message" && promptBody && !isRenderedItem(item, turnId) &&
+        p.text === provisional.dataset.copyText;
+      if (isPromptEcho) {
+        delete provisional.dataset.liveUserInput;
+        registerRenderedItemBody(promptBody, item, turnId);
+        markRenderedItem(item, turnId);
+        continue;
+      }
+      addItem(item, turnId, true);
+    }
+    breakTaskGroup();
+  } finally {
+    state.renderTarget = prevTarget;
+    state.currentRenderTurnId = prevTurnId;
+    state.activeTaskGroup = prevTaskGroup;
+  }
+
+  const heightBefore = t.scrollHeight;
+  // Rows land under the marker. With the marker above or inside the viewport they land above what
+  // the reader is looking at, so the view moves down by their height, as for an older history page.
+  // With the marker below it (the reader is up in older turns) they move nothing in view.
+  const landsAboveView = marker.getBoundingClientRect().top < t.getBoundingClientRect().bottom;
+  const anchor = marker.nextSibling;
+  while (container.firstChild) t.insertBefore(container.firstChild, anchor);
+  collapseSupersededReasoningRows(t);
+  if (landsAboveView) t.scrollTop += t.scrollHeight - heightBefore;
+
+  if (items.length) partial.oldestItemId = String(items[0].id);
+  partial.remaining = Math.max(0, partial.remaining - items.length);
+  partial.hasMore = hasMore;
+  if (hasMore) {
+    const text = marker.querySelector(".turn-gap-text");
+    if (text) text.textContent = turnGapText(partial.remaining);
+  } else {
+    marker.remove();
+    state.partialTurn = null;
+  }
+
+  if (state.pendingTaskNavigation) fulfillPendingTaskIntent(state.pendingTaskNavigation);
+  if (state.pendingTaskOpen) fulfillPendingTaskIntent(state.pendingTaskOpen);
+
+  // Keep topping up, as after a history page: the next items page while the screen is short and
+  // the turn is partial, then older turns once it is whole.
+  maybeAutoFillHistory();
+}
+
 // Load older history when the user scrolls near the top (H4/H6 infinite scroll).
 function onTranscriptScroll() {
   const t = $("transcript");
+  if (t.scrollTop < 80 && state.threadId && state.partialTurn && state.partialTurn.hasMore) {
+    // The live turn's earlier items first; older turns only once the turn is complete.
+    if (!state.loadingTurnItems) loadTurnItemsPage();
+    return;
+  }
   if (t.scrollTop < 80 && state.hasMoreHistory && !state.loadingHistory && state.oldestTurnId && state.threadId) {
     state.loadingHistory = true;
     state.pendingOlder = true;
@@ -4738,6 +4926,21 @@ function renderLiveTurnSnapshot(snap) {
   } finally {
     state.replayingLiveSnapshot = false;
     state.replayReasoningRows = null;
+  }
+  // After the replay, because a user turn's prompt row is its echo item, which only exists once
+  // the riders have replayed. The marker goes directly under it.
+  if (snap && snap.turn_id && snap.omitted && snap.omitted.before) {
+    state.partialTurn = {
+      turnId: String(snap.turn_id),
+      oldestItemId: String(snap.omitted.before),
+      remaining: Number(snap.omitted.count) || 0,
+      hasMore: true,
+    };
+    renderTurnGapRow(state.partialTurn);
+    // The history page that preceded this snapshot ran the autofill while no turn was partial, so
+    // it could only page older turns. Now the live turn's items come first; on a screen already
+    // full this does nothing. The page it may fetch lands after the scroll below.
+    maybeAutoFillHistory();
   }
   if (stick) scrollTranscriptToBottom();
 }

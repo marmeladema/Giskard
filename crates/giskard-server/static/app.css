@@ -857,6 +857,11 @@
   .msg.error .role { color:#f85149; opacity:1; }
   .msg.notice { background:#241d10; border:1px solid #d29922; color:#f0d98c; max-width:100%; }
   .msg.notice .role { color:#d29922; opacity:1; }
+  .msg.turn-gap { background:var(--panel); border:1px dashed var(--border); color:var(--muted); max-width:100%; min-width:0; }
+  .msg.turn-gap .body { display:flex; flex-wrap:wrap; align-items:center; gap:8px; white-space:normal; min-width:0; }
+  .turn-gap-text { min-width:0; max-width:100%; overflow-wrap:anywhere; }
+  .turn-gap-actions { display:flex; flex-wrap:wrap; gap:6px; min-width:0; }
+  .turn-gap-actions button { font-size:12px; padding:4px 8px; }
   .msg.tasks.state-running { border-color:#d29922; }
   .msg.tasks.state-succeeded { border-color:#238636; }
   .msg.tasks.state-failed { border-color:#f85149; }
@@ -1072,6 +1077,7 @@
   [data-appearance="ide"] .msg.error .role { color:#f85149; }
   [data-appearance="ide"] .msg.notice { background:rgba(210,153,34,.09); border:0; border-bottom:1px solid var(--border); color:var(--fg); }
   [data-appearance="ide"] .msg.notice .role { color:#d29922; }
+  [data-appearance="ide"] .msg.turn-gap { background:transparent; border:0; border-bottom:1px dashed var(--border); }
   [data-appearance="ide"] .msg.server-request { background:rgba(110,64,201,.10); border:0; border-bottom:1px solid var(--border); }
 
   /* Terminal — dense, monospace, log-style rows. */
@@ -1096,6 +1102,7 @@
   [data-appearance="terminal"] .msg.error .role { color:#ff6b63; }
   [data-appearance="terminal"] .msg.notice { background:transparent; border:0; color:#e3c46a; }
   [data-appearance="terminal"] .msg.notice .role { color:#d29922; }
+  [data-appearance="terminal"] .msg.turn-gap { background:transparent; border:0; }
 
   /* =================== Mobile / responsive ===================
      The same page adapts to the viewport (no separate mobile build). On narrow screens the

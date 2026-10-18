@@ -2336,6 +2336,52 @@ fn browser_scopes_async_http_results_to_an_active_view_generation() {
     assert!(delta_renderer.contains("resetTranscriptForAuthoritativeSnapshot();"));
 }
 
+/// A live turn whose snapshot left items out pages them in before any older turn (spec LP4):
+/// both the scroll handler and the autofill test the partial turn before the history gates.
+#[test]
+fn browser_pages_a_partial_live_turn_before_older_history() {
+    let body = app_js();
+    for (start, end) in [
+        (
+            "function onTranscriptScroll() {",
+            "function handleEvent(ev) {",
+        ),
+        (
+            "function maybeAutoFillHistory() {",
+            "async function loadHistoryPage(before, limit, older) {",
+        ),
+    ] {
+        let handler = between(body, start, end);
+        let partial = handler
+            .find("state.partialTurn")
+            .unwrap_or_else(|| panic!("`{start}` must consult state.partialTurn"));
+        let history = handler
+            .find("state.hasMoreHistory")
+            .unwrap_or_else(|| panic!("`{start}` must still page history"));
+        assert!(
+            partial < history,
+            "`{start}` must page the partial turn before older history"
+        );
+        assert!(handler.contains("loadTurnItemsPage();"));
+    }
+
+    let loader = between(
+        body,
+        "async function loadTurnItemsPage() {",
+        "function renderTurnItemsPage(partial, page) {",
+    );
+    assert!(loader.contains("const view = captureActiveViewIdentity();"));
+    assert!(
+        loader
+            .matches("if (!activeViewIdentityIsCurrent(view)) return;")
+            .count()
+            >= 2
+    );
+    // A cursor the server cannot page from must not leave the marker blocking older history.
+    assert!(loader.contains("e.status === 404"));
+    assert!(loader.contains("state.partialTurn = null;"));
+}
+
 /// A task the server said outlived its turn is remembered, and when a reconnect's snapshot no
 /// longer lists it the browser reads the settled item itself. That is how a late completion
 /// reaches a client that was disconnected when it happened: nothing in the index or the resync

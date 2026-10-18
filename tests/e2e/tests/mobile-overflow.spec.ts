@@ -111,6 +111,15 @@ for (const appearance of APPEARANCES) {
         kind: "activity", title: `Indexed ${LONG_TOKEN}`, detail: LONG_LINE,
       });
       await expect(page.locator("#transcript .msg.agent pre")).toBeVisible();
+      // The marker a long live turn's snapshot draws for the items it left out, its text carrying the
+      // long token so it has to wrap.
+      await page.evaluate(([turn, token]) => {
+        (window as unknown as { renderLiveTurnSnapshot: (snap: unknown) => void })
+          .renderLiveTurnSnapshot({ turn_id: turn, accumulated: [], omitted: { count: 3, before: "x" } });
+        const text = document.querySelector("#transcript .msg.turn-gap .turn-gap-text")!;
+        text.textContent += ` ${token}`;
+      }, [TURN, LONG_TOKEN]);
+      await expect(page.locator("#transcript .msg.turn-gap")).toContainText("3 earlier items");
 
       // Rows appended below the note folded it to its summary line.
       await expect(reasoning).toHaveClass(/collapsed/);

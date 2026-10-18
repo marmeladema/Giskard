@@ -115,6 +115,12 @@ const SCRIPTED_STEERING_REPLY: &str = "Scripted steering accepted on the active 
 /// unfinished, so browser tests can reload mid-stream and check the coalesced live snapshot.
 /// Interrupting it ends the turn.
 const SCRIPTED_STREAMING_HOLD_TRIGGER: &str = "Stream a note, then hold this turn open.";
+/// Echoes the prompt as a user-message item, completes `SCRIPTED_LONG_TURN_REPLIES` agent messages
+/// reading `Scripted reply K of 20`, then streams and holds the same unfinished note as
+/// `SCRIPTED_STREAMING_HOLD_TRIGGER`. With `[history] turn_items = 8` (see `write_config`) a reload
+/// mid-turn leaves items out of the live snapshot, so browser tests can page them back in.
+const SCRIPTED_LONG_TURN_TRIGGER: &str = "Stream twenty replies, then hold this turn open.";
+const SCRIPTED_LONG_TURN_REPLIES: usize = 20;
 /// A harness that speaks the neutral protocol but has no backend: every turn streams the same
 /// canned agent message, so the browser-visible transcript is fully deterministic.
 struct ScriptedHarness {
@@ -585,8 +591,9 @@ impl AgentHarness for ScriptedHarness {
         let stream_reasoning = input_text == Some(SCRIPTED_REASONING_TRIGGER);
         let wait_for_steering = input_text == Some(SCRIPTED_STEERING_TRIGGER);
         let stream_then_hold = input_text == Some(SCRIPTED_STREAMING_HOLD_TRIGGER);
+        let long_then_hold = input_text == Some(SCRIPTED_LONG_TURN_TRIGGER);
 
-        if wait_for_steering || stream_then_hold {
+        if wait_for_steering || stream_then_hold || long_then_hold {
             self.active_steering_turns
                 .lock()
                 .await
@@ -816,6 +823,68 @@ impl AgentHarness for ScriptedHarness {
                 return;
             }
 
+            if long_then_hold {
+                let _ = sender.append(AgentEvent::TurnStarted {
+                    thread: thread_id,
+                    turn,
+                });
+                tokio::task::yield_now().await;
+                let echo_id = ItemId::new();
+                let _ = sender.append(AgentEvent::ItemStarted {
+                    thread: thread_id,
+                    turn,
+                    item: ItemStart {
+                        id: echo_id,
+                        harness_item_id: "scripted_long_turn_user".into(),
+                        kind: ItemKind::UserMessage,
+                        command: None,
+                        tool: None,
+                    },
+                });
+                let _ = sender.append(AgentEvent::ItemCompleted {
+                    thread: thread_id,
+                    turn,
+                    item: Item {
+                        id: echo_id,
+                        harness_item_id: "scripted_long_turn_user".into(),
+                        payload: ItemPayload::UserMessage {
+                            text: SCRIPTED_LONG_TURN_TRIGGER.into(),
+                        },
+                        created_at: chrono::Utc::now(),
+                    },
+                });
+                for k in 1..=SCRIPTED_LONG_TURN_REPLIES {
+                    let item_id = ItemId::new();
+                    let harness_item_id = format!("scripted_long_turn_reply_{k}");
+                    let _ = sender.append(AgentEvent::ItemStarted {
+                        thread: thread_id,
+                        turn,
+                        item: ItemStart {
+                            id: item_id,
+                            harness_item_id: harness_item_id.clone(),
+                            kind: ItemKind::AgentMessage,
+                            command: None,
+                            tool: None,
+                        },
+                    });
+                    let _ = sender.append(AgentEvent::ItemCompleted {
+                        thread: thread_id,
+                        turn,
+                        item: Item {
+                            id: item_id,
+                            harness_item_id,
+                            payload: ItemPayload::AgentMessage {
+                                text: format!("Scripted reply {k} of {SCRIPTED_LONG_TURN_REPLIES}"),
+                            },
+                            created_at: chrono::Utc::now(),
+                        },
+                    });
+                    tokio::task::yield_now().await;
+                }
+                stream_held_note(&sender, thread_id, turn).await;
+                return;
+            }
+
             let item_id = ItemId::new();
             let _ = sender.append(AgentEvent::TurnStarted {
                 thread: thread_id,
@@ -898,29 +967,7 @@ impl AgentHarness for ScriptedHarness {
             });
             tokio::task::yield_now().await;
             if stream_then_hold {
-                let reasoning_id = ItemId::new();
-                let _ = sender.append(AgentEvent::ItemStarted {
-                    thread: thread_id,
-                    turn,
-                    item: ItemStart {
-                        id: reasoning_id,
-                        harness_item_id: "scripted_held_reasoning_1".into(),
-                        kind: ItemKind::Reasoning,
-                        command: None,
-                        tool: None,
-                    },
-                });
-                tokio::task::yield_now().await;
-                for chunk in SCRIPTED_REASONING_DETAIL.split_inclusive(' ') {
-                    let _ = sender.append(AgentEvent::ItemDelta {
-                        thread: thread_id,
-                        turn,
-                        item_id: reasoning_id,
-                        delta: ItemDelta::Text { text: chunk.into() },
-                    });
-                    tokio::task::yield_now().await;
-                }
-                // No completion and no `TurnCompleted`: the turn stays open until interrupted.
+                stream_held_note(&sender, thread_id, turn).await;
                 return;
             }
             let _ = sender.append(AgentEvent::TurnCompleted {
@@ -1139,6 +1186,33 @@ fn hash_password(password: &str) -> Result<String, String> {
         .map_err(|e| format!("failed to hash replay password: {e}"))
 }
 
+/// Start a reasoning note and stream `SCRIPTED_REASONING_DETAIL` into it word by word, leaving it
+/// open. Nothing follows, not even `TurnCompleted`: the turn stays open until interrupted.
+async fn stream_held_note(sender: &EventLog, thread_id: ThreadId, turn: TurnId) {
+    let reasoning_id = ItemId::new();
+    let _ = sender.append(AgentEvent::ItemStarted {
+        thread: thread_id,
+        turn,
+        item: ItemStart {
+            id: reasoning_id,
+            harness_item_id: "scripted_held_reasoning_1".into(),
+            kind: ItemKind::Reasoning,
+            command: None,
+            tool: None,
+        },
+    });
+    tokio::task::yield_now().await;
+    for chunk in SCRIPTED_REASONING_DETAIL.split_inclusive(' ') {
+        let _ = sender.append(AgentEvent::ItemDelta {
+            thread: thread_id,
+            turn,
+            item_id: reasoning_id,
+            delta: ItemDelta::Text { text: chunk.into() },
+        });
+        tokio::task::yield_now().await;
+    }
+}
+
 /// Write a `config.toml` into `data_dir` so the standard loader reads it back: this keeps the
 /// replay server on the exact same config path as production instead of hand-building `Config`.
 fn write_config(data_dir: &Path, bind: &str, password_hash: &str) -> Result<(), String> {
@@ -1150,6 +1224,11 @@ secure_cookies = false
 
 [auth]
 password_hash = "{password_hash}"
+
+# A small live-snapshot tail, so the long-turn scenario (`SCRIPTED_LONG_TURN_TRIGGER`) leaves items
+# out of the snapshot and the browser tests can page them in. No other scenario reaches 8 items.
+[history]
+turn_items = 8
 
 # The scripted harness under the reserved name every seeded project is stamped with.
 [harnesses.codex]
