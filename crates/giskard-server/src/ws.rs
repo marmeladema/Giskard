@@ -1414,6 +1414,16 @@ async fn run_subscribe_bootstrap(
     //   on top. The browser may keep a stale live DOM block visible until the replacement snapshot
     //   arrives, so delta rows still need to be inserted before that retained live block on the UI
     //   side.
+    // One config read serves both the history page size and the live snapshot's tail.
+    let (initial_turns, tail_items) = history_limit_or_default(
+        state,
+        thread_id,
+        "subscribe_history",
+        |config| (config.history.initial, config.history.turn_items),
+        (5, 100),
+    )
+    .await;
+    let tail_items = tail_items.max(1);
     let history_started_at = Instant::now();
     let resync_delta = match since {
         Some(cursor) => state
@@ -1432,17 +1442,9 @@ async fn run_subscribe_bootstrap(
             has_more: None,
         })
     } else {
-        let limit = history_limit_or_default(
-            state,
-            thread_id,
-            "subscribe_history",
-            |config| config.history.initial,
-            5,
-        )
-        .await;
         let (turns, has_more) = state
             .store
-            .load_history(project_id, thread_id, None, limit)
+            .load_history(project_id, thread_id, None, initial_turns)
             .await
             .map_err(|e| WsError::from_persist(e, "subscribe_history", Some(thread_id)))?;
         Some(ServerMessage::HistoryDelta {
@@ -1469,7 +1471,9 @@ async fn run_subscribe_bootstrap(
 
     let live_snapshot_started_at = Instant::now();
     let runtime = state.registry.thread_runtime(thread_id).await;
-    let live_snapshot = runtime.as_ref().and_then(|runtime| runtime.live_snapshot());
+    let live_snapshot = runtime
+        .as_ref()
+        .and_then(|runtime| runtime.live_snapshot_bounded(tail_items));
     debug!(
         %project_id,
         %thread_id,
@@ -1478,6 +1482,11 @@ async fn run_subscribe_bootstrap(
         accumulated_events = live_snapshot
             .as_ref()
             .map_or(0, |snapshot| snapshot.accumulated.len()),
+        omitted_items = live_snapshot
+            .as_ref()
+            .and_then(|snapshot| snapshot.omitted.as_ref())
+            .map_or(0, |omitted| omitted.count),
+        tail_items,
         elapsed_ms = live_snapshot_started_at.elapsed().as_millis(),
         "built subscription live snapshot"
     );

@@ -493,8 +493,13 @@ impl From<Item> for WireItem {
 
 impl WireItem {
     pub fn from_persisted_item(item: Item) -> Self {
-        let mut wire: Self = item.into();
-        if let WireItemPayload::Reasoning { text, preview } = &mut wire.payload {
+        Self::from(item).with_reasoning_preview()
+    }
+
+    /// Cut a reasoning note's text to its 1 KiB head and describe the full note in `preview` when
+    /// the note is longer (spec RP1). Any other payload, and a note that fits, is returned as is.
+    pub fn with_reasoning_preview(mut self) -> Self {
+        if let WireItemPayload::Reasoning { text, preview } = &mut self.payload {
             let full = std::mem::take(text);
             let (prefix, truncated) =
                 giskard_core::item::reasoning_head_preview(&full, REASONING_PREVIEW_MAX_BYTES);
@@ -509,7 +514,7 @@ impl WireItem {
                 *text = full;
             }
         }
-        wire
+        self
     }
 
     /// Convert an item with the descriptor produced at the command normalization boundary.

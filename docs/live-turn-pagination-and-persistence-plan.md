@@ -196,6 +196,8 @@ server requests derived identically to `outstandingApprovals`/`outstandingServer
 
 ### L2 — Bounded live snapshot and live-item paging (wire + browser)
 
+**Status: implemented in [PR #308](https://github.com/marmeladema/Giskard/pull/308)** (spec 1.101, LP1–LP6); landed once it merges.
+
 Detailed plan: [`live-turn-pagination-and-persistence-plan/l2-bounded-live-snapshot-and-item-paging.md`](live-turn-pagination-and-persistence-plan/l2-bounded-live-snapshot-and-item-paging.md).
 Where it refines what follows, it wins.
 
@@ -207,7 +209,7 @@ Where it refines what follows, it wins.
 omitted: Option<OmittedItems>,
 struct OmittedItems {
     count: u32,      // settled items that precede the tail and were not sent
-    before: ItemId,  // where paging starts: the first item at or after the cut
+    before: ItemId,  // where paging starts: the first completed item at or after the cut
 }
 ```
 
@@ -217,8 +219,9 @@ item is omitted and counted; everything else rides along, expanded **before** th
 order: every open item, because it is still changing and a reconnecting client must see it to keep
 receiving its deltas; every completed item whose status is still running (a background command, a
 running tool, a file change in progress), because a later completion will upsert it and the browser
-can only upsert a row it has; every outstanding approval and server request, because the user still
-has to act on it; and errors and notices. Answered approvals, resolved server requests and diffs
+can only upsert a row it has; the turn's first `UserMessage` item, because an ordinary user turn's
+snapshot carries no `user_input` and that echo is its prompt row; every outstanding approval and
+server request, because the user still has to act on it; and errors and notices. Answered approvals, resolved server requests and diffs
 older than the tail are not sent. Within the tail, order is exactly L1's.
 
 Spec §13.6.1 requires every new wire read to name its authority, clock and delivery class: this is
@@ -256,9 +259,10 @@ for a settled item that was omitted and never paged in would draw a new row at t
 the running-status rule above keeps the known producers of repeat completions out of the omitted
 set, and an id list inside `OmittedItems` is the fallback if a new producer appears.
 
-**Browser.** `renderLiveTurnSnapshot`: when `omitted` is present, render the prompt row, then a
-marker row ("N earlier items in this turn are not shown", with a button; a new row kind — add it to
-`mobile-overflow.spec.ts`), then the riders and the tail. The scroll-up path (`onTranscriptScroll`)
+**Browser.** `renderLiveTurnSnapshot`: when `omitted` is present, replay the riders and the tail,
+then insert a marker row ("N earlier items in this turn are not shown", with a button; a new row
+kind — add it to `mobile-overflow.spec.ts`) directly under the turn's prompt row, which for a user
+turn is the echo item that just replayed. The scroll-up path (`onTranscriptScroll`)
 and the open-time autofill check `state.partialTurn = { turnId, oldestItemId, remaining, hasMore }`
 **before** paging older turns: while the topmost turn is partial, they page its items; when
 `has_more` is false the marker goes and the next scroll-up resumes `loadHistoryPage`. Paged rows

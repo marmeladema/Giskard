@@ -54,8 +54,18 @@ persisted one from its payload.
   and creates a new row at the bottom when the item is not rendered.
 - **The wire struct.** `LiveTurnSnapshot` (`giskard-proto/src/lib.rs:226-255`) has `thread_id,
   turn_id, user_input, accumulated, answered_approvals, answered_server_requests`, the last two with
-  `serde(default, skip_serializing_if)`. Struct literals: `lib.rs:1377`, `:1406`, `live.rs:606`,
-  `tests/turn_steering.rs:276`. The spec sketches it at `specs/giskard-specification.md:4112-4126`.
+  `serde(default, skip_serializing_if)`. Struct literals: `lib.rs:1377`, `:1406`, `live.rs:606`
+  (`tests/turn_steering.rs:276` is a function returning one, not a literal). The spec sketches it
+  at `specs/giskard-specification.md:4112-4126`.
+- **The prompt row is an item, not `user_input`.** `live_turn_user_input` (`registry.rs:137-148`)
+  returns `None` unless the turn's context kind is `ExternalSubagent` or `ExternalOrphan`; it seeds
+  both the live buffer (`event_forwarder.rs:1938`, `:1952`) and the live `TurnStarted` broadcast
+  (`:1727`). For an ordinary user turn the prompt row therefore comes from the harness's
+  `UserMessage` echo item, which both adapters emit (`giskard-harness-codex/src/mapping.rs:2710-
+  2719`, `giskard-harness-claude/src/mapper.rs:364`) as the turn's **oldest** item. A cut that
+  omitted it would leave the live turn without a prompt row until the last page loaded. Filling
+  `user_input` for user turns is not a free fix either: the same function feeds the live
+  `TurnStarted`, and a live session would then draw a provisional prompt next to its optimistic one.
 - **Subscribe.** `ws.rs:1472` calls `runtime.live_snapshot()`; the history page size is read with
   `history_limit_or_default(state, thread_id, "subscribe_history", |config| config.history.initial,
   5)` (`routes.rs:4596-4617`, used from `ws.rs` and `routes.rs:5062`). The debug line at
@@ -127,15 +137,23 @@ persisted one from its payload.
 
 - **D1. The cut.** Let `N = max(1, [history] turn_items)`. Walk `entries` from the end counting
   `LiveEntry::Item` entries; the cut is the index of the N-th item from the end, or 0 when the turn
-  has at most N items, in which case the snapshot is exactly L1's. Entries at or after the cut
+  has at most N items, in which case the snapshot is exactly L1's (with exactly N items the N-th
+  item from the end is the first item, but events ahead of it are still sent: the cut is 0, not
+  that item's index). Entries at or after the cut
   expand as L1 does. Entries before the cut are classified:
   - a **settled** item (see D2) is **omitted** and counted;
   - an **unsettled** item rides along;
+  - the turn's **first `UserMessage` item entry** (by position) rides along: it is the prompt of an
+    ordinary user turn, whose snapshot carries no `user_input` (see the facts), and a turn must
+    show what was asked before anything it answered. Later `UserMessage` items (steering) are
+    ordinary items and page in at their own position;
   - an `Event` rides along if it is an `ApprovalRequested` not in `resolved_approvals`, a
     `ServerRequestReceived` with no later `ServerRequestResolved` and not in
-    `resolved_server_requests`, an `Error`, a `Notice`, or a `TurnCompleted`; it is omitted if it
-    is an answered approval, a resolved server request (both its received and resolved events), or
-    a `DiffUpdated`.
+    `resolved_server_requests`, an `Error`, a `Notice`, a `ThreadOpened`, or a `TurnCompleted`; it
+    is omitted if it is an answered approval, a resolved server request (both its received and
+    resolved events), or a `DiffUpdated`.
+
+  A rider is never counted in `omitted.count`, and a live page never returns one (D4).
 
   Riders expand **before** the tail, in their arrival order, right after `turn_started`. They are
   older than the tail, so above it is where a reader expects them, and the browser's
@@ -168,13 +186,20 @@ persisted one from its payload.
   pub struct OmittedItems {
       /// How many settled items precede the tail and were not sent.
       pub count: u32,
-      /// Where paging starts (`GET …/items?before=`): the first item at or after the cut, open or
-      /// completed. A position, not a content reference, which is why an open item serves as well.
+      /// Where paging starts (`GET …/items?before=`): the first *completed* item at or after the
+      /// cut, else the item at the cut. A position, not a content reference.
       pub before: ItemId,
   }
   ```
 
-  The four struct literals named above gain the field (`omitted: None` in the three tests that do
+  Why completed: only `ItemCompleted` puts an item into the persisted turn
+  (`event_forwarder.rs:1903`). An item still open at the cut that never completes (an interrupted
+  note or command) would not be in the payload, and once the turn is persisted the route could not
+  resolve the cursor. The items between the cut and a later cursor are open, so they are in the
+  snapshot and never in a live page; after the commit, a persisted page before that cursor simply
+  does not reach them, and they are already rendered.
+
+  The three struct literals named above gain the field (`omitted: None` in the two tests that do
   not exercise it).
 
 - **D4. The route.**
@@ -196,8 +221,10 @@ persisted one from its payload.
   client already has). Without `before`, the page ends at the newest item.
 
   **Live page content.** Settled completed items (D2) whose entry index is strictly below the
-  cursor's, the last `limit` of them, oldest-first; `has_more` is whether any settled completed
-  item precedes the page. Projection: `WireItem::from_item_with_outputs(item, command_descriptor,
+  cursor's, excluding the first `UserMessage` entry (a rider, already in the snapshot), the last
+  `limit` of them, oldest-first; `has_more` is whether any such item precedes the page. A page
+  from the payload of a persisted turn does include the echo; the browser's upsert makes that a
+  no-op on the row the snapshot drew. Projection: `WireItem::from_item_with_outputs(item, command_descriptor,
   tool_descriptor).with_reasoning_preview()` (D5). Open and unsettled items are never in a page;
   they are in the snapshot.
 
@@ -229,15 +256,20 @@ persisted one from its payload.
 - **D6. Browser.**
   - New state `state.partialTurn: null | { turnId, oldestItemId, remaining, hasMore }` and
     `state.loadingTurnItems: false`. Set in `renderLiveTurnSnapshot` when `snap.omitted` is present
-    (`remaining = snap.omitted.count`, `oldestItemId = snap.omitted.before`),
-    after `renderLiveTurnUserInput` and before the replay. Cleared wherever `oldestTurnId` is
+    (`remaining = snap.omitted.count`, `oldestItemId = snap.omitted.before`), after the replay and
+    before the final scroll, together with the marker. Cleared wherever `oldestTurnId` is
     cleared (`app.js:2742`, `:2828`, `:4096` in `resetTranscriptForAuthoritativeSnapshot`) and in
     `reconcileInFlightTurn`, whose `removeTurnRows` deletes the marker along with the live rows.
     It is **not** cleared by `turn_completed`: the omitted items are still unloaded, the marker
     stays, and the route serves the rest from the payload once the turn commits.
-  - **Marker row.** A new row kind `.msg.turn-gap` drawn with `bubble("turn-gap", "")` right after
-    the prompt row, so `appendBubble` stamps it with the turn id. Body: the text "N earlier items
-    in this turn are not shown" and a button "Load earlier items". Styled beside `.msg.notice`
+  - **Marker row.** A new row kind `.msg.turn-gap`, created **after the replay** (the prompt row
+    of a user turn is the echo item, which only exists once the riders have replayed) and inserted
+    directly after the turn's first `.msg.user[data-turn=turnId]`, or as the turn's first row when
+    it has none; `dataset.turn` is set to the turn id so `removeTurnRows` deletes it with the live
+    rows. Its role label reads "earlier", like every row's: the IDE and terminal appearances lay a
+    row out as a role/body grid, so an empty or missing role would cost dead space or move the
+    body into the role column. Body: the text "N earlier items in this turn are not shown" and a
+    button "Load earlier items". Styled beside `.msg.notice`
     (`app.css:858`) and the `.approval-actions button` rule (`:446-447`), with `max-width:100%`
     and `min-width:0` on the flex children so it never widens the page.
   - **Paging.** `loadTurnItemsPage()` guards with `captureActiveViewIdentity` /
@@ -245,21 +277,42 @@ persisted one from its payload.
     `…/turns/${turnId}/items?before=${oldestItemId}`, and on success renders into a detached
     container with `state.renderTarget` set, `state.currentRenderTurnId = turnId`, and
     `state.activeTaskGroup = null`, calling `addItem(item, turnId, true)` per item, as
-    `renderPersistedTurn` does. One pre-step per page: a `user_message` item whose text matches
-    the turn's existing prompt row (`.msg.user[data-turn=turnId]` in the transcript) is registered
-    onto that row with `registerRenderedItemBody` and `markRenderedItem` instead of being rendered,
-    because `provisionalUserBodyForTurn` cannot see the transcript from a detached container and
-    would otherwise draw a second prompt. The container's rows are inserted immediately **after
+    `renderPersistedTurn` does. One pre-step per page, for the turns that do carry `user_input`
+    (sub-agent and orphan turns, whose provisional prompt row has `dataset.liveUserInput`): a
+    `user_message` item whose text matches that row is registered onto it with
+    `registerRenderedItemBody` and `markRenderedItem` instead of being rendered, because
+    `provisionalUserBodyForTurn` cannot see the transcript from a detached container and would
+    otherwise draw a second prompt. For a user turn the echo is a rider and never in a live page;
+    if a persisted page returns it, the row already exists and `addItem` upserts it in place. The
+    container's rows are inserted immediately **after
     the marker row** (pages walk backward, so each page is older than the last and belongs
     directly under the marker), then `collapseSupersededReasoningRows(transcript)`, then the
-    viewport is kept with the history page's height-delta rule. The marker's count becomes
+    viewport is kept: when the marker is above or inside the viewport the rows land above what the
+    reader sees, and the history page's height-delta rule applies; when it is below the viewport
+    (the reader scrolled up into older turns, which is where the scroll path fires) nothing in view
+    moved and `scrollTop` is left alone. Applying the delta there would push the view down by the
+    page's height. The marker's count becomes
     `remaining - items.length`, `partialTurn.oldestItemId` becomes `items[0].id`, and when
     `has_more` is false the marker is removed and `partialTurn` set to null.
+  - **A 404.** The route answers 404 when the cursor or the turn is gone. The page cannot succeed
+    on a retry, so the browser removes the marker and sets `partialTurn` to null (with the error
+    notice); otherwise every scroll to the top would retry it, and the precedence rule would keep
+    older turns from ever paging in.
   - **Precedence.** `onTranscriptScroll` and `maybeAutoFillHistory` page the partial turn first:
     while `state.partialTurn?.hasMore` and not `loadingTurnItems`, they call `loadTurnItemsPage`
     and return; only when the turn is complete do they fall through to `loadHistoryPage`. The
     history gates (`hasMoreHistory`, `loadingHistory`, `oldestTurnId`) are untouched, and
     `taskHistoryLoading` keeps its veto on autofill.
+  - **Autofill.** `renderLiveTurnSnapshot` runs `maybeAutoFillHistory` once it has drawn the
+    marker, and `renderTurnItemsPage` runs it after each page, as `renderHistoryPage` does; its
+    guards make an extra call harmless. Without the first call nothing pages the turn until the
+    reader scrolls: the bootstrap sends `HistoryDelta` before `LiveTurnSnapshot`, so the autofill
+    the history page ran saw no partial turn. Without the second, a screen taller than the tail
+    plus one page stays short with items unpaged. **Accepted:** that history autofill may already
+    have paged older turns, so precedence holds for scroll-up and for the top-up after the
+    snapshot but not for the first screenful. Deferring the history autofill until the snapshot
+    would close that, but needs a guard for a turn that is active with no snapshot yet; not in
+    this milestone.
   - **Known limitation, accepted.** A live `item_completed` for a settled item that was omitted
     and never paged in creates a row at the bottom instead of upserting one above. The producers
     of repeat completions are running commands, tools and file changes, which D2 keeps out of the
@@ -324,9 +377,11 @@ the matching `ThreadRuntimeSupport` method, modelled on `live_item` (`:596-606`)
 
 ### F. `crates/giskard-server/src/ws.rs` (+12)
 
-Read `turn_items` through `history_limit_or_default(state, thread_id, "subscribe_live_tail",
-|config| config.history.turn_items, 100)`, take `max(1, …)`, call `live_snapshot_bounded`, and add
-`omitted_items` and `tail_items` to the debug line at `:1474-1482`.
+Read `initial` and `turn_items` together, with one `history_limit_or_default(state, thread_id,
+"subscribe_history", |config| (config.history.initial, config.history.turn_items), (5, 100))`
+(the helper becomes generic over the value it selects), so a subscribe still reads the config
+once. Take `max(1, …)` of the tail, call `live_snapshot_bounded`, and add `omitted_items` and
+`tail_items` to the debug line at `:1474-1482`.
 
 ### G. `crates/giskard-server/src/routes.rs` (+110)
 
@@ -348,11 +403,13 @@ a marker; it does not (the seeded thread is short), so no regeneration.
 
 ### I. Replay server and e2e helpers (+70)
 
-- `SCRIPTED_LONG_TURN_TRIGGER = "Stream twenty replies, then hold this turn open."`: twenty
+- `SCRIPTED_LONG_TURN_TRIGGER = "Stream twenty replies, then hold this turn open."`: the prompt
+  echo as a `UserMessage` item (start and completion, as the other scenarios send it), twenty
   completed agent messages, each `ItemStarted` + `ItemCompleted` with text `Scripted reply K of
   20` (no deltas needed), then the streaming-hold tail (a reasoning note streamed and left open),
   registered in `active_steering_turns` like the other holds so Stop ends it. Mirrored in
-  `helpers.ts`.
+  `helpers.ts`. With `turn_items = 8` the turn has 22 item entries; the tail is the note plus
+  replies 14–20, the echo rides along, and `omitted.count` is 13 (replies 1–13).
 - `write_config` (`:1144-1168`) gains `[history]\nturn_items = 8` with a comment that the e2e long
   turn relies on it. No existing scenario reaches 8 items in one turn (`mobile-overflow` injects
   seven), so no other spec changes.
@@ -384,8 +441,8 @@ a marker; it does not (the seeded thread is short), so no regeneration.
 
 **Unit, `live.rs`** (public API only, through `snapshot(thread, n)` and `items_page`):
 
-1. *No cut under the limit.* 5 items, `n = 100` → identical to `snapshot(thread, usize::MAX)`,
-   `omitted == None`.
+1. *No cut under the limit.* An answered approval and a `DiffUpdated` ahead of 5 items: `n = 100`
+   and `n = 5` → identical to `snapshot(thread, usize::MAX)`, `omitted == None`.
 2. *The cut.* 30 completed messages, `n = 10` → `turn_started`, then exactly items 21–30 as
    start+completion pairs, `omitted == Some { count: 20, before: items[20] }`.
 3. *Riders.* Before the cut: an open reasoning item, a command completed with status `running`,
@@ -399,7 +456,9 @@ a marker; it does not (the seeded thread is short), so no regeneration.
 4. *Settled.* `is_settled` through observable behaviour: a file change with `status:
    "in_progress"` rides along, one with `"completed"` is omitted; same for tool `running` vs
    `completed`.
-5. *Cursor position.* `omitted.before` is an open item when the first entry at the cut is open.
+5. *Cursor position.* With an open item at the cut and a completed one after it, `omitted.before`
+   is the completed one, and a page before it holds the omitted items but not the open one; with
+   nothing completed in the tail it is the item at the cut.
 6. *Pages from the live buffer.* With the state of test 2: `items_page(before = items[20], 10)` →
    items 11–20 oldest-first, `has_more == true`; `before = items[10]` → 1–10, `has_more == false`;
    `before = None` → the newest 10; unknown id → `UnknownCursor`; another turn id → `NotLive`;
@@ -410,6 +469,9 @@ a marker; it does not (the seeded thread is short), so no regeneration.
 8. *Pending starts and usage still last.* Port the L1 ordering tests to the new signature with
    `usize::MAX`; they pass unchanged.
 9. *Persistence blocked.* A `TurnCompleted` before the cut rides along (D1).
+10. *The prompt rides along.* A `UserMessage` first, then 30 messages, `n = 10` → the echo expands
+    before the tail, `omitted.count == 30 - 10`, and `items_page` never returns the echo; a second
+    `UserMessage` in the middle (a steer) is omitted and paged like any item.
 
 **Store, `store.rs`:** `load_turn_items` display order with an amended payload; `None` for an
 unindexed turn; flat layout returns the turn's items.
@@ -425,10 +487,11 @@ thread → 404; a persisted turn seeded with `fixtures::completed_turn` carrying
 previewed. Unauthenticated → the same status the history route gives.
 
 **End-to-end, `tests/e2e/tests/live-turn-paging.spec.ts` (new, about 90 lines):** send the long
-trigger, wait for twenty agent rows and the open note, reload; expect the prompt row, then a
-`.msg.turn-gap` reading "12 earlier items", then agent rows 9–20 in order and the open note
-expanded; press the marker → rows 1–8 appear between the marker's place and row 9, in order, the
-marker is gone, and `.msg.agent` count is 20 with no duplicate text; Stop the turn. A second test
+trigger, wait for twenty agent rows and the open note, reload; expect the prompt row (the echo),
+then a `.msg.turn-gap` reading "13 earlier items", then agent rows 14–20 in order and the open note
+expanded; press the marker → rows 6–13 appear under the marker (a page is 8 items), the marker
+reads "5 earlier items"; press again → rows 1–5, the marker is gone, `.msg.agent` count is 20 with
+no duplicate text and exactly one `.msg.user` for the turn; Stop the turn. A second test
 scrolls to the top instead of pressing and asserts the same end state. A third checks that after
 loading all items, scrolling to the top still pages older *turns* (create one completed turn
 first). `mobile-overflow.spec.ts`: call `renderLiveTurnSnapshot({ thread_id, turn_id, accumulated:
@@ -444,8 +507,9 @@ the active view identity like `loadHistoryPage`.
 - `cargo fmt --all --check`, `cargo clippy --all-targets -- -D warnings`, `cargo test` green.
 - `tests/e2e/run.sh` green including the new spec and the extended overflow spec.
 - With the replay server and `turn_items = 8`: reload during the long turn and read the
-  `build_live_snapshot` line: `omitted_items=12`, `accumulated_events` is 1 + 8×2 + 2 (the open
-  note's start and delta).
+  `build_live_snapshot` line: `omitted_items=13`, `accumulated_events` is 1 (`TurnStarted`) + 2
+  (the echo's start and completion, a rider) + 7×2 (replies 14–20) + 2 (the open note's start and
+  delta) = 19.
 - `grep -n 'turn_items' README.md config.example.toml docs/api-endpoints.md specs/giskard-specification.md` each hit.
 - `git diff --stat` shows no change under `crates/giskard-persist/src/history.rs` or
   `crates/giskard-persist/src/bin/`.
@@ -464,8 +528,10 @@ the active view identity like `loadHistoryPage`.
   `onTranscriptScroll` or `maybeAutoFillHistory` is inverted.
 - `tests/e2e_smoke.rs` stops compiling: `live_snapshot()` was removed instead of kept as the
   unbounded delegate.
-- A test constructs `LiveTurnSnapshot { … }` without the new field and fails to compile: the four
+- A test constructs `LiveTurnSnapshot { … }` without the new field and fails to compile: the three
   literals are listed above.
+- After a reload the live turn has no prompt row until its last page loads: the first
+  `UserMessage` entry was counted as an ordinary settled item instead of riding along.
 - `history.jsonl` or a payload format changed: out of scope.
 
 ## Follow-ups (not this milestone)

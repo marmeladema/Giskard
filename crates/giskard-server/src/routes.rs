@@ -55,6 +55,7 @@ const MAX_ATTACHMENT_NAME_BYTES: usize = 255;
 const MAX_ATTACHMENT_MIME_BYTES: usize = 127;
 const GIT_COMMAND_TIMEOUT: Duration = Duration::from_secs(3);
 const MAX_HISTORY_PAGE_TURNS: usize = 100;
+const MAX_ITEM_PAGE_ITEMS: usize = 100;
 
 #[derive(Clone)]
 struct HttpRequestContext {
@@ -137,6 +138,10 @@ pub fn protected_routes(state: AppState) -> Router<AppState> {
         .route(
             "/api/projects/{id}/threads/{thread_id}/turns/{turn_id}/items/{item_id}",
             get(turn_item),
+        )
+        .route(
+            "/api/projects/{id}/threads/{thread_id}/turns/{turn_id}/items",
+            get(turn_items),
         )
         // File reads name their thread in the path rather than leaving it implicit. The workspace a
         // read is answered from is the thread's, so the thread has to be part of the request; a
@@ -4593,13 +4598,13 @@ pub(crate) fn warning_info(
     }
 }
 
-pub(crate) async fn history_limit_or_default(
+pub(crate) async fn history_limit_or_default<T: fmt::Debug>(
     state: &AppState,
     thread_id: ThreadId,
     action: &'static str,
-    select: impl FnOnce(&giskard_persist::Config) -> usize,
-    fallback: usize,
-) -> usize {
+    select: impl FnOnce(&giskard_persist::Config) -> T,
+    fallback: T,
+) -> T {
     match state.store.load_config().await {
         Ok(config) => select(&config),
         Err(error) => {
@@ -4607,7 +4612,7 @@ pub(crate) async fn history_limit_or_default(
                 %thread_id,
                 action = %action,
                 %error,
-                fallback,
+                ?fallback,
                 "failed to load history config; using fallback page size"
             );
             fallback
@@ -4625,6 +4630,20 @@ struct HistoryQuery {
 struct HistoryResponse {
     thread_id: ThreadId,
     turns: Vec<WireTurn>,
+    has_more: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct TurnItemsQuery {
+    before: Option<giskard_core::ItemId>,
+    limit: Option<usize>,
+}
+
+#[derive(serde::Serialize)]
+struct TurnItemsResponse {
+    turn_id: giskard_core::TurnId,
+    /// Oldest first.
+    items: Vec<WireItem>,
     has_more: bool,
 }
 
@@ -5042,6 +5061,112 @@ fn wire_turn_item(item: crate::thread_runtime::LiveItem) -> WireTurnItem {
             item: WireItem::from_item_with_outputs(item, command_output, tool_output),
         },
     }
+}
+
+/// One page of a turn's items, oldest first (spec §13.6, LP3): the items a bounded live snapshot
+/// left out, served from the runtime while the turn is live and from its payload once persisted.
+/// Resolution mirrors [`turn_item`], so a turn committing between the two reads is still found.
+async fn turn_items(
+    State(state): State<AppState>,
+    AxumPath((project_id, thread_id, turn_id)): AxumPath<(
+        ProjectId,
+        ThreadId,
+        giskard_core::TurnId,
+    )>,
+    Query(query): Query<TurnItemsQuery>,
+) -> Result<Json<TurnItemsResponse>, ApiError> {
+    use crate::thread_runtime::LiveItemsLookup;
+
+    if state
+        .store
+        .load_thread(project_id, thread_id)
+        .await?
+        .is_none()
+    {
+        return Err(ApiError::NotFound);
+    }
+    let default_limit = history_limit_or_default(
+        &state,
+        thread_id,
+        "http_turn_items",
+        |config| config.history.turn_items,
+        100,
+    )
+    .await;
+    let limit = query
+        .limit
+        .unwrap_or(default_limit)
+        .clamp(1, MAX_ITEM_PAGE_ITEMS);
+    let before = query.before;
+    let not_found = |reason: &'static str| {
+        debug!(
+            %project_id,
+            %thread_id,
+            %turn_id,
+            before = display_opt(before),
+            reason,
+            "turn items page not found"
+        );
+        ApiError::NotFound
+    };
+    let page = |source: &'static str, items: Vec<WireItem>, has_more: bool| {
+        debug!(
+            %project_id,
+            %thread_id,
+            %turn_id,
+            source,
+            before = display_opt(before),
+            returned = items.len(),
+            has_more,
+            "served turn items page"
+        );
+        Ok(Json(TurnItemsResponse {
+            turn_id,
+            items,
+            has_more,
+        }))
+    };
+
+    let runtime = state.registry.thread_runtime(thread_id).await;
+    let live = || {
+        runtime
+            .as_ref()
+            .map_or(LiveItemsLookup::NotLive, |runtime| {
+                runtime.live_items_page(turn_id, before, limit)
+            })
+    };
+    match live() {
+        LiveItemsLookup::Page(live) => return page("live", live.items, live.has_more),
+        LiveItemsLookup::UnknownCursor => return Err(not_found("unknown_cursor")),
+        LiveItemsLookup::NotLive => {}
+    }
+    let persisted = state
+        .store
+        .load_turn_items(project_id, thread_id, turn_id)
+        .await?;
+    let Some(items) = persisted else {
+        // The turn may have gone live after the first look; ask the runtime once more.
+        return match live() {
+            LiveItemsLookup::Page(live) => page("live", live.items, live.has_more),
+            LiveItemsLookup::UnknownCursor => Err(not_found("unknown_cursor")),
+            LiveItemsLookup::NotLive => Err(not_found("unknown_turn")),
+        };
+    };
+    let end = match before {
+        None => items.len(),
+        Some(before) => items
+            .iter()
+            .position(|item| item.id == before)
+            .ok_or_else(|| not_found("unknown_cursor"))?,
+    };
+    let start = end.saturating_sub(limit);
+    let wire = items
+        .into_iter()
+        .skip(start)
+        .take(end - start)
+        .map(WireItem::from_persisted_item)
+        .collect();
+    page("persisted", wire, start > 0)
 }
 
 /// Completed transcript pagination is an ordinary authenticated request/response. It deliberately

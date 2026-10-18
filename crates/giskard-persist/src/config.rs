@@ -396,6 +396,10 @@ pub struct HistoryConfig {
     /// Turns loaded per "scroll up" page. Small for the same reason as `initial`: a turn is not a
     /// fixed amount of content, so loading many at once can pull far more than a screen.
     pub page: usize,
+    /// Items of a turn sent at once: the newest ones of the live turn in its reconnect snapshot,
+    /// and the default size of an items page (spec §13.6, LP6). Items still running or waiting on
+    /// the user are sent regardless. Read as at least 1.
+    pub turn_items: usize,
 }
 
 impl Default for HistoryConfig {
@@ -403,6 +407,7 @@ impl Default for HistoryConfig {
         Self {
             initial: 5,
             page: 5,
+            turn_items: 100,
         }
     }
 }

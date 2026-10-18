@@ -251,6 +251,20 @@ pub struct LiveTurnSnapshot {
     /// a reload would render it actionable again and re-answering routes a stale id to the harness.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub answered_server_requests: Vec<ServerRequestId>,
+    /// Present exactly when settled items older than the tail were left out of `accumulated`
+    /// (spec §13.6, LP2).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub omitted: Option<OmittedItems>,
+}
+
+/// The settled items a bounded [`LiveTurnSnapshot`] left out, and where paging them starts.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OmittedItems {
+    /// How many settled items precede the tail and were not sent.
+    pub count: u32,
+    /// Where paging starts (`GET …/items?before=`): the first item at or after the cut, open or
+    /// completed. A position, not a content reference, which is why an open item serves as well.
+    pub before: ItemId,
 }
 
 /// An approval the user resolved during an in-flight turn (part of [`LiveTurnSnapshot`]).
@@ -1390,9 +1404,11 @@ mod tests {
             }],
             answered_approvals: vec![],
             answered_server_requests: vec![],
+            omitted: None,
         };
         let json = serde_json::to_value(&snapshot).unwrap();
         assert_eq!(json["thread_id"], thread.to_string());
+        assert!(json.get("omitted").is_none());
         assert_eq!(json["accumulated"][0]["kind"], "server_request_received");
         assert_eq!(json["accumulated"][0]["request"]["id"], "req_1");
         assert_eq!(
@@ -1403,6 +1419,7 @@ mod tests {
 
     #[test]
     fn live_turn_snapshot_includes_answered_approvals() {
+        let omitted_before = ItemId::new();
         let snapshot = LiveTurnSnapshot {
             thread_id: ThreadId::new(),
             turn_id: TurnId::new(),
@@ -1413,8 +1430,14 @@ mod tests {
                 decision: ApprovalDecision::Accept,
             }],
             answered_server_requests: vec![ServerRequestId("req_1".into())],
+            omitted: Some(OmittedItems {
+                count: 20,
+                before: omitted_before,
+            }),
         };
         let json = serde_json::to_value(&snapshot).unwrap();
+        assert_eq!(json["omitted"]["count"], 20);
+        assert_eq!(json["omitted"]["before"], omitted_before.to_string());
         assert_eq!(json["answered_approvals"][0]["request_id"], "ap_1");
         assert_eq!(json["answered_approvals"][0]["decision"], "accept");
         let back: LiveTurnSnapshot = serde_json::from_value(json).unwrap();
@@ -1426,6 +1449,13 @@ mod tests {
         assert_eq!(
             back.answered_approvals[0].decision,
             ApprovalDecision::Accept
+        );
+        assert_eq!(
+            back.omitted,
+            Some(OmittedItems {
+                count: 20,
+                before: omitted_before,
+            })
         );
     }
 

@@ -3644,7 +3644,7 @@ mod tests {
 
         let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(2);
         loop {
-            if runtime.live_snapshot(&authority).is_some_and(|snapshot| {
+            if runtime.live_snapshot(&authority, usize::MAX).is_some_and(|snapshot| {
                 snapshot.accumulated.iter().any(|event| {
                     matches!(event, WireAgentEvent::TurnUsageUpdated { usage: got, .. } if *got == usage)
                 })
@@ -4433,7 +4433,7 @@ mod tests {
         );
         assert_eq!(saved[0].items.len(), 1);
         assert!(
-            runtime.live_snapshot(&authority).is_none(),
+            runtime.live_snapshot(&authority, usize::MAX).is_none(),
             "synthetic completion should clear live state"
         );
 
@@ -4836,7 +4836,7 @@ mod tests {
             "events for another thread must not be persisted into the target thread"
         );
         assert!(
-            runtime.live_snapshot(&authority).is_none(),
+            runtime.live_snapshot(&authority, usize::MAX).is_none(),
             "events for another thread must not create a live snapshot"
         );
         assert!(
@@ -4985,7 +4985,7 @@ mod tests {
             "foreign events must not be persisted into the target thread"
         );
         assert!(
-            runtime.live_snapshot(&authority).is_none(),
+            runtime.live_snapshot(&authority, usize::MAX).is_none(),
             "foreign events must not create target-thread live state"
         );
         assert!(
@@ -5112,7 +5112,7 @@ mod tests {
             "turnless request alone must not persist a turn"
         );
         assert!(
-            runtime.live_snapshot(&authority).is_none(),
+            runtime.live_snapshot(&authority, usize::MAX).is_none(),
             "turnless request alone must not create target-thread live turn state"
         );
     }

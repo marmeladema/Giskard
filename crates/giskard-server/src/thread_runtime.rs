@@ -43,8 +43,8 @@ pub(crate) use requests::{RequestResolution, RuntimeRequestId};
 
 use diffs::CapturedDiffState;
 use gate::TurnGate;
-pub(crate) use live::LiveItem;
 use live::LiveTurnState;
+pub(crate) use live::{LiveItem, LiveItemsLookup};
 use outputs::{ItemOutputState, prepare_item_output};
 use requests::{ClaimRejection, CommitRejection, RequestLedger, RequestPayload};
 use tasks::RunningTaskState;
@@ -248,9 +248,15 @@ impl ResolvedThreadRuntime {
         self.support.live_is_active(&self.authority)
     }
 
-    /// Returns reconnect state without creating a runtime entry.
+    /// Returns the unbounded reconnect state without creating a runtime entry.
     pub fn live_snapshot(&self) -> Option<LiveTurnSnapshot> {
-        self.support.live_snapshot(&self.authority)
+        self.live_snapshot_bounded(usize::MAX)
+    }
+
+    /// Returns reconnect state carrying at most `tail_items` of the newest items, plus everything
+    /// older that is still changing or waiting on the user (spec §13.6, LP1).
+    pub fn live_snapshot_bounded(&self, tail_items: usize) -> Option<LiveTurnSnapshot> {
+        self.support.live_snapshot(&self.authority, tail_items)
     }
 
     /// Reports whether the current runtime entry contains running tasks.
@@ -291,6 +297,17 @@ impl ResolvedThreadRuntime {
 
     pub(crate) fn live_item(&self, turn_id: TurnId, item_id: ItemId) -> Option<LiveItem> {
         self.support.live_item(&self.authority, turn_id, item_id)
+    }
+
+    /// Pages the live turn's settled items before `before`, oldest first (spec §13.6, LP3).
+    pub(crate) fn live_items_page(
+        &self,
+        turn_id: TurnId,
+        before: Option<ItemId>,
+        limit: usize,
+    ) -> LiveItemsLookup {
+        self.support
+            .live_items_page(&self.authority, turn_id, before, limit)
     }
 
     /// Captures an exact-entry permit for caching a persisted output version.
@@ -573,11 +590,12 @@ impl ThreadRuntimeSupport {
     pub(crate) fn live_snapshot(
         &self,
         authority: &Arc<ThreadAuthority>,
+        tail_items: usize,
     ) -> Option<LiveTurnSnapshot> {
         let thread_id = authority.thread_id();
         let entry = self.existing_entry(authority)?;
         let entry = lock_unpoison(&entry, "thread runtime entry");
-        entry.live.snapshot(thread_id)
+        entry.live.snapshot(thread_id, tail_items)
     }
 
     pub(crate) fn live_item_events(
@@ -603,6 +621,21 @@ impl ThreadRuntimeSupport {
         let entry = self.existing_entry(authority)?;
         let entry = lock_unpoison(&entry, "thread runtime entry");
         entry.live.live_item(thread_id, turn_id, item_id)
+    }
+
+    pub(crate) fn live_items_page(
+        &self,
+        authority: &Arc<ThreadAuthority>,
+        turn_id: TurnId,
+        before: Option<ItemId>,
+        limit: usize,
+    ) -> LiveItemsLookup {
+        let thread_id = authority.thread_id();
+        let Some(entry) = self.existing_entry(authority) else {
+            return LiveItemsLookup::NotLive;
+        };
+        let entry = lock_unpoison(&entry, "thread runtime entry");
+        entry.live.items_page(thread_id, turn_id, before, limit)
     }
 
     pub(crate) fn ensure_live_turn(
@@ -1866,7 +1899,7 @@ mod tests {
         let authority = test_authority(thread_id);
 
         assert!(!runtime.live_is_active(&authority));
-        assert!(runtime.live_snapshot(&authority).is_none());
+        assert!(runtime.live_snapshot(&authority, usize::MAX).is_none());
         assert!(
             runtime
                 .live_item_events(&authority, ItemId::new())

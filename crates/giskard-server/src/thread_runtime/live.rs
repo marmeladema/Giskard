@@ -8,13 +8,16 @@ use giskard_core::event::AgentEvent;
 use giskard_core::ids::{ApprovalId, ItemId, ServerRequestId, ThreadId, TurnId};
 use giskard_core::item::{
     CommandOutputDescriptor, Item, ItemDelta, ItemKind, ItemPayload, ItemStart,
+    command_status_is_running, file_change_status_is_running, tool_status_is_running,
 };
 #[cfg(test)]
 use giskard_core::server_request::ServerRequest;
 use giskard_core::user_input::UserInput;
 #[cfg(test)]
 use giskard_proto::WireApprovalRequest;
-use giskard_proto::{AnsweredApproval, LiveTurnSnapshot, WireAgentEvent, WireToolOutput};
+use giskard_proto::{
+    AnsweredApproval, LiveTurnSnapshot, OmittedItems, WireAgentEvent, WireItem, WireToolOutput,
+};
 
 const MAX_LIVE_COMMAND_OUTPUT: usize = 16 * 1024;
 const LIVE_COMMAND_OUTPUT_EDGE: usize = 8 * 1024;
@@ -26,6 +29,11 @@ const LIVE_COMMAND_OUTPUT_TRUNCATED: &str = "\n\n[... command output truncated i
 /// that completion, so a completion replaces in place and a delta appends to one string: the cost
 /// of an event does not grow with the turn, and the snapshot carries one or two events per item
 /// instead of every chunk ever streamed.
+///
+/// A snapshot carries a bounded tail of these items (LP1): settled items older than the tail are
+/// left out and paged on demand through [`LiveTurnState::items_page`], while anything still
+/// changing or still waiting on the user rides along regardless of age. Because entries never
+/// move, an entry's index is the position both the cut and the page cursor are measured in.
 struct LiveTurn {
     turn_id: TurnId,
     user_input: Option<UserInput>,
@@ -36,7 +44,8 @@ struct LiveTurn {
     /// Arrival order. An item sits where the browser draws its row: at its start for a start that
     /// draws one (see [`start_draws_row`]), otherwise at its first delta or completion. Every other
     /// event sits where it arrived, so a request card replays where the live transcript drew it.
-    /// Entries are only ever pushed, never removed or moved.
+    /// Entries are only ever pushed, never removed or moved, so an index is a stable position for
+    /// the life of the turn.
     entries: Vec<LiveEntry>,
     /// The index in `entries` of each item's entry, written only by [`LiveTurn::entry_for`].
     slots: HashMap<ItemId, usize>,
@@ -161,6 +170,85 @@ impl LiveTurn {
         })
     }
 
+    /// The index of the `tail_items`-th item entry from the end, or 0 when the turn has no more
+    /// items than that (LP1), so such a turn snapshots exactly as unbounded. Entries at or after
+    /// the cut are the tail.
+    fn cut(&self, tail_items: usize) -> usize {
+        let mut items = self
+            .entries
+            .iter()
+            .enumerate()
+            .rev()
+            .filter(|(_, entry)| matches!(entry, LiveEntry::Item(_)));
+        match items.nth(tail_items.max(1) - 1) {
+            Some((index, _)) if items.next().is_some() => index,
+            _ => 0,
+        }
+    }
+
+    /// Where paging the omitted items starts (LP2): the first completed item at or after the cut,
+    /// else the item at the cut. A completed item is in the payload once the turn is persisted, so
+    /// the cursor still resolves there; an item still open when the turn ends may never be.
+    fn page_cursor(&self, cut: usize) -> Option<ItemId> {
+        let tail = || {
+            self.entries[cut..].iter().filter_map(|entry| match entry {
+                LiveEntry::Item(item) => Some(item),
+                LiveEntry::Event(_) => None,
+            })
+        };
+        tail()
+            .find(|item| item.completed.is_some())
+            .or_else(|| tail().next())
+            .map(|item| item.id)
+    }
+
+    /// The index of the turn's first `UserMessage` item entry: an ordinary user turn's prompt row.
+    /// Its snapshot carries no `user_input`, so this echo is what shows what was asked.
+    fn prompt_slot(&self) -> Option<usize> {
+        self.entries.iter().position(|entry| match entry {
+            LiveEntry::Item(item) => item.is_user_message(),
+            LiveEntry::Event(_) => false,
+        })
+    }
+
+    /// Which entries before `cut` ride along in a bounded snapshot (LP1): an unsettled item, the
+    /// turn's prompt echo ([`Self::prompt_slot`]), an approval not yet answered, a server request
+    /// neither answered nor closed by a later resolved event, and every `Error`, `Notice`,
+    /// `ThreadOpened` and `TurnCompleted`. A settled item, an answered approval, a closed server
+    /// request (its received and its resolved event alike) and a `DiffUpdated` are left out.
+    fn riders(&self, cut: usize) -> Vec<bool> {
+        let prompt = self.prompt_slot();
+        let mut resolved_later: HashSet<&ServerRequestId> = HashSet::new();
+        let mut rides = vec![false; cut];
+        // Walk backwards so "resolved later" is known at each received event. Resolutions in the
+        // tail count too: a request closed there is no longer outstanding.
+        for (index, entry) in self.entries.iter().enumerate().rev() {
+            let rider = match entry {
+                LiveEntry::Item(item) => !item.is_settled() || prompt == Some(index),
+                LiveEntry::Event(AgentEvent::ServerRequestResolved { request_id, .. }) => {
+                    resolved_later.insert(request_id);
+                    false
+                }
+                LiveEntry::Event(AgentEvent::ServerRequestReceived { request, .. }) => {
+                    !resolved_later.contains(&request.id)
+                        && !self.resolved_server_requests.contains(&request.id)
+                }
+                LiveEntry::Event(AgentEvent::ApprovalRequested { request, .. }) => {
+                    !self.resolved_approvals.contains_key(&request.id)
+                }
+                LiveEntry::Event(AgentEvent::DiffUpdated { .. }) => false,
+                // `Error`, `Notice`, a persistence-blocked turn's `TurnCompleted`, and anything
+                // else that is not an item lifecycle event: rare, and dropping one would change
+                // what the reader sees.
+                LiveEntry::Event(_) => true,
+            };
+            if index < cut {
+                rides[index] = rider;
+            }
+        }
+        rides
+    }
+
     fn start_item(&mut self, thread: ThreadId, turn: TurnId, start: ItemStart) {
         if !self.slots.contains_key(&start.id) && !start_draws_row(&start) {
             self.pending_starts.insert(start.id, (thread, turn, start));
@@ -250,6 +338,52 @@ fn started_event(thread: ThreadId, turn: TurnId, item: ItemStart) -> AgentEvent 
 }
 
 impl LiveItemEntry {
+    /// Whether no later completion will change this item (LP1): it has completed, and not with a
+    /// status that says it is still running. A command or tool completes running when it goes to
+    /// the background, and a file change completes `inProgress` before it is applied; the browser
+    /// can only upsert a row it has, so such an item must always be sent.
+    fn is_settled(&self) -> bool {
+        let Some(item) = &self.completed else {
+            return false;
+        };
+        let running = match &item.payload {
+            ItemPayload::CommandExecution { status, .. } => {
+                status.as_deref().is_some_and(command_status_is_running)
+            }
+            ItemPayload::ToolCall { status, .. } => {
+                status.as_deref().is_some_and(tool_status_is_running)
+            }
+            ItemPayload::FileChange { status, .. } => {
+                status.as_deref().is_some_and(file_change_status_is_running)
+            }
+            _ => false,
+        };
+        !running
+    }
+
+    fn is_user_message(&self) -> bool {
+        match &self.completed {
+            Some(item) => matches!(item.payload, ItemPayload::UserMessage { .. }),
+            None => self
+                .start
+                .as_ref()
+                .is_some_and(|start| start.kind == ItemKind::UserMessage),
+        }
+    }
+
+    /// The latest completion as the browser receives it: output reduced to its descriptors and a
+    /// reasoning note cut to its head preview (LP5).
+    fn wire_completed(&self, turn: &LiveTurn) -> Option<WireItem> {
+        self.completed.as_ref().map(|item| {
+            WireItem::from_item_with_outputs(
+                item.clone(),
+                turn.command_output_descriptors.get(&self.id).cloned(),
+                turn.tool_output_descriptors.get(&self.id).cloned(),
+            )
+            .with_reasoning_preview()
+        })
+    }
+
     /// Join a text delta the way the browser does: a tool call's progress chunks are separated by
     /// a newline (`appendToolProgress`), everything else concatenates (`appendStream`). The browser
     /// routes a delta by the kind `item_started` announced, so only `start` decides.
@@ -293,15 +427,11 @@ impl LiveItemEntry {
             self.started_event()
                 .and_then(WireAgentEvent::from_agent_event),
         );
-        if let Some(item) = &self.completed {
+        if let Some(item) = self.wire_completed(turn) {
             out.push(WireAgentEvent::ItemCompleted {
                 thread: self.thread,
                 turn: self.turn,
-                item: giskard_proto::WireItem::from_item_with_outputs(
-                    item.clone(),
-                    turn.command_output_descriptors.get(&self.id).cloned(),
-                    turn.tool_output_descriptors.get(&self.id).cloned(),
-                ),
+                item,
             });
         }
         let text = (!self.text.is_empty()).then(|| ItemDelta::Text {
@@ -328,6 +458,24 @@ pub(crate) enum LiveItem {
         command_output: Option<CommandOutputDescriptor>,
         tool_output: Option<WireToolOutput>,
     },
+}
+
+/// One page of a live turn's settled items, oldest first (spec §13.6, LP3).
+#[derive(Debug)]
+pub(crate) struct LiveItemsPage {
+    pub(crate) items: Vec<WireItem>,
+    /// Whether a settled item precedes the page.
+    pub(crate) has_more: bool,
+}
+
+/// What the live buffer knows about an items page request: the route's three outcomes.
+#[derive(Debug)]
+pub(crate) enum LiveItemsLookup {
+    Page(LiveItemsPage),
+    /// The turn is live but `before` names none of its items.
+    UnknownCursor,
+    /// The turn is not this thread's live turn; the route asks the store instead.
+    NotLive,
 }
 
 #[derive(Default)]
@@ -536,7 +684,59 @@ impl LiveTurnState {
         entry.start.clone().map(LiveItem::Started)
     }
 
-    pub fn snapshot(&self, thread_id: ThreadId) -> Option<LiveTurnSnapshot> {
+    /// The `limit` settled items before `before` (or before the end), oldest first (LP3). Open
+    /// and unsettled items are never in a page, nor is the prompt echo: every snapshot carries
+    /// them. Entries never move, so a page stays valid while the turn goes on.
+    pub(crate) fn items_page(
+        &self,
+        thread_id: ThreadId,
+        turn_id: TurnId,
+        before: Option<ItemId>,
+        limit: usize,
+    ) -> LiveItemsLookup {
+        let Some(turn) = self
+            .turn
+            .as_ref()
+            .filter(|turn| self.thread_id == Some(thread_id) && turn.turn_id == turn_id)
+        else {
+            return LiveItemsLookup::NotLive;
+        };
+        let end = match before {
+            None => turn.entries.len(),
+            Some(before) => match turn.slots.get(&before) {
+                Some(&slot) if matches!(turn.entries.get(slot), Some(LiveEntry::Item(_))) => slot,
+                _ => return LiveItemsLookup::UnknownCursor,
+            },
+        };
+        let limit = limit.max(1);
+        let prompt = turn.prompt_slot();
+        let mut settled =
+            turn.entries[..end]
+                .iter()
+                .enumerate()
+                .rev()
+                .filter_map(|(index, entry)| match entry {
+                    LiveEntry::Item(item) if item.is_settled() && prompt != Some(index) => {
+                        Some(item)
+                    }
+                    _ => None,
+                });
+        let mut items: Vec<WireItem> = settled
+            .by_ref()
+            .take(limit)
+            .filter_map(|item| item.wire_completed(turn))
+            .collect();
+        items.reverse();
+        LiveItemsLookup::Page(LiveItemsPage {
+            items,
+            has_more: settled.next().is_some(),
+        })
+    }
+
+    /// The reconnect snapshot, carrying at most `tail_items` of the newest items plus everything
+    /// before them that is still changing or waiting on the user (LP1). `usize::MAX` is the
+    /// unbounded snapshot.
+    pub fn snapshot(&self, thread_id: ThreadId, tail_items: usize) -> Option<LiveTurnSnapshot> {
         (self.thread_id == Some(thread_id))
             .then_some(self.turn.as_ref())
             .flatten()
@@ -557,17 +757,26 @@ impl LiveTurnState {
                         _ => None,
                     })
                     .collect();
-                // LB2: `TurnStarted` first, each entry in arrival order, the starts still waiting
-                // for a row, the latest usage last.
+                // LB2/LP1: `TurnStarted` first, then the entries before the cut that ride along,
+                // then the tail, each in arrival order, then the starts still waiting for a row,
+                // the latest usage last. Riders are older than the tail, so above it is where the
+                // reader expects them.
+                let cut = turn.cut(tail_items);
+                let riders = turn.riders(cut);
+                let mut omitted_count: usize = 0;
                 let mut accumulated: Vec<WireAgentEvent> = Vec::with_capacity(
-                    turn.entries.len() + 2, // usually one or two events per entry
+                    turn.entries.len() - cut + 2, // usually one or two events per entry
                 );
                 accumulated.extend(
                     turn.turn_started
                         .clone()
                         .and_then(WireAgentEvent::from_agent_event),
                 );
-                for entry in &turn.entries {
+                for (index, entry) in turn.entries.iter().enumerate() {
+                    if index < cut && !riders[index] {
+                        omitted_count += usize::from(matches!(entry, LiveEntry::Item(_)));
+                        continue;
+                    }
                     match entry {
                         LiveEntry::Item(item) => item.expand(turn, &mut accumulated),
                         LiveEntry::Event(event) => {
@@ -575,6 +784,13 @@ impl LiveTurnState {
                         }
                     }
                 }
+                let omitted = (omitted_count > 0)
+                    .then(|| turn.page_cursor(cut))
+                    .flatten()
+                    .map(|before| OmittedItems {
+                        count: u32::try_from(omitted_count).unwrap_or(u32::MAX),
+                        before,
+                    });
                 accumulated.extend(turn.pending_starts.values().filter_map(
                     |(thread, turn_id, start)| {
                         WireAgentEvent::from_agent_event(started_event(
@@ -610,6 +826,7 @@ impl LiveTurnState {
                     accumulated,
                     answered_approvals,
                     answered_server_requests,
+                    omitted,
                 }
             })
     }
@@ -963,7 +1180,7 @@ mod tests {
             .expect("late turn start reuses the buffer");
         store.append(thread, AgentEvent::TurnStarted { thread, turn });
 
-        let snapshot = store.snapshot(thread).expect("snapshot");
+        let snapshot = store.snapshot(thread, usize::MAX).expect("snapshot");
         assert_eq!(snapshot.turn_id, turn);
         assert_eq!(snapshot.user_input, Some(input));
         // The delayed `TurnStarted` replays first (D3): replayed after the item, the browser's
@@ -1019,7 +1236,7 @@ mod tests {
             },
         );
 
-        let snapshot = store.snapshot(thread).expect("snapshot");
+        let snapshot = store.snapshot(thread, usize::MAX).expect("snapshot");
         let outputs = snapshot
             .accumulated
             .iter()
@@ -1075,7 +1292,7 @@ mod tests {
             );
         }
 
-        let snapshot = store.snapshot(thread).expect("snapshot");
+        let snapshot = store.snapshot(thread, usize::MAX).expect("snapshot");
         assert_eq!(snapshot.accumulated.len(), 3);
         assert!(matches!(
             snapshot.accumulated[1],
@@ -1154,7 +1371,7 @@ mod tests {
         };
         assert!(retained_output.len() <= CommandOutputDescriptor::PREVIEW_MAX_BYTES);
 
-        let snapshot = store.snapshot(thread).expect("snapshot");
+        let snapshot = store.snapshot(thread, usize::MAX).expect("snapshot");
         let completed = snapshot.accumulated.iter().find_map(|event| {
             let WireAgentEvent::ItemCompleted { item, .. } = event else {
                 return None;
@@ -1240,7 +1457,7 @@ mod tests {
         };
         assert_eq!(retained, "");
 
-        let snapshot = store.snapshot(thread).expect("snapshot");
+        let snapshot = store.snapshot(thread, usize::MAX).expect("snapshot");
         let outputs = snapshot
             .accumulated
             .iter()
@@ -1295,7 +1512,7 @@ mod tests {
             },
         );
 
-        let snapshot = store.snapshot(thread).expect("snapshot");
+        let snapshot = store.snapshot(thread, usize::MAX).expect("snapshot");
         // The harness resolved one with its own event, the other is still open. The outstanding
         // server requests are derived from `accumulated` plus `answered_server_requests`, so only
         // the still-open one is reported as pending.
@@ -1329,7 +1546,7 @@ mod tests {
         // The harness re-raises the same id after resolving it.
         store.append(thread, server_request_received(thread, turn, &id));
 
-        let snapshot = store.snapshot(thread).expect("snapshot");
+        let snapshot = store.snapshot(thread, usize::MAX).expect("snapshot");
         assert_eq!(
             outstanding_server_requests(&snapshot),
             vec![id],
@@ -1365,7 +1582,7 @@ mod tests {
         // A re-opens after being resolved.
         store.append(thread, server_request_received(thread, turn, &a));
 
-        let snapshot = store.snapshot(thread).expect("snapshot");
+        let snapshot = store.snapshot(thread, usize::MAX).expect("snapshot");
         assert_eq!(
             outstanding_server_requests(&snapshot),
             vec![b.clone(), a.clone()],
@@ -1410,7 +1627,7 @@ mod tests {
             },
         );
 
-        let snapshot = store.snapshot(thread).expect("snapshot");
+        let snapshot = store.snapshot(thread, usize::MAX).expect("snapshot");
         let pending = snapshot
             .accumulated
             .iter()
@@ -1491,7 +1708,7 @@ mod tests {
             ApprovalDecision::Accept,
         );
 
-        let snapshot = store.snapshot(thread).expect("snapshot");
+        let snapshot = store.snapshot(thread, usize::MAX).expect("snapshot");
         // The answered approval must not come back as actionable — re-answering a stale id errors.
         assert!(
             outstanding_approvals(&snapshot).is_empty(),
@@ -1525,7 +1742,7 @@ mod tests {
             ApprovalDecision::Decline,
         );
 
-        let snapshot = store.snapshot(thread).expect("snapshot");
+        let snapshot = store.snapshot(thread, usize::MAX).expect("snapshot");
         // Only the still-open approval is actionable; the answered one is not, even though both
         // ride along in `accumulated`.
         assert_eq!(
@@ -1555,7 +1772,7 @@ mod tests {
             store.append(thread, approval_requested(thread, turn, id));
         }
 
-        let snapshot = store.snapshot(thread).expect("snapshot");
+        let snapshot = store.snapshot(thread, usize::MAX).expect("snapshot");
         assert_eq!(
             outstanding_approvals(&snapshot),
             vec![
@@ -1607,7 +1824,7 @@ mod tests {
             store.append(thread, server_request_received(thread, turn, id));
         }
 
-        let snapshot = store.snapshot(thread).expect("snapshot");
+        let snapshot = store.snapshot(thread, usize::MAX).expect("snapshot");
         assert_eq!(
             outstanding_server_requests(&snapshot),
             ids,
@@ -1639,7 +1856,7 @@ mod tests {
         let thread = ThreadId::new();
         // No panic and no snapshot materializes when the turn buffer was already cleared.
         store.resolve_approval(thread, ApprovalId("ap_1".into()), ApprovalDecision::Accept);
-        assert!(store.snapshot(thread).is_none());
+        assert!(store.snapshot(thread, usize::MAX).is_none());
     }
 
     // ---- Item-centric buffer (L1) ----
@@ -1759,7 +1976,13 @@ mod tests {
                 WireAgentEvent::ServerRequestReceived { request, .. } => {
                     format!("server_request:{}", request.id.0)
                 }
+                WireAgentEvent::ServerRequestResolved { request_id, .. } => {
+                    format!("server_request_resolved:{}", request_id.0)
+                }
                 WireAgentEvent::TurnCompleted { .. } => "turn_completed".to_owned(),
+                WireAgentEvent::Error { .. } => "error".to_owned(),
+                WireAgentEvent::Notice { .. } => "notice".to_owned(),
+                WireAgentEvent::DiffUpdated { .. } => "diff".to_owned(),
                 other => format!("{other:?}"),
             })
             .collect()
@@ -1811,7 +2034,7 @@ mod tests {
                 store.append(thread, text_delta(thread, turn, id, chunk));
             }
             store.append(thread, completion.clone());
-            store.snapshot(thread).expect("snapshot")
+            store.snapshot(thread, usize::MAX).expect("snapshot")
         };
         let chunked = replay(&words);
         let whole = replay(std::slice::from_ref(&full));
@@ -1847,7 +2070,7 @@ mod tests {
             store.append(thread, text_delta(thread, turn, id, chunk));
         }
 
-        let snapshot = store.snapshot(thread).expect("snapshot");
+        let snapshot = store.snapshot(thread, usize::MAX).expect("snapshot");
         assert_eq!(
             shape(&snapshot),
             vec![format!("start:{id}"), format!("text:{id}")]
@@ -1872,7 +2095,7 @@ mod tests {
             for chunk in chunks {
                 store.append(thread, text_delta(thread, turn, id, chunk));
             }
-            let snapshot = store.snapshot(thread).expect("snapshot");
+            let snapshot = store.snapshot(thread, usize::MAX).expect("snapshot");
             texts(&snapshot).concat()
         };
 
@@ -1900,7 +2123,7 @@ mod tests {
         store.append(thread, completed_message(thread, turn, b, "B"));
         store.append(thread, text_delta(thread, turn, a, "late"));
 
-        let snapshot = store.snapshot(thread).expect("snapshot");
+        let snapshot = store.snapshot(thread, usize::MAX).expect("snapshot");
         assert_eq!(
             shape(&snapshot),
             vec![
@@ -1934,7 +2157,7 @@ mod tests {
         store.append(thread, completed_command(thread, turn, a, "completed"));
         store.append(thread, server_request_received(thread, turn, &request));
 
-        let snapshot = store.snapshot(thread).expect("snapshot");
+        let snapshot = store.snapshot(thread, usize::MAX).expect("snapshot");
         assert_eq!(
             shape(&snapshot),
             vec![
@@ -1969,7 +2192,7 @@ mod tests {
         store.append(thread, approval_requested(thread, turn, "ap_2"));
         store.append(thread, text_delta(thread, turn, open, "thinking"));
 
-        let snapshot = store.snapshot(thread).expect("snapshot");
+        let snapshot = store.snapshot(thread, usize::MAX).expect("snapshot");
         assert_eq!(
             shape(&snapshot),
             vec![
@@ -2003,7 +2226,7 @@ mod tests {
         );
         store.append(thread, usage(thread, turn, 10));
 
-        let snapshot = store.snapshot(thread).expect("snapshot");
+        let snapshot = store.snapshot(thread, usize::MAX).expect("snapshot");
         assert_eq!(
             shape(&snapshot),
             vec![
@@ -2032,7 +2255,7 @@ mod tests {
         store.append(thread, started(thread, turn, a, ItemKind::AgentMessage));
         store.append(thread, AgentEvent::TurnStarted { thread, turn });
 
-        let snapshot = store.snapshot(thread).expect("snapshot");
+        let snapshot = store.snapshot(thread, usize::MAX).expect("snapshot");
         assert_eq!(snapshot.turn_id, turn);
         assert_eq!(
             shape(&snapshot),
@@ -2051,7 +2274,7 @@ mod tests {
         store.append(thread, usage(thread, turn, 10));
         store.append(thread, started(thread, turn, a, ItemKind::AgentMessage));
 
-        let snapshot = store.snapshot(thread).expect("snapshot");
+        let snapshot = store.snapshot(thread, usize::MAX).expect("snapshot");
         assert_eq!(
             shape(&snapshot),
             vec![
@@ -2088,7 +2311,7 @@ mod tests {
         );
         store.append(thread, output_delta(thread, turn, running, "after"));
 
-        let snapshot = store.snapshot(thread).expect("snapshot");
+        let snapshot = store.snapshot(thread, usize::MAX).expect("snapshot");
         assert_eq!(
             shape(&snapshot),
             vec![
@@ -2228,10 +2451,560 @@ mod tests {
             },
         );
 
-        let snapshot = store.snapshot(thread).expect("snapshot");
+        let snapshot = store.snapshot(thread, usize::MAX).expect("snapshot");
         assert_eq!(
             shape(&snapshot).last().map(String::as_str),
             Some("turn_completed")
+        );
+    }
+
+    // ---- Bounded snapshot and live-item paging (LP1–LP5) ----
+
+    /// Append `count` completed agent messages (start + completion) and return their ids in order.
+    fn push_messages(
+        store: &mut LiveTurnState,
+        thread: ThreadId,
+        turn: TurnId,
+        count: usize,
+    ) -> Vec<ItemId> {
+        (0..count)
+            .map(|n| {
+                let id = ItemId::new();
+                store.append(thread, started(thread, turn, id, ItemKind::AgentMessage));
+                store.append(
+                    thread,
+                    completed_message(thread, turn, id, &format!("message {n}")),
+                );
+                id
+            })
+            .collect()
+    }
+
+    fn completed_payload(
+        thread: ThreadId,
+        turn: TurnId,
+        id: ItemId,
+        payload: ItemPayload,
+    ) -> AgentEvent {
+        AgentEvent::ItemCompleted {
+            thread,
+            turn,
+            item: Item {
+                id,
+                harness_item_id: format!("h_{id}"),
+                payload,
+                created_at: Utc::now(),
+            },
+        }
+    }
+
+    fn diff_updated(thread: ThreadId, turn: TurnId) -> AgentEvent {
+        AgentEvent::DiffUpdated {
+            thread,
+            turn,
+            diff: giskard_core::diff::FileDiff {
+                path: "src/lib.rs".into(),
+                change: giskard_core::item::FileChangeKind::Modified,
+                old_text: Some("a".into()),
+                new_text: Some("b".into()),
+                hunks: Vec::new(),
+                binary: false,
+                captured: None,
+            },
+        }
+    }
+
+    fn file_change(status: &str) -> ItemPayload {
+        ItemPayload::FileChange {
+            path: "src/lib.rs".into(),
+            change: giskard_core::item::FileChangeKind::Modified,
+            changes: Vec::new(),
+            status: Some(status.into()),
+        }
+    }
+
+    fn tool_call(status: &str) -> ItemPayload {
+        ItemPayload::ToolCall {
+            name: "lookup".into(),
+            input: serde_json::Value::Null,
+            output: None,
+            server: None,
+            status: Some(status.into()),
+            metadata: None,
+            subagent: None,
+            error: None,
+        }
+    }
+
+    /// The start + completion pairs a run of completed items expands to.
+    fn pairs(ids: &[ItemId]) -> Vec<String> {
+        ids.iter()
+            .flat_map(|id| [format!("start:{id}"), format!("completed:{id}")])
+            .collect()
+    }
+
+    fn page(lookup: LiveItemsLookup) -> (Vec<ItemId>, bool) {
+        match lookup {
+            LiveItemsLookup::Page(page) => (
+                page.items.iter().map(|item| item.id).collect(),
+                page.has_more,
+            ),
+            other => panic!("expected a page, got {other:?}"),
+        }
+    }
+
+    fn live_turn(store: &mut LiveTurnState) -> (ThreadId, TurnId) {
+        let thread = ThreadId::new();
+        let turn = TurnId::new();
+        store.replace_turn_with_user_input(thread, turn, None);
+        store.append(thread, AgentEvent::TurnStarted { thread, turn });
+        (thread, turn)
+    }
+
+    #[test]
+    fn a_turn_within_the_limit_snapshots_exactly_as_unbounded() {
+        let mut store = LiveTurnState::new();
+        let (thread, turn) = live_turn(&mut store);
+        // Events ahead of the first item that a cut would leave out: still sent at the limit.
+        store.append(thread, approval_requested(thread, turn, "ap_done"));
+        store.resolve_approval(
+            thread,
+            ApprovalId("ap_done".into()),
+            ApprovalDecision::Accept,
+        );
+        store.append(thread, diff_updated(thread, turn));
+        push_messages(&mut store, thread, turn, 5);
+
+        let bounded = store.snapshot(thread, 100).expect("snapshot");
+        let unbounded = store.snapshot(thread, usize::MAX).expect("snapshot");
+        assert_eq!(bounded.omitted, None);
+        assert_eq!(
+            serde_json::to_value(&bounded).unwrap(),
+            serde_json::to_value(&unbounded).unwrap()
+        );
+        let at_limit = store.snapshot(thread, 5).expect("snapshot");
+        assert_eq!(at_limit.omitted, None, "exactly the limit is not a cut");
+        assert_eq!(
+            shape(&at_limit),
+            shape(&unbounded),
+            "exactly the limit is exactly unbounded"
+        );
+    }
+
+    #[test]
+    fn the_snapshot_carries_the_newest_items_and_counts_the_rest() {
+        let mut store = LiveTurnState::new();
+        let (thread, turn) = live_turn(&mut store);
+        let ids = push_messages(&mut store, thread, turn, 30);
+
+        let snapshot = store.snapshot(thread, 10).expect("snapshot");
+        let mut expected = vec!["turn_started".to_owned()];
+        expected.extend(pairs(&ids[20..]));
+        assert_eq!(shape(&snapshot), expected);
+        assert_eq!(
+            snapshot.omitted,
+            Some(OmittedItems {
+                count: 20,
+                before: ids[20],
+            })
+        );
+        assert_eq!(
+            store.snapshot(thread, 0).expect("snapshot").omitted,
+            Some(OmittedItems {
+                count: 29,
+                before: ids[29],
+            }),
+            "a limit of 0 reads as 1"
+        );
+    }
+
+    #[test]
+    fn what_is_still_changing_or_waiting_rides_along_above_the_tail() {
+        let mut store = LiveTurnState::new();
+        let (thread, turn) = live_turn(&mut store);
+        let reasoning = ItemId::new();
+        store.append(
+            thread,
+            started(thread, turn, reasoning, ItemKind::Reasoning),
+        );
+        store.append(thread, text_delta(thread, turn, reasoning, "thinking"));
+        let command = ItemId::new();
+        store.append(
+            thread,
+            AgentEvent::ItemStarted {
+                thread,
+                turn,
+                item: command_start(command),
+            },
+        );
+        store.append(thread, completed_command(thread, turn, command, "running"));
+        let settled_early = push_messages(&mut store, thread, turn, 1);
+        store.append(thread, approval_requested(thread, turn, "ap_open"));
+        store.append(thread, approval_requested(thread, turn, "ap_done"));
+        store.resolve_approval(
+            thread,
+            ApprovalId("ap_done".into()),
+            ApprovalDecision::Accept,
+        );
+        let closed = ServerRequestId("sr_closed".into());
+        store.append(thread, server_request_received(thread, turn, &closed));
+        store.append(
+            thread,
+            AgentEvent::ServerRequestResolved {
+                thread,
+                turn: Some(turn),
+                request_id: closed.clone(),
+            },
+        );
+        let open = ServerRequestId("sr_open".into());
+        store.append(thread, server_request_received(thread, turn, &open));
+        let answered = ServerRequestId("sr_answered".into());
+        store.append(thread, server_request_received(thread, turn, &answered));
+        store.resolve_server_request(thread, answered.clone());
+        store.append(
+            thread,
+            AgentEvent::Error {
+                thread,
+                turn: Some(turn),
+                error: giskard_core::error::HarnessError::Protocol("bad frame".into()),
+            },
+        );
+        store.append(
+            thread,
+            AgentEvent::Notice {
+                thread,
+                turn: Some(turn),
+                message: "heads up".into(),
+            },
+        );
+        store.append(thread, diff_updated(thread, turn));
+        let settled_late = push_messages(&mut store, thread, turn, 2);
+        let tail = push_messages(&mut store, thread, turn, 10);
+
+        let snapshot = store.snapshot(thread, 10).expect("snapshot");
+        let mut expected: Vec<String> = [
+            "turn_started".to_owned(),
+            format!("start:{reasoning}"),
+            format!("text:{reasoning}"),
+            format!("start:{command}"),
+            format!("completed:{command}"),
+            "approval:ap_open".to_owned(),
+            "server_request:sr_open".to_owned(),
+            "error".to_owned(),
+            "notice".to_owned(),
+        ]
+        .into();
+        expected.extend(pairs(&tail));
+        assert_eq!(shape(&snapshot), expected);
+        assert_eq!(
+            snapshot.omitted,
+            Some(OmittedItems {
+                count: (settled_early.len() + settled_late.len()) as u32,
+                before: tail[0],
+            })
+        );
+        assert_eq!(
+            outstanding_approvals(&snapshot),
+            vec![ApprovalId("ap_open".into())]
+        );
+        assert_eq!(outstanding_server_requests(&snapshot), vec![open]);
+    }
+
+    #[test]
+    fn a_completion_that_is_still_running_is_never_omitted() {
+        let mut store = LiveTurnState::new();
+        let (thread, turn) = live_turn(&mut store);
+        let [file_running, file_done, tool_running, tool_done] =
+            std::array::from_fn(|_| ItemId::new());
+        for (id, payload) in [
+            (file_running, file_change("inProgress")),
+            (file_done, file_change("completed")),
+            (tool_running, tool_call("running")),
+            (tool_done, tool_call("completed")),
+        ] {
+            store.append(thread, completed_payload(thread, turn, id, payload));
+        }
+        let tail = push_messages(&mut store, thread, turn, 1);
+
+        let snapshot = store.snapshot(thread, 1).expect("snapshot");
+        let mut expected = vec![
+            "turn_started".to_owned(),
+            format!("completed:{file_running}"),
+            format!("completed:{tool_running}"),
+        ];
+        expected.extend(pairs(&tail));
+        assert_eq!(shape(&snapshot), expected);
+        assert_eq!(snapshot.omitted.map(|omitted| omitted.count), Some(2));
+    }
+
+    #[test]
+    fn the_cursor_names_a_completed_item_when_the_tail_has_one() {
+        let mut store = LiveTurnState::new();
+        let (thread, turn) = live_turn(&mut store);
+        let settled = push_messages(&mut store, thread, turn, 3);
+        let open = ItemId::new();
+        store.append(thread, started(thread, turn, open, ItemKind::AgentMessage));
+        store.append(thread, text_delta(thread, turn, open, "still writing"));
+        let completed = push_messages(&mut store, thread, turn, 1);
+
+        // The open item is at the cut, but an item that never completes is never persisted, so
+        // the cursor is the first completed one after it, which the payload will hold.
+        let snapshot = store.snapshot(thread, 2).expect("snapshot");
+        assert_eq!(
+            snapshot.omitted,
+            Some(OmittedItems {
+                count: 3,
+                before: completed[0],
+            })
+        );
+        let mut expected = vec![
+            "turn_started".to_owned(),
+            format!("start:{open}"),
+            format!("text:{open}"),
+        ];
+        expected.extend(pairs(&completed));
+        assert_eq!(shape(&snapshot), expected);
+        assert_eq!(
+            page(store.items_page(thread, turn, Some(completed[0]), 10)),
+            (settled.clone(), false),
+            "the open item between the cut and the cursor is not in a page"
+        );
+
+        // A tail with nothing completed falls back to the item at the cut.
+        let snapshot = store.snapshot(thread, 1).expect("snapshot");
+        assert_eq!(
+            snapshot.omitted.map(|omitted| omitted.before),
+            Some(completed[0])
+        );
+        let mut store = LiveTurnState::new();
+        let (thread, turn) = live_turn(&mut store);
+        push_messages(&mut store, thread, turn, 3);
+        let open = ItemId::new();
+        store.append(thread, started(thread, turn, open, ItemKind::AgentMessage));
+        store.append(thread, text_delta(thread, turn, open, "still writing"));
+        let snapshot = store.snapshot(thread, 1).expect("snapshot");
+        assert_eq!(
+            snapshot.omitted,
+            Some(OmittedItems {
+                count: 3,
+                before: open,
+            })
+        );
+    }
+
+    #[test]
+    fn pages_walk_the_settled_items_backwards_from_the_cursor() {
+        let mut store = LiveTurnState::new();
+        let (thread, turn) = live_turn(&mut store);
+        let ids = push_messages(&mut store, thread, turn, 30);
+
+        assert_eq!(
+            page(store.items_page(thread, turn, Some(ids[20]), 10)),
+            (ids[10..20].to_vec(), true)
+        );
+        assert_eq!(
+            page(store.items_page(thread, turn, Some(ids[10]), 10)),
+            (ids[..10].to_vec(), false)
+        );
+        assert_eq!(
+            page(store.items_page(thread, turn, None, 10)),
+            (ids[20..].to_vec(), true)
+        );
+        assert_eq!(
+            page(store.items_page(thread, turn, Some(ids[20]), 3)),
+            (ids[17..20].to_vec(), true)
+        );
+        assert!(matches!(
+            store.items_page(thread, turn, Some(ItemId::new()), 10),
+            LiveItemsLookup::UnknownCursor
+        ));
+        assert!(matches!(
+            store.items_page(thread, TurnId::new(), None, 10),
+            LiveItemsLookup::NotLive
+        ));
+        assert!(matches!(
+            store.items_page(ThreadId::new(), turn, None, 10),
+            LiveItemsLookup::NotLive
+        ));
+    }
+
+    #[test]
+    fn a_page_never_carries_an_open_or_running_item() {
+        let mut store = LiveTurnState::new();
+        let (thread, turn) = live_turn(&mut store);
+        let first = push_messages(&mut store, thread, turn, 2);
+        let command = ItemId::new();
+        store.append(
+            thread,
+            AgentEvent::ItemStarted {
+                thread,
+                turn,
+                item: command_start(command),
+            },
+        );
+        store.append(thread, completed_command(thread, turn, command, "running"));
+        let open = ItemId::new();
+        store.append(thread, started(thread, turn, open, ItemKind::AgentMessage));
+        store.append(thread, text_delta(thread, turn, open, "still writing"));
+        let last = push_messages(&mut store, thread, turn, 1);
+
+        let expected: Vec<ItemId> = first.iter().chain(&last).copied().collect();
+        assert_eq!(
+            page(store.items_page(thread, turn, None, 100)),
+            (expected, false)
+        );
+        assert_eq!(
+            page(store.items_page(thread, turn, Some(open), 100)),
+            (first, false),
+            "an open item serves as a cursor"
+        );
+    }
+
+    #[test]
+    fn a_completed_reasoning_note_is_previewed_and_an_open_one_is_not() {
+        let mut store = LiveTurnState::new();
+        let (thread, turn) = live_turn(&mut store);
+        let long = ItemId::new();
+        let short = ItemId::new();
+        let open = ItemId::new();
+        let long_text = "a long thought.\n".repeat(192); // 3 KiB over many lines
+        for (id, text) in [(long, long_text.as_str()), (short, "brief")] {
+            store.append(thread, started(thread, turn, id, ItemKind::Reasoning));
+            store.append(
+                thread,
+                completed_payload(
+                    thread,
+                    turn,
+                    id,
+                    ItemPayload::Reasoning { text: text.into() },
+                ),
+            );
+        }
+        store.append(thread, started(thread, turn, open, ItemKind::Reasoning));
+        store.append(thread, text_delta(thread, turn, open, &long_text));
+
+        let reasoning = |item: &WireItem| match &item.payload {
+            WireItemPayload::Reasoning { text, preview } => (text.len(), preview.is_some()),
+            other => panic!("expected reasoning, got {other:?}"),
+        };
+        let snapshot = store.snapshot(thread, usize::MAX).expect("snapshot");
+        let completions: Vec<(usize, bool)> = snapshot
+            .accumulated
+            .iter()
+            .filter_map(|event| match event {
+                WireAgentEvent::ItemCompleted { item, .. } => Some(reasoning(item)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(completions.len(), 2);
+        assert!(
+            completions[0].0 <= 1024 && completions[0].1,
+            "{completions:?}"
+        );
+        assert_eq!(completions[1], ("brief".len(), false));
+        assert_eq!(texts(&snapshot), vec![long_text.as_str()]);
+
+        let LiveItemsLookup::Page(paged) = store.items_page(thread, turn, None, 10) else {
+            panic!("live page");
+        };
+        let paged: Vec<(usize, bool)> = paged.items.iter().map(reasoning).collect();
+        assert_eq!(paged, completions);
+    }
+
+    #[test]
+    fn a_cut_keeps_pending_starts_and_usage_last() {
+        let mut store = LiveTurnState::new();
+        let (thread, turn) = live_turn(&mut store);
+        push_messages(&mut store, thread, turn, 3);
+        store.append(thread, usage(thread, turn, 10));
+        let waiting = ItemId::new();
+        store.append(thread, started(thread, turn, waiting, ItemKind::Reasoning));
+        let tail = push_messages(&mut store, thread, turn, 1);
+
+        let snapshot = store.snapshot(thread, 1).expect("snapshot");
+        let mut expected = vec!["turn_started".to_owned()];
+        expected.extend(pairs(&tail));
+        expected.extend([format!("start:{waiting}"), "usage".to_owned()]);
+        assert_eq!(shape(&snapshot), expected);
+    }
+
+    #[test]
+    fn a_turn_completed_before_the_cut_rides_along() {
+        let mut store = LiveTurnState::new();
+        let (thread, turn) = live_turn(&mut store);
+        push_messages(&mut store, thread, turn, 3);
+        store.append(
+            thread,
+            AgentEvent::TurnCompleted {
+                thread,
+                turn,
+                usage: giskard_core::token::TokenUsage::default(),
+                status: giskard_core::turn::TurnStatus {
+                    kind: giskard_core::turn::TurnStatusKind::Completed,
+                    message: None,
+                },
+            },
+        );
+        let tail = push_messages(&mut store, thread, turn, 2);
+
+        let snapshot = store.snapshot(thread, 2).expect("snapshot");
+        let mut expected = vec!["turn_started".to_owned(), "turn_completed".to_owned()];
+        expected.extend(pairs(&tail));
+        assert_eq!(shape(&snapshot), expected);
+        assert_eq!(snapshot.omitted.map(|omitted| omitted.count), Some(3));
+    }
+
+    #[test]
+    fn the_prompt_echo_rides_along_and_a_steer_pages_like_any_item() {
+        let mut store = LiveTurnState::new();
+        let (thread, turn) = live_turn(&mut store);
+        let user_message = |id: ItemId, text: &str| {
+            completed_payload(
+                thread,
+                turn,
+                id,
+                ItemPayload::UserMessage { text: text.into() },
+            )
+        };
+        let prompt = ItemId::new();
+        store.append(thread, started(thread, turn, prompt, ItemKind::UserMessage));
+        store.append(thread, user_message(prompt, "do the thing"));
+        let before_steer = push_messages(&mut store, thread, turn, 15);
+        let steer = ItemId::new();
+        store.append(thread, user_message(steer, "and also this"));
+        let after_steer = push_messages(&mut store, thread, turn, 15);
+        let messages: Vec<ItemId> = before_steer.iter().chain(&after_steer).copied().collect();
+
+        let snapshot = store.snapshot(thread, 10).expect("snapshot");
+        let mut expected = vec![
+            "turn_started".to_owned(),
+            format!("start:{prompt}"),
+            format!("completed:{prompt}"),
+        ];
+        expected.extend(pairs(&messages[20..]));
+        assert_eq!(shape(&snapshot), expected);
+        // Thirty messages and the steer precede nothing but the tail; the echo is not counted.
+        assert_eq!(
+            snapshot.omitted,
+            Some(OmittedItems {
+                count: 30 + 1 - 10,
+                before: messages[20],
+            })
+        );
+
+        let mut paged = Vec::new();
+        let mut before = Some(messages[20]);
+        while let Some(cursor) = before {
+            let (ids, has_more) = page(store.items_page(thread, turn, Some(cursor), 10));
+            before = has_more.then(|| ids[0]);
+            paged.splice(0..0, ids);
+        }
+        let mut expected: Vec<ItemId> = before_steer.clone();
+        expected.push(steer);
+        expected.extend(&after_steer[..5]);
+        assert_eq!(
+            paged, expected,
+            "the steer pages at its position, the echo never"
         );
     }
 }

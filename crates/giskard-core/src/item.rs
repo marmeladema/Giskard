@@ -263,6 +263,15 @@ pub fn serialize_tool_output(
     Ok((bytes, descriptor))
 }
 
+/// Returns true when a file-change status string denotes a patch still being applied. Codex reports
+/// `inProgress` on `item/started` and a terminal `completed` / `failed` / `declined` afterwards.
+pub fn file_change_status_is_running(status: &str) -> bool {
+    matches!(
+        normalized_command_status(status).as_str(),
+        "in_progress" | "inprogress" | "running"
+    )
+}
+
 /// Tool-call statuses which still describe a nonterminal result.
 pub fn tool_status_is_running(status: &str) -> bool {
     matches!(
@@ -490,6 +499,16 @@ mod tests {
         }
         assert!(!tool_status_is_running("completed"));
         assert!(!tool_status_is_running("provider_specific_terminal"));
+    }
+
+    #[test]
+    fn file_change_running_status_normalizes_provider_spellings() {
+        for status in ["inProgress", "in_progress", "IN-PROGRESS", "running"] {
+            assert!(file_change_status_is_running(status), "{status}");
+        }
+        for status in ["completed", "failed", "declined"] {
+            assert!(!file_change_status_is_running(status), "{status}");
+        }
     }
 
     #[test]

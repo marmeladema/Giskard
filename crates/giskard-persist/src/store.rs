@@ -1698,6 +1698,20 @@ impl PersistStore {
         turn: TurnId,
         item_id: ItemId,
     ) -> Result<Option<Item>, PersistError> {
+        Ok(self
+            .load_turn_items(project, thread, turn)
+            .await?
+            .and_then(|items| items.into_iter().find(|item| item.id == item_id)))
+    }
+
+    /// Load every item of an indexed turn, in display order. `None` when the turn is not indexed
+    /// or its payload is missing.
+    pub async fn load_turn_items(
+        &self,
+        project: ProjectId,
+        thread: ThreadId,
+        turn: TurnId,
+    ) -> Result<Option<Vec<Item>>, PersistError> {
         self.ensure_migrated(project, thread).await;
         let records = self.load_turn_records_unlocked(project, thread).await?;
         if !records.iter().any(|record| record.turn_id == turn) {
@@ -1721,7 +1735,7 @@ impl PersistStore {
                 .await?
                 .map(|payload| payload.items)
         };
-        Ok(loaded_items.and_then(|items| items.into_iter().find(|item| item.id == item_id)))
+        Ok(loaded_items)
     }
 
     /// Load one terminal command's retained output from an indexed immutable turn payload.
@@ -5168,6 +5182,67 @@ mod layout_tests {
             command_status(&after[0].items[0]),
             (Some("completed"), Some(0), "all tests passed"),
             "load_all_turns must not serve a pre-amendment cache"
+        );
+    }
+
+    /// The items page reads the whole list, so it has to come back in display order even when an
+    /// amendment for an earlier item sits last in the file.
+    #[tokio::test]
+    async fn load_turn_items_returns_display_order_after_an_earlier_item_is_amended() {
+        let (_tmp, store) = make_store();
+        let pid = ProjectId::new();
+        let tid = ThreadId::new();
+
+        let command = giskard_core::ItemId::new();
+        let middle = item("between");
+        let last = item("and here is what I found");
+        let turn = turn_with_items(
+            "run the tests",
+            vec![running_command_item(command), middle.clone(), last.clone()],
+        );
+        store.append_turn(pid, tid, &turn).await.unwrap();
+        let outcome = store
+            .amend_turn_item(pid, tid, turn.id, &settled_command_item(command))
+            .await
+            .unwrap();
+        assert_eq!(outcome, AmendOutcome::Amended);
+
+        let items = store
+            .load_turn_items(pid, tid, turn.id)
+            .await
+            .unwrap()
+            .expect("an indexed turn");
+        assert_eq!(
+            items.iter().map(|item| item.id).collect::<Vec<_>>(),
+            vec![command, middle.id, last.id]
+        );
+        assert_eq!(command_status(&items[0]).0, Some("completed"));
+        assert!(
+            store
+                .load_turn_items(pid, tid, giskard_core::TurnId::new())
+                .await
+                .unwrap()
+                .is_none(),
+            "an unindexed turn has no items"
+        );
+    }
+
+    #[tokio::test]
+    async fn load_turn_items_reads_a_flat_layout_turn() {
+        let (_tmp, store) = make_store();
+        let pid = ProjectId::new();
+        let tid = ThreadId::new();
+        write_format1_thread(&store, pid, &test_thread(pid, tid), &[]).await;
+        store.unmigratable.write().await.insert((pid, tid));
+
+        let items = vec![item("first"), item("second")];
+        let turn = turn_with_items("prompt", items.clone());
+        store.append_turn(pid, tid, &turn).await.unwrap();
+        assert_eq!(store.thread_layout(pid, tid).await, ThreadLayout::Flat);
+
+        assert_eq!(
+            store.load_turn_items(pid, tid, turn.id).await.unwrap(),
+            Some(items)
         );
     }
 
