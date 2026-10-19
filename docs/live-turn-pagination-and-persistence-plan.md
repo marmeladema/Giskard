@@ -281,87 +281,98 @@ items and then holds the turn open, reload, assert the marker and tail, page by 
 scroll, assert every item present once and in order, then let the turn complete and assert the
 persisted rendering matches.
 
-### P1 — The live payload file (durable format change, own review)
+### P1 — The live turn file (durable format change, own review)
 
-**Layout.** A live turn is a file in a new per-thread directory, written in the **payload format**:
+Detailed plan: [`live-turn-pagination-and-persistence-plan/p1-live-turn-file.md`](live-turn-pagination-and-persistence-plan/p1-live-turn-file.md).
+Where it refines what follows, it wins.
+
+**Layout.** A thread's live turn accumulates in one file, written in the **payload format**:
 
 ```
 threads/<thread_id>/
 ├── history.jsonl
-├── turns/<turn_id>.jsonl          # committed payloads, exactly as today
-└── live/<turn_id>.jsonl           # the one in-flight turn's payload, being extended
+├── live.jsonl                     # the one in-flight turn's payload, being extended
+└── turns/<turn_id>.jsonl          # committed payloads, exactly as today
 ```
 
-A separate directory rather than a suffix in `turns/` keeps the invariant "everything in `turns/`
-is a committed payload" true by construction, leaves `sweep-orphan-payloads` and
-`history_validation_errors` untouched, and makes the recovery check a single `stat` of a directory
-that is normally absent. A rename within the thread directory is atomic and same-filesystem.
+One file, not a directory: a thread has at most one live turn (the turn gate admits one owner), and
+every payload names its own turn in its first record (`{"kind":"turn_header", …, "turn_id":"…"}`),
+so recovery reads the id from the file and commit knows it from the forwarder. A fixed path keeps
+the recovery check to one `stat`, leaves `sweep-orphan-payloads` and validation untouched (both
+look at `turns/` and the index), and makes "`turns/` holds only committed payloads" visible on disk.
+It is JSONL in the payload format, never a rewritten whole-file JSON: a rewrite per item is
+quadratic, and the point of the milestone is that finishing a turn is a rename.
 
-**Birth.** On the forwarder's first owned event for a turn, write `live/<turn_id>.jsonl` with
-temp + fsync + rename, containing the `turn_header` and the `user_input` record. From that moment
-a crash can no longer lose the prompt. The header gains optional bounded fields the index record
-will need and the payload does not carry: `model`, `mode`, `started_at`. `PayloadTurnHeader` has no
-`deny_unknown_fields`, so older builds read such a header unchanged; in the committed file these
-fields are redundant with the index and ignored. (Alternative: a new `kind: "live"` record. Older
-builds would warn once per file; decide at review, the header route is quieter.)
+**Birth.** When the forwarder attaches to a turn, the store writes `live.jsonl` with temp + fsync +
+rename, containing the `turn_header` and the `user_input` record. From that moment a crash can no
+longer lose the prompt. The header gains optional bounded fields the index record will need and
+the payload does not carry — `model`, `mode`, `started_at` — written only for a live file and
+ignored by every reader but recovery; format stays 1, and the whole-file writer's output is
+byte-identical to today.
 
 **Extension.** One appended `item` record per `ItemCompleted`, with its display `index`, exactly
-the record `payload_file_bytes` writes and `amend_turn_item` appends — one `write_all`, no fsync
-(LA5). A repeat completion appends another record without `index`, which the reader folds last-wins
-into the first slot. One appended `usage` record (new bounded kind, last-wins singleton) per
-`TurnUsageUpdated`, so recovery can credit the ledger. Deltas are never written: the spec makes
-them transient, and `ItemCompleted` carries the canonical form. Diffs are written at commit as
-today (fold by path makes per-update appends possible later if wanted).
+the record the whole-file writer produces and `amend_turn_item` appends — one `write_all`, no fsync
+(LA5). A repeat completion folds into its slot. One appended `usage` record (a new bounded
+last-wins singleton kind) per `TurnUsageUpdated`, carrying the model the event names when it names
+one, so recovery can credit the ledger to the right model: the forwarder adopts that model into a
+turn that started without one, and the index record it would have written names it. Deltas are
+never written: the spec makes them transient, and `ItemCompleted` carries the canonical form. Diffs
+are written at commit, as today.
 
-**Commit.** Append the `status` record and the `diff` records, `fsync`, rename
-`live/<id>.jsonl` → `turns/<id>.jsonl`, then take the existing index path.
-`append_turn_unlocked` already has the branch "payload exists → skip the payload write, append the
-index record" for the retry case; the rename is its second producer, and that comment must say so.
-Payload-first, index-last is preserved. For a large turn this is cheaper than today's whole-file
-serialization — this is the "finishing a turn moves the file" the request asked for.
+**Authority.** The header fields and the `usage` records duplicate what the index record carries
+once the turn commits. For a turn the index references, the index record is the **sole** authority
+for `model`, `mode`, `usage`, `started_at` and `completed_at`, as `TurnRecord::into_turn` already
+behaves; the header fields and `usage` records are recovery inputs, read only to build the index
+record a crash prevented and by `validate`, and never by `into_turn`, `load_turns`,
+`recompute_aggregates` or a wire read. `validate` reports a header whose known model or mode
+differs from its record's as damage; it does not treat a header without a model beside a record
+with one (the adopted-model case), or the interim `usage` records, as disagreement.
 
-`parse_turn_payload` folds collections by identity and singletons last-wins, so a file built
-incrementally parses to the same `TurnPayload` as the file a whole write would have produced. A
-test asserts that equality for a representative turn, including a repeat completion.
+**Commit.** The store's existing commit path learns one more case: when this thread's registered
+live file is for the turn being committed, it appends the `status` and `diff` records, fsyncs,
+renames `live.jsonl` → `turns/<turn_id>.jsonl`, and falls into the branch it already has for a
+payload that exists, which appends the index record. Payload first, index last, unchanged; the
+forwarder's commit code does not change. For a large turn this is cheaper than today's whole-file
+serialization. A file built incrementally parses to the same `TurnPayload` as the whole write would
+have produced, and a test asserts it.
 
 **Failure policy.** The live file is best effort and never makes commit less reliable than today.
-A failed birth or append is logged at `warn` once per turn (not per item), the writer is disabled
-for the rest of that turn, and commit falls back to the whole-file write because the payload is
-absent. A thread on the flat layout has no per-turn files and gets no live file, reported like LA4.
+A failed birth or append is logged at `warn` once per turn, the writer is marked failed, a partial
+file is deleted so it cannot be finished into a payload missing items, and commit writes whole as
+it does now. A thread on the flat layout has no per-turn files and gets no live file, reported
+like LA4.
 
-**Writer ownership.** The forwarder is already the single owner of `CurrentTurnItems` and the
-caller of `persist_turn`; it holds a `LiveTurnWriter` obtained from the store through
-`ThreadMetadataService` (birth, `append_item`, `append_usage`, `commit`). Writes go through
-`tokio::fs` (the blocking pool); item completions are far too infrequent for a queue to matter.
-The store registers open writers by `(ThreadId, TurnId)` under the per-thread lock so recovery can
-tell a crashed file from one being written in this process.
+**Writer ownership.** The store owns the open file handle, one per thread at most, registered at
+birth and removed at commit or discard. The forwarder, already the single owner of the turn's items
+and the caller of `persist_turn`, calls `begin`, `append_item` and `append_usage` through
+`ThreadMetadataService`. The registry of open handles is what tells recovery a live file is in use
+rather than stale.
 
-**Recovery.** A `live/<id>.jsonl` with no registered writer is a crashed turn. Recovery runs once
-per process per thread, under the thread lock, from the same gate every read and write path already
-passes (`ensure_migrated`, `store.rs:699`), so it always precedes the first turn this process runs
-on that thread and the recovered record lands in the index before any newer turn's. It parses the
-file best-effort, builds a `Turn` with status `Interrupted` and a bounded message ("Giskard stopped
-before this turn completed; N items recovered"), `usage` from the last `usage` record,
-`completed_at` = the last recovered item's `created_at`, else `started_at` — never the recovery
-wall clock, so a thread that crashed days ago does not jump to the top of the list (spec §5.4
-repair recency rule) — and commits it through the normal path (rename + index + aggregates). A live
-file that lost its prologue (no `user_input`) is quarantined to `.corrupt-<ts>` like any
-unreadable payload. `giskard-admin validate` reports an unrecovered live file per thread;
-`recover-live-turns` performs recovery with the data-directory lock, for operators who want it done
-before starting the server.
+**Recovery.** A `live.jsonl` with no registered writer is a crashed turn. Recovery runs once per
+process per thread, under the thread lock, from the same gate every read and write path already
+passes (beside `ensure_migrated`), and birth runs it first, so it always precedes the first turn
+this process runs on that thread and the recovered record lands in the index before any newer
+turn's. It parses the file best-effort, builds a `Turn` with status `Interrupted` and a bounded
+message, usage from the last `usage` record, the model by the forwarder's adoption rule (the
+header's when known, else the last `usage` record's), `completed_at` = the last recovered item's
+`created_at`, else `started_at` — never the recovery wall clock, so a thread that crashed days ago
+does not jump to the top of the list (spec §5.4 repair recency rule) — and commits it through the
+normal path with `RestoreActivity`. A live file whose turn is already in `turns/` is a leftover and
+is deleted; one that lost its prologue is quarantined to `.corrupt-<ts>`. `giskard-admin validate`
+reports an unrecovered live file; `recover-live-turns` recovers them under the data-directory lock.
 
 **Documentation that must move in the same change.** Spec §5.2 (layout), §5.4 (a third appended
-file; commit as rename; recovery rule), §5.5 (admin), a 1.100 changelog; `README.md` storage
-layout and admin commands; `AGENTS.md` conventions ("Two files are appended to… Nothing else
-appends" becomes three, and the commit rule gains the rename).
+file; commit as rename; recovery rule; the header fields and the `usage` kind under format
+identification), §5.5 (admin), a 1.102 changelog; `README.md` storage layout and admin commands;
+`AGENTS.md` conventions ("Two files are appended to… Nothing else appends" becomes three, and the
+commit rule gains the rename).
 
 Tests: store tests for birth atomicity, append, repeat completion, usage last-wins, commit rename
-plus index, fold equality with the whole-file write, torn tail, recovery (items, usage,
-`completed_at` rule, recency), lost prologue, write-failure fallback, flat layout, sweep and
-validate behaviour, `.deleting` rename of a thread with a live file; forwarder tests with a failing
-store (`#[traced_test]` asserting the once-per-turn warning); an integration test that kills the
-replay server mid-turn (or drops the forwarder without the stream ending) and asserts the thread
-reopens with the recovered turn.
+plus index, fold equality with the whole-file write, torn tail, recovery (items, usage, adopted
+model, `completed_at` rule, recency), lost prologue, leftover file, write-failure fallback, flat
+layout, `into_turn` ignoring header and `usage` records, validate (including the header/record
+disagreement) and the admin command; forwarder tests with the fake harness; an integration test that
+starts a server on a directory prepared the way a crash leaves it and asserts the recovered turn.
 
 ### L3 — Bounded persisted turns (optional, extends L2)
 
