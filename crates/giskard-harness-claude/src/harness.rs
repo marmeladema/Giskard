@@ -27,7 +27,9 @@ use tokio::time::Instant;
 use tracing::{debug, info, warn};
 
 use crate::attachments::user_message_line;
-use crate::catalog::{ANTHROPIC_PROVIDER_ID, CatalogSnapshot, descriptors, parse_entries};
+use crate::catalog::{
+    ANTHROPIC_PROVIDER_ID, CatalogSnapshot, anthropic_model, descriptors, parse_entries,
+};
 use crate::frame::Frame;
 use crate::ids::is_task_native_id;
 use crate::log_fields::display_opt;
@@ -199,6 +201,19 @@ impl ClaudeHarness {
 
     fn catalog_snapshot(&self) -> Option<CatalogSnapshot> {
         lock(&self.catalog).clone()
+    }
+
+    /// Hand a new mapper the catalog's `(value, resolvedModel)` pairs, so a sub-agent's frame
+    /// model id is reported as the selector the picker shows.
+    fn seed_catalog(&self, mapper: &mut ClaudeMapper) {
+        if let Some(snapshot) = lock(&self.catalog).as_ref() {
+            mapper.note_catalog(snapshot.entries.iter().filter_map(|entry| {
+                entry
+                    .resolved_model
+                    .clone()
+                    .map(|resolved| (entry.value.clone(), resolved))
+            }));
+        }
     }
 
     /// Threads whose child runs.
@@ -455,9 +470,8 @@ impl ClaudeHarness {
             "Claude Code applied a different model than the one requested"
         );
         Some(ModelRef {
-            provider: ANTHROPIC_PROVIDER_ID.into(),
-            model: applied.model,
             reasoning_effort: applied.effort.map(Effort),
+            ..anthropic_model(applied.model)
         })
     }
 
@@ -902,6 +916,7 @@ impl ClaudeHarness {
             self.resumed_model(&target, &session_id, spawned.handshake.applied.clone());
         let mut mapper =
             ClaudeMapper::new(thread, session_id.clone(), target.workspace_root.clone());
+        self.seed_catalog(&mut mapper);
         // The handshake set `default`; a `status` it emitted (mapped from `early_lines`) is not
         // drift.
         mapper.set_expected_mode("default");
@@ -1870,6 +1885,7 @@ impl AgentHarness for ClaudeHarness {
             self.resumed_model(&target, &session_id, spawned.handshake.applied.clone());
         let mut mapper =
             ClaudeMapper::new(opts.thread, session_id.clone(), opts.workspace_root.clone());
+        self.seed_catalog(&mut mapper);
         // The handshake set `default`; a `status` it emitted (mapped from `early_lines`) is not
         // drift.
         mapper.set_expected_mode("default");
@@ -2308,6 +2324,7 @@ mod tests {
     use tracing_test::traced_test;
 
     use super::*;
+    use crate::catalog::anthropic_model as model;
     use crate::log_checks::{a_line_with, lines_with, no_line_with};
     use crate::process::MAX_STDOUT_LINE_BYTES;
     use crate::process::tests::fake_claude;
@@ -2363,14 +2380,6 @@ mod tests {
         let harness =
             ClaudeHarness::with_spawner(PathBuf::from(WORKSPACE), launch, spawner.clone());
         (harness, spawner)
-    }
-
-    fn model(name: &str) -> ModelRef {
-        ModelRef {
-            provider: ANTHROPIC_PROVIDER_ID.into(),
-            model: name.into(),
-            reasoning_effort: None,
-        }
     }
 
     fn open_options(
@@ -6448,7 +6457,9 @@ mod tests {
             route.agent_name.as_deref(),
             Some("Read and find magic number")
         );
-        assert_eq!(route.resumed_model, Some(model("sonnet")));
+        // The `Agent` call named no model, so the route claims none: the session's `sonnet` may
+        // not be the sub-agent's.
+        assert_eq!(route.resumed_model, None);
         assert_eq!(
             route.parent_harness_thread_id.as_deref(),
             Some(handle.harness_thread_id.as_str())
@@ -6494,6 +6505,12 @@ mod tests {
             event,
             AgentEvent::ItemCompleted { item, .. }
                 if matches!(&item.payload, giskard_core::item::ItemPayload::UserMessage { .. })
+        )));
+        // The sub-agent's frames name `claude-haiku-4-5-20251001`, which the handshake's catalog
+        // resolves `haiku` to: its usage reports the selector the picker shows.
+        assert!(events.iter().any(|event| matches!(
+            event,
+            AgentEvent::TurnUsageUpdated { model: Some(reported), .. } if *reported == model("haiku")
         )));
         assert_eq!(
             completion(&until_completed(&mut stream).await).1,

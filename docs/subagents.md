@@ -94,6 +94,13 @@ minted; the Sub-agents monitor names it after the call's `description`.
   (`--forward-subagent-text`): the delegated prompt as the turn's user message, the sub-agent's
   own tool calls and results, its thinking when shown, and its closing message. Its usage comes
   from its own API messages.
+- **Model.** A sub-agent need not run on its parent's model: the `Agent` call may ask for one
+  (`model: "haiku"`), and an agent definition or Claude Code's sub-agent default may pick another.
+  The child thread starts on the model the call asked for, or shows the model as unreported when
+  it asked for none, and switches to the model the sub-agent's own messages name as soon as the
+  first one arrives (shown as the picker's alias when the model catalog has one, such as `haiku`
+  for `claude-haiku-4-5-…`). Its context gauge counts the sub-agent's own tokens against an
+  unknown window: Claude Code reports no window for a sub-agent, and the parent's may not be its.
 - **Permanently read-only, never resumable.** There is no session to attach, so the thread stays
   read-only forever. Reopening it after a restart (or after its parent's process ended) shows its
   persisted history over a silent live stream; nothing is spawned or resumed for it.

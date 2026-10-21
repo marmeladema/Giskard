@@ -31,6 +31,7 @@ use giskard_core::turn::{TurnStatus, TurnStatusKind};
 use serde_json::{Value, json};
 use tracing::{debug, error, info, warn};
 
+use crate::catalog::{DEFAULT_ALIAS, anthropic_model};
 use crate::frame::{
     BlockStart, Delta, Frame, FrameError, StreamEvent, StreamEventKind, redact_serde_error,
 };
@@ -46,6 +47,11 @@ const RATE_LIMIT_NOTICE_UTILIZATION: f64 = 0.9;
 
 /// The tool whose `tool_use` block delegates to a sub-agent and mints a route.
 const AGENT_TOOL: &str = "Agent";
+/// The `Agent` call's `model` that asks for the spawning conversation's model; it names none.
+const INHERIT_MODEL: &str = "inherit";
+/// The `message.model` of an `assistant` message the CLI wrote itself (an API error's text), with
+/// zero usage: no model ran it.
+const SYNTHETIC_MODEL: &str = "<synthetic>";
 
 /// Where a frame's items belong: the child process's own thread, or a sub-agent route.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -133,6 +139,10 @@ pub enum MapperOutput {
         parent_harness_thread_id: String,
         /// `input.description`, the thread's name.
         agent_name: Option<String>,
+        /// `input.model` of the `Agent` call: the model the delegation asked for, which the
+        /// thread shows until the sub-agent's first frame names the one it runs on. `None` when
+        /// the call named none (or `inherit`): an agent definition or the CLI's default decides.
+        model: Option<ModelRef>,
     },
     /// A route was dropped: no further event is mapped onto it and its asks are gone. Its log stays
     /// open for the sub-agent thread.
@@ -179,6 +189,9 @@ struct SessionState {
     model_usage_window: Option<u32>,
     /// The non-`none` `apiKeySource` already surfaced, so a re-emitted `init` does not repeat it.
     api_key_source_noticed: Option<String>,
+    /// `(value, resolvedModel)` of the catalog entries the façade seeded (`note_catalog`), so a
+    /// sub-agent's frame model id reads as the picker's selector (`claude-haiku-…` → `haiku`).
+    catalog: Vec<(String, String)>,
     // ENTITY-AUTHORITY-EXCEPTION:
     // Role: Remember each Claude Code task's type, which only `task_started` carries, and the
     //   sub-agent route of a `local_agent` task, so an ask's `agent_id` or a `task_updated`
@@ -255,6 +268,8 @@ struct RouteSeed {
     subagent_type: Option<String>,
     description: Option<String>,
     is_backgrounded: bool,
+    /// `input.model` of the `Agent` call, `inherit` excluded.
+    model: Option<String>,
 }
 
 /// One sub-agent route: an `Agent` call (or a forked skill's `Skill` call) of this session and
@@ -329,8 +344,12 @@ impl RouteState {
 struct TurnState {
     id: TurnId,
     kind: TurnKind,
-    /// The model the adapter asked for on this turn, through `note_turn_model`.
+    /// The model the adapter asked for on this turn, through `note_turn_model`; on a route's
+    /// turn, the model its latest `assistant` frame named.
     model: Option<ModelRef>,
+    /// A route turn's `message.model` as the frame spelled it, so an unchanged model is not looked
+    /// up again on every frame.
+    native_model: Option<String>,
     /// The latest single API request's usage, which is what occupies the context window now: a
     /// `message_delta`'s, then the last `result.usage.iterations` entry. `TurnUsageUpdated`
     /// carries it.
@@ -338,8 +357,8 @@ struct TurnState {
     /// The sum of every `result.usage` of the turn, which `TurnCompleted` carries. A held result
     /// and the CLI's continuation result are two halves of one turn, so they add up.
     result_usage: Option<TokenUsage>,
-    /// Last `(usage, context_window)` pair emitted as `TurnUsageUpdated`, for dedup.
-    emitted_usage: Option<(TokenUsage, Option<u32>)>,
+    /// Last `(usage, context_window, model)` emitted as `TurnUsageUpdated`, for dedup.
+    emitted_usage: Option<(TokenUsage, Option<u32>, Option<ModelRef>)>,
     // ENTITY-AUTHORITY-EXCEPTION:
     // Role: Gate turn completion on the `local_agent` tasks the turn started.
     // Source of truth: `task_started` adds a task, a terminal `task_updated` removes it, and so
@@ -438,6 +457,7 @@ impl TurnState {
             id,
             kind,
             model: None,
+            native_model: None,
             window_usage: TokenUsage::default(),
             result_usage: None,
             emitted_usage: None,
@@ -656,6 +676,27 @@ impl ClaudeMapper {
     /// The non-`none` `apiKeySource` this thread already surfaced.
     pub fn api_key_source_noticed(&self) -> Option<&str> {
         self.session.api_key_source_noticed.as_deref()
+    }
+
+    /// Seed the catalog a sub-agent's frame model id is read against: `(value, resolvedModel)` of
+    /// each entry. The `default` alias is skipped, so an id resolves to the entry the picker shows.
+    pub fn note_catalog(&mut self, entries: impl IntoIterator<Item = (String, String)>) {
+        self.session.catalog = entries
+            .into_iter()
+            .filter(|(value, _)| value != DEFAULT_ALIAS)
+            .collect();
+    }
+
+    /// The `ModelRef` a sub-agent frame's `message.model` names: the first catalog entry
+    /// resolving to it, else the id itself.
+    fn frame_model(&self, native: &str) -> ModelRef {
+        let model = self
+            .session
+            .catalog
+            .iter()
+            .find(|(_, resolved)| resolved == native)
+            .map_or(native, |(value, _)| value.as_str());
+        anthropic_model(model)
     }
 
     /// Seed a respawned child's mapper with the `apiKeySource` its thread already surfaced, so
@@ -1790,16 +1831,22 @@ impl ClaudeMapper {
     /// Emit `TurnUsageUpdated` for the route's active turn unless the same `(usage, window)` pair
     /// was the last one emitted.
     fn emit_usage(&mut self, route: &Route, out: &mut Out) {
-        let window = self.session.context_window();
+        // The session's window is the parent's: its effective (auto-compact) window, which an agent
+        // definition's `autoCompactWindow` overrides, and forwarded frames carry no window of
+        // their own. A sub-agent's window is therefore unknown, never borrowed.
+        let window = match route {
+            Route::Primary => self.session.context_window(),
+            Route::Task(_) => None,
+        };
         let thread = self.thread_of(route);
         let Some(turn) = self.turn_of_mut(route) else {
             return;
         };
-        let pair = (turn.window_usage, window);
-        if turn.emitted_usage == Some(pair) {
+        let key = (turn.window_usage, window, turn.model.clone());
+        if turn.emitted_usage.as_ref() == Some(&key) {
             return;
         }
-        turn.emitted_usage = Some(pair);
+        turn.emitted_usage = Some(key);
         let event = AgentEvent::TurnUsageUpdated {
             thread,
             turn: turn.id,
@@ -2014,6 +2061,7 @@ impl ClaudeMapper {
             subagent_type: text("subagent_type"),
             description: text("description"),
             is_backgrounded: input.get("run_in_background").and_then(Value::as_bool) == Some(true),
+            model: text("model").filter(|model| !model.is_empty() && model != INHERIT_MODEL),
         };
         Some(self.open_route(parent, tool_use_id, seed, out))
     }
@@ -2058,6 +2106,7 @@ impl ClaudeMapper {
             subagent_type: task.subagent_type.clone(),
             description: description.clone(),
             is_backgrounded: task.is_backgrounded == Some(true),
+            model: None,
         };
         info!(
             thread_id = %self.thread_of(&parent),
@@ -2138,6 +2187,7 @@ impl ClaudeMapper {
             parent_harness_thread_id = %parent_harness_thread_id,
             turn_id = display_opt(self.turn_of(parent).map(|turn| turn.id)),
             subagent_type = display_opt(route.subagent_type.as_deref()),
+            requested_model = display_opt(seed.model.as_deref()),
             action = "route_opened",
             "sub-agent route minted"
         );
@@ -2146,6 +2196,7 @@ impl ClaudeMapper {
             harness_thread_id: route.harness_thread_id.clone(),
             parent_harness_thread_id,
             agent_name: route.description.clone(),
+            model: seed.model.map(anthropic_model),
         });
         let link = route.link(SubagentAction::Spawned);
         self.session.routes.insert(tool_use_id.to_owned(), route);
@@ -2492,6 +2543,40 @@ impl ClaudeMapper {
         });
     }
 
+    /// Record the model a route's `assistant` frame names on the route's turn, logging the first
+    /// one (and any change) at `info`. A change is reported at once, since the frame bringing it
+    /// may carry no new usage; the first model rides on the usage that follows it.
+    fn note_route_model(&mut self, route: &Route, turn_id: TurnId, native: String, out: &mut Out) {
+        let Some(previous) = self.turn_of(route).map(|turn| turn.native_model.clone()) else {
+            return;
+        };
+        if previous.as_deref() == Some(native.as_str()) {
+            return;
+        }
+        let model = self.frame_model(&native);
+        let thread = self.thread_of(route);
+        info!(
+            thread_id = %thread,
+            harness_thread_id = %self.harness_thread_id,
+            route = display_opt(route.label()),
+            turn_id = %turn_id,
+            native_model = %native,
+            previous_native_model = display_opt(previous.as_deref()),
+            model = %model.model,
+            session_model = display_opt(self.session.model.as_deref()),
+            action = "subagent_model",
+            "sub-agent frame names its model"
+        );
+        let Some(turn) = self.turn_of_mut(route) else {
+            return;
+        };
+        turn.model = Some(model);
+        turn.native_model = Some(native);
+        if previous.is_some() {
+            self.emit_usage(route, out);
+        }
+    }
+
     /// Count one child API message's usage once and report it on the route's turn.
     fn note_route_usage(
         &mut self,
@@ -2575,8 +2660,24 @@ impl ClaudeMapper {
         };
         let message_id = message.message.id;
         if let Route::Task(id) = &route {
-            // Forwarded frames carry no stream events: usage comes from each API message.
-            self.note_route_usage(id, &message_id, message.message.usage.as_ref(), out);
+            if message.message.model == SYNTHETIC_MODEL {
+                // No model ran it and its usage is zero: neither is the sub-agent's.
+                debug!(
+                    thread_id = %self.thread_of(&route),
+                    harness_thread_id = %self.harness_thread_id,
+                    route = display_opt(route.label()),
+                    turn_id = %turn,
+                    message_id = %message_id,
+                    action = "subagent_model",
+                    "a synthetic sub-agent message names no model; its model and usage are skipped"
+                );
+            } else {
+                // The sub-agent's model is known only from its own frames; noted before the usage,
+                // so the `TurnUsageUpdated` it emits carries it.
+                self.note_route_model(&route, turn, message.message.model, out);
+                // Forwarded frames carry no stream events: usage comes from each API message.
+                self.note_route_usage(id, &message_id, message.message.usage.as_ref(), out);
+            }
         }
         let Some(state) = self.turn_of_mut(&route) else {
             return;
@@ -4170,6 +4271,7 @@ mod tests {
                     harness_thread_id,
                     parent_harness_thread_id,
                     agent_name,
+                    ..
                 } => Some((
                     *thread,
                     harness_thread_id.clone(),
@@ -5552,11 +5654,7 @@ mod tests {
 
         let mut mapper = new_mapper();
         mapper.begin_turn(TurnId::new(), TurnKind::User);
-        let model = ModelRef {
-            provider: "anthropic".into(),
-            model: "claude-haiku-4-5-20251001".into(),
-            reasoning_effort: None,
-        };
+        let model = anthropic_model("claude-haiku-4-5-20251001");
         mapper.note_turn_model(model.clone());
         let outputs: Vec<MapperOutput> = out_lines("text-turn")
             .iter()
@@ -5566,6 +5664,221 @@ mod tests {
             event,
             AgentEvent::TurnUsageUpdated { model: Some(reported), .. } if *reported == model
         )));
+    }
+
+    /// The `delegation` fixture with its `Agent` call asking for `requested` (when set) and the
+    /// sub-agent's frames naming `subagent_model`; the session stays on `claude-haiku-4-5-20251001`.
+    fn delegation_on(requested: Option<&str>, subagent_model: &str) -> Vec<String> {
+        out_lines("delegation")
+            .into_iter()
+            .map(|line| {
+                let mut frame = frame_of(&line);
+                if frame["type"] != "assistant" {
+                    return line;
+                }
+                if frame["parent_tool_use_id"].is_string() {
+                    frame["message"]["model"] = json!(subagent_model);
+                } else if let Some(requested) = requested {
+                    for block in frame["message"]["content"].as_array_mut().unwrap() {
+                        if block["type"] == "tool_use" && block["name"] == AGENT_TOOL {
+                            block["input"]["model"] = json!(requested);
+                        }
+                    }
+                }
+                frame.to_string()
+            })
+            .collect()
+    }
+
+    fn route_models(outputs: &[MapperOutput]) -> Vec<Option<ModelRef>> {
+        outputs
+            .iter()
+            .filter_map(|output| match output {
+                MapperOutput::RouteOpened { model, .. } => Some(model.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn reported_models(outputs: &[MapperOutput]) -> Vec<Option<ModelRef>> {
+        events(outputs)
+            .into_iter()
+            .filter_map(|event| match event {
+                AgentEvent::TurnUsageUpdated { model, .. } => Some(model.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    #[traced_test]
+    fn a_sub_agent_reports_the_model_its_frames_name() {
+        let mut mapper = new_mapper();
+        mapper.note_catalog([
+            ("default".to_owned(), "claude-sonnet-5-5".to_owned()),
+            ("opus".to_owned(), "claude-opus-5-5".to_owned()),
+            ("sonnet".to_owned(), "claude-sonnet-5-5".to_owned()),
+        ]);
+        let primary = mapper.thread;
+        let lines = delegation_on(Some("sonnet"), "claude-sonnet-5-5");
+        let outputs = drive_lines(&mut mapper, &lines, 1, TurnKind::User, false).concat();
+
+        // The route opens on the model its `Agent` call asked for.
+        assert_eq!(
+            route_models(&outputs),
+            vec![Some(anthropic_model("sonnet"))]
+        );
+        let (child, ..) = routes_opened(&outputs)[0].clone();
+
+        // Its usage names the model its frames ran on, as the catalog's selector (not `default`),
+        // and no context window: the session's is the parent model's.
+        let child_outputs = on_thread(&outputs, child);
+        let reported = reported_models(&child_outputs);
+        assert!(!reported.is_empty());
+        assert!(
+            reported
+                .iter()
+                .all(|model| *model == Some(anthropic_model("sonnet")))
+        );
+        assert!(
+            usage_updates(&child_outputs)
+                .iter()
+                .all(|(_, window)| window.is_none())
+        );
+        // The primary turn reports only the model the adapter noted (none here).
+        assert!(
+            reported_models(&on_thread(&outputs, primary))
+                .iter()
+                .all(Option::is_none)
+        );
+        logs_assert(a_line_with(&[
+            " INFO ",
+            r#"action="subagent_model""#,
+            "native_model=claude-sonnet-5-5",
+            "model=sonnet",
+        ]));
+    }
+
+    #[test]
+    fn a_sub_agent_model_outside_the_catalog_is_its_own_id() {
+        let mut mapper = new_mapper();
+        let lines = delegation_on(Some("inherit"), "claude-opus-5-5");
+        let outputs = drive_lines(&mut mapper, &lines, 1, TurnKind::User, false).concat();
+        // `inherit` names no model, so the route opens on none.
+        assert_eq!(route_models(&outputs), vec![None]);
+        let (child, ..) = routes_opened(&outputs)[0].clone();
+        assert!(
+            reported_models(&on_thread(&outputs, child))
+                .iter()
+                .all(|model| *model == Some(anthropic_model("claude-opus-5-5")))
+        );
+    }
+
+    #[test]
+    fn a_sub_agent_reports_no_context_window_even_on_the_session_model() {
+        let mut mapper = new_mapper();
+        mapper.note_context_window(200_000);
+        let primary = mapper.thread;
+        let outputs = drive(&mut mapper, "delegation", TurnKind::User).concat();
+        assert_eq!(route_models(&outputs), vec![None]);
+        let (child, ..) = routes_opened(&outputs)[0].clone();
+        let child_outputs = on_thread(&outputs, child);
+        // The fixture's sub-agent runs on the session's own model, and still borrows no window:
+        // the session's is the parent's effective window, not necessarily the sub-agent's.
+        assert!(!usage_updates(&child_outputs).is_empty());
+        assert!(
+            usage_updates(&child_outputs)
+                .iter()
+                .all(|(_, window)| window.is_none())
+        );
+        assert!(
+            reported_models(&child_outputs)
+                .iter()
+                .all(|model| *model == Some(anthropic_model("claude-haiku-4-5-20251001")))
+        );
+        // The primary keeps the session's window.
+        assert!(
+            usage_updates(&on_thread(&outputs, primary))
+                .iter()
+                .any(|(_, window)| window.is_some())
+        );
+    }
+
+    /// The `delegation` lines up to (and including) the sub-agent's first `assistant` frame, that
+    /// frame, and the rest.
+    fn delegation_split() -> (Vec<String>, String, Vec<String>) {
+        let lines = out_lines("delegation");
+        let first = lines
+            .iter()
+            .position(|line| {
+                let frame = frame_of(line);
+                frame["type"] == "assistant" && frame["parent_tool_use_id"].is_string()
+            })
+            .unwrap();
+        (
+            lines[..=first].to_vec(),
+            lines[first].clone(),
+            lines[first + 1..].to_vec(),
+        )
+    }
+
+    #[test]
+    #[traced_test]
+    fn a_synthetic_sub_agent_message_is_not_the_sub_agent_model() {
+        let (head, sub_frame, tail) = delegation_split();
+        let mut synthetic = frame_of(&sub_frame);
+        synthetic["message"]["model"] = json!(SYNTHETIC_MODEL);
+        synthetic["message"]["id"] = json!("msg_synthetic");
+        synthetic["message"]["content"] =
+            json!([{"type": "text", "text": "API Error: overloaded"}]);
+        synthetic["message"]["usage"] = json!({"input_tokens": 0, "output_tokens": 0});
+        let mut lines = head;
+        lines.push(synthetic.to_string());
+        lines.extend(tail);
+
+        let mut mapper = new_mapper();
+        let outputs = drive_lines(&mut mapper, &lines, 1, TurnKind::User, false).concat();
+        let (child, ..) = routes_opened(&outputs)[0].clone();
+        let child_outputs = on_thread(&outputs, child);
+        assert!(
+            reported_models(&child_outputs)
+                .iter()
+                .all(|model| *model == Some(anthropic_model("claude-haiku-4-5-20251001")))
+        );
+        // Its zero usage is not the sub-agent's either.
+        assert!(
+            usage_updates(&child_outputs)
+                .iter()
+                .all(|(usage, _)| *usage != TokenUsage::default())
+        );
+        // Its text still reaches the transcript.
+        assert!(completed_items(&child_outputs).iter().any(|item| matches!(
+            &item.payload,
+            ItemPayload::AgentMessage { text } if text.contains("overloaded")
+        )));
+        logs_assert(a_line_with(&[
+            r#"action="subagent_model""#,
+            "a synthetic sub-agent message names no model",
+        ]));
+    }
+
+    #[test]
+    fn a_sub_agent_model_change_is_reported_without_new_usage() {
+        let (head, sub_frame, _) = delegation_split();
+        // A second frame of the same API message (its usage already counted) on another model.
+        let mut switched = frame_of(&sub_frame);
+        switched["message"]["model"] = json!("claude-opus-5-5");
+        switched["message"]["content"] = json!([{"type": "text", "text": "switched"}]);
+        let mut mapper = new_mapper();
+        let mut outputs = drive_lines(&mut mapper, &head, 1, TurnKind::User, false).concat();
+        let (child, ..) = routes_opened(&outputs)[0].clone();
+        let before = reported_models(&on_thread(&outputs, child)).len();
+        outputs = mapper.map_line(&switched.to_string());
+        assert_eq!(
+            reported_models(&on_thread(&outputs, child)),
+            vec![Some(anthropic_model("claude-opus-5-5"))]
+        );
+        assert!(before > 0);
     }
 
     #[test]

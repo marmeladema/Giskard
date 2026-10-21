@@ -372,6 +372,74 @@ async fn persisted_turn_ids(
     }
 }
 
+/// Whether two model references name one model; the reasoning effort is not part of its identity.
+fn same_model(a: &ModelRef, b: &ModelRef) -> bool {
+    a.provider == b.provider && a.model == b.model
+}
+
+/// Persist the model an external turn's harness reported as the thread's `current_model`.
+async fn persist_external_turn_model(
+    thread_metadata: &ThreadMetadataService,
+    project_id: ProjectId,
+    thread_id: ThreadId,
+    turn_id: TurnId,
+    model: &ModelRef,
+) {
+    let stored = model.clone();
+    let mutation = thread_metadata
+        .mutate(project_id, thread_id, move |tf| {
+            if !tf
+                .current_model
+                .as_known()
+                .is_some_and(|known| same_model(known, &stored))
+            {
+                tf.current_model = TurnModel::Known(stored);
+            }
+        })
+        .await;
+    match mutation {
+        Ok(ThreadMutation::Changed { after, .. }) => info!(
+            %project_id,
+            %thread_id,
+            %turn_id,
+            metadata_revision = after.revision,
+            provider = %model.provider,
+            model = %model.model,
+            action = "external_model_adopted",
+            "persisted an external turn's reported model as the thread's"
+        ),
+        Ok(ThreadMutation::Unchanged { current }) => debug!(
+            %project_id,
+            %thread_id,
+            %turn_id,
+            metadata_revision = current.revision,
+            provider = %model.provider,
+            model = %model.model,
+            action = "external_model_adopted",
+            "an external turn's reported model was already the thread's"
+        ),
+        Ok(ThreadMutation::Missing) => warn!(
+            %project_id,
+            %thread_id,
+            %turn_id,
+            provider = %model.provider,
+            model = %model.model,
+            action = "external_model_adopted",
+            "thread file missing while persisting an external turn's reported model"
+        ),
+        Err(error) => error!(
+            %project_id,
+            %thread_id,
+            %turn_id,
+            provider = %model.provider,
+            model = %model.model,
+            %error,
+            action = "external_model_adopted",
+            "failed to persist an external turn's reported model"
+        ),
+    }
+}
+
 /// Persist an effective context window reported by the harness for a turn's model.
 async fn persist_model_context_window(
     thread_metadata: &ThreadMetadataService,
@@ -1793,6 +1861,53 @@ impl ThreadEventForwarder {
         Ok(())
     }
 
+    /// A turn Giskard did not start (a sub-agent's, an orphan's) runs on whatever model its harness
+    /// reports, not on the thread's stored guess: the reported model replaces the turn context's
+    /// and becomes the thread's `current_model`. A sub-agent thread is admitted with the model its
+    /// delegation asked for, or `unknown`, until its first frame names the one it runs on. A turn
+    /// Giskard started keeps the model it asked for; a mismatch there is the context-window
+    /// write's to report.
+    async fn adopt_external_turn_model(&mut self, turn: TurnId, model: &ModelRef) {
+        if !matches!(
+            self.turn.context.kind,
+            TurnContextKind::ExternalSubagent | TurnContextKind::ExternalOrphan
+        ) {
+            return;
+        }
+        if self
+            .turn
+            .context
+            .model
+            .as_known()
+            .is_some_and(|known| same_model(known, model))
+        {
+            return;
+        }
+        let previous = std::mem::replace(
+            &mut self.turn.context.model,
+            TurnModel::Known(model.clone()),
+        );
+        info!(
+            project_id = %self.binding.project_id,
+            thread_id = %self.thread_id(),
+            %turn,
+            turn_kind = turn_context_kind_label(self.turn.context.kind),
+            previous_model = ?previous,
+            provider = %model.provider,
+            model = %model.model,
+            action = "external_model_adopted",
+            "adopting the harness-reported model of an external turn"
+        );
+        persist_external_turn_model(
+            &self.services.thread_metadata,
+            self.binding.project_id,
+            self.thread_id(),
+            turn,
+            model,
+        )
+        .await;
+    }
+
     /// Live usage, live context window, model adoption, and the durable context-window write.
     async fn record_turn_usage(&mut self, event: &AgentEvent) {
         let thread_id = self.thread_id();
@@ -1809,10 +1924,17 @@ impl ThreadEventForwarder {
             if let Some(window) = context_window {
                 self.turn.live_context_window = Some(*window);
             }
+            if let Some(model) = model {
+                self.adopt_external_turn_model(*turn, model).await;
+            }
             if let (Some(model), Some(window)) = (model, context_window) {
-                if self.turn.context.model.as_known().is_some_and(|expected| {
-                    model.provider != expected.provider || model.model != expected.model
-                }) {
+                if self
+                    .turn
+                    .context
+                    .model
+                    .as_known()
+                    .is_some_and(|expected| !same_model(expected, model))
+                {
                     error!(
                         %project_id,
                         %thread_id,
@@ -3181,6 +3303,170 @@ mod tests {
             track_item_identity(&mut identities, &conflicting),
             Some((turn, "cmd_1".into(), original_item, conflicting_item))
         );
+    }
+
+    /// A sub-agent thread file in a fresh store, on `current_model`, behind a metadata service.
+    async fn subagent_metadata(
+        current_model: TurnModel,
+    ) -> (
+        tempfile::TempDir,
+        Arc<PersistStore>,
+        ThreadMetadataService,
+        ProjectId,
+        ThreadId,
+    ) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = Arc::new(PersistStore::new(tmp.path().to_path_buf()));
+        let project_id = ProjectId::new();
+        let thread_id = ThreadId::new();
+        store
+            .create_project(project_id, "proj", "/tmp/test", "claude-code")
+            .await
+            .unwrap();
+        let now = Utc::now();
+        store
+            .save_thread(
+                project_id,
+                &ThreadFile {
+                    revision: 0,
+                    version: 1,
+                    id: thread_id,
+                    project_id,
+                    title: "t".into(),
+                    harness_thread_id: "task:toolu_1".into(),
+                    harness: "claude-code".into(),
+                    parent_thread_id: Some(ThreadId::new()),
+                    spawned_by_turn_id: Some(TurnId::new()),
+                    kind: giskard_core::ThreadKind::Subagent,
+                    mode: TurnMode::Known(Mode::Build),
+                    current_model,
+                    context_window: 0,
+                    model_context_windows: Default::default(),
+                    permission_preset: PermissionPreset::AskFirst,
+                    model_efforts: Default::default(),
+                    tokens: TokenLedger::default(),
+                    created_at: now,
+                    updated_at: now,
+                    archived: false,
+                    git_workspace: None,
+                },
+            )
+            .await
+            .unwrap();
+        let service = ThreadMetadataService::new(store.clone(), Arc::new(Hub::new()));
+        (tmp, store, service, project_id, thread_id)
+    }
+
+    fn claude_model(model: &str) -> ModelRef {
+        ModelRef {
+            provider: "anthropic".into(),
+            model: model.into(),
+            reasoning_effort: None,
+        }
+    }
+
+    #[tokio::test]
+    #[traced_test]
+    async fn an_external_turn_model_is_persisted_once() {
+        let (_tmp, store, service, project_id, thread_id) =
+            subagent_metadata(TurnModel::Unknown).await;
+        let turn = TurnId::new();
+        let haiku = claude_model("haiku");
+        persist_external_turn_model(&service, project_id, thread_id, turn, &haiku).await;
+        let after = store
+            .load_thread(project_id, thread_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(after.current_model, TurnModel::Known(haiku.clone()));
+        logs_assert(a_line_with(&[
+            " INFO ",
+            r#"action="external_model_adopted""#,
+            "persisted an external turn's reported model as the thread's",
+        ]));
+
+        // The same model again, with another effort, changes nothing and bumps no revision.
+        let with_effort = ModelRef {
+            reasoning_effort: Some(giskard_core::model::Effort("high".into())),
+            ..haiku.clone()
+        };
+        persist_external_turn_model(&service, project_id, thread_id, turn, &with_effort).await;
+        let again = store
+            .load_thread(project_id, thread_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(again.revision, after.revision);
+        assert_eq!(again.current_model, TurnModel::Known(haiku));
+        logs_assert(a_line_with(&[
+            " DEBUG ",
+            "an external turn's reported model was already the thread's",
+        ]));
+    }
+
+    #[tokio::test]
+    #[traced_test]
+    async fn an_external_turn_model_for_a_missing_thread_is_a_warning() {
+        let (_tmp, _store, service, project_id, _thread_id) =
+            subagent_metadata(TurnModel::Unknown).await;
+        let missing = ThreadId::new();
+        persist_external_turn_model(
+            &service,
+            project_id,
+            missing,
+            TurnId::new(),
+            &claude_model("haiku"),
+        )
+        .await;
+        logs_assert(a_line_with(&[
+            " WARN ",
+            &missing.to_string(),
+            "thread file missing while persisting an external turn's reported model",
+        ]));
+    }
+
+    #[tokio::test]
+    #[traced_test]
+    async fn an_external_turn_model_that_cannot_be_written_is_an_error() {
+        let (tmp, _store, service, project_id, thread_id) =
+            subagent_metadata(TurnModel::Unknown).await;
+        // Corrupt every JSON file of the thread, so the read half of the update fails.
+        let mut corrupted = 0;
+        for entry in walk(tmp.path()) {
+            if entry.extension().is_some_and(|ext| ext == "json")
+                && entry.to_string_lossy().contains(&thread_id.to_string())
+            {
+                std::fs::write(&entry, "{").unwrap();
+                corrupted += 1;
+            }
+        }
+        assert!(corrupted > 0, "the thread's metadata file was not found");
+        persist_external_turn_model(
+            &service,
+            project_id,
+            thread_id,
+            TurnId::new(),
+            &claude_model("haiku"),
+        )
+        .await;
+        logs_assert(a_line_with(&[
+            " ERROR ",
+            &thread_id.to_string(),
+            "failed to persist an external turn's reported model",
+        ]));
+    }
+
+    fn walk(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+        let mut files = Vec::new();
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                files.extend(walk(&path));
+            } else {
+                files.push(path);
+            }
+        }
+        files
     }
 
     #[tokio::test]

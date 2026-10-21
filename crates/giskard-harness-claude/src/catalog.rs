@@ -2,7 +2,7 @@
 
 use std::time::Instant;
 
-use giskard_core::model::ModelDescriptor;
+use giskard_core::model::{ModelDescriptor, ModelRef};
 use serde::Deserialize;
 use serde_json::Value;
 use tracing::warn;
@@ -10,8 +10,17 @@ use tracing::warn;
 /// The single provider a Claude Code instance routes to.
 pub const ANTHROPIC_PROVIDER_ID: &str = "anthropic";
 
+/// A model of this instance's provider, with no reasoning effort: a selector (`haiku`) or a full id.
+pub(crate) fn anthropic_model(model: impl Into<String>) -> ModelRef {
+    ModelRef {
+        provider: ANTHROPIC_PROVIDER_ID.into(),
+        model: model.into(),
+        reasoning_effort: None,
+    }
+}
+
 /// The catalog alias that names another entry; never offered as a picker row.
-const DEFAULT_ALIAS: &str = "default";
+pub(crate) const DEFAULT_ALIAS: &str = "default";
 
 /// One `initialize.models` entry. Unknown keys are ignored.
 #[derive(Debug, Clone, Deserialize)]

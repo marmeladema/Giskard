@@ -3647,6 +3647,124 @@ async fn thread_rename_updates_thread_summary_and_persistence() {
     assert_eq!(saved.title, "Better title now");
 }
 
+/// A sub-agent's thread is admitted without a model when its harness names none, and adopts the
+/// model its first turn's usage reports: on the thread, which the browser shows, and on the turn.
+#[tokio::test]
+async fn a_subagent_thread_adopts_the_model_its_turn_reports() {
+    let harness = FakeHarness::new(ActivityScript::default());
+    let (server, mut probe) = start_activity_server_with_probe(harness.clone()).await;
+    let state = &server.state;
+    let base = server.base.clone();
+    let client = reqwest::Client::new();
+    let cookie = auth::login(&client, &base).await;
+    let project_id = create_project_only(&client, &base, &cookie).await;
+    let parent_id = fixtures::persist_primary_thread(
+        &state.store,
+        project_id,
+        ThreadId::new(),
+        "native-parent",
+        fake_native_model(),
+    )
+    .await;
+    let parent_resp = client
+        .post(format!("{base}/api/projects/{project_id}/threads"))
+        .header("cookie", &cookie)
+        .json(&serde_json::json!({ "thread_id": parent_id }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(parent_resp.status(), 200);
+    let parent_file = state
+        .store
+        .load_thread(project_id, parent_id)
+        .await
+        .unwrap()
+        .unwrap();
+    let parent_model = parent_file.current_model.as_known().unwrap().clone();
+    let spawned_by_turn_id = state
+        .registry
+        .start_turn(
+            parent_id,
+            UserInput::text("subagent activity"),
+            TurnOverrides {
+                model: Some(parent_model.clone()),
+                mode: parent_file.mode.as_known().unwrap(),
+                permission_preset: parent_file.permission_preset,
+            },
+            parent_model.clone(),
+        )
+        .await
+        .unwrap();
+
+    let child_id = probe.expect_admitted("native-child").await;
+    let admitted = state
+        .store
+        .load_thread(project_id, child_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(admitted.kind, giskard_core::ThreadKind::Subagent);
+    assert_eq!(
+        admitted.current_model,
+        giskard_core::turn::TurnModel::Unknown
+    );
+
+    let reported = ModelRef {
+        provider: parent_model.provider.clone(),
+        model: format!("{}-subagent", parent_model.model),
+        reasoning_effort: None,
+    };
+    assert_ne!(reported.model, parent_model.model);
+    harness.core.wait_for_readers(child_id, 1).await;
+    let log = harness.core.try_log(child_id).unwrap();
+    let turn = TurnId::new();
+    log.append(AgentEvent::TurnStarted {
+        thread: child_id,
+        turn,
+    });
+    log.append(AgentEvent::TurnUsageUpdated {
+        thread: child_id,
+        turn,
+        usage: TokenUsage::default(),
+        context_window: None,
+        model: Some(reported.clone()),
+    });
+    harness.core.complete_turn(child_id, turn);
+
+    let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(5);
+    loop {
+        let turns = state
+            .store
+            .load_all_turns(project_id, child_id)
+            .await
+            .unwrap();
+        if let Some(record) = turns.iter().find(|record| record.id == turn) {
+            assert_eq!(record.model.as_known(), Some(&reported));
+            break;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            panic!("the sub-agent turn was not persisted");
+        }
+        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+    }
+    let child = state
+        .store
+        .load_thread(project_id, child_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(child.current_model.as_known(), Some(&reported));
+    // The parent keeps its own model.
+    let parent = state
+        .store
+        .load_thread(project_id, parent_id)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(parent.current_model.as_known(), Some(&parent_model));
+    harness.core.complete_turn(parent_id, spawned_by_turn_id);
+}
+
 #[tokio::test]
 async fn importing_subagent_thread_records_parent_and_reuses_native_child() {
     let harness = FakeHarness::new(ActivityScript::default());

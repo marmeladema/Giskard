@@ -651,9 +651,8 @@ pub(crate) mod tests {
 
     fn model(effort: Option<&str>) -> ModelRef {
         ModelRef {
-            provider: "anthropic".into(),
-            model: "sonnet".into(),
             reasoning_effort: effort.map(|e| Effort(e.into())),
+            ..crate::catalog::anthropic_model("sonnet")
         }
     }
 

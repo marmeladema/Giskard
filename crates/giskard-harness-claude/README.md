@@ -74,8 +74,8 @@ routes*). A child idle for `idle_shutdown_secs` is stopped and its thread respaw
   thread whose child answers it), CLI `request_id`, and what the answer needs: the tool-use id, the
   tool name and the raw `permission_suggestions` of an approval, the subtype and `input` of a server
   request) and `routes` (sub-agent thread → its `task:` id, retained log, owning primary thread and
-  command sender, parent native id, name and model; a **cold** route has a fresh, open, silent log
-  and no owner). The façade also remembers, once, the sentence in which the CLI refused a bypass
+  command sender, parent native id, name and requested model; a **cold** route has a fresh, open,
+  silent log and no owner). The façade also remembers, once, the sentence in which the CLI refused a bypass
   launch (`bypass_refused`). `open_thread` inserts an entry after its child's handshake. An entry
   **outlives a reaped child**: the reap clears its child (keeping the session id, the open log, the
   model the CLI holds, which a confirmed model change also updates, and the API-billing notice it
@@ -231,8 +231,9 @@ which sums every request, added across a held result and the CLI's continuation 
 belong to one Giskard turn.
 
 `context_window` is the session's `autocompact_state.effective_window` when it reported one, else
-`result.modelUsage[<session model>].contextWindow` once a `result` has been seen, else unknown.
-`model` is set only when the adapter called `note_turn_model` for the turn.
+`result.modelUsage[<session model>].contextWindow` once a `result` has been seen, else unknown;
+a sub-agent route's is always unknown. `model` is set only when the adapter called `note_turn_model` for the turn, or, on a sub-agent
+route's turn, from the forwarded frames (see *Sub-agent routes*).
 
 `result.modelUsage` may name a second model. `AgentEvent` has no per-model usage channel, so the
 turn's usage is the summed `result.usage` and each `modelUsage` entry is only logged at `debug`
@@ -643,7 +644,8 @@ route's thread and turn and recorded with the route's thread and the primary as 
 - **Mint.** An `Agent` `tool_use` block mints a route keyed by its tool-use id, on whichever route
   the block arrived (the primary, or an outer route for a nested delegation): a fresh `ThreadId`,
   `task:<id>`, the parent's native id (the session id, or `task:<outer>`), the name
-  (`input.description`) and the prompt (`input.prompt`). `MapperOutput::RouteOpened` comes before
+  (`input.description`), the prompt (`input.prompt`) and the requested model (`input.model`, an
+  alias such as `haiku`; `inherit` names none). `MapperOutput::RouteOpened` comes before
   the block's `ItemStarted`, so the supervisor has created and published the route's retained log
   before the server's forwarder sends the link, and every child frame is retained for the claim.
   Logged at `info` with `action = "route_opened"`.
@@ -677,6 +679,18 @@ route's thread and turn and recorded with the route's thread and the primary as 
   primary's, on the route's thread and turn; the delegated prompt is a `UserMessage`. Usage comes
   from each child API message's `message.usage`, counted once per `message.id` though every
   one-block frame repeats it.
+- **Model.** The route's published model (the claim's `resumed_model`) is the `Agent` call's
+  `input.model`, else none: never the session's, since an agent definition's `model` or the CLI's
+  sub-agent default may override it, and a forked skill's task names none. Each forwarded
+  `assistant` frame's `message.model` becomes the route turn's `TurnUsageUpdated.model`, read
+  against the catalog the façade seeds the mapper with (`note_catalog`, every entry but
+  `default`): the first entry whose `resolvedModel` it is gives its selector (`haiku`), else the id
+  stands. The first model, and any change, is logged at `info` with `action = "subagent_model"`;
+  a change is reported at once, even when its frame brings no new usage. A `<synthetic>` frame
+  (text the CLI wrote itself, such as an API error, with zero usage) is mapped as text but names no
+  model and counts no usage (`debug`). A route's `context_window` is always unknown: the session's
+  window is the parent's effective (auto-compact) window, which an agent definition's
+  `autoCompactWindow` overrides, and forwarded frames carry none.
 - **End.** A terminal `task_updated` of the route's task (or, when none came, its terminal
   `task_notification`, logged at `info` with `action = "task_notification"`) completes its turn
   **at once**: open tool
@@ -718,7 +732,7 @@ route's thread and turn and recorded with the route's thread and the primary as 
   parent's turn continues.
 - **Claim.** `claim_native_thread` accepts only a `task:` id (anything else is `Protocol`). A live
   route is **adopted**: the handle's thread is the mapper's, with `agent_name`, `resumed_model`
-  (the child's model) and `parent_harness_thread_id`. Otherwise the session that produced the
+  (the model the `Agent` call asked for, if any) and `parent_harness_thread_id`. Otherwise the session that produced the
   route is gone (a persisted sub-agent reopened after a restart), and a **cold route** is bound
   under the proposed thread: an open, silent stream, no child. A route whose child exited is
   already cold, and the claim adopts it with its retained history.

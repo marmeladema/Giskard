@@ -1208,11 +1208,13 @@ impl Supervisor {
                 harness_thread_id,
                 parent_harness_thread_id,
                 agent_name,
+                model,
             } => self.open_route(
                 thread,
                 harness_thread_id,
                 parent_harness_thread_id,
                 agent_name,
+                model,
             ),
             MapperOutput::RouteClosed { thread } => self.close_route(thread),
         }
@@ -1221,12 +1223,17 @@ impl Supervisor {
 
     /// The mapper minted a route: give it a retained log and publish it to the façade, so the
     /// server's claim adopts it and its reader starts at the route's first event.
+    ///
+    /// The route's model is the one its `Agent` call asked for, if any; never this session's,
+    /// which an agent definition or the CLI's sub-agent default may override. The sub-agent's own
+    /// frames report the model it runs on.
     fn open_route(
         &mut self,
         thread: ThreadId,
         harness_thread_id: String,
         parent_harness_thread_id: String,
         agent_name: Option<String>,
+        model: Option<ModelRef>,
     ) {
         let log = Arc::new(EventLog::new());
         self.route_logs.insert(thread, log.clone());
@@ -1242,7 +1249,7 @@ impl Supervisor {
                     commands,
                     parent_harness_thread_id: Some(parent_harness_thread_id.clone()),
                     agent_name,
-                    model: Some(self.current_model.clone()),
+                    model: model.clone(),
                     generation: Some(self.generation),
                 },
             );
@@ -1255,6 +1262,7 @@ impl Supervisor {
             harness_thread_id = display_opt(self.context.harness_thread_id.as_deref()),
             route = %harness_thread_id,
             parent_harness_thread_id = %parent_harness_thread_id,
+            requested_model = display_opt(model.as_ref().map(|model| model.model.as_str())),
             live_routes,
             action = "route_opened",
             "sub-agent route published"
