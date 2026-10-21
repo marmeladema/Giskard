@@ -10,9 +10,10 @@
 
 use claude_codes::io::{AssistantMessage, ResultMessage, UserMessage};
 use claude_codes::{
-    ApiRetryMessage, CompactBoundaryMessage, InitMessage, PermissionDeniedMessage, RateLimitEvent,
-    SessionTitleChangedMessage, StatusMessage, StreamEventMessage, TaskNotificationMessage,
-    TaskStartedMessage, TaskUpdatedMessage, ToolPermissionRequest, UsageInfo,
+    ApiRetryMessage, CompactBoundaryMessage, ControlCancelRequest, InitMessage,
+    PermissionDeniedMessage, RateLimitEvent, SessionTitleChangedMessage, StatusMessage,
+    StreamEventMessage, TaskNotificationMessage, TaskStartedMessage, TaskUpdatedMessage,
+    ToolPermissionRequest, UsageInfo,
 };
 use serde::de::DeserializeOwned;
 use serde_json::Value;
@@ -135,9 +136,9 @@ impl Frame {
             "control_request" => Self::parse_control_request(value),
             "control_response" => Self::parse_control_response(value),
             "control_cancel_request" => {
-                typed::<CancelEnvelope>(value, "control_cancel_request", None).map(|envelope| {
+                typed::<ControlCancelRequest>(value, "control_cancel_request", None).map(|cancel| {
                     Frame::ControlCancelRequest {
-                        request_id: envelope.request_id,
+                        request_id: cancel.request_id,
                     }
                 })
             }
@@ -311,12 +312,6 @@ impl Frame {
             raw: value,
         })
     }
-}
-
-/// The `control_cancel_request` frame's one field.
-#[derive(serde::Deserialize)]
-struct CancelEnvelope {
-    request_id: String,
 }
 
 /// A `stream_event` frame. `claude-codes` leaves `event` an untyped `Value`, so the event is this
