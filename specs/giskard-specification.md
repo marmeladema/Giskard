@@ -9,7 +9,16 @@
 
 **Document status:** Implementation-ready specification.
 **Audience:** An AI coding agent (and its human reviewer) implementing the system.
-**Version:** 1.101
+**Version:** 1.102
+
+> **Amendment — a sub-agent's own model (1.102).** A Claude Code sub-agent thread no longer copies
+> its parent session's model. It is admitted on the model its `Agent` call asked for (`input.model`,
+> an alias such as `haiku`), or as `unknown` when the call named none, and adopts the model its
+> forwarded `assistant` frames name, which its `TurnUsageUpdated.model` reports. For a turn Giskard
+> did not start (a sub-agent's or an orphan's), the server takes the model the harness reports as
+> authoritative: it replaces the turn's model and the thread's `current_model`, and the browser
+> shows it. A sub-agent's usage no longer borrows its parent session's context window: it reports
+> none. No wire type, route or on-disk format changes.
 
 > **Amendment — bounded live snapshot (1.101).** A reconnect snapshot carries at most
 > `[history] turn_items` (default 100) of the live turn's newest items. Older items still changing
@@ -264,6 +273,25 @@
 > the intended frontend for the foreseeable future; treat every Dioxus/WASM/`giskard-ui` reference
 > below as historical design context, not a current requirement. The wire contract (`giskard-proto`)
 > and all backend design remain authoritative.
+
+**Changelog (1.101 → 1.102), a sub-agent's own model:**
+- **SM1:** The Claude Code adapter publishes a sub-agent route with the model its `Agent` call's
+  `input.model` names (`inherit` and an empty value name none), else none; never its session's
+  model, which an agent definition's `model` or the CLI's sub-agent default may override. The
+  claim's `resumed_model` is that model or `None`, so the thread is admitted on the requested
+  alias or as `TurnModel::Unknown` (1.77). A forked skill's route asks for none.
+- **SM2:** A route turn's `TurnUsageUpdated.model` is the model its latest forwarded `assistant`
+  frame names (`message.model`), reported as the selector of the first catalog entry (`default`
+  excluded) whose `resolvedModel` it is, else as the id itself. A change of model is reported at
+  once, even on a frame bringing no new usage. A `<synthetic>` frame (text the CLI wrote itself,
+  such as an API error, with zero usage) names no model and counts no usage. The route's
+  `context_window` is always unknown: the session's is the parent's effective window, which an
+  agent definition's `autoCompactWindow` overrides, and forwarded frames carry none.
+- **SM3:** For an `ExternalSubagent` or `ExternalOrphan` turn, a `TurnUsageUpdated.model` that
+  differs (by provider and model) from the turn's model replaces it, with or without a context
+  window, and is persisted as the thread's `current_model`, published as thread metadata (an
+  orphan's is persisted, not published). A turn Giskard started keeps the model it asked for; a
+  mismatch there is still logged and its context window not persisted.
 
 **Changelog (1.100 → 1.101), bounded live snapshot:**
 - **LP1:** A `LiveTurnSnapshot` carries the newest `N = max(1, turn_items)` item entries of the
@@ -2550,6 +2578,7 @@ verified protocol is recorded in [`claude-code-harness-plan.md`](claude-code-har
 | `result` (held while the CLI's agent tasks still run) | `TurnCompleted` |
 | `interrupt` control request | `interrupt` |
 | `Agent` tool call + `system/task_started` / `task_updated` of its `local_agent` task | a sub-agent thread (`task:<tool_use_id>`, the §7 sub-agent model) whose items are the frames forwarded with `--forward-subagent-text`; read-only and never resumable |
+| `Agent` call `input.model`, then `message.model` of the sub-agent's forwarded `assistant` frames | the sub-agent thread's `current_model`: requested, then reported (SM1–SM3) |
 | `stop_task` control request | `interrupt` on a sub-agent thread |
 | `/compact` user line | `compact_thread` |
 | `mcp_status` control request | `list_mcp_servers` |
