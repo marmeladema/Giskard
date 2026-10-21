@@ -3,7 +3,7 @@
 Stream-json transcripts recorded against **Claude Code 2.1.286** (the two `subagent-*`, the
 `replay-compact`, the five `background-{stop,complete,taskstop,fail,stop-next-turn}`, the
 `prompt-not-replayed` and the `mcp-status` scenarios against **2.1.287**, the two `forked-skill*`
-against **2.1.289**) by driving a real
+against **2.1.289**, the three `delegation-background*` against **2.1.306**) by driving a real
 `claude -p` child over a stdio pipe, for the mapper tests of
 [`specs/claude-code-harness-plan.md`](../../../../specs/claude-code-harness-plan.md) (§11). They
 live in `crates/giskard-harness-claude/tests/fixtures/`, where the mapper tests read them.
@@ -33,6 +33,9 @@ closed stdin when the scenario's stop condition was met.
 | `accept-for-session` | manual | the ask's `addRules` suggestion echoed back with `destination: "session"`; three identical commands, one ask | session; 1 result |
 | `cancel` | manual | deny with `interrupt: true`; the rejection tool result, the interruption text, and an `error_during_execution` result | cancel; 1 result |
 | `delegation` | acceptEdits, `--forward-subagent-text` | a **foreground** delegation: `task_started` with `is_backgrounded: false`, the child's frames tagged with `parent_tool_use_id`, one `result` | allow; 1 result then 200 s |
+| `delegation-background` | default, `--forward-subagent-text` | a **backgrounded** delegation with the parent kept busy: the `Agent` call, `task_started` `is_backgrounded: true` (line 4), the first `result` (8), a second prompt written the instant it arrived and served at once (`init` 9, "pong" 23, `result` 24) while the sub-agent's frames interleave (10–19); the sub-agent ends mid-prompt (`task_updated` completed 20, `task_notification` 21), and the CLI's continuation runs **after** that prompt's `result`: re-emitted `init` (25), text, `result` with `origin: {kind: "task-notification", …}` (27) | 3 results then 5 s |
+| `delegation-background-idle` | default, `--forward-subagent-text` | the same with a twenty-read sub-agent: the second prompt completes (`result` 15) while the sub-agent still runs (16–82); it ends with the parent idle (83–84) and the continuation follows directly (`init` 86, `result` with `origin.kind: "task-notification"` 88) | 3 results then 5 s |
+| `delegation-background-stop` | default, `--forward-subagent-text` | `stop_task` on the running background agent 1 s after the first `result`: `task_updated` killed (14), `task_notification` stopped (15), the `{}` reply (17), the sub-agent's trailing `[Request interrupted by user]` frame with `agent_id` (18), **then a continuation turn** (`init` 19, `result` with `origin.kind: "task-notification"` 24); a prompt 10 s later is an ordinary turn (25–27) with nothing queued into it | stop_task; 10 s quiet; 1 more result then 5 s |
 | `delegation-interrupted` | manual, `--forward-subagent-text` | a **backgrounded** delegation interrupted while the child's tool ran: first `result`, then `task_updated` killed, and no second `result` | interrupt 2 s after the child's first tool call; 12 s quiet |
 | `compact` | manual | a text turn, then `/compact`: `status compacting`, the re-emitted `init`, `compact_boundary`, and the degenerate `result` | 2 results |
 | `plan-exit-denied` | plan | the plan file write, the `ExitPlanMode` ask answered deny, the plan in `permission_denials` | deny ExitPlanMode; 1 result |

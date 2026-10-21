@@ -1,0 +1,2 @@
+{"type": "user", "message": {"role": "user", "content": [{"type": "text", "text": "Use the Agent tool with run_in_background set to true, subagent_type general-purpose, description 'reader', and this prompt: Read the file data.txt with the Read tool three separate times, then reply with the single word finished. After launching it, reply with the single word launched and stop."}]}}
+{"type": "user", "message": {"role": "user", "content": [{"type": "text", "text": "Reply with the single word pong."}]}}

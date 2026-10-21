@@ -1,0 +1,28 @@
+{
+ "scenario": "delegation-background-stop",
+ "argv": [
+  "claude",
+  "-p",
+  "--input-format",
+  "stream-json",
+  "--output-format",
+  "stream-json",
+  "--verbose",
+  "--permission-prompt-tool",
+  "stdio",
+  "--setting-sources",
+  "",
+  "--model",
+  "haiku",
+  "--permission-mode",
+  "default",
+  "--forward-subagent-text",
+  "--session-id",
+  "d7bbb859-5572-44c6-8541-29c9cefe6f94"
+ ],
+ "cwd": "/work/project",
+ "exit": 0,
+ "results": 3,
+ "asks": 0,
+ "elapsed_s": 180.7
+}

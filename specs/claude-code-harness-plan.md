@@ -1728,6 +1728,12 @@ exposed to a stdio host at all; fixed by a neutral `connection` state on `McpSer
 `mcp-status` fixture), resources that can say "not reported", and a browser chip that states the
 connection. This retires the tool inventory from `init.tools` once planned for milestone 8:
 `init.tools` adds nothing `mcp_status` lacks; implemented, see the adapter README's *MCP servers*.
+Its §4: a backgrounded sub-agent kept the parent thread busy until it ended, because the mapper
+held the delegating turn's first `result` for the CLI's continuation `result` (this plan's
+two-result model, §5.3); recorded on 2.1.306 (three `delegation-background*` fixtures), the CLI
+ends the parent's turn at the first `result`, serves prompts while the sub-agent runs, and runs
+the continuation as a turn of its own; planned as ending the turn on every `result`, routes that
+outlive their turn, and the outcome row as a late amendment of the delegating turn.
 
 ### Later, as its own decision — the hook route (§9.4)
 

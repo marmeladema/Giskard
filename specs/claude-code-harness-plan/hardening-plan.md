@@ -578,6 +578,197 @@ status, once per status string; `warn` for a tool entry without a name). Fields:
 - No chip reads "Unknown" for a connected server.
 - The `mcp-status` fixture backs the adapter's tests; every existing test passes.
 
+## 4. A backgrounded sub-agent blocks the parent thread until it ends
+
+### Symptom
+
+The model delegates with the `Agent` tool and `run_in_background: true`, answers ("launched"), and
+the CLI ends its turn. In Giskard the parent thread stays **running** until the sub-agent ends: the
+composer refuses a new prompt (`ThreadBusy`), Cancel is the only control left, and the sub-agent's
+whole run plus the CLI's own follow-up land inside the delegating turn. Stopping the sub-agent ends
+the parent turn as `Failed` or `Interrupted`.
+
+### Cause, verified
+
+| Layer | Behaviour | Where |
+| --- | --- | --- |
+| Claude adapter | `on_result` keeps the `result` as `held_result` while any `local_agent` task the turn started is in `open_agent_tasks`; `close_agent_task` keeps holding after a `completed` task "for the CLI's continuation `result`", so the turn ends only on the continuation's `result`, or on a kill, failure or stop (then `Failed` / `Interrupted`). Every agent task joins the set, backgrounded or not. | `mapper.rs` `on_result` (`hold_result`), `close_agent_task`, `on_task_started` |
+| Claude adapter | `finish_turn` calls `drop_spawned_routes(&Route::Primary)`, which fails any still-open route (`route_still_open`, "parent turn ended") and drops it. A route therefore cannot outlive the turn that spawned it, which is why the hold exists. | `mapper.rs` `finish_turn`, `drop_spawned_routes` |
+| Claude adapter | The sub-agent's outcome row (`Activity`, `harness_item_id = task_updated:<task_id>`, carrying the link) needs an **active** turn on the spawning route; otherwise it logs "no active turn on the spawning thread; the sub-agent's outcome has no row" at `debug`. | `mapper.rs` `report_background_outcome` |
+| Claude adapter | The supervisor's `INTERRUPTED_HOLD_GRACE` finishes an interrupted held turn after 5 s (PR #297): a mitigation of the hold, not of the block. | `session.rs` |
+| Server | A `TurnIntent` is rejected with `ThreadBusy` while the forwarder owns a turn, and a held turn is an owned turn. Nothing here is wrong: the adapter says the turn is live. | `event_forwarder.rs` (`inflight`, `admitted`, `owned_turn`) |
+| Server | A late `ItemCompleted` for a persisted turn is amended into the payload and broadcast only for a `CommandExecution` or a `ToolCall`; any other payload only reaches the thread runtime. The link admission reads `Activity` links from owned events only. | `event_forwarder.rs` `apply_late`, `subagent_activity_info` call sites |
+
+The hold was a design decision of the harness plan (§3.1 "Turn ids", §5.3, and the hazards table:
+"closing the turn on the first `result` persists *I have delegated this* and drops the work"). Its
+premise, that the two `result` frames of a backgrounded delegation are one turn, does not match the
+CLI, which ends the parent's turn at the first `result` and keeps serving prompts while the
+sub-agent runs. Nothing is dropped by ending the turn there: the sub-agent's frames are routed by
+`parent_tool_use_id`, not by the parent's turn, and the continuation is a turn of its own.
+
+### Verified facts (2.1.306; the same shape was first seen on 2.1.288)
+
+Recorded in `delegation-background`, `delegation-background-idle` and `delegation-background-stop`
+(shipped with this section; `default` mode, `--forward-subagent-text`, no asks). The sub-agent's
+prompt is "read `data.txt` with the Read tool N times, then reply `finished`", N = 3 or 20.
+
+| Observation | Consequence for the adapter |
+| --- | --- |
+| The delegating turn ends at its first `result` with the agent task open: `task_started` (`local_agent`, `is_backgrounded: true`, line 4), the `Agent` call's `tool_result` ("Async agent launched successfully …", `tool_use_result.status: "async_launched"`, line 5), "launched", `result` (`num_turns: 2`, line 8) — `delegation-background` lines 2–8, `-idle` lines 2–8, `-stop` lines 3–9 | The first `result` is the end of the Giskard turn. |
+| A prompt written the instant that `result` arrives is served at once: `init` (line 9), "pong" (line 23), `result` (line 24) in `delegation-background`; `init` (9), "pong" (14), `result` (15) in `-idle`. The sub-agent's frames (`parent_tool_use_id` = the `Agent` call) interleave with the prompt's own: lines 10–19 of `delegation-background`, lines 11–13 and 16–82 of `-idle` | The parent accepts a new turn while a route is live. Routed frames keep landing on the sub-agent thread whatever the parent is doing. |
+| The sub-agent's end is `task_updated` `completed` then `task_notification` `completed` (with `usage: {total_tokens, tool_uses, duration_ms}` and `output_file`): `delegation-background` lines 20–21, `-idle` lines 83–84 | As for an `Agent` delegation today: the route's turn ends on the update. |
+| The CLI then runs a **continuation turn** on its own: re-emitted `init`, assistant text, `result` whose `origin` is `{"kind": "task-notification", "producer": "session-task", "runId": …}` — `delegation-background` lines 25–27, `-idle` lines 86–88. It runs when the parent is idle: directly after the task ended (`-idle`, parent idle since line 15), or **queued behind the prompt in flight** (`delegation-background`: the task ended at line 20 during the "pong" prompt, the continuation started at line 25 after its `result`). | The continuation is an external turn (the mapper's `external_turn` path), never part of the delegating turn. `ResultMessage.origin` is typed in claude-codes 2.1.286 (`MessageOrigin { kind, extra }`), so its `result` is recognisable without the raw frame; the `init` carries no marker. |
+| `stop_task` on the running background agent (`-stop`, 1 s after the first `result`): `task_updated` `killed`, `task_notification` `stopped`, the `{}` reply (lines 14–17), the sub-agent's trailing `[Request interrupted by user]` user frame (line 18, with `agent_id`), **then a continuation turn too** (`init` line 19, text, `result` with `origin.kind: "task-notification"`, lines 19–24). A later prompt is an ordinary turn (lines 25–27): nothing is queued into it. | A stopped background agent may or may not be followed by a continuation: `delegation-interrupted` (2.1.286, `interrupt` instead of `stop_task`) had none. The adapter must not wait for one. |
+| `task_updated` and `task_notification` carry a `run_id` equal to the continuation result's `origin.runId`; claude-codes 2.1.286 drops the task frames' `run_id` (no such field, no `flatten`) | Correlating a continuation with its task is not possible through the typed frames; `origin.kind` alone says what the turn is. Not needed for this fix. |
+| The `Agent` call's `tool_use_result` names `resolvedModel` (`claude-haiku-5-5`), `agentId`, `outputFile` and the prompt at launch (line 5 of each recording) | Observed, not acted on: a sub-agent's model is known at launch, before its first frame (hardening §3 of the model work reads it from the first `assistant` frame). |
+
+### Step 1: a `result` always ends the turn (`crates/giskard-harness-claude/src/mapper.rs`)
+
+- `on_result` completes the turn on every `result`, as it does when no agent task is open. Remove
+  `TurnState.held_result` and `TurnState.open_agent_tasks`, the `hold_result` branch, the hold and
+  release branches of `close_agent_task` (the function goes; `on_task_updated` and
+  `on_task_notification` call `end_route` alone), `abandon_agent_task`, and the gate's
+  `ENTITY-AUTHORITY-EXCEPTION` comment. A `result` with `origin.kind == "task-notification"` on an
+  external turn is logged as the continuation it is (Step 3).
+- `on_task_started` no longer records `gates_turn`; a `local_agent` task is an entry in
+  `session.tasks` like any other, removed by its terminal update or notification, and it keeps the
+  child busy (`has_tasks`) until then, as a background command does.
+
+### Step 2: a backgrounded route outlives its turn (`mapper.rs`)
+
+- `RouteState` gains `spawned_turn: TurnId` (the turn of the delegating call) and `turn_ended:
+  bool`. `drop_spawned_routes(parent)`, called from `finish_turn` and from a route's own end, keeps
+  every route with `is_backgrounded` set whose task has not ended: it marks `turn_ended` and logs
+  `info` with `action = "route_outlives_turn"`, the route, its task id and the turn. A foreground
+  route still open there is failed and dropped as today (`route_still_open`); it cannot happen on a
+  `result`, only on a superseded turn or child exit.
+- A route is dropped when **both** its task has ended and its spawning turn has ended, whichever
+  comes last: `end_route` calls `drop_route` when `turn_ended` is set; `finish_turn` drops the
+  routes whose task already ended. The `routes` exception comment and the README's *Close* bullet
+  state the new lifetime: "from its delegating call until its task has ended and its spawning turn
+  has ended, or the child exits".
+- Nested routes follow their parent route as today. Child exit completes and drops every route as
+  today; the supervisor cools them.
+- The outcome row. `report_background_outcome` emits on the spawning route's active turn when that
+  turn is still the one that spawned the route (a background agent that ends before its own turn's
+  `result`). When the spawning turn has ended, it emits the same `Activity` as a **late**
+  `ItemCompleted` on `spawned_turn` (no `ItemStarted`: the server ignores a start for a persisted
+  turn), `harness_item_id = task_updated:<task_id>`, the link's action from `outcome_action()`,
+  logged at `info` with `action = "subagent_outcome"` and `late = true`. The "no active turn" debug
+  branch goes. A route whose spawning turn is unknown (opened by a routed frame with no delegating
+  call) keeps the current debug branch.
+- `interrupt` on the primary thread with no active turn stays what it is (the CLI answers at once).
+  A background sub-agent is stopped from its own thread (`stop_task`), as today.
+
+### Step 3: the continuation turn (`mapper.rs`)
+
+- The re-emitted `init` and the first `assistant` frame of a continuation arrive with no active
+  turn: `ensure_turn` opens an external turn as today. `on_result` reads `result.origin`: with
+  `kind == "task-notification"` the `turn_completed` line carries `origin = "task-notification"`
+  and the external turn is logged as `action = "continuation_turn"` at `info` (the `init` gives no
+  earlier signal). Any other `origin.kind` is logged verbatim; none is an error.
+- The prompt acknowledgement gate is untouched: the continuation has no noted prompt, so neither its
+  `init` nor its first answer emits a `UserMessage`.
+- The server already classifies such a turn as `ExternalOrphan` on the primary thread and persists
+  it; no change.
+
+### Step 4: the supervisor (`crates/giskard-harness-claude/src/session.rs`)
+
+Remove `INTERRUPTED_HOLD_GRACE`, `interrupted_hold_since`, `interrupted_hold_deadline`, the select
+arm, and the mapper's `holds_interrupted_result` and `release_interrupted_hold`. `busy_with` is
+unchanged: a live route (`has_routes`) or an open task (`has_tasks`) keeps the child from being
+reaped while a background agent runs.
+
+### Step 5: the server accepts a late sub-agent outcome (`event_forwarder.rs`)
+
+- `apply_late` treats an `ItemCompleted` whose payload is an `Activity` carrying a `subagent` link
+  like a late tool completion: `amend_turn_item` on the persisted turn (the LA5 append), then a
+  `Transcript` broadcast so an open browser shows the row, with the same `amend_turn_item` log
+  actions and the same `Missing` / error handling. An `Activity` without a link stays as today.
+- The link admission (`subagent_activity_info`) also runs on that late event, so the sub-agent
+  thread's status moves to `Completed`, `Interrupted` or `Failed` from a row on a persisted turn.
+  Nothing new is admitted by it: the `Spawned` link was processed when the delegating turn ran.
+- No wire type, route or on-disk format changes.
+
+### Step 6: tests
+
+- Mapper, on the recordings. `delegation-background`: three primary turns (`launched` completed on
+  line 8, `pong` on line 24, the continuation on line 27 with the origin logged), one route whose
+  thread receives lines 10–19 and completes `Completed` at line 20, a `RouteClosed` only after
+  line 20 (the task ended after the spawning turn), the outcome `Activity` emitted as a late
+  `ItemCompleted` on the first turn's id with `SubagentAction::Completed`, no `hold_result` line.
+  `delegation-background-idle`: the same with the continuation directly after the task's end, and
+  the "pong" turn completing at line 15 while the route is live. `delegation-background-stop`: the
+  route ends `Interrupted` at line 14 (the adapter sent `stop_task`), the trailing frame at line 18
+  is dropped, the continuation at lines 19–24 and the user's turn at lines 25–27 complete, and
+  the outcome row's link is `Interrupted`.
+- Mapper, synthetic: a background agent that ends before its own turn's `result` puts the outcome
+  row on that live turn, not late, and the route is dropped at the `result`; a foreground route open
+  at a superseded turn is still failed; child exit with a live background route completes it
+  `Failed` naming the exit and drops it; a `result` with an unknown `origin.kind` is logged and
+  completes the turn.
+- Supervisor / façade (scripted child): after the first `result`, `start_turn` succeeds while the
+  route is live and the sub-agent's frames keep landing on the sub-agent thread; the child is not
+  reaped while the route lives (`reaping()` + `IDLE`) and is reaped once the task ends and the
+  continuation completes; `interrupt` on a sub-agent thread while the parent runs another turn.
+- Delete `an_interrupt_releases_a_turn_held_by_an_agent_task_that_never_ends` and
+  `an_interrupted_turn_holding_its_result_is_released`, the hold assertions of
+  `a_notification_ends_an_agent_task_that_got_no_terminal_update`, and every `hold_result`,
+  `release_held_result` or `agent_task_abandoned` assertion; `delegation-interrupted` keeps its
+  route tests, with its first `result` now completing the turn.
+- Server: a late `Activity` with a link is amended, broadcast, and moves the sub-agent thread's
+  status; one without a link is not amended; the `Missing` warning and the write error. An e2e
+  test on the fake harness: a sub-agent thread opened by a delegating turn stays live after that
+  turn completes, the parent accepts a second prompt, and the outcome row appears on the first
+  turn's items after the sub-agent completes.
+
+### Step 7: documentation
+
+- Adapter README: *Turn completion* (drop the agent-task gate, the hold, the grace; add the
+  continuation turn and its `origin`), *Sub-agent routes* (*End*, *Backgrounded*, *Close* with the
+  new lifetime and the late outcome row), *Process control* (`interrupt` with a live background
+  route).
+- `specs/claude-code-harness-plan.md`: §3.1 "Turn ids" row, §5.3's backgrounded shape and the
+  "second `result`" paragraphs, the "A `result` does not always end the turn" bullet, and the
+  hazards row, all rewritten to the three-turn model with the recordings as evidence; §11's entry
+  for this pass.
+- `specs/giskard-specification.md`: an amendment (the next free number; the P1 plan's reservation
+  moves if it lands second) stating that a backgrounded sub-agent thread outlives its delegating
+  turn, that the parent accepts prompts meanwhile, that the CLI's continuation is an external turn,
+  and that the sub-agent's outcome row is a late amendment of the delegating turn (LA5).
+- `docs/subagents.md`: the user-facing sentence that a background sub-agent runs beside the parent.
+- Fixtures README: the three rows (added with this section).
+
+### Logging
+
+Actions introduced: `route_outlives_turn` (`info`), `continuation_turn` (`info`, with
+`origin`), `subagent_outcome` with `late = true` (`info`). Removed: `hold_result`,
+`release_held_result`, `agent_task_abandoned`. Stable fields as elsewhere: `thread_id`,
+`harness_thread_id`, `turn_id`, `route`, `task_id`.
+
+### Verification
+
+1. `cargo fmt --all --check`, `cargo clippy --workspace --all-targets --locked -- -D warnings`,
+   `cargo test --workspace --locked`.
+2. Against a logged-in `claude` 2.1.306: ask for a background delegation that reads a file twenty
+   times. The parent thread is idle as soon as "launched" lands; a second prompt is accepted and
+   answered while the sub-agent thread shows it running; the sub-agent thread completes; the CLI's
+   follow-up appears as an external turn on the parent; after a reload the delegating turn shows the
+   outcome row with the sub-agent's final status.
+3. Stop the sub-agent from its thread mid-run: the parent stays usable, the sub-agent reads
+   `Interrupted`, and whether or not a continuation follows, nothing waits for it.
+4. `RUST_LOG=giskard_harness_claude=debug`: `route_outlives_turn`, `continuation_turn` and a late
+   `subagent_outcome` appear; no `hold_result`.
+
+### Acceptance
+
+- A backgrounded delegation ends its Giskard turn at the first `result`; the parent accepts a new
+  prompt while the sub-agent runs.
+- The sub-agent thread shows the whole run and its end, whatever the parent did meanwhile.
+- The continuation is an external turn on the parent, present or absent without consequence.
+- The delegating turn's persisted items carry the outcome row once the sub-agent ends.
+- No hold, grace or abandonment code remains; the three recordings drive the mapper tests.
+
 ## Observed while recording, not yet an issue
 
 - `system/thinking_tokens` frames appear between assistant frames (two in the first, discarded

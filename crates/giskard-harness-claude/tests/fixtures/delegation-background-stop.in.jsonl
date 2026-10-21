@@ -1,0 +1,3 @@
+{"type": "user", "message": {"role": "user", "content": [{"type": "text", "text": "Use the Agent tool with run_in_background set to true, subagent_type general-purpose, description 'reader', and this prompt: Read the file data.txt with the Read tool twenty separate times, one Read call after another, then reply with the single word finished. After launching it, reply with the single word launched and stop."}]}}
+{"type": "control_request", "request_id": "37fd597c-e87b-403f-ae2f-4ad0aa078cef", "request": {"subtype": "stop_task", "task_id": "a85c2dcc34163878d"}}
+{"type": "user", "message": {"role": "user", "content": [{"type": "text", "text": "What happened to the reader agent? Reply in one sentence."}]}}
