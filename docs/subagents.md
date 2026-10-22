@@ -113,10 +113,14 @@ minted; the Sub-agents monitor names it after the call's `description`.
   is withdrawn by Claude Code, its turn ends `Interrupted`, and the parent's turn continues with
   the interruption as the `Agent` call's result. A child whose session is gone reports that the
   sub-agent is no longer running.
-- **Backgrounded delegations.** The parent's `Agent` call completes as soon as the sub-agent is
-  launched, with its link still running. When the sub-agent ends, an activity row on the parent
-  carries the outcome (completed, killed or failed) and the link, so **Open linked thread** works
-  from either row.
+- **Backgrounded delegations.** A background sub-agent runs beside the parent: the parent's turn
+  ends as soon as the sub-agent is launched, and the parent accepts new prompts while the child
+  thread shows the sub-agent still running. The parent's `Agent` call completes at launch with its
+  link still running. When the sub-agent ends, an activity row added to the delegating turn carries
+  the outcome (completed, killed or failed) and the link, so **Open linked thread** works from
+  either row; it stays there after a reload. Claude Code then usually answers on its own about the
+  sub-agent's result, as a turn of the parent that no prompt opened. Stop a background sub-agent
+  from its own thread.
 - **Nesting.** A sub-agent's own delegation is a child of the child: its link appears in the outer
   child's transcript and its native parent is `task:<outer>`.
 - **Not shown.** The rejection sentence and the `[Request interrupted by user for tool use]` marker

@@ -14,6 +14,9 @@ export const SCRIPTED_DIFF_TRIGGER = "Trigger two scripted lazy diffs.";
 export const SCRIPTED_DIFF_PATH = "src/lazy-diff.rs";
 export const SCRIPTED_SUBAGENT_TRIGGER = "Spawn the scripted linked sub-agent.";
 export const SCRIPTED_NESTED_SUBAGENT_TRIGGER = "Spawn a scripted nested sub-agent.";
+/** A backgrounded delegation whose outcome row reaches its turn late, after the thread's next turn. */
+export const SCRIPTED_BACKGROUND_SUBAGENT_TRIGGER = "Spawn a scripted background sub-agent.";
+export const SCRIPTED_BACKGROUND_OUTCOME_TITLE = "Background child finished";
 export const SCRIPTED_SUBAGENT_PROMPT = "Review the linked child task.";
 export const SCRIPTED_SUBAGENT_REPLY = "Child replay output";
 

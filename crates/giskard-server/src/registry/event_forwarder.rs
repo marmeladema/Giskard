@@ -255,6 +255,15 @@ fn is_terminal_command_completion(event: &AgentEvent) -> bool {
         .unwrap_or(false)
 }
 
+/// A sub-agent's outcome row: a completed `Activity` that carries the sub-agent's link.
+fn is_subagent_outcome(event: &AgentEvent) -> bool {
+    matches!(
+        event,
+        AgentEvent::ItemCompleted { item, .. }
+            if matches!(&item.payload, ItemPayload::Activity { subagent: Some(_), .. })
+    )
+}
+
 fn completed_tool_has_terminal_output(item: &Item) -> bool {
     let ItemPayload::ToolCall { output, status, .. } = &item.payload else {
         return false;
@@ -1462,6 +1471,21 @@ impl ThreadEventForwarder {
     /// The late path: an event for a turn this forwarder has already persisted. It updates
     /// runtime task state only and cannot enter a newer turn's transcript.
     async fn apply_late(&mut self, event: AgentEvent) -> ForwarderControl {
+        // A sub-agent's outcome has no runtime task and no addressable output: it takes its own
+        // path, not the command and tool branches below. It still writes the store and reaches
+        // clients, so, as `prepare_output` and the runtime application do for a completion, a
+        // forwarder whose runtime authority was replaced stops here.
+        if is_subagent_outcome(&event) {
+            let runtime = &self.services.runtime;
+            let current = runtime
+                .event_application_permit(&self.authority)
+                .is_some_and(|permit| runtime.restoration_is_current(&permit));
+            if !current {
+                return ForwarderControl::Exit(ForwarderExitReason::RuntimeAuthorityReplaced);
+            }
+            self.apply_late_subagent_outcome(event).await;
+            return ForwarderControl::Continue;
+        }
         let thread_id = self.thread_id();
         let project_id = self.binding.project_id;
         let hub = self.services.hub.clone();
@@ -1650,6 +1674,93 @@ impl ThreadEventForwarder {
             }
         }
         ForwarderControl::Continue
+    }
+
+    /// A backgrounded sub-agent outlives its delegating turn, so its outcome row (the `Activity`
+    /// carrying its link) arrives for a turn already persisted. The row is amended into that turn
+    /// (LA5), shown to an open browser, and its link offered to the driver as on the owned path.
+    async fn apply_late_subagent_outcome(&mut self, event: AgentEvent) {
+        let thread_id = self.thread_id();
+        let project_id = self.binding.project_id;
+        let AgentEvent::ItemCompleted { turn, item, .. } = &event else {
+            return;
+        };
+        let ItemPayload::Activity {
+            subagent: Some(link),
+            ..
+        } = &item.payload
+        else {
+            return;
+        };
+        let (turn, item_id) = (*turn, item.id);
+        match self
+            .services
+            .thread_metadata
+            .amend_turn_item(project_id, thread_id, turn, item)
+            .await
+        {
+            Ok(AmendOutcome::Amended) => {
+                info!(
+                    %project_id,
+                    %thread_id,
+                    %turn,
+                    %item_id,
+                    harness_item_id = %item.harness_item_id,
+                    subagent_harness_thread_id = %link.harness_thread_id,
+                    subagent_action = ?link.action,
+                    action = "amend_turn_item",
+                    kind = "subagent_outcome",
+                    "amended a persisted turn with a late sub-agent outcome"
+                );
+            }
+            Ok(AmendOutcome::Unsupported) => {
+                warn!(
+                    %project_id,
+                    %thread_id,
+                    %turn,
+                    %item_id,
+                    harness_item_id = %item.harness_item_id,
+                    subagent_harness_thread_id = %link.harness_thread_id,
+                    action = "amend_turn_item",
+                    kind = "subagent_outcome",
+                    "a late sub-agent outcome is shown but not persisted: the thread has no per-turn payload"
+                );
+            }
+            Err(error) => {
+                error!(
+                    %project_id,
+                    %thread_id,
+                    %turn,
+                    %item_id,
+                    harness_item_id = %item.harness_item_id,
+                    subagent_harness_thread_id = %link.harness_thread_id,
+                    action = "amend_turn_item",
+                    kind = "subagent_outcome",
+                    %error,
+                    "failed to amend a persisted turn with a late sub-agent outcome"
+                );
+            }
+        }
+        let info = subagent_activity_info(item);
+        // Published whatever the write did, as a late command completion is: an open browser
+        // shows the row now, and a failed or unsupported write costs it only on a reload.
+        self.services
+            .hub
+            .publish(
+                thread_id,
+                Outbound::Transcript {
+                    event: Box::new(event),
+                    user_input: None,
+                    command_output: None,
+                },
+            )
+            .await;
+        // The `Spawned` link was admitted while the delegating turn ran, so this one finds the
+        // sub-agent's thread already classified and admits nothing new.
+        if let Some(info) = info {
+            self.send_subagent_link(turn, item_id, "late_item_completed", info)
+                .await;
+        }
     }
 
     /// The turnless path: an event that names no turn while this forwarder owns none.
@@ -1986,41 +2097,15 @@ impl ThreadEventForwarder {
                 }
             }
             AgentEvent::ItemStarted { item, turn, .. } => {
-                if let Some(info) = subagent_start_info(item)
-                    && let Err(error) = self
-                        .driver
-                        .link(Link {
-                            parent_thread_id: thread_id,
-                            spawned_by_turn_id: *turn,
-                            item_id: item.id,
-                            origin: "item_started",
-                            info,
-                            reply: None,
-                        })
-                        .await
-                {
-                    warn!(%project_id, parent_thread_id = %thread_id, turn_id = %turn,
-                    item_id = %item.id, %error,
-                    "failed to send linked native identity to the project event driver");
+                if let Some(info) = subagent_start_info(item) {
+                    self.send_subagent_link(*turn, item.id, "item_started", info)
+                        .await;
                 }
             }
             AgentEvent::ItemCompleted { item, turn, .. } => {
-                if let Some(info) = subagent_activity_info(item)
-                    && let Err(error) = self
-                        .driver
-                        .link(Link {
-                            parent_thread_id: thread_id,
-                            spawned_by_turn_id: *turn,
-                            item_id: item.id,
-                            origin: "item_completed",
-                            info,
-                            reply: None,
-                        })
-                        .await
-                {
-                    warn!(%project_id, parent_thread_id = %thread_id, turn_id = %turn,
-                    item_id = %item.id, %error,
-                    "failed to send linked native identity to the project event driver");
+                if let Some(info) = subagent_activity_info(item) {
+                    self.send_subagent_link(*turn, item.id, "item_completed", info)
+                        .await;
                 }
                 if self.turn.items.upsert(item) {
                     error!(
@@ -2042,6 +2127,35 @@ impl ThreadEventForwarder {
                 }
             }
             _ => {}
+        }
+    }
+
+    /// Hand a sub-agent link to the project driver, which admits or classifies its native thread.
+    /// The send has no reply: a driver that is gone is logged and the event keeps flowing.
+    /// `&mut self` only so the future stays `Send`: the forwarder is not `Sync`.
+    async fn send_subagent_link(
+        &mut self,
+        turn: TurnId,
+        item_id: ItemId,
+        origin: &'static str,
+        info: SubagentActivityInfo,
+    ) {
+        let thread_id = self.thread_id();
+        let project_id = self.binding.project_id;
+        if let Err(error) = self
+            .driver
+            .link(Link {
+                parent_thread_id: thread_id,
+                spawned_by_turn_id: turn,
+                item_id,
+                origin,
+                info,
+                reply: None,
+            })
+            .await
+        {
+            warn!(%project_id, parent_thread_id = %thread_id, turn_id = %turn, %item_id, origin,
+                %error, "failed to send linked native identity to the project event driver");
         }
     }
 
@@ -5040,6 +5154,361 @@ mod tests {
         assert_eq!(item.id, item_id);
     }
 
+    /// A forwarder whose thread has one persisted turn, the delegating one, so every event for
+    /// that turn takes the late path. The driver records the links it is sent.
+    struct LateOutcomeFixture {
+        _tmp: tempfile::TempDir,
+        store: Arc<PersistStore>,
+        project_id: ProjectId,
+        thread_id: ThreadId,
+        turn: TurnId,
+        log: Arc<EventLog>,
+        client_rx: mpsc::Receiver<ServerMessage>,
+        links: mpsc::UnboundedReceiver<Link>,
+        forwarder: JoinHandle<()>,
+        runtime: Arc<ThreadRuntimeSupport>,
+        authority: Arc<super::ThreadAuthority>,
+    }
+
+    async fn late_outcome_fixture() -> LateOutcomeFixture {
+        let (tmp, store, project_id, thread_id, model) = usage_forwarder_fixture().await;
+        let turn = TurnId::new();
+        let now = Utc::now();
+        store
+            .append_turn(
+                project_id,
+                thread_id,
+                &Turn {
+                    id: turn,
+                    user_input: UserInput::text("delegate in the background"),
+                    items: vec![Item {
+                        id: ItemId::new(),
+                        harness_item_id: "msg_launched".into(),
+                        payload: ItemPayload::AgentMessage {
+                            text: "launched".into(),
+                        },
+                        created_at: now,
+                    }],
+                    model: TurnModel::Known(model.clone()),
+                    mode: TurnMode::Known(Mode::Build),
+                    status: TurnStatus {
+                        kind: TurnStatusKind::Completed,
+                        message: None,
+                    },
+                    usage: TokenUsage::default(),
+                    diffs: Vec::new(),
+                    started_at: now,
+                    completed_at: Some(now),
+                    skipped_records: 0,
+                },
+            )
+            .await
+            .unwrap();
+        let log = Arc::new(EventLog::new());
+        let hub = Arc::new(Hub::new());
+        let (client_tx, client_rx) = mpsc::channel(16);
+        let _replacements = hub.register_client(1, client_tx).await;
+        assert!(hub.subscribe(thread_id, 1).await);
+        let ledger = ledger::spawn(store.clone());
+        let (driver, links) = DriverHandle::recording_links_for_test();
+        let (forwarder, runtime, _coordinator, authority) = spawn_forwarder_handle_with_driver(
+            thread_id,
+            project_id,
+            AgentEventStream::new(log.reader()),
+            hub,
+            store.clone(),
+            ledger,
+            model,
+            "next",
+            None,
+            driver,
+        );
+        LateOutcomeFixture {
+            _tmp: tmp,
+            store,
+            project_id,
+            thread_id,
+            turn,
+            log,
+            client_rx,
+            links,
+            forwarder,
+            runtime,
+            authority,
+        }
+    }
+
+    /// The row the Claude adapter emits when a backgrounded sub-agent ends after its delegating
+    /// turn: a completed `Activity`, with no `ItemStarted` before it.
+    fn late_activity(
+        thread: ThreadId,
+        turn: TurnId,
+        harness_item_id: &str,
+        subagent: Option<giskard_core::item::SubagentLink>,
+    ) -> (ItemId, AgentEvent) {
+        let id = ItemId::new();
+        let event = AgentEvent::ItemCompleted {
+            thread,
+            turn,
+            item: Item {
+                id,
+                harness_item_id: harness_item_id.into(),
+                payload: ItemPayload::Activity {
+                    title: "Read data.txt".into(),
+                    detail: Some("completed".into()),
+                    metadata: None,
+                    subagent,
+                },
+                created_at: Utc::now(),
+            },
+        };
+        (id, event)
+    }
+
+    fn completed_link(native: &str) -> giskard_core::item::SubagentLink {
+        giskard_core::item::SubagentLink {
+            harness_thread_id: native.into(),
+            path: None,
+            initial_prompt: None,
+            action: giskard_core::item::SubagentAction::Completed,
+            status: Some(giskard_core::item::SubagentStatus::Completed),
+            message: None,
+        }
+    }
+
+    /// The ids of every `ItemCompleted` broadcast up to and including `until`, in order.
+    async fn broadcast_item_completions_until(
+        client_rx: &mut mpsc::Receiver<ServerMessage>,
+        until: ItemId,
+    ) -> Vec<ItemId> {
+        tokio::time::timeout(tokio::time::Duration::from_secs(2), async {
+            let mut seen = Vec::new();
+            loop {
+                let message = client_rx.recv().await.expect("the hub stays open");
+                if let ServerMessage::Event { agent_event, .. } = message
+                    && let WireAgentEvent::ItemCompleted { item, .. } = *agent_event
+                {
+                    seen.push(item.id);
+                    if item.id == until {
+                        return seen;
+                    }
+                }
+            }
+        })
+        .await
+        .expect("the late sub-agent outcome should be broadcast")
+    }
+
+    async fn next_link(links: &mut mpsc::UnboundedReceiver<Link>) -> Link {
+        tokio::time::timeout(tokio::time::Duration::from_secs(2), links.recv())
+            .await
+            .expect("a link should reach the driver")
+            .expect("the recording driver stays open")
+    }
+
+    #[tokio::test]
+    #[traced_test]
+    async fn a_late_subagent_outcome_is_amended_broadcast_and_linked() {
+        let mut fixture = late_outcome_fixture().await;
+        let (item_id, event) = late_activity(
+            fixture.thread_id,
+            fixture.turn,
+            "task_updated:b1",
+            Some(completed_link("task:toolu_bg")),
+        );
+        assert!(fixture.log.append(event));
+
+        let seen = broadcast_item_completions_until(&mut fixture.client_rx, item_id).await;
+        assert_eq!(seen, vec![item_id]);
+        // The amendment is written before the broadcast, so it is on disk by now.
+        let amended = fixture
+            .store
+            .load_turn_item(fixture.project_id, fixture.thread_id, fixture.turn, item_id)
+            .await
+            .unwrap()
+            .expect("the outcome row is amended into the delegating turn");
+        assert!(matches!(
+            amended.payload,
+            ItemPayload::Activity {
+                subagent: Some(ref link),
+                ..
+            } if link.action == giskard_core::item::SubagentAction::Completed
+        ));
+        let turns = fixture
+            .store
+            .load_all_turns(fixture.project_id, fixture.thread_id)
+            .await
+            .unwrap();
+        assert_eq!(turns.len(), 1, "an amendment adds no turn");
+        assert_eq!(turns[0].items.len(), 2, "the row joins the turn's items");
+
+        let link = next_link(&mut fixture.links).await;
+        assert_eq!(link.parent_thread_id, fixture.thread_id);
+        assert_eq!(link.spawned_by_turn_id, fixture.turn);
+        assert_eq!(link.item_id, item_id);
+        assert_eq!(link.origin, "late_item_completed");
+        assert_eq!(link.info.native_thread_id, "task:toolu_bg");
+        assert!(link.reply.is_none());
+
+        logs_assert(a_line_with(&[
+            " INFO ",
+            "action=\"amend_turn_item\"",
+            "kind=\"subagent_outcome\"",
+            "amended a persisted turn with a late sub-agent outcome",
+        ]));
+    }
+
+    #[tokio::test]
+    async fn a_late_activity_without_a_link_is_neither_amended_nor_broadcast() {
+        let mut fixture = late_outcome_fixture().await;
+        let (plain_id, plain) =
+            late_activity(fixture.thread_id, fixture.turn, "activity:plain", None);
+        let (linked_id, linked) = late_activity(
+            fixture.thread_id,
+            fixture.turn,
+            "task_updated:b2",
+            Some(completed_link("task:toolu_after")),
+        );
+        assert!(fixture.log.append(plain));
+        assert!(fixture.log.append(linked));
+
+        // Events are applied in order, so once the linked row is out the plain one was handled.
+        let seen = broadcast_item_completions_until(&mut fixture.client_rx, linked_id).await;
+        assert_eq!(
+            seen,
+            vec![linked_id],
+            "a row without a link is not broadcast"
+        );
+        assert!(
+            fixture
+                .store
+                .load_turn_item(
+                    fixture.project_id,
+                    fixture.thread_id,
+                    fixture.turn,
+                    plain_id
+                )
+                .await
+                .unwrap()
+                .is_none(),
+            "a row without a link is not amended"
+        );
+        // Nor offered to the driver: the only link is the linked row's.
+        assert_eq!(next_link(&mut fixture.links).await.item_id, linked_id);
+        assert!(fixture.links.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    #[traced_test]
+    async fn a_late_subagent_outcome_that_cannot_be_written_is_still_broadcast_and_linked() {
+        let mut fixture = late_outcome_fixture().await;
+        // A first outcome proves the forwarder has loaded the turn as persisted: a payload gone
+        // before that load would drop the turn from what the forwarder knows to be persisted.
+        let (first_id, first) = late_activity(
+            fixture.thread_id,
+            fixture.turn,
+            "task_updated:first",
+            Some(completed_link("task:toolu_first")),
+        );
+        assert!(fixture.log.append(first));
+        broadcast_item_completions_until(&mut fixture.client_rx, first_id).await;
+        next_link(&mut fixture.links).await;
+
+        let payload = giskard_persist::layout::ThreadPaths::new(
+            fixture
+                .store
+                .data_dir()
+                .join("projects")
+                .join(fixture.project_id.to_string())
+                .join("threads"),
+            fixture.thread_id,
+            giskard_persist::ThreadLayout::Directory,
+        )
+        .turn_payload(fixture.turn);
+        tokio::fs::remove_file(&payload).await.unwrap();
+
+        let (item_id, event) = late_activity(
+            fixture.thread_id,
+            fixture.turn,
+            "task_updated:second",
+            Some(completed_link("task:toolu_second")),
+        );
+        assert!(fixture.log.append(event));
+        let seen = broadcast_item_completions_until(&mut fixture.client_rx, item_id).await;
+        assert_eq!(
+            seen,
+            vec![item_id],
+            "a failed write still reaches an open browser"
+        );
+        let link = next_link(&mut fixture.links).await;
+        assert_eq!(link.item_id, item_id);
+        assert_eq!(link.origin, "late_item_completed");
+        assert!(
+            !payload.exists(),
+            "a failed amendment does not conjure a payload"
+        );
+
+        logs_assert(a_line_with(&[
+            " ERROR ",
+            "action=\"amend_turn_item\"",
+            "kind=\"subagent_outcome\"",
+            "failed to amend a persisted turn with a late sub-agent outcome",
+            "cannot amend a turn whose payload is missing",
+        ]));
+    }
+
+    #[tokio::test]
+    async fn a_stale_forwarder_neither_amends_nor_broadcasts_a_late_subagent_outcome() {
+        let mut fixture = late_outcome_fixture().await;
+        // A first outcome proves the forwarder has loaded the turn as persisted.
+        let (first_id, first) = late_activity(
+            fixture.thread_id,
+            fixture.turn,
+            "task_updated:first",
+            Some(completed_link("task:toolu_first")),
+        );
+        assert!(fixture.log.append(first));
+        broadcast_item_completions_until(&mut fixture.client_rx, first_id).await;
+        next_link(&mut fixture.links).await;
+
+        // Another owner took the thread's runtime: this forwarder's authority is no longer current.
+        fixture
+            .runtime
+            .forget_threads(std::slice::from_ref(&fixture.authority));
+        let (item_id, event) = late_activity(
+            fixture.thread_id,
+            fixture.turn,
+            "task_updated:stale",
+            Some(completed_link("task:toolu_stale")),
+        );
+        assert!(fixture.log.append(event));
+        tokio::time::timeout(tokio::time::Duration::from_secs(2), &mut fixture.forwarder)
+            .await
+            .expect("a stale forwarder exits")
+            .unwrap();
+
+        assert!(
+            fixture
+                .store
+                .load_turn_item(fixture.project_id, fixture.thread_id, fixture.turn, item_id)
+                .await
+                .unwrap()
+                .is_none(),
+            "a stale forwarder does not amend the store"
+        );
+        while let Ok(message) = fixture.client_rx.try_recv() {
+            if let ServerMessage::Event { agent_event, .. } = message
+                && let WireAgentEvent::ItemCompleted { item, .. } = *agent_event
+            {
+                assert_ne!(item.id, item_id, "a stale forwarder does not broadcast");
+            }
+        }
+        assert!(
+            fixture.links.try_recv().is_err(),
+            "a stale forwarder sends no link"
+        );
+    }
+
     #[tokio::test]
     async fn live_turn_forwarder_ignores_events_for_other_threads() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -6057,6 +6526,38 @@ mod tests {
         Arc<super::ThreadCoordinator>,
         Arc<super::ThreadAuthority>,
     ) {
+        spawn_forwarder_handle_with_driver(
+            thread_id,
+            project_id,
+            stream,
+            hub,
+            store,
+            ledger,
+            model,
+            user_input,
+            harness_turn_id,
+            DriverHandle::disconnected(),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn spawn_forwarder_handle_with_driver(
+        thread_id: ThreadId,
+        project_id: ProjectId,
+        stream: AgentEventStream,
+        hub: Arc<Hub>,
+        store: Arc<PersistStore>,
+        ledger: ledger::LedgerHandle,
+        model: ModelRef,
+        user_input: &str,
+        harness_turn_id: Option<TurnId>,
+        driver: DriverHandle,
+    ) -> (
+        JoinHandle<()>,
+        Arc<ThreadRuntimeSupport>,
+        Arc<super::ThreadCoordinator>,
+        Arc<super::ThreadAuthority>,
+    ) {
         let ctx = TurnContext {
             user_input: UserInput::text(user_input),
             model: TurnModel::Known(model.clone()),
@@ -6088,36 +6589,40 @@ mod tests {
             harness_turn_id.unwrap_or_default(),
         ));
         let weak_harness = Arc::downgrade(&harness);
-        let handle = tokio::spawn(async move {
-            let (reply, _response) = oneshot::channel();
-            intent_tx
-                .send(TurnIntent::StartTurn {
-                    input: ctx.user_input.clone(),
-                    overrides: giskard_core::turn::TurnOverrides {
-                        model: None,
-                        mode: Mode::Build,
-                        permission_preset: PermissionPreset::AskFirst,
-                    },
-                    context: ctx.clone(),
-                    reply,
-                })
+        // Instrumented so a `#[traced_test]` sees the forwarder's lines as its own.
+        let handle = tokio::spawn(
+            async move {
+                let (reply, _response) = oneshot::channel();
+                intent_tx
+                    .send(TurnIntent::StartTurn {
+                        input: ctx.user_input.clone(),
+                        overrides: giskard_core::turn::TurnOverrides {
+                            model: None,
+                            mode: Mode::Build,
+                            permission_preset: PermissionPreset::AskFirst,
+                        },
+                        context: ctx.clone(),
+                        reply,
+                    })
+                    .await
+                    .unwrap();
+                ThreadEventForwarder::new(
+                    services,
+                    task_authority,
+                    coordinator_for_task,
+                    weak_harness,
+                    stream,
+                    cancel_rx,
+                    intent_rx,
+                    driver,
+                )
                 .await
-                .unwrap();
-            ThreadEventForwarder::new(
-                services,
-                task_authority,
-                coordinator_for_task,
-                weak_harness,
-                stream,
-                cancel_rx,
-                intent_rx,
-                DriverHandle::disconnected(),
-            )
-            .await
-            .run()
-            .await;
-            drop(harness);
-        });
+                .run()
+                .await;
+                drop(harness);
+            }
+            .in_current_span(),
+        );
         (handle, runtime, coordinator, authority)
     }
 

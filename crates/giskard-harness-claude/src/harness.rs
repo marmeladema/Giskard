@@ -7053,6 +7053,209 @@ mod tests {
         harness.shutdown().await.unwrap();
     }
 
+    /// `line` with its `pointer` field set to `value`.
+    fn with_field(line: &str, pointer: &str, value: Value) -> String {
+        let mut frame: Value = serde_json::from_str(line).unwrap();
+        *frame.pointer_mut(pointer).unwrap() = value;
+        frame.to_string()
+    }
+
+    /// Whatever `stream` delivers before it goes quiet.
+    async fn drain(stream: &mut AgentEventStream) -> Vec<AgentEvent> {
+        let mut events = Vec::new();
+        while let Ok(Ok(event)) =
+            tokio::time::timeout(Duration::from_millis(100), stream.recv()).await
+        {
+            events.push(event);
+        }
+        events
+    }
+
+    #[tokio::test(start_paused = true)]
+    #[traced_test]
+    async fn a_background_sub_agent_leaves_the_parent_free_for_the_next_prompt() {
+        // `delegation-background-idle`: "launched" (lines 1–8), "pong" with the sub-agent's frames
+        // between its own (9–15), the rest of the sub-agent's run (16–82), its end (83–85), and
+        // the CLI's continuation (86–88).
+        let lines = fixture_lines("delegation-background-idle");
+        let (child, record) = scripted(
+            handshake_steps("sonnet"),
+            vec![
+                Step::OnStdin(user(), vec![Action::Emit(lines[..8].to_vec())]),
+                Step::OnStdin(user(), vec![Action::Emit(lines[8..15].to_vec())]),
+            ],
+        );
+        let injector = child.injector();
+        let (harness, _) = harness_with(reaping(), vec![child]);
+        let (options, _updates) = open_options(ThreadId::new(), None, "sonnet");
+        let handle = harness.open_thread(options).await.unwrap();
+        let mut stream = harness.subscribe(&handle);
+        let first = harness
+            .start_turn(&handle, text("delegate"), overrides())
+            .await
+            .unwrap();
+        let link = spawned_link(&mut stream).await;
+        let route = harness
+            .claim_native_thread(
+                ThreadId::new(),
+                link.harness_thread_id,
+                PathBuf::from(WORKSPACE),
+            )
+            .await
+            .unwrap();
+        let mut sub = harness.subscribe(&route);
+        let (completed, status, _) = completion(&until_completed(&mut stream).await);
+        assert_eq!((completed, status), (first, TurnStatusKind::Completed));
+
+        // The parent takes the next prompt while the sub-agent runs, and the sub-agent's frames
+        // keep landing on its own thread.
+        let second = harness
+            .start_turn(&handle, text("ping"), overrides())
+            .await
+            .unwrap();
+        let (completed, status, _) = completion(&until_completed(&mut stream).await);
+        assert_eq!((completed, status), (second, TurnStatusKind::Completed));
+        let running = drain(&mut sub).await;
+        assert!(matches!(running[0], AgentEvent::TurnStarted { .. }));
+        assert!(running.iter().any(|event| matches!(
+            event,
+            AgentEvent::ItemStarted { item, .. }
+                if item.tool.as_ref().is_some_and(|tool| tool.name == "Read")
+        )));
+        assert!(
+            !running
+                .iter()
+                .any(|event| matches!(event, AgentEvent::TurnCompleted { .. }))
+        );
+
+        // The live route keeps the idle parent's child from being reaped.
+        tokio::time::sleep(2 * IDLE).await;
+        assert_eq!(harness.live_children(), 1);
+        assert!(!lock(&record).stdin_closed);
+
+        // The sub-agent ends; its outcome row is a late item of the delegating turn, and the CLI's
+        // continuation is a turn of its own.
+        for line in &lines[15..] {
+            injector.emit(line.clone());
+        }
+        assert_eq!(
+            completion(&until_completed(&mut sub).await).1,
+            TurnStatusKind::Completed
+        );
+        let events = until_completed(&mut stream).await;
+        let outcome: Vec<_> = events
+            .iter()
+            .filter_map(|event| match event {
+                AgentEvent::ItemCompleted { turn, item, .. } => match &item.payload {
+                    giskard_core::item::ItemPayload::Activity {
+                        subagent: Some(link),
+                        ..
+                    } => Some((*turn, link.status)),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            outcome,
+            vec![(first, Some(giskard_core::item::SubagentStatus::Completed))]
+        );
+        let continuation = turns_started(&events);
+        assert_eq!(continuation.len(), 1);
+        assert!(continuation[0] != first && continuation[0] != second);
+        let (completed, status, _) = completion(&events);
+        assert_eq!(
+            (completed, status),
+            (continuation[0], TurnStatusKind::Completed)
+        );
+
+        // Nothing keeps the child busy any more.
+        tokio::time::sleep(IDLE).await;
+        reaped(&harness, &record).await;
+        logs_assert(a_line_with(&[" INFO ", r#"action="route_outlives_turn""#]));
+        logs_assert(a_line_with(&[" INFO ", r#"action="continuation_turn""#]));
+        harness.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    #[traced_test]
+    async fn a_background_sub_agent_is_stopped_from_its_thread_while_the_parent_runs() {
+        // `delegation-background`: "launched" (lines 1–8), then "pong" begins (9–12) and is still
+        // running when the sub-agent is stopped.
+        let lines = fixture_lines("delegation-background");
+        let updated = lines
+            .iter()
+            .position(|line| line.contains("\"subtype\": \"task_updated\""))
+            .unwrap();
+        let killed = vec![
+            with_field(&lines[updated], "/patch/status", json!("killed")),
+            with_field(&lines[updated + 1], "/status", json!("stopped")),
+        ];
+        let pong_result = lines
+            .iter()
+            .enumerate()
+            .filter(|(_, line)| line.contains("\"type\": \"result\""))
+            .nth(1)
+            .unwrap()
+            .1
+            .clone();
+        let (child, record) = scripted(
+            handshake_steps("sonnet"),
+            vec![
+                Step::OnStdin(user(), vec![Action::Emit(lines[..8].to_vec())]),
+                Step::OnStdin(user(), vec![Action::Emit(lines[8..12].to_vec())]),
+                Step::OnStdin(
+                    control("stop_task"),
+                    vec![Action::Emit(killed), Action::Respond(json!({}))],
+                ),
+            ],
+        );
+        let injector = child.injector();
+        let (harness, _) = harness_with(ClaudeLaunchOptions::default(), vec![child]);
+        let (options, _updates) = open_options(ThreadId::new(), None, "sonnet");
+        let handle = harness.open_thread(options).await.unwrap();
+        let mut stream = harness.subscribe(&handle);
+        let first = harness
+            .start_turn(&handle, text("delegate"), overrides())
+            .await
+            .unwrap();
+        let link = spawned_link(&mut stream).await;
+        let route = harness
+            .claim_native_thread(
+                ThreadId::new(),
+                link.harness_thread_id,
+                PathBuf::from(WORKSPACE),
+            )
+            .await
+            .unwrap();
+        let mut sub = harness.subscribe(&route);
+        assert_eq!(completion(&until_completed(&mut stream).await).0, first);
+        let second = harness
+            .start_turn(&handle, text("ping"), overrides())
+            .await
+            .unwrap();
+
+        harness.interrupt(&route).await.unwrap();
+        let stop: Vec<Value> = written(&record)
+            .into_iter()
+            .filter(|line| line["request"]["subtype"] == "stop_task")
+            .map(|line| line["request"].clone())
+            .collect();
+        assert_eq!(
+            stop,
+            vec![json!({"subtype": "stop_task", "task_id": "a49201b8554844f64"})]
+        );
+        assert_eq!(
+            completion(&until_completed(&mut sub).await).1,
+            TurnStatusKind::Interrupted
+        );
+        // The parent's running turn is not ended by it: its own `result` does.
+        injector.emit(pong_result);
+        let (completed, status, _) = completion(&until_completed(&mut stream).await);
+        assert_eq!((completed, status), (second, TurnStatusKind::Completed));
+        harness.shutdown().await.unwrap();
+    }
+
     #[tokio::test(start_paused = true)]
     async fn a_reaped_thread_respawns_with_resume_on_the_next_turn() {
         // The first child switches to opus on its turn; the respawn launches on opus.
@@ -7291,66 +7494,6 @@ mod tests {
             "no notification followed",
         ]));
         // Nothing keeps the child busy any more: it is reaped like any idle child.
-        tokio::time::sleep(IDLE).await;
-        reaped(&harness, &record).await;
-        harness.shutdown().await.unwrap();
-    }
-
-    #[tokio::test(start_paused = true)]
-    #[traced_test]
-    async fn an_interrupt_releases_a_turn_held_by_an_agent_task_that_never_ends() {
-        // The turn's `result` arrives while an agent task is open, and nothing ever ends that
-        // task; the CLI already ended its turn, so it answers the interrupt and says no more.
-        let result = fixture_lines("text-turn")
-            .into_iter()
-            .find(|line| line.contains("\"type\": \"result\""))
-            .unwrap();
-        let task = r#"{"type":"system","subtype":"task_started","session_id":"s","task_id":"a1","tool_use_id":"toolu_gone","task_type":"local_agent","is_backgrounded":false,"description":"/review","uuid":"u1"}"#;
-        let (child, record) = scripted(
-            handshake_steps("sonnet"),
-            vec![
-                Step::OnStdin(user(), vec![Action::Emit(vec![task.into(), result])]),
-                Step::OnStdin(
-                    control("interrupt"),
-                    vec![Action::Respond(json!({"still_queued": []}))],
-                ),
-            ],
-        );
-        let (harness, _) = harness_with(reaping(), vec![child]);
-        let (options, _updates) = open_options(ThreadId::new(), None, "sonnet");
-        let handle = harness.open_thread(options).await.unwrap();
-        let mut stream = harness.subscribe(&handle);
-        let turn = harness
-            .start_turn(&handle, text("review the change"), overrides())
-            .await
-            .unwrap();
-        tokio::time::sleep(Duration::from_secs(60)).await;
-        assert!(
-            harness
-                .start_turn(&handle, text("next"), overrides())
-                .await
-                .is_err(),
-            "the held turn is still active"
-        );
-
-        let interrupted = Instant::now();
-        harness.interrupt(&handle).await.unwrap();
-        let events = until_completed(&mut stream).await;
-        let (completed, status, _) = completion(&events);
-        assert_eq!(completed, turn);
-        assert_eq!(status, TurnStatusKind::Interrupted);
-        assert!(
-            interrupted.elapsed() >= crate::session::INTERRUPTED_HOLD_GRACE,
-            "{:?}",
-            interrupted.elapsed()
-        );
-        logs_assert(a_line_with(&[" WARN ", "action=\"release_held_result\""]));
-        logs_assert(a_line_with(&[
-            " WARN ",
-            "action=\"agent_task_abandoned\"",
-            "task_id=a1 ",
-        ]));
-        // The task the turn waited on is no longer tracked: the child is reaped like any idle one.
         tokio::time::sleep(IDLE).await;
         reaped(&harness, &record).await;
         harness.shutdown().await.unwrap();

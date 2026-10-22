@@ -15,6 +15,7 @@ use giskard_core::event::AgentEvent;
 use giskard_core::ids::{ItemId, ProjectId, ThreadId, TurnId};
 use giskard_core::item::{CommandExecutionStart, ToolCallStart};
 use giskard_core::item::{Item, ItemKind, ItemPayload, ItemStart};
+use giskard_core::item::{SubagentAction, SubagentLink, SubagentStatus};
 use giskard_proto::{ClientMessage, ServerMessage};
 use giskard_testenv::fake::{self, FakeCore, FakeHarness, Gate, Script, TurnCall};
 use giskard_testenv::ws::TestWs;
@@ -30,6 +31,8 @@ const HARNESS_ITEM_ID: &str = "native-late-item";
 enum LateKind {
     Command,
     Tool,
+    /// A backgrounded sub-agent's outcome row: it has no start, only a late completion.
+    SubagentOutcome,
 }
 
 /// Starts a turn with one still-running item, completes the turn, and then — once the test opens
@@ -54,8 +57,8 @@ impl LateScript {
         }
     }
 
-    fn started_item(&self) -> ItemStart {
-        match self.kind {
+    fn started_item(&self) -> Option<ItemStart> {
+        Some(match self.kind {
             LateKind::Command => ItemStart {
                 id: self.item_id,
                 harness_item_id: HARNESS_ITEM_ID.into(),
@@ -84,7 +87,8 @@ impl LateScript {
                     started_at_ms: Some(1_785_000_000_000),
                 }),
             },
-        }
+            LateKind::SubagentOutcome => return None,
+        })
     }
 
     fn settled_item(&self, output: &str) -> Item {
@@ -111,6 +115,19 @@ impl LateScript {
                 subagent: None,
                 error: None,
             },
+            LateKind::SubagentOutcome => ItemPayload::Activity {
+                title: "Read data.txt".into(),
+                detail: Some(output.into()),
+                metadata: None,
+                subagent: Some(SubagentLink {
+                    harness_thread_id: "task:toolu_late".into(),
+                    path: None,
+                    initial_prompt: None,
+                    action: SubagentAction::Completed,
+                    status: Some(SubagentStatus::Completed),
+                    message: None,
+                }),
+            },
         };
         Item {
             id: self.item_id,
@@ -132,11 +149,13 @@ impl Script for LateScript {
             thread: call.thread,
             turn: call.turn,
         });
-        call.log.append(AgentEvent::ItemStarted {
-            thread: call.thread,
-            turn: call.turn,
-            item: self.started_item(),
-        });
+        if let Some(item) = self.started_item() {
+            call.log.append(AgentEvent::ItemStarted {
+                thread: call.thread,
+                turn: call.turn,
+                item,
+            });
+        }
         // The turn ends with the item still running: the forwarder persists it as it stands.
         core.complete_turn(call.thread, call.turn);
 
@@ -658,12 +677,38 @@ async fn a_failed_amendment_keeps_the_runtime_copy_serving_the_late_output() {
 
 // ---- G6: flat layout ----
 
-/// A thread still on the format 1 flat layout has no per-turn payload to amend. The amendment is
-/// reported unsupported, nothing is written, and the late completion behaves exactly as it did
-/// before durable amendments existed.
-#[tokio::test]
-async fn a_flat_layout_thread_is_unsupported_and_behaves_as_before() {
-    let fixture = start(LateKind::Command).await;
+/// A flat-layout thread whose turn has been persisted with its item unsettled, and the flat
+/// history's bytes at that point.
+struct FlatThread {
+    fixture: Fixture,
+    socket: TestWs,
+    turn: TurnId,
+    flat_history: std::path::PathBuf,
+    before: Vec<u8>,
+}
+
+impl FlatThread {
+    /// Asserts the amendment wrote nothing: the flat history is untouched and no payload exists.
+    async fn assert_nothing_written(&self) {
+        assert_eq!(
+            tokio::fs::read(&self.flat_history).await.unwrap(),
+            self.before,
+            "an unsupported amendment writes nothing"
+        );
+        assert!(
+            !self
+                .fixture
+                .threads_dir()
+                .join(self.fixture.thread_id.to_string())
+                .join("turns")
+                .exists(),
+            "an unsupported amendment does not create a turn payload"
+        );
+    }
+}
+
+async fn flat_thread_with_a_persisted_turn(kind: LateKind) -> FlatThread {
+    let fixture = start(kind).await;
 
     // A format 1 history whose interior line cannot be parsed: the migration would lose turns, so
     // the thread stays flat. That is the only way a live thread is still on format 1.
@@ -706,23 +751,29 @@ async fn a_flat_layout_thread_is_unsupported_and_behaves_as_before() {
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     }
     let before = tokio::fs::read(&flat_history).await.unwrap();
+    FlatThread {
+        fixture,
+        socket,
+        turn,
+        flat_history,
+        before,
+    }
+}
 
-    fixture.release();
-    expect_late_item_completion(&mut socket).await;
+/// A thread still on the format 1 flat layout has no per-turn payload to amend. The amendment is
+/// reported unsupported, nothing is written, and the late completion behaves exactly as it did
+/// before durable amendments existed.
+#[tokio::test]
+async fn a_flat_layout_thread_is_unsupported_and_behaves_as_before() {
+    let mut flat = flat_thread_with_a_persisted_turn(LateKind::Command).await;
+    let turn = flat.turn;
+
+    flat.fixture.release();
+    expect_late_item_completion(&mut flat.socket).await;
 
     // Today's behaviour, unchanged: the live client saw it, and nothing durable moved.
-    assert_eq!(
-        tokio::fs::read(&flat_history).await.unwrap(),
-        before,
-        "an unsupported amendment writes nothing"
-    );
-    assert!(
-        !threads_dir
-            .join(fixture.thread_id.to_string())
-            .join("turns")
-            .exists(),
-        "an unsupported amendment does not create a turn payload"
-    );
+    flat.assert_nothing_written().await;
+    let fixture = &flat.fixture;
     // And the runtime copy was dropped, as it is today: the route has nothing left to serve. (The
     // status is the corrupt-history reader's, not the amendment's — this thread is unreadable by
     // construction, which is the only way a live thread is still on format 1.)
@@ -734,6 +785,32 @@ async fn a_flat_layout_thread_is_unsupported_and_behaves_as_before() {
         .await;
     assert_ne!(response.status(), 200);
     assert!(!response.text().await.unwrap().contains(LATE_OUTPUT));
+}
+
+/// A backgrounded sub-agent's outcome row on a flat-layout thread: nothing is written, the open
+/// browser still gets the row, and an operator is told the turn on disk will not carry it.
+#[tokio::test]
+#[traced_test]
+async fn a_late_subagent_outcome_on_a_flat_layout_thread_is_unsupported_but_still_shown() {
+    let mut flat = flat_thread_with_a_persisted_turn(LateKind::SubagentOutcome).await;
+
+    flat.fixture.release();
+    expect_late_item_completion(&mut flat.socket).await;
+
+    flat.assert_nothing_written().await;
+    logs_assert(|lines: &[&str]| {
+        let warned = lines.iter().any(|line| {
+            line.contains("WARN")
+                && line.contains("action=\"amend_turn_item\"")
+                && line.contains("kind=\"subagent_outcome\"")
+                && line.contains("shown but not persisted")
+        });
+        if warned {
+            Ok(())
+        } else {
+            Err("no warn-level unsupported sub-agent outcome amendment was logged".into())
+        }
+    });
 }
 
 // ---- H7: damaged record surfaced ----

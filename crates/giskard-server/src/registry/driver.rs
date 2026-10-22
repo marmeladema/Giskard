@@ -345,6 +345,26 @@ impl DriverHandle {
         }
     }
 
+    /// A driver that admits nothing and hands every link it is sent to the test.
+    #[cfg(test)]
+    pub(super) fn recording_links_for_test() -> (Self, mpsc::UnboundedReceiver<Link>) {
+        let (tx, mut rx) = mpsc::channel(4);
+        let (links_tx, links_rx) = mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            while let Some(command) = rx.recv().await {
+                if let DriverCommand::Link(link) = command {
+                    let _ = links_tx.send(*link);
+                }
+            }
+        });
+        (
+            Self {
+                tx: DriverSender::Strong(tx),
+            },
+            links_rx,
+        )
+    }
+
     #[cfg(test)]
     pub(super) fn responsive_for_test() -> Self {
         let (tx, mut rx) = mpsc::channel(4);

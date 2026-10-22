@@ -56,7 +56,7 @@ Milestone 1 is implemented; see `claude-code-harness-plan/milestone-1-plan.md`.
 | Processes | **1 `codex app-server` per project**, multiplexing every thread | **1 `claude` per session**; a session ≈ one Giskard thread |
 | Native thread id | Codex-minted rollout id | **client-minted UUID** via `--session-id`; resumed with `--resume=<uuid>` |
 | Concurrency | one worker task fans out to N threads | N independent children, each single-threaded through its own turn. Two sessions in the same cwd run concurrent tool-using turns, each with its own `<uuid>.jsonl` under one cwd-encoded directory, with no locking or contention (§3.4) |
-| Turn ids | native `turnId` | **none** — Giskard mints every `TurnId`. A turn is "user message → `result`" **only when nothing was delegated**: a backgrounded delegation emits **two** `result` messages with the sub-agent's work between them, while a foreground one emits one. Completion therefore gates on the agent task's terminal `task_updated`, not on `result` (§5.3) |
+| Turn ids | native `turnId` | **none** — Giskard mints every `TurnId`. A turn is "user message → `result`", a backgrounded delegation included: its first `result` ends the delegating turn while the sub-agent runs on its own thread, and the CLI's continuation once the sub-agent ended is a **turn of its own** (its `result` carries `origin.kind: "task-notification"`), which the mapper opens as an external turn (§5.3; recorded on 2.1.306, the three `delegation-background*` fixtures) |
 | Model catalog | `model/list` RPC | the `initialize` control response already carries the session's `models` array, and `list_models` refreshes it — answered by the child from its own authentication, so Giskard needs no key and makes no HTTP request (§3.3, §6) |
 | Session storage | Codex thread store | `~/.claude/projects/<project>/<uuid>.jsonl`, where `<project>` is **derived from cwd** (and can be pinned with `CLAUDE_CODE_PROJECT_DIR_NAME`, §5.2). Storage is cwd-derived; **resume is not cwd-scoped** — see below |
 
@@ -113,7 +113,7 @@ turn's first answer frame as a backstop. `--replay-user-messages` was tried for 
 
 | Message | Use in Giskard |
 | --- | --- |
-| `system/init` | effective `session_id`, `model`, **`permissionMode`**, `tools`, `mcp_servers`, `slash_commands`, `apiKeySource`, `claude_code_version`, and a **`capabilities`** array naming the protocol behaviours this build implements — check it to feature-detect instead of comparing versions. Authoritative for applied *session settings*; for what actually ran, `result.modelUsage` is the truth, since a host-managed provider can serve a different model than `init` reports. **Re-emitted** on three known triggers — after `set_model`, after `/compact`, and when a backgrounded sub-agent's `task_notification` starts the parent's continuation, immediately before the second `result` (§5.3). Treat it as a repeatable announcement rather than a one-shot handshake; three independent triggers suggest there are more. |
+| `system/init` | effective `session_id`, `model`, **`permissionMode`**, `tools`, `mcp_servers`, `slash_commands`, `apiKeySource`, `claude_code_version`, and a **`capabilities`** array naming the protocol behaviours this build implements — check it to feature-detect instead of comparing versions. Authoritative for applied *session settings*; for what actually ran, `result.modelUsage` is the truth, since a host-managed provider can serve a different model than `init` reports. **Re-emitted** on three known triggers — after `set_model`, after `/compact`, and when a backgrounded sub-agent's `task_notification` starts the parent's continuation turn, at its top (§5.3). Treat it as a repeatable announcement rather than a one-shot handshake; three independent triggers suggest there are more. |
 | `stream_event` | raw Anthropic streaming events (`content_block_delta`, …) → `ItemDelta` |
 | `assistant` | complete message with `text` / `thinking` / `tool_use` blocks → `AgentMessage` / `Reasoning` / `ToolCall` items |
 | `user` (tool_result) | tool output + `tool_use_result` (stdout/stderr/interrupted) → `ItemCompleted` |
@@ -554,11 +554,11 @@ overlay is applied by the layer above.
 - `subscribe` must answer before the child has produced anything: create the retained `EventLog` at
   open, fill it from that process's reader.
 - A child's exit ends **that thread's** stream only. One crash must not close its siblings'.
-- **A `result` does not always end the turn.** A backgrounded delegation emits two (§5.3), so turn bookkeeping
-  stays open until every **agent-type** task (`task_type: "local_agent"`) has a terminal
-  `task_updated`. Background *command* tasks (`local_bash`) must not gate the turn — they legitimately
-  outlive it — and belong in `RunningTaskState` instead, which is where they reach it since the
-  hardening pass (`claude-code-harness-plan/hardening-plan.md` §2).
+- **A `result` always ends the turn.** A backgrounded delegation's first `result` ends the delegating
+  turn; the sub-agent runs on, on its own route, which outlives that turn, and the CLI's
+  continuation `result` ends a turn of its own (§5.3; `claude-code-harness-plan/hardening-plan.md`
+  §4). Background *command* tasks (`local_bash`) outlive their turn too, and belong in
+  `RunningTaskState`, which is where they reach it since the hardening pass (§2 of the same plan).
 - `discoveries()` is `DiscoveryStream::closed()`: a per-thread process produces no *unsolicited*
   native traffic, so there is nothing to discover.
 - **`claim_native_thread` must be implemented**, for `task:` ids. It cannot stay at the trait default,
@@ -695,38 +695,45 @@ this resumable?" without loading the thread. A prefix answers it at the point of
 prefixed identifiers are already established practice here — `app.js` special-cases
 `subagent_prompt:` item ids.
 
-**And the parent turn may not end when it looks like it does.** A delegation runs in one of two
-shapes, and **`task_started.is_backgrounded` is the discriminator**:
+**And a backgrounded delegation outlives its turn.** A delegation runs in one of two shapes, and
+**`task_started.is_backgrounded` is the discriminator**:
 
 | `is_backgrounded` | What follows |
 | --- | --- |
 | `false` | The parent waits. One `result`, after the sub-agent finishes. |
-| `true` | The parent's `tool_result` is the internal metadata *"Async agent launched successfully"* and its `result` lands immediately. The sub-agent's tool calls, approval asks and answer arrive afterwards, then `task_updated` → `task_notification` → **a re-emitted `system/init`** → a **second `result`** carrying the outcome. |
+| `true` | The parent's `tool_result` is the internal metadata *"Async agent launched successfully"* and its `result` lands immediately: **that `result` ends the parent's turn**. The sub-agent's tool calls, approval asks and answer arrive afterwards, then `task_updated` → `task_notification` → **a re-emitted `system/init`** → the CLI's **continuation turn**, whose `result` carries `origin: {kind: "task-notification", …}`. |
 
 Which shape a call takes is decided per delegation, not by configuration: the same prompt produced
-each. So **the mapper must handle both**, and must not assume a second `result` either arrives or
-does not.
+each. So **the mapper must handle both**, and must not assume a continuation either arrives or does
+not.
+
+The first draft of this plan read the two `result` frames of a backgrounded delegation as one turn,
+and held the first for the second. The CLI does not: recorded on 2.1.306 (first seen on 2.1.288,
+the `delegation-background`, `-idle` and `-stop` fixtures), it ends the parent's turn at the first
+`result`, serves a prompt written that instant while the sub-agent's frames keep arriving, and runs
+the continuation as a turn of its own, directly after the task ended when the parent is idle, or
+queued behind the prompt in flight. A stopped background agent may be followed by a continuation
+(`-stop`) or not (`delegation-interrupted`). So the delegating turn ends at its `result`, the
+sub-agent's **route outlives it** (dropped once both its task and its spawning turn have ended),
+the continuation is an external turn, and the sub-agent's outcome row reaches the delegating turn
+as a **late** item the server amends into the persisted turn. Nothing is dropped by ending the turn
+there: the sub-agent's frames are routed by `parent_tool_use_id`, not by the parent's turn
+(hardening plan §4).
 
 This is a property of the Agent tool, not of the environment: the backgrounded shape reproduces with a
 child whose only `CLAUDE_*` variables are `CLAUDE_CONFIG_DIR` and a token-file path — no
 `CLAUDE_AUTO_BACKGROUND_TASKS`, no `CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST`, no subagent-depth setting.
 
-**The rule this imposes, and its scope.** The mapper keeps the parent turn open until every
-**agent-type** task it started has reached a terminal `task_updated`:
+**The task registry also carries background shell commands.** A `task_type: "local_bash"` task can
+be `is_backgrounded: true` and legitimately outlive its turn — a dev server is the obvious case, and
+its terminal `task_updated` may not arrive for hours or at all (§3.3's `stop_task` only produced one
+because the probe killed the task). Background command tasks belong in Giskard's existing
+running-task projection — `RunningTaskState` in `thread_runtime/tasks.rs`, fed from the command
+item's own status — which is where a long-lived shell already surfaces to the UI and where
+`terminate_command` hooks in. A background agent task outlives its turn the same way, on its route.
 
-> **Gate turn completion on `task_type: "local_agent"` tasks only.**
-
-**Scoping matters, because the task registry also carries background shell commands.** A
-`task_type: "local_bash"` task can be `is_backgrounded: true` and legitimately outlive its turn — a dev
-server is the obvious case, and its terminal `task_updated` may not arrive for hours or at all (§3.3's
-`stop_task` only produced one because the probe killed the task). Gating on *every* `task_started`
-would therefore hold such a turn open forever. Background command tasks belong in Giskard's existing
-running-task projection instead — `RunningTaskState` in `thread_runtime/tasks.rs`, fed from the
-command item's own status — which is where a long-lived shell already surfaces to the UI and where
-`terminate_command` would hook in.
-
-**The agent-task rule is load-bearing in both directions, because an interrupted delegation produces no
-second `result` at all.** Interrupting while the sub-agent's tool is in flight yields:
+**An interrupted delegation produces no continuation at all.** Interrupting while the sub-agent's
+tool is in flight yields:
 
 ```
 system/task_updated  patch={"status":"killed","end_time":…}
@@ -734,10 +741,9 @@ tool_result  parent=toolu_…  is_error=true   "The user doesn't want to proceed
 text         parent=toolu_…  "[Request interrupted by user for tool use]"
 ```
 
-and then nothing — the sub-agent's command is killed, and the second `result` never comes. An adapter
-that waits for a `result` to close the turn would hang; one that closes on the first would have closed
-too early. **A terminal `task_updated` — `completed` or `killed` — on the agent task is the only signal
-that works for both cases.** The `[Request interrupted by user for tool use]` text block is a useful
+and then nothing — the sub-agent's command is killed, and no continuation comes. **A terminal
+`task_updated` — `completed` or `killed` — on the agent task is what ends the sub-agent's route**,
+whatever the parent does; nothing waits for a continuation. The `[Request interrupted by user for tool use]` text block is a useful
 marker to surface in the child thread, and the child's `tool_result` again carries *rejection* wording
 for what was an interrupt (§9.3), so it must not be mapped as a denial.
 
@@ -765,10 +771,7 @@ single `result`. Stopped with `stop_task` (`forked-skill-stop`), it ends like an
 delegation: `task_updated` `killed`, then `task_notification` `stopped`, and the parent's turn goes
 on. So the mapper also mints a route at a `local_agent` `task_started` that names an
 open call other than `Agent`, and a terminal `task_notification` ends an agent task no terminal update
-ended. Gating on the update alone held such a turn's `result` forever, and an interrupt could not end
-it either: the CLI had already finished its turn, so it answers the interrupt and sends nothing else.
-An interrupted turn that still holds its `result` after a short grace is therefore finished as
-interrupted by the adapter.
+ended.
 
 The CLI's own transcript format is documented as internal and unstable — *"the entry format is
 internal to Claude Code and changes between versions"* — so this design's reliance on the **stream**
@@ -1732,8 +1735,11 @@ Its §4: a backgrounded sub-agent kept the parent thread busy until it ended, be
 held the delegating turn's first `result` for the CLI's continuation `result` (this plan's
 two-result model, §5.3); recorded on 2.1.306 (three `delegation-background*` fixtures), the CLI
 ends the parent's turn at the first `result`, serves prompts while the sub-agent runs, and runs
-the continuation as a turn of its own; planned as ending the turn on every `result`, routes that
-outlive their turn, and the outcome row as a late amendment of the delegating turn.
+the continuation as a turn of its own; fixed by ending the turn on every `result`, routes that
+outlive their turn (`route_outlives_turn`), the continuation logged as such (`continuation_turn`),
+and the outcome row as a late amendment of the delegating turn, which the server's `apply_late`
+amends and broadcasts; implemented, see the adapter README's *Turn completion* and *Sub-agent
+routes*.
 
 ### Later, as its own decision — the hook route (§9.4)
 
@@ -1772,7 +1778,7 @@ the endpoint inventory. What this adapter still owns, by milestone:
 | Cost/quota semantics differ under a subscription | Treat euro cost as notional; surface `rate_limit_event` (§6) |
 | `full_access` fails to start when the server process runs as root (§8.1) | Outside the documented setup, but the raw failure is an opaque spawn error: detect the refusal and surface its cause |
 | A checkout carries permission rules Giskard would otherwise honour | `project` and `local` scopes stay excluded (§8.3); only the machine owner's user-scope file is loaded. The exclusion covers `.mcp.json` as well as `settings.json` — a separate surface that would otherwise start a checkout's MCP servers unprompted |
-| **A backgrounded delegation emits two `result` messages** (§5.3) | The highest-severity mapper hazard in this plan, because it fails silently: closing the turn on the first `result` persists "I have delegated this" and drops the work. Worse, whether a delegation backgrounds is decided per call, so a mapper that closes on the first `result` works intermittently. Keep the turn open until every **agent-type** task has a terminal `task_updated` — and no longer, since a backgrounded `local_bash` task legitimately outlives its turn. Cover both halves with the milestone 1 delegation and backgrounded-command fixtures |
+| **A backgrounded delegation outlives its turn** (§5.3) | The first `result` ends the delegating turn, and the CLI serves the next prompt while the sub-agent runs; the continuation is a turn of its own. Holding the turn for the continuation (this plan's first design) kept the parent thread busy until the sub-agent ended. The work is not dropped by ending the turn: the sub-agent's route outlives it and its frames are routed by `parent_tool_use_id`, and its outcome row is amended into the delegating turn late. Whether a delegation backgrounds is decided per call, so both shapes must be covered: the `delegation` and three `delegation-background*` fixtures, with the backgrounded-command ones (hardening plan §4) |
 
 ---
 

@@ -184,29 +184,25 @@ naming `parent_tool_use_id` and the frame type, never attributed to the primary 
 
 - `begin_turn` opens a turn. Calling it while one is active is a caller bug: the previous turn is
   completed as `Failed` ("superseded by a new turn") and logged at `error`.
+- **A `result` ends the turn.** Every `result` completes the active turn, whatever tasks it
+  started. A backgrounded sub-agent runs on, on its own route (see *Sub-agent routes*), and the
+  CLI ends the parent's turn at the first `result` and serves the next prompt while the sub-agent
+  runs (recorded on 2.1.306, the three `delegation-background*` fixtures; first seen on 2.1.288).
+  A `local_agent` task is an entry of the task map like any other, removed by its terminal
+  `task_updated`, or by the terminal `task_notification` of a task that got no update (a forked
+  skill's that completes, `forked-skill`); until then it keeps the child busy, as a background
+  command does.
 - **External turn.** After a backgrounded task finishes, the CLI re-emits `system/init` and runs a
-  continuation with no user message. An `assistant`, `stream_event`, `result` or `can_use_tool`
-  frame with no active turn opens one: the mapper mints a `TurnId`, emits `TurnStarted` and logs at
-  `info` with `action = "external_turn"`. The server claims such a turn as an external turn.
-- **Agent-task gate.** A `result` completes the turn unless a `local_agent` task the turn started is
-  still open; then the result is held. A terminal `task_updated` removes its task, and so does the
-  terminal `task_notification` of a task that got no update: a forked skill's task that completes
-  ends with the notification alone (recorded on 2.1.289, `forked-skill`), and gating on the update
-  held that turn's `result` for good. A stopped one gets the usual `killed` update first
-  (`forked-skill-stop`). When the last task goes and a result is held: `completed` keeps holding (the CLI's continuation `result` completes
-  the turn), while `killed`, `failed` or `stopped` completes it now from the held result, as
-  `Interrupted` if the adapter sent an interrupt, else `Failed`, because no second `result` comes.
-  A `local_bash` task never gates completion; a foreground delegation never holds, since its task
-  completes before the single `result`. An **interrupted** turn that still holds its result
-  `INTERRUPTED_HOLD_GRACE` (5 s) after the hold and the interrupt both stand is finished
-  `Interrupted` by the supervisor (`release_held_result` at `warn`, with `open_agent_tasks`): the
-  CLI already ended that turn, so the interrupt brings no `result`, and only the tasks' own ends
-  (an interrupt makes the CLI kill them) could release it. Without this, a task whose end the
-  adapter never sees would make the turn impossible to stop. A turn that ends while agent tasks
-  it waited on are still open (that release, or a superseded turn; every agent task, a nested
-  route's included, joins the primary turn's set) stops tracking them: each leaves the task map
-  with one `warn` naming it (`action = "agent_task_abandoned"`), so it no longer keeps the child
-  busy and the child can be reaped, and a later end for it is ignored as an unknown task's.
+  continuation with no user message, directly when the parent is idle, else queued behind the
+  prompt in flight. An `assistant`, `stream_event`, `result` or `can_use_tool` frame with no active
+  turn opens one: the mapper mints a `TurnId`, emits `TurnStarted` and logs at `info` with
+  `action = "external_turn"`. The server claims such a turn as an external turn. The continuation's
+  `init` carries no marker; its `result` does, `origin: {kind: "task-notification", …}`: the
+  mapper logs it at `info` with `action = "continuation_turn"` (and `external`), and the
+  `turn_completed` line carries `origin`. Any other `origin.kind` is logged verbatim
+  (`action = "result_origin"`); none is an error. A continuation may follow a stopped background
+  agent or not (`delegation-background-stop` has one, `delegation-interrupted` none): nothing
+  waits for it, and it has no noted prompt, so it acknowledges no `UserMessage`.
 - **Status.** `is_error: false` is `Completed`. An error result is `Interrupted` when the adapter
   called `note_interrupt_sent` or `terminal_reason` is `aborted_streaming` / `aborted_tools`, else
   `Failed` with the result text, else the joined `errors`, else the subtype.
@@ -227,8 +223,8 @@ cache_creation_input_tokens + cache_read_input_tokens`; output tokens are `outpu
 input as what occupies the window now (spec §10.3): a `message_delta`'s, and for the closing event
 the last entry of `result.usage.iterations` (the summed `result.usage` when there is none, as on the
 degenerate `/compact` result). `TurnCompleted.usage` is the turn's billing figure: `result.usage`,
-which sums every request, added across a held result and the CLI's continuation result, since both
-belong to one Giskard turn.
+which sums every request of the turn. The CLI's continuation after a background task is a turn of
+its own, with its own `result.usage`.
 
 `context_window` is the session's `autocompact_state.effective_window` when it reported one, else
 `result.modelUsage[<session model>].contextWindow` once a `result` has been seen, else unknown;
@@ -393,10 +389,12 @@ deduplicated away), since the server reads no handle.
   - Per-prompt `init` re-emission is observed behaviour, not documented. That is what the backstop
     is for.
 - **Interrupt** writes the `interrupt` control request and resolves on its response, within 10 s.
-  With no active turn the CLI answers at once and nothing else happens; nor does it for a turn
-  whose `result` the agent-task gate holds, which the supervisor finishes after a grace (*Turn
-  completion*). On a sub-agent thread it is
-  `stop_task` instead (see *Sub-agent routes*).
+  With no active turn the CLI answers at once and nothing else happens to the parent: the
+  interrupt is noted on no turn. A background sub-agent still running then may be killed by it
+  (`delegation-interrupted`, 2.1.286: interrupted after the delegating turn's `result`, the task
+  reads `killed`), and its route ends `Failed("agent task <id> was killed")`, since nothing noted a
+  stop for it. A background sub-agent is stopped from its own thread: on a sub-agent thread
+  `interrupt` is `stop_task` instead (see *Sub-agent routes*), whatever the parent is doing.
 - **Rename.** `set_thread_name` sends `rename_session` (`source: "host"`) to a live child; a cold,
   reaped or `task:` thread is a no-op, since Giskard keeps its own name. `interrupt` on a reaped
   thread is `Ok` too: it has no active turn.
@@ -426,8 +424,8 @@ deduplicated away), since the server reads no handle.
   `reaped_outputs` on the exit line): the log is the thread's, and a respawned child may already
   be writing to it.
 - **Idle reaping.** A child is idle when it has no turn hand-off in flight, no ask awaiting the
-  user, no live sub-agent route, no open task (a `local_bash` task outlives its turn and can still
-  ask), no control request awaiting its answer and no active turn. Once it has been idle, and has
+  user, no live sub-agent route (a backgrounded sub-agent's outlives its delegating turn), no open
+  task (a `local_bash` or background `local_agent` task outlives its turn and can still ask), no control request awaiting its answer and no active turn. Once it has been idle, and has
   written no stdout line, for `idle_shutdown_secs` (a key on the `claude-code` declaration; 600 s by
   default, `0` never; a value too large for the clock never reaps), the supervisor reaps it. The
   quiet-stdout condition makes the closed list fail safe: a frame the mapper does not model (a
@@ -662,7 +660,7 @@ route's thread and turn and recorded with the route's thread and the primary as 
   thread, which nothing reads until the link, so an ask would wait for good. The call's
   completion carries the link too, as an `Agent` call's does. The task's `task_started` then opens
   the route's turn as for an `Agent` call. A task naming a command
-  or file call, or no open call, gets no route (it still gates the turn). Recorded on 2.1.289
+  or file call, or no open call, gets no route. Recorded on 2.1.289
   (`forked-skill`): the skill's prompt, its tool calls and its answer arrive tagged with the
   `Skill` call's id, then `task_notification` `completed` with **no** `task_updated`, then the
   call's `tool_result` (`tool_use_result.status: "forked"`) and the turn's single `result`.
@@ -701,24 +699,37 @@ route's thread and turn and recorded with the route's thread and the primary as 
   when the adapter sent `stop_task` for the route or the spawning turn was interrupted, else
   `Failed("agent task <id> was killed")` (or `was stopped`); `failed` → `Failed` with the patch's
   `error` (a notification carries none). A terminal update for a task already ended or unknown is ignored at `debug`
-  (`stop_task` on a completed task still emits `killed`). The primary turn's agent-task gate is
-  unchanged.
+  (`stop_task` on a completed task still emits `killed`). The route's end touches no primary turn.
 - **Trailing frames.** A killed sub-agent's rejection `tool_result` and its `[Request interrupted by
   user for tool use]` marker **trail** the terminal update. They are dropped at `debug` with
   `action = "route_trailing_frame"`, the route and its thread: the `Interrupted` status says the
   same, and holding the turn open for them would leave the sub-agent looking busy.
-- **Backgrounded.** A backgrounded delegation's `Agent` call completes at launch with its link still
-  `Started`; when its task ends, an `Activity` on the spawning thread's turn carries the outcome and
-  the link (`harness_item_id = task_updated:<task_id>`).
-- **Close.** When the turn that spawned a route ends, the mapper drops the route (`RouteClosed`: the
-  supervisor stops appending to its log and drops its asks; `info`, `action = "route_closed"`). The
-  log stays **open and published**: the sub-agent thread's owner keeps reading it (a closed stream
-  would end that owner as failed), and a claim that lands after the parent's turn ended still adopts
-  the route and reads its retained events. A route still running there (an agent task the gate let
-  through because the turn failed or was superseded) is first completed `Failed("parent turn
-  ended")` at `warn` (`action = "route_still_open"`), and its task, which the ended turn no longer
-  waits for, leaves the task map (`agent_task_abandoned`). Nested routes are dropped with their parent
-  route. Child exit completes every open route turn (`Interrupted` after an interrupt or a
+- **Backgrounded.** A backgrounded delegation (`run_in_background`, or `task_started`
+  `is_backgrounded: true`) runs beside the parent: the spawning turn ends at its `result` while
+  the route lives on, and the CLI serves the next prompt meanwhile, the sub-agent's frames
+  interleaving with the prompt's own and landing on the route's thread. Its `Agent` call completes
+  at launch with its link still `Started`; when its task ends, an `Activity` carries the outcome
+  and the link (`harness_item_id = task_updated:<task_id>`, title the call's `description`, detail
+  `completed`, `killed` or the error), logged at `info` with `action = "subagent_outcome"` and
+  `late`. While the spawning turn is still the spawning thread's active turn (a sub-agent that
+  ended before its turn's `result`), the row starts and completes on it; once that turn has ended,
+  it is a **late** `ItemCompleted` of the spawning turn alone (no `ItemStarted`, which the server
+  ignores for a persisted turn), which the server amends into the persisted turn (spec LA5). A
+  route the mapper knows no spawning turn for, with no active turn on its parent, reports no row
+  (`debug`).
+- **Close.** A route lives from its delegating call until its task has ended **and** its spawning
+  turn has ended, or the child exits; the mapper drops it at whichever comes last (`RouteClosed`:
+  the supervisor stops appending to its log and drops its asks; `info`, `action =
+  "route_closed"`). When the spawning turn ends, a backgrounded route still running is kept,
+  marked as having outlived its turn (`info`, `action = "route_outlives_turn"`, with its task and
+  the turn), and its own end drops it; a route whose task already ended is dropped then. The log
+  stays **open and published**: the sub-agent thread's owner keeps reading it (a closed stream
+  would end that owner as failed), and a claim that lands after the parent's turn ended still
+  adopts the route and reads its retained events. A **foreground** route still running when its
+  spawning turn ends (never on a `result`, since its call's `tool_result` comes first: only a
+  superseded turn or child exit) is first completed `Failed("parent turn ended")` at `warn`
+  (`action = "route_still_open"`) and dropped; its task stays in the task map until the CLI
+  reports its end. Nested routes are dropped with their parent route. Child exit completes every open route turn (`Interrupted` after an interrupt or a
   `stop_task`, else `Failed` naming the exit) and drops every route; the supervisor then turns its
   published routes cold (logged as `routes_cooled` on the exit line). A route's mapper state never
   outlives its child; its log lives until the sub-agent thread's own delete or archive, or shutdown.

@@ -9,7 +9,15 @@
 
 **Document status:** Implementation-ready specification.
 **Audience:** An AI coding agent (and its human reviewer) implementing the system.
-**Version:** 1.102
+**Version:** 1.103
+
+> **Amendment — a background sub-agent runs beside its parent (1.103).** A Claude Code sub-agent
+> delegated in the background no longer keeps its parent thread busy. The delegating turn ends at
+> its first `result`, as the CLI ends it; the sub-agent thread outlives that turn and keeps
+> running, and the parent accepts new prompts meanwhile. The turn the CLI runs on its own once the
+> sub-agent ended is an external turn on the parent. The sub-agent's outcome row reaches the
+> delegating turn after it was persisted, as a late item the server amends into that turn's payload
+> (LA5) and broadcasts. No wire type, route or on-disk format changes.
 
 > **Amendment — a sub-agent's own model (1.102).** A Claude Code sub-agent thread no longer copies
 > its parent session's model. It is admitted on the model its `Agent` call asked for (`input.model`,
@@ -273,6 +281,27 @@
 > the intended frontend for the foreseeable future; treat every Dioxus/WASM/`giskard-ui` reference
 > below as historical design context, not a current requirement. The wire contract (`giskard-proto`)
 > and all backend design remain authoritative.
+
+**Changelog (1.102 → 1.103), a background sub-agent runs beside its parent:**
+- **BS1:** In the Claude Code adapter a `result` always ends the turn it closes. A backgrounded
+  delegation's first `result` ends the delegating turn (recorded on Claude Code 2.1.306): the
+  sub-agent's thread and route outlive it, from the delegating call until both its task and its
+  spawning turn have ended, or the child exits. A foreground sub-agent still running when its
+  spawning turn ends (a superseded turn, a child exit) is still completed `Failed`.
+- **BS2:** The parent thread accepts a new prompt while a background sub-agent runs; the
+  sub-agent's frames keep landing on its own thread whatever the parent does. The child process
+  is not reaped while the sub-agent runs. A background sub-agent is stopped from its own thread.
+- **BS3:** The turn the CLI runs once a background task ended (its `result` carries
+  `origin.kind: "task-notification"`) is an external turn on the parent, classified and persisted
+  as any external turn. Nothing waits for it: it may or may not follow a stopped sub-agent.
+- **BS4:** The sub-agent's outcome row (an `Activity` with `harness_item_id =
+  task_updated:<task_id>` carrying the sub-agent link and its final status) belongs to the
+  delegating turn. When that turn is still active it is an ordinary item; once the turn was
+  persisted it arrives as a late `ItemCompleted`, which the server amends into the turn's payload
+  (LA1, LA5), broadcasts to open clients, and passes through the sub-agent link admission like an
+  owned item's link. A late `Activity` without a link is not amended. The browser places a new
+  item for a turn that already ended with that turn's rows, not at the live end of the
+  transcript, when the turn is on screen.
 
 **Changelog (1.101 → 1.102), a sub-agent's own model:**
 - **SM1:** The Claude Code adapter publishes a sub-agent route with the model its `Agent` call's

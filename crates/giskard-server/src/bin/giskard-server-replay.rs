@@ -32,7 +32,7 @@ use giskard_core::event::AgentEvent;
 use giskard_core::ids::{ApprovalId, ItemId, ThreadId, TurnId};
 use giskard_core::item::{
     FileChangeEntry, FileChangeKind, Item, ItemDelta, ItemKind, ItemPayload, ItemStart,
-    SubagentAction, SubagentLink,
+    SubagentAction, SubagentLink, SubagentStatus,
 };
 use giskard_core::token::TokenUsage;
 use giskard_core::turn::{TurnOverrides, TurnStatus, TurnStatusKind};
@@ -54,6 +54,11 @@ const SCRIPTED_DIFF_COMPLETION_DELAY: std::time::Duration = std::time::Duration:
 const HTTP_GRACEFUL_SHUTDOWN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 const SCRIPTED_SUBAGENT_TRIGGER: &str = "Spawn the scripted linked sub-agent.";
 const SCRIPTED_NESTED_SUBAGENT_TRIGGER: &str = "Spawn a scripted nested sub-agent.";
+/// A backgrounded delegation: the turn ends with the child running, and the child's outcome row
+/// reaches that turn late, once the thread's next turn completed (as a Claude Code background
+/// sub-agent's does), so the browser must place it in the delegating turn, not at the bottom.
+const SCRIPTED_BACKGROUND_SUBAGENT_TRIGGER: &str = "Spawn a scripted background sub-agent.";
+const SCRIPTED_BACKGROUND_OUTCOME_TITLE: &str = "Background child finished";
 const SCRIPTED_SUBAGENT_PROMPT: &str = "Review the linked child task.";
 const SCRIPTED_SUBAGENT_REPLY: &str = "Child replay output";
 const SCRIPTED_SUBAGENT_PREFIX: &str = "scripted-subagent|";
@@ -153,6 +158,13 @@ struct ScriptedHarness {
     // Synchronization: The mutex makes validation and removal one atomic operation.
     // Invalidation/removal: Acceptance, interruption, thread deletion, or harness drop removes it.
     active_steering_turns: tokio::sync::Mutex<HashMap<ThreadId, TurnId>>,
+    // ENTITY-AUTHORITY-EXCEPTION:
+    // Role: Hold a background delegation's outcome row until the thread's next turn completed.
+    // Source of truth: The background sub-agent trigger records the row and its delegating turn.
+    // Structural reason: The row must arrive late, for a turn the server already persisted.
+    // Synchronization: The mutex makes the next turn's take one atomic operation.
+    // Invalidation/removal: The next turn on the thread takes it; harness drop removes the rest.
+    late_outcomes: tokio::sync::Mutex<HashMap<ThreadId, (TurnId, Item)>>,
 }
 
 type ActiveApprovals = Arc<tokio::sync::Mutex<HashMap<ApprovalId, (ThreadId, TurnId)>>>;
@@ -190,6 +202,7 @@ impl ScriptedHarness {
             native_bindings: tokio::sync::Mutex::new(native_bindings),
             active_approvals: Arc::new(tokio::sync::Mutex::new(HashMap::new())),
             active_steering_turns: tokio::sync::Mutex::new(HashMap::new()),
+            late_outcomes: tokio::sync::Mutex::new(HashMap::new()),
         })
     }
 
@@ -551,10 +564,12 @@ impl AgentHarness for ScriptedHarness {
 
         let input_text = input.as_text();
         let subagent_native_thread_id = match input_text {
-            Some(SCRIPTED_SUBAGENT_TRIGGER) => Some(format!(
-                "{SCRIPTED_SUBAGENT_PREFIX}{}|{turn}",
-                thread.harness_thread_id
-            )),
+            Some(SCRIPTED_SUBAGENT_TRIGGER | SCRIPTED_BACKGROUND_SUBAGENT_TRIGGER) => {
+                Some(format!(
+                    "{SCRIPTED_SUBAGENT_PREFIX}{}|{turn}",
+                    thread.harness_thread_id
+                ))
+            }
             Some(SCRIPTED_NESTED_SUBAGENT_TRIGGER) => Some(format!(
                 "{SCRIPTED_NESTED_SUBAGENT_PREFIX}{}|{turn}",
                 thread.harness_thread_id
@@ -564,6 +579,37 @@ impl AgentHarness for ScriptedHarness {
                 thread.harness_thread_id
             )),
             _ => None,
+        };
+
+        // A background delegation leaves its outcome for the thread's next turn to deliver.
+        let late_outcome = if input_text == Some(SCRIPTED_BACKGROUND_SUBAGENT_TRIGGER) {
+            let outcome = Item {
+                id: ItemId::new(),
+                harness_item_id: format!("scripted_subagent_outcome_{turn}"),
+                payload: ItemPayload::Activity {
+                    title: SCRIPTED_BACKGROUND_OUTCOME_TITLE.into(),
+                    detail: Some("completed".into()),
+                    metadata: None,
+                    subagent: subagent_native_thread_id.clone().map(|harness_thread_id| {
+                        SubagentLink {
+                            harness_thread_id,
+                            path: Some(SCRIPTED_SUBAGENT_AGENT_NAME.into()),
+                            initial_prompt: Some(SCRIPTED_SUBAGENT_PROMPT.into()),
+                            action: SubagentAction::Completed,
+                            status: Some(SubagentStatus::Completed),
+                            message: None,
+                        }
+                    }),
+                },
+                created_at: chrono::Utc::now(),
+            };
+            self.late_outcomes
+                .lock()
+                .await
+                .insert(thread_id, (turn, outcome));
+            None
+        } else {
+            self.late_outcomes.lock().await.remove(&thread_id)
         };
 
         let raise_approval_then_error = input_text == Some(SCRIPTED_APPROVAL_THEN_ERROR_TRIGGER);
@@ -979,6 +1025,14 @@ impl AgentHarness for ScriptedHarness {
                     message: None,
                 },
             });
+            if let Some((delegating_turn, item)) = late_outcome {
+                tokio::task::yield_now().await;
+                let _ = sender.append(AgentEvent::ItemCompleted {
+                    thread: thread_id,
+                    turn: delegating_turn,
+                    item,
+                });
+            }
         });
 
         Ok(turn)

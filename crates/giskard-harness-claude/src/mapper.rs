@@ -52,6 +52,8 @@ const INHERIT_MODEL: &str = "inherit";
 /// The `message.model` of an `assistant` message the CLI wrote itself (an API error's text), with
 /// zero usage: no model ran it.
 const SYNTHETIC_MODEL: &str = "<synthetic>";
+/// `result.origin.kind` of the turn the CLI runs on its own once a background task ended.
+const TASK_NOTIFICATION_ORIGIN: &str = "task-notification";
 
 /// Where a frame's items belong: the child process's own thread, or a sub-agent route.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -158,10 +160,10 @@ pub enum MapperOutput {
 ///   mode, the effective window, tasks, the notices and unknown frames already reported, the
 ///   sub-agent routes and the routes already dropped);
 /// - one sub-agent route, from its `Agent` call (or a forked skill's `task_started`) until its
-///   spawning turn ends or the child exits:
+///   task has ended and its spawning turn has ended, or the child exits:
 ///   [`RouteState`] (its minted thread, its task, its link status, its own [`TurnState`]);
 /// - one turn, dropped when the turn completes: [`TurnState`] (the turn id and kind, its model,
-///   usage, open agent tasks, a held `result`, the interrupt flag, denied tool uses);
+///   usage, the interrupt flag, denied tool uses);
 /// - one item within the turn, dropped with the turn: [`TurnItems`] (item ids, open text and
 ///   thinking blocks, open tool calls).
 ///
@@ -197,14 +199,13 @@ struct SessionState {
     //   sub-agent route of a `local_agent` task, so an ask's `agent_id` or a `task_updated`
     //   resolves to its route.
     // Source of truth: `system/task_started` establishes the entry.
-    // Structural reason: `task_updated` and `can_use_tool` name the task id alone; its type gates
-    //   turn completion and its route receives the ask.
+    // Structural reason: `task_updated` and `can_use_tool` name the task id alone; its type says
+    //   how its end is handled and its route receives the ask.
     // Synchronization: The single adapter task that owns the child process owns the mapper.
     // Invalidation/removal: A terminal `task_updated` removes the entry (a background command's
     //   entry waits for its `task_notification`, or child exit), and so does the terminal
     //   `task_notification` of an agent task that got no update (a forked skill that completed);
-    //   an agent task no turn waits for any more is evicted (`abandon_agent_task`); dropping a
-    //   route clears the entry's route; shutdown drops the rest.
+    //   dropping a route clears the entry's route; shutdown drops the rest.
     tasks: HashMap<String, TaskEntry>,
     // ENTITY-AUTHORITY-EXCEPTION:
     // Role: One sub-agent route per delegating call of this session (an `Agent` call, or the
@@ -214,8 +215,10 @@ struct SessionState {
     // Structural reason: Forwarded frames name the call (`parent_tool_use_id`), asks name the task
     //   (`agent_id`), and the server names the thread; the entry joins the three.
     // Synchronization: The single adapter task that owns the child process owns the mapper.
-    // Invalidation/removal: Dropped by `finish_turn` of the route that spawned it once its task is
-    //   terminal and its own turn has completed; `child_exited` completes and drops the rest.
+    // Invalidation/removal: Lives from its delegating call until its task has ended and its
+    //   spawning turn has ended, or the child exits: dropped by whichever comes last, `end_route`
+    //   (a backgrounded route that outlived its turn) or the spawning route's `finish_turn`;
+    //   `child_exited` completes and drops the rest.
     routes: HashMap<String, RouteState>,
     // ENTITY-AUTHORITY-EXCEPTION:
     // Role: Recognise the frames that trail a dropped route (a killed sub-agent's rejection and
@@ -296,6 +299,11 @@ struct RouteState {
     call_open: bool,
     /// The route's current status as the parent's link reports it.
     status: SubagentStatus,
+    /// The turn of the delegating call, on `parent`; `None` when the parent had no turn.
+    spawned_turn: Option<TurnId>,
+    /// The spawning turn ended while the route still ran (a backgrounded delegation): the route
+    /// is dropped at its own end.
+    turn_ended: bool,
     /// `input.description` of the `Agent` call, the outcome activity's title.
     description: Option<String>,
     /// The child's turn: the same `TurnState` the primary uses, items included.
@@ -310,7 +318,8 @@ struct RouteState {
 }
 
 impl RouteState {
-    /// The route's turn ended (terminal task, child exit, or its spawning turn ended).
+    /// The route's turn ended (terminal task, child exit, or a foreground route's spawning turn
+    /// ended).
     fn ended(&self) -> bool {
         matches!(
             self.status,
@@ -354,25 +363,15 @@ struct TurnState {
     /// `message_delta`'s, then the last `result.usage.iterations` entry. `TurnUsageUpdated`
     /// carries it.
     window_usage: TokenUsage,
-    /// The sum of every `result.usage` of the turn, which `TurnCompleted` carries. A held result
-    /// and the CLI's continuation result are two halves of one turn, so they add up.
+    /// The turn's `result.usage` (on a route's turn, the sum of its messages' usage), which
+    /// `TurnCompleted` carries.
     result_usage: Option<TokenUsage>,
     /// Last `(usage, context_window, model)` emitted as `TurnUsageUpdated`, for dedup.
     emitted_usage: Option<(TokenUsage, Option<u32>, Option<ModelRef>)>,
-    // ENTITY-AUTHORITY-EXCEPTION:
-    // Role: Gate turn completion on the `local_agent` tasks the turn started.
-    // Source of truth: `task_started` adds a task, a terminal `task_updated` removes it, and so
-    //   does the terminal `task_notification` of a task that got no update (a forked skill that
-    //   completed).
-    // Structural reason: A backgrounded delegation's first `result` is not the turn's end.
-    // Synchronization: The single adapter task that owns the child process owns the mapper.
-    // Invalidation/removal: Terminal task updates (or notifications) remove entries; turn
-    //   completion drops the set, evicting any task still in it from the session's tasks.
-    open_agent_tasks: HashSet<String>,
-    /// A `result` that arrived while agent tasks were open.
-    held_result: Option<Box<ResultMessage>>,
     /// The adapter sent `interrupt` (or a deny with `interrupt: true`) during this turn.
     interrupt_sent: bool,
+    /// The CLI started this turn on its own (`ensure_turn`): no prompt of the adapter's opened it.
+    external: bool,
     // ENTITY-AUTHORITY-EXCEPTION:
     // Role: Mark tool uses whose ask was answered deny, so their completion reads `declined`.
     // Source of truth: The mapper's own `ExitPlanMode` denial and `system/permission_denied`.
@@ -461,9 +460,8 @@ impl TurnState {
             window_usage: TokenUsage::default(),
             result_usage: None,
             emitted_usage: None,
-            open_agent_tasks: HashSet::new(),
-            held_result: None,
             interrupt_sent: false,
+            external: false,
             denied_tool_use_ids: HashSet::new(),
             prompt_acknowledged: false,
             prompt: None,
@@ -520,6 +518,7 @@ impl ClaudeMapper {
                     kind: TurnStatusKind::Failed,
                     message: Some("superseded by a new turn".into()),
                 },
+                None,
                 &mut out,
             );
         }
@@ -550,45 +549,6 @@ impl ClaudeMapper {
                 "interrupt noted with no active turn"
             ),
         }
-    }
-
-    /// The adapter interrupted a turn that holds its `result`. The CLI already ended that turn,
-    /// so the interrupt brings no `result` of its own: only the end of the agent tasks the turn
-    /// waits on can finish it, and the supervisor's grace bounds that wait.
-    pub fn holds_interrupted_result(&self) -> bool {
-        self.turn
-            .as_ref()
-            .is_some_and(|turn| turn.interrupt_sent && turn.held_result.is_some())
-    }
-
-    /// Finish an interrupted turn still holding its `result` once the supervisor's grace ran out:
-    /// `Interrupted`, whatever agent tasks it still waits on (one the CLI never reports ended
-    /// would otherwise hold it for good). Called by the supervisor's timer only.
-    pub fn release_interrupted_hold(&mut self) -> Vec<MapperOutput> {
-        let mut out = Vec::new();
-        let Some(turn) = self.turn.as_mut() else {
-            return out;
-        };
-        if !turn.interrupt_sent || turn.held_result.take().is_none() {
-            return out;
-        }
-        warn!(
-            thread_id = %self.thread,
-            harness_thread_id = %self.harness_thread_id,
-            turn_id = %turn.id,
-            open_agent_tasks = turn.open_agent_tasks.len(),
-            action = "release_held_result",
-            "the interrupted turn still holds its result; finishing it as interrupted"
-        );
-        self.emit_usage(&Route::Primary, &mut out);
-        self.finish_turn(
-            TurnStatus {
-                kind: TurnStatusKind::Interrupted,
-                message: None,
-            },
-            &mut out,
-        );
-        out
     }
 
     /// The model the adapter asked for on this turn, so `TurnUsageUpdated.model` can be set.
@@ -853,6 +813,7 @@ impl ClaudeMapper {
                     "Claude Code exited ({exit}) before the turn completed"
                 )),
             },
+            None,
             out,
         );
     }
@@ -1231,12 +1192,12 @@ impl ClaudeMapper {
             .task_type
             .clone()
             .unwrap_or_else(|| TaskType::Unknown(String::new()));
-        let gates = matches!(task_type, TaskType::LocalAgent);
+        let agent = matches!(task_type, TaskType::LocalAgent);
         // A `local_agent` task names the `Agent` call that minted its route, or another open call
         // that runs a sub-agent (a forked skill's `Skill` call), whose route is minted now.
         let route = match &task.tool_use_id {
-            Some(id) if gates && self.session.routes.contains_key(id) => Some(id.clone()),
-            Some(id) if gates => self.mint_task_route(id, &task, out),
+            Some(id) if agent && self.session.routes.contains_key(id) => Some(id.clone()),
+            Some(id) if agent => self.mint_task_route(id, &task, out),
             _ => None,
         };
         // A backgrounded `local_bash` task names the background `Bash` call it runs. A foreground
@@ -1259,7 +1220,6 @@ impl ClaudeMapper {
             native_item_id = display_opt(task.tool_use_id.as_deref()),
             route = display_opt(route.as_ref().map(|id| format!("{TASK_ID_PREFIX}{id}"))),
             spawn_depth = display_opt(task.spawn_depth),
-            gates_turn = gates,
             background_command = command.is_some(),
             "Claude Code task started"
         );
@@ -1273,20 +1233,6 @@ impl ClaudeMapper {
         );
         if let Some(id) = &route {
             self.start_route(id, &task, out);
-        }
-        if !gates {
-            return;
-        }
-        match self.turn.as_mut() {
-            Some(turn) => {
-                turn.open_agent_tasks.insert(task.task_id);
-            }
-            None => warn!(
-                thread_id = %self.thread,
-                harness_thread_id = %self.harness_thread_id,
-                task_id = %task.task_id,
-                "an agent task started with no active turn; it cannot hold one"
-            ),
         }
     }
 
@@ -1394,70 +1340,6 @@ impl ClaudeMapper {
                 "terminal update for an unknown or already ended task; ignored"
             ),
         }
-        self.close_agent_task(&task.task_id, &status, error, out);
-    }
-
-    /// Agent task `task_id` ended with `status`: it no longer gates the primary turn. When it was
-    /// the last one and a result is held, `completed` keeps holding for the CLI's continuation
-    /// `result`, and any other status finishes the turn from the held result now.
-    fn close_agent_task(
-        &mut self,
-        task_id: &str,
-        status: &TaskStatus,
-        error: Option<&str>,
-        out: &mut Out,
-    ) {
-        let Some(turn) = self.turn.as_mut() else {
-            return;
-        };
-        if !turn.open_agent_tasks.remove(task_id)
-            || !turn.open_agent_tasks.is_empty()
-            || turn.held_result.is_none()
-        {
-            return;
-        }
-        if matches!(status, TaskStatus::Completed) {
-            // The CLI runs a continuation turn after a completed background agent; its `result`
-            // completes the turn.
-            debug!(
-                thread_id = %self.thread,
-                harness_thread_id = %self.harness_thread_id,
-                turn_id = %turn.id,
-                task_id = %task_id,
-                action = "hold_result",
-                "last agent task completed; holding the turn for the continuation result"
-            );
-            return;
-        }
-        // A killed, failed or stopped agent task produces no second `result`: finish now.
-        let interrupted = turn.interrupt_sent;
-        turn.held_result = None;
-        info!(
-            thread_id = %self.thread,
-            harness_thread_id = %self.harness_thread_id,
-            turn_id = %turn.id,
-            task_id = %task_id,
-            status = %status,
-            interrupted,
-            action = "release_held_result",
-            "last agent task ended without completing; finishing the held turn"
-        );
-        let status = if interrupted {
-            TurnStatus {
-                kind: TurnStatusKind::Interrupted,
-                message: None,
-            }
-        } else {
-            TurnStatus {
-                kind: TurnStatusKind::Failed,
-                message: Some(error.map_or_else(
-                    || format!("agent task {task_id} ended {status}"),
-                    str::to_owned,
-                )),
-            }
-        };
-        self.emit_usage(&Route::Primary, out);
-        self.finish_turn(status, out);
     }
 
     /// The background command a `local_bash` task runs: the open `Command` tool `tool_use_id`
@@ -1516,7 +1398,6 @@ impl ClaudeMapper {
             if let Some(id) = route {
                 self.end_route(&id, &task.task_id, None, &task.status, out);
             }
-            self.close_agent_task(&task.task_id, &task.status, None, out);
             return;
         }
         let command = entry.is_some_and(|entry| entry.command.is_some());
@@ -1735,8 +1616,8 @@ impl ClaudeMapper {
 
     // ---- turns ---------------------------------------------------------------------------------
 
-    /// The active turn, or a turn the CLI started on its own (a continuation after a background
-    /// task), which the mapper opens itself.
+    /// The active turn, or a turn the CLI started on its own (the continuation it runs once a
+    /// background task ended), which the mapper opens itself.
     fn ensure_turn(&mut self, frame_type: &str, out: &mut Out) -> TurnId {
         if let Some(turn) = &self.turn {
             return turn.id;
@@ -1750,7 +1631,9 @@ impl ClaudeMapper {
             frame_type,
             "Claude Code started a turn on its own"
         );
-        self.turn = Some(TurnState::new(turn, TurnKind::User));
+        let mut state = TurnState::new(turn, TurnKind::User);
+        state.external = true;
+        self.turn = Some(state);
         out.push(self.event(AgentEvent::TurnStarted {
             thread: self.thread,
             turn,
@@ -1758,6 +1641,8 @@ impl ClaudeMapper {
         turn
     }
 
+    /// A `result` ends the turn, whatever tasks it started: a backgrounded sub-agent runs on, on
+    /// its own route, and the CLI serves the next prompt meanwhile.
     fn on_result(&mut self, result: Box<ResultMessage>, out: &mut Out) {
         let turn_id = self.ensure_turn("result", out);
         self.record_model_usage(&result, turn_id);
@@ -1770,21 +1655,33 @@ impl ClaudeMapper {
                 .add(&token_usage(usage));
             turn.window_usage = last_request_usage(usage);
         }
-        if !turn.open_agent_tasks.is_empty() {
-            info!(
+        // The CLI's continuation after a background task is a turn of its own; its `init` carries
+        // no marker, so its `result` is the first frame that says what the turn was.
+        let origin = result.origin.as_ref().map(|origin| origin.kind.as_str());
+        match origin {
+            Some(TASK_NOTIFICATION_ORIGIN) => info!(
                 thread_id = %self.thread,
                 harness_thread_id = %self.harness_thread_id,
                 turn_id = %turn_id,
-                action = "hold_result",
-                open_agent_tasks = turn.open_agent_tasks.len(),
-                "result arrived while agent tasks are open; holding the turn"
-            );
-            turn.held_result = Some(result);
-            return;
+                external = turn.external,
+                origin = TASK_NOTIFICATION_ORIGIN,
+                action = "continuation_turn",
+                "the turn was the CLI's continuation after a background task ended"
+            ),
+            Some(kind) => info!(
+                thread_id = %self.thread,
+                harness_thread_id = %self.harness_thread_id,
+                turn_id = %turn_id,
+                external = turn.external,
+                origin = %kind,
+                action = "result_origin",
+                "the result names an origin"
+            ),
+            None => {}
         }
         let status = result_status(&result, turn.interrupt_sent);
         self.emit_usage(&Route::Primary, out);
-        self.finish_turn(status, out);
+        self.finish_turn(status, origin, out);
     }
 
     fn record_model_usage(&mut self, result: &ResultMessage, turn: TurnId) {
@@ -1857,8 +1754,9 @@ impl ClaudeMapper {
         out.push(MapperOutput::Event(event));
     }
 
-    /// Complete the active turn and drop its state.
-    fn finish_turn(&mut self, status: TurnStatus, out: &mut Out) {
+    /// Complete the active turn and drop its state. `origin` is the `result.origin.kind` that ended
+    /// it, if any.
+    fn finish_turn(&mut self, status: TurnStatus, origin: Option<&str>, out: &mut Out) {
         let Some(turn) = self.turn.take() else {
             return;
         };
@@ -1869,6 +1767,7 @@ impl ClaudeMapper {
             turn_kind = ?turn.kind,
             action = "turn_completed",
             status = ?status.kind,
+            origin = display_opt(origin),
             input_tokens = turn.completed_usage().input,
             output_tokens = turn.completed_usage().output,
             "turn completed"
@@ -1879,35 +1778,8 @@ impl ClaudeMapper {
             usage: turn.completed_usage(),
             status,
         }));
-        // The gate holds a turn until every agent task it started (a nested route's included) is
-        // terminal, so one still open here ended the turn some other way (an interrupted hold
-        // released after its grace, a superseded turn), and its route, if any, is failed below:
-        // nothing waits for it any more, and tracking it would keep the child busy for good.
-        let mut abandoned: Vec<String> = turn.open_agent_tasks.into_iter().collect();
-        abandoned.sort();
-        for task_id in abandoned {
-            self.abandon_agent_task(&task_id, turn.id);
-        }
-        // The primary turn's gate holds it until every agent task it started is terminal, so the
-        // routes it spawned have normally ended by now.
+        // The routes it spawned whose task ended go; a backgrounded one still running outlives it.
         self.drop_spawned_routes(&Route::Primary, out);
-    }
-
-    /// Stop tracking agent task `task_id`, whose end no turn waits for any more: its entry would
-    /// keep the child busy, so never reaped, until the CLI reports an end it may never report. A
-    /// later terminal update or notification for it is ignored as for an unknown task.
-    fn abandon_agent_task(&mut self, task_id: &str, turn: TurnId) {
-        if self.session.tasks.remove(task_id).is_none() {
-            return;
-        }
-        warn!(
-            thread_id = %self.thread,
-            harness_thread_id = %self.harness_thread_id,
-            turn_id = %turn,
-            task_id = %task_id,
-            action = "agent_task_abandoned",
-            "the turn waiting on an agent task ended before the task did; no longer tracking it"
-        );
     }
 
     fn on_compact_boundary(&mut self, boundary: &CompactBoundaryMessage, out: &mut Out) {
@@ -2164,6 +2036,7 @@ impl ClaudeMapper {
             Route::Primary => self.harness_thread_id.clone(),
             Route::Task(outer) => format!("{TASK_ID_PREFIX}{outer}"),
         };
+        let spawned_turn = self.turn_of(parent).map(|turn| turn.id);
         let route = RouteState {
             thread: ThreadId::new(),
             harness_thread_id: format!("{TASK_ID_PREFIX}{tool_use_id}"),
@@ -2176,6 +2049,8 @@ impl ClaudeMapper {
             stop_sent: false,
             call_open: true,
             status: SubagentStatus::Pending,
+            spawned_turn,
+            turn_ended: false,
             description: seed.description,
             turn: None,
             counted_messages: HashSet::new(),
@@ -2185,7 +2060,7 @@ impl ClaudeMapper {
             harness_thread_id = %self.harness_thread_id,
             route = %route.harness_thread_id,
             parent_harness_thread_id = %parent_harness_thread_id,
-            turn_id = display_opt(self.turn_of(parent).map(|turn| turn.id)),
+            turn_id = display_opt(spawned_turn),
             subagent_type = display_opt(route.subagent_type.as_deref()),
             requested_model = display_opt(seed.model.as_deref()),
             action = "route_opened",
@@ -2241,8 +2116,9 @@ impl ClaudeMapper {
     }
 
     /// The end of route `id`'s task `task_id` (its terminal `task_updated`, or the
-    /// `task_notification` of a task that got none): its turn ends now, and a backgrounded
-    /// delegation's outcome is reported on the spawning route.
+    /// `task_notification` of a task that got none): its turn ends now, a backgrounded
+    /// delegation's outcome is reported on the spawning route, and a route that outlived its
+    /// spawning turn is dropped.
     fn end_route(
         &mut self,
         id: &str,
@@ -2313,10 +2189,20 @@ impl ClaudeMapper {
         };
         self.finish_route_turn(id, subagent, turn_status, out);
         self.report_background_outcome(id, task_id, error, out);
+        if self
+            .session
+            .routes
+            .get(id)
+            .is_some_and(|route| route.turn_ended)
+        {
+            self.drop_route(id, out);
+        }
     }
 
     /// A route whose parent's `Agent` call already completed (a backgrounded delegation) reports
-    /// its outcome as one `Activity` on the spawning route, carrying the link.
+    /// its outcome as one `Activity` on the spawning route, carrying the link: on the spawning turn
+    /// while it is still the active one, else as a late completion of that turn, which the server
+    /// amends into its persisted items.
     fn report_background_outcome(
         &mut self,
         id: &str,
@@ -2331,6 +2217,7 @@ impl ClaudeMapper {
             return;
         }
         let parent = route.parent.clone();
+        let spawned_turn = route.spawned_turn;
         let title = route
             .description
             .clone()
@@ -2341,31 +2228,51 @@ impl ClaudeMapper {
             _ => error.unwrap_or("failed").to_owned(),
         };
         let link = route.link(route.outcome_action());
-        let Some(turn) = self.turn_of(&parent).map(|turn| turn.id) else {
-            debug!(
-                thread_id = %self.thread_of(&parent),
-                harness_thread_id = %self.harness_thread_id,
-                route = %link.harness_thread_id,
-                task_id = %task_id,
-                action = "subagent_outcome",
-                "no active turn on the spawning thread; the sub-agent's outcome has no row"
-            );
-            return;
-        };
+        let active = self.turn_of(&parent).map(|turn| turn.id);
         let thread = self.thread_of(&parent);
+        let (turn, late) = match (spawned_turn, active) {
+            (Some(spawned), Some(active)) if spawned == active => (spawned, false),
+            (Some(spawned), _) => (spawned, true),
+            (None, Some(active)) => (active, false),
+            (None, None) => {
+                debug!(
+                    thread_id = %thread,
+                    harness_thread_id = %self.harness_thread_id,
+                    route = %link.harness_thread_id,
+                    task_id = %task_id,
+                    action = "subagent_outcome",
+                    "no active turn on the spawning thread; the sub-agent's outcome has no row"
+                );
+                return;
+            }
+        };
+        info!(
+            thread_id = %thread,
+            harness_thread_id = %self.harness_thread_id,
+            route = %link.harness_thread_id,
+            turn_id = %turn,
+            task_id = %task_id,
+            status = ?link.status,
+            late,
+            action = "subagent_outcome",
+            "sub-agent outcome reported on the spawning turn"
+        );
         let id = ItemId::new();
         let harness_item_id = format!("task_updated:{task_id}");
-        out.push(self.event(AgentEvent::ItemStarted {
-            thread,
-            turn,
-            item: ItemStart {
-                id,
-                harness_item_id: harness_item_id.clone(),
-                kind: ItemKind::Activity,
-                command: None,
-                tool: None,
-            },
-        }));
+        // The server ignores a start for a persisted turn: a late row is its completion alone.
+        if !late {
+            out.push(self.event(AgentEvent::ItemStarted {
+                thread,
+                turn,
+                item: ItemStart {
+                    id,
+                    harness_item_id: harness_item_id.clone(),
+                    kind: ItemKind::Activity,
+                    command: None,
+                    tool: None,
+                },
+            }));
+        }
         out.push(self.event(AgentEvent::ItemCompleted {
             thread,
             turn,
@@ -2473,10 +2380,16 @@ impl ClaudeMapper {
         self.drop_spawned_routes(&Route::Task(id.to_owned()), out);
     }
 
-    /// The turn of `parent` ended: drop the routes it spawned. A route still running here (an
-    /// agent task the gate let through because the turn failed or was superseded) is completed
-    /// `Failed` first.
+    /// The turn of `parent` ended: drop the routes it spawned whose task has ended. A backgrounded
+    /// route still running outlives the turn, and its own end drops it; a foreground route still
+    /// running here (its turn was superseded, or the child exited) is completed `Failed` first.
     fn drop_spawned_routes(&mut self, parent: &Route, out: &mut Out) {
+        self.close_spawned_routes(parent, true, out);
+    }
+
+    /// Drop the routes `parent` spawned: those still running are completed `Failed` first, except
+    /// that with `outlive` set a backgrounded one is kept, marked as having outlived its turn.
+    fn close_spawned_routes(&mut self, parent: &Route, outlive: bool, out: &mut Out) {
         let mut spawned: Vec<(String, ThreadId)> = self
             .session
             .routes
@@ -2486,11 +2399,27 @@ impl ClaudeMapper {
             .collect();
         spawned.sort_by(|(left, _), (right, _)| left.cmp(right));
         for (id, thread) in spawned {
-            let open = self
-                .session
-                .routes
-                .get(&id)
-                .is_some_and(|route| !route.ended());
+            let Some(route) = self.session.routes.get_mut(&id) else {
+                continue;
+            };
+            let open = !route.ended();
+            if open && outlive && route.is_backgrounded {
+                // Already kept by an earlier turn's end: it waits for its own.
+                if !route.turn_ended {
+                    route.turn_ended = true;
+                    info!(
+                        thread_id = %thread,
+                        harness_thread_id = %self.harness_thread_id,
+                        route = %route.harness_thread_id,
+                        task_id = display_opt(route.task_id.as_deref()),
+                        turn_id = display_opt(route.spawned_turn),
+                        parent_route = display_opt(parent.label()),
+                        action = "route_outlives_turn",
+                        "the turn that spawned a background sub-agent ended; the sub-agent runs on"
+                    );
+                }
+                continue;
+            }
             if open {
                 warn!(
                     thread_id = %thread,
@@ -2517,7 +2446,7 @@ impl ClaudeMapper {
     /// Forget route `id` (its turn has ended): its log closes, its trailing frames are dropped.
     fn drop_route(&mut self, id: &str, out: &mut Out) {
         // Nested routes go first, so a nested route never outlives its parent.
-        self.drop_spawned_routes(&Route::Task(id.to_owned()), out);
+        self.close_spawned_routes(&Route::Task(id.to_owned()), false, out);
         let Some(route) = self.session.routes.remove(id) else {
             return;
         };
@@ -4617,33 +4546,46 @@ mod tests {
     }
 
     #[test]
-    fn a_backgrounded_delegation_holds_the_turn_until_the_task_is_terminal() {
+    #[traced_test]
+    fn a_backgrounded_delegation_ends_its_turn_at_the_first_result() {
+        // The recorder's interrupt came after the first `result`, with no turn left to note it on.
         let lines = out_lines("delegation-interrupted");
         let mut mapper = new_mapper();
         let primary = mapper.thread;
-        let per_line = drive(&mut mapper, "delegation-interrupted", TurnKind::User);
-        let result_line = lines
-            .iter()
-            .position(|line| line.contains(r#""type": "result""#))
-            .unwrap();
-        assert!(turn_completions(&on_thread(&per_line[result_line], primary)).is_empty());
-
-        let killed_line = lines
-            .iter()
-            .position(|line| line.contains(r#""status": "killed""#))
-            .unwrap();
-        let completions = turn_completions(&on_thread(&per_line[killed_line], primary));
+        let per_line = drive_lines(&mut mapper, &lines, 1, TurnKind::User, false);
+        let result_line = position(&lines, |frame| frame["type"] == "result");
+        let completions = turn_completions(&on_thread(&per_line[result_line], primary));
         assert_eq!(completions.len(), 1);
-        assert_eq!(completions[0].2.kind, TurnStatusKind::Interrupted);
+        assert_eq!(completions[0].2.kind, TurnStatusKind::Completed);
+        // The route outlives the turn: the sub-agent's frames still land on it.
+        assert!(routes_closed(&per_line[result_line]).is_empty());
+        logs_assert(a_line_with(&[" INFO ", r#"action="route_outlives_turn""#]));
+        let (child, ..) = routes_opened(&per_line.concat())[0].clone();
+        let bash = position(&lines, |frame| {
+            frame["parent_tool_use_id"].is_string()
+                && frame.pointer("/message/content/0/name") == Some(&json!("Bash"))
+        });
+        assert!(bash > result_line);
+        assert!(
+            started_items(&on_thread(&per_line[bash], child))
+                .iter()
+                .any(|item| item.command.is_some())
+        );
 
+        // The kill ends the route and drops it, its spawning turn long over.
+        let killed = position(&lines, |frame| frame["patch"]["status"] == "killed");
+        assert_eq!(routes_closed(&per_line[killed]), vec![child]);
+        assert!(turn_completions(&on_thread(&per_line[killed], primary)).is_empty());
         assert_eq!(
             turn_completions(&on_thread(&per_line.concat(), primary)).len(),
             1
         );
+        assert!(!mapper.has_routes());
+        logs_assert(no_line_with(r#"action="hold_result""#));
     }
 
     #[test]
-    fn a_killed_agent_task_without_an_interrupt_fails_the_held_turn() {
+    fn a_background_agent_killed_without_a_stop_fails_its_route() {
         let mut mapper = new_mapper();
         let primary = mapper.thread;
         let outputs: Vec<MapperOutput> = drive_lines(
@@ -4656,7 +4598,8 @@ mod tests {
         .into_iter()
         .flatten()
         .collect();
-        let completions = turn_completions(&on_thread(&outputs, primary));
+        let (child, ..) = routes_opened(&outputs)[0].clone();
+        let completions = turn_completions(&on_thread(&outputs, child));
         assert_eq!(completions.len(), 1);
         assert_eq!(completions[0].2.kind, TurnStatusKind::Failed);
         assert!(
@@ -4666,31 +4609,9 @@ mod tests {
                 .as_deref()
                 .is_some_and(|message| message.contains("killed"))
         );
-    }
-
-    #[test]
-    fn a_completed_background_agent_keeps_the_turn_for_the_continuation_result() {
-        let mut mapper = new_mapper();
-        let turn = TurnId::new();
-        mapper.begin_turn(turn, TurnKind::User);
-        mapper.map_line(r#"{"type":"system","subtype":"task_started","session_id":"s","task_id":"a1","task_type":"local_agent","is_backgrounded":true,"description":"d","uuid":"u1"}"#);
-        let result = line_of("text-turn", "result");
-        assert!(turn_completions(&mapper.map_line(&result)).is_empty());
-        let updated = mapper.map_line(r#"{"type":"system","subtype":"task_updated","session_id":"s","task_id":"a1","patch":{"status":"completed"},"uuid":"u2"}"#);
-        assert!(turn_completions(&updated).is_empty());
-        assert_eq!(mapper.active_turn(), Some(turn));
-        let outputs = mapper.map_line(&result);
-        let completions = turn_completions(&outputs);
-        assert_eq!(completions.len(), 1);
-        assert_eq!(completions[0].0, turn);
-        assert_eq!(completions[0].2.kind, TurnStatusKind::Completed);
-        // The held result and the continuation are two halves of one turn: their usage adds up,
-        // while the window still holds only the continuation's last request.
-        assert_eq!(completions[0].1, TokenUsage::new(2 * 21_970, 2 * 53));
-        assert_eq!(
-            usage_updates(&outputs).last().map(|(usage, _)| *usage),
-            Some(TokenUsage::new(21_970, 53))
-        );
+        let primary = turn_completions(&on_thread(&outputs, primary));
+        assert_eq!(primary.len(), 1);
+        assert_eq!(primary[0].2.kind, TurnStatusKind::Completed);
     }
 
     #[test]
@@ -6672,52 +6593,31 @@ mod tests {
 
     #[test]
     #[traced_test]
-    fn an_interrupted_turn_holding_its_result_is_released() {
-        let mut mapper = new_mapper();
-        let turn = TurnId::new();
-        mapper.begin_turn(turn, TurnKind::User);
-        for task in ["a1", "a2"] {
-            mapper.map_line(&format!(r#"{{"type":"system","subtype":"task_started","session_id":"s","task_id":"{task}","task_type":"local_agent","is_backgrounded":true,"description":"d","uuid":"u-{task}"}}"#));
-        }
-        assert!(turn_completions(&mapper.map_line(&line_of("text-turn", "result"))).is_empty());
-        // Held, but not interrupted: the release is the supervisor's only after an interrupt.
-        assert!(!mapper.holds_interrupted_result());
-        assert!(mapper.release_interrupted_hold().is_empty());
-        assert_eq!(mapper.active_turn(), Some(turn));
-
-        mapper.note_interrupt_sent();
-        assert!(mapper.holds_interrupted_result());
-        let outputs = mapper.release_interrupted_hold();
-        let completions = turn_completions(&outputs);
-        assert_eq!(completions.len(), 1);
-        assert_eq!(completions[0].0, turn);
-        assert_eq!(completions[0].2.kind, TurnStatusKind::Interrupted);
-        assert_eq!(completions[0].1, TokenUsage::new(21_970, 53));
-        assert_eq!(mapper.active_turn(), None);
-        assert!(!mapper.holds_interrupted_result());
-        // The tasks it waited on are no longer tracked, so they cannot keep the child busy.
-        assert!(!mapper.has_tasks());
-        logs_assert(a_line_with(&[" WARN ", r#"action="release_held_result""#]));
-        for task in ["task_id=a1 ", "task_id=a2 "] {
-            logs_assert(lines_with(
-                1,
-                &[" WARN ", r#"action="agent_task_abandoned""#, task],
-            ));
-        }
-        // A late end for an abandoned task is ignored like an unknown task's.
-        let late = mapper.map_line(r#"{"type":"system","subtype":"task_updated","session_id":"s","task_id":"a1","patch":{"status":"completed"},"uuid":"u3"}"#);
-        assert!(events(&late).is_empty());
-    }
-
-    #[test]
-    #[traced_test]
     fn a_backgrounded_delegation_reports_its_outcome_on_the_parent() {
         let lines = out_lines("delegation-interrupted");
+        let killed = position(&lines, |frame| frame["patch"]["status"] == "killed");
         let mut mapper = new_mapper();
         let primary = mapper.thread;
-        let per_line = drive(&mut mapper, "delegation-interrupted", TurnKind::User);
+        let turn = TurnId::new();
+        let mut per_line = Vec::new();
+        let mut child = None;
+        for (index, line) in lines.iter().enumerate() {
+            let mut outputs = Vec::new();
+            if index == 0 {
+                outputs.extend(mapper.begin_turn(turn, TurnKind::User));
+            }
+            // The adapter stops the sub-agent from its own thread.
+            if index == killed {
+                mapper.note_stop_sent(child.unwrap());
+            }
+            outputs.extend(mapper.map_line(line));
+            if let Some((thread, ..)) = routes_opened(&outputs).first() {
+                child = Some(*thread);
+            }
+            per_line.push(outputs);
+        }
         let outputs = per_line.concat();
-        let (child, ..) = routes_opened(&outputs)[0].clone();
+        let child = child.unwrap();
 
         // The call completes at launch, its link still running.
         let (status, _, link) = agent_completion(&on_thread(&outputs, primary));
@@ -6725,37 +6625,29 @@ mod tests {
         assert_eq!(link.action, SubagentAction::Started);
         assert_eq!(link.status, Some(SubagentStatus::Running));
 
-        // The killed update ends the route at once: the primary sent the interrupt.
-        let killed = position(&lines, |frame| frame["patch"]["status"] == "killed");
+        // The killed update ends the route at once: the adapter stopped it.
         let completions = turn_completions(&on_thread(&per_line[killed], child));
         assert_eq!(completions.len(), 1);
         assert_eq!(completions[0].2.kind, TurnStatusKind::Interrupted);
         assert_eq!(turn_completions(&on_thread(&outputs, child)).len(), 1);
 
-        // Its outcome is a row on the parent, with the link.
-        let outcome: Vec<_> = completed_items(&on_thread(&per_line[killed], primary))
-            .into_iter()
-            .filter_map(|item| match &item.payload {
-                ItemPayload::Activity {
-                    title,
-                    detail,
-                    subagent: Some(link),
-                    ..
-                } => Some((
-                    item.harness_item_id.clone(),
-                    title.clone(),
-                    detail.clone(),
-                    link.clone(),
-                )),
-                _ => None,
-            })
-            .collect();
+        // Its outcome is a row on the delegating turn, with the link: a late completion, since
+        // that turn ended at its `result`.
+        let at_kill = on_thread(&per_line[killed], primary);
+        assert!(started_items(&at_kill).is_empty());
+        let outcome = outcome_rows(&at_kill);
         assert_eq!(outcome.len(), 1);
-        assert_eq!(outcome[0].0, "task_updated:a562b8d9494720fd6");
-        assert_eq!(outcome[0].1, "Run bash command and report magic number");
-        assert_eq!(outcome[0].2.as_deref(), Some("killed"));
-        assert_eq!(outcome[0].3.action, SubagentAction::Interrupted);
-        assert_eq!(outcome[0].3.status, Some(SubagentStatus::Interrupted));
+        assert_eq!(outcome[0].0, turn);
+        assert_eq!(outcome[0].1, "task_updated:a562b8d9494720fd6");
+        assert_eq!(outcome[0].2, "Run bash command and report magic number");
+        assert_eq!(outcome[0].3.as_deref(), Some("killed"));
+        assert_eq!(outcome[0].4.action, SubagentAction::Interrupted);
+        assert_eq!(outcome[0].4.status, Some(SubagentStatus::Interrupted));
+        logs_assert(a_line_with(&[
+            " INFO ",
+            r#"action="subagent_outcome""#,
+            "late=true",
+        ]));
 
         // The rejection and the marker trail the kill: nothing, at debug.
         let trailing: Vec<usize> = lines
@@ -6777,7 +6669,347 @@ mod tests {
 
         let primary_completions = turn_completions(&on_thread(&outputs, primary));
         assert_eq!(primary_completions.len(), 1);
-        assert_eq!(primary_completions[0].2.kind, TurnStatusKind::Interrupted);
+        assert_eq!(primary_completions[0].0, turn);
+        assert_eq!(primary_completions[0].2.kind, TurnStatusKind::Completed);
+    }
+
+    /// Every outcome row on `outputs`: `(turn, harness_item_id, title, detail, link)`.
+    fn outcome_rows(
+        outputs: &[MapperOutput],
+    ) -> Vec<(TurnId, String, String, Option<String>, SubagentLink)> {
+        events(outputs)
+            .into_iter()
+            .filter_map(|event| match event {
+                AgentEvent::ItemCompleted { turn, item, .. } => match &item.payload {
+                    ItemPayload::Activity {
+                        title,
+                        detail,
+                        subagent: Some(link),
+                        ..
+                    } if item.harness_item_id.starts_with("task_updated:") => Some((
+                        *turn,
+                        item.harness_item_id.clone(),
+                        title.clone(),
+                        detail.clone(),
+                        link.clone(),
+                    )),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Drive a `delegation-background*` recording as the adapter would: a user turn begun before
+    /// each line index of `turns` (where the recorder wrote its prompts), and `note_stop_sent` for
+    /// the route before line index `stop`. Returns each line's outputs, the begun turns and the
+    /// route's thread.
+    fn drive_background(
+        mapper: &mut ClaudeMapper,
+        name: &str,
+        turns: &[usize],
+        stop: Option<usize>,
+    ) -> (Vec<Vec<MapperOutput>>, Vec<TurnId>, ThreadId) {
+        let mut begun = Vec::new();
+        let mut route = None;
+        let mut per_line = Vec::new();
+        for (index, line) in out_lines(name).iter().enumerate() {
+            let mut outputs = Vec::new();
+            if turns.contains(&index) {
+                let turn = TurnId::new();
+                outputs.extend(mapper.begin_turn(turn, TurnKind::User));
+                begun.push(turn);
+            }
+            if stop == Some(index) {
+                mapper.note_stop_sent(route.unwrap());
+            }
+            outputs.extend(mapper.map_line(line));
+            if let Some((thread, ..)) = routes_opened(&outputs).first() {
+                route = Some(*thread);
+            }
+            per_line.push(outputs);
+        }
+        (per_line, begun, route.expect("no route was minted"))
+    }
+
+    /// The turn started on `thread` at `outputs`, if any.
+    fn turn_started_on(outputs: &[MapperOutput], thread: ThreadId) -> Option<TurnId> {
+        events(&on_thread(outputs, thread))
+            .into_iter()
+            .find_map(|event| match event {
+                AgentEvent::TurnStarted { turn, .. } => Some(*turn),
+                _ => None,
+            })
+    }
+
+    #[test]
+    #[traced_test]
+    fn a_background_sub_agent_runs_beside_the_parent_s_next_prompt() {
+        // Fixture lines are 1-based in the README; `per_line` is 0-based.
+        let mut mapper = new_mapper();
+        let primary = mapper.thread;
+        let (per_line, begun, child) =
+            drive_background(&mut mapper, "delegation-background", &[0, 8], None);
+        let outputs = per_line.concat();
+        let lines = out_lines("delegation-background");
+
+        // Three primary turns: "launched" at line 8, "pong" at line 24, the continuation at 27.
+        let completed = |index: usize| turn_completions(&on_thread(&per_line[index], primary));
+        assert_eq!(completed(7).len(), 1);
+        assert_eq!(completed(7)[0].0, begun[0]);
+        assert_eq!(completed(23).len(), 1);
+        assert_eq!(completed(23)[0].0, begun[1]);
+        assert_eq!(completed(26).len(), 1);
+        let continuation = completed(26)[0].0;
+        assert!(!begun.contains(&continuation));
+        assert_eq!(turn_started_on(&per_line[25], primary), Some(continuation));
+        assert_eq!(turn_completions(&on_thread(&outputs, primary)).len(), 3);
+        assert!(
+            turn_completions(&on_thread(&outputs, primary))
+                .iter()
+                .all(|(_, _, status)| status.kind == TurnStatusKind::Completed)
+        );
+
+        // The route's thread receives the sub-agent's frames, lines 10–19, and nothing of them
+        // reaches the parent, busy with its own prompt.
+        for (index, line) in lines.iter().enumerate().take(19).skip(9) {
+            if frame_of(line)["parent_tool_use_id"].is_string() {
+                assert!(on_thread(&per_line[index], primary).is_empty(), "{index}");
+                assert!(!on_thread(&per_line[index], child).is_empty(), "{index}");
+            }
+        }
+        let child_outputs = on_thread(&outputs, child);
+        assert!(completed_items(&child_outputs).iter().any(|item| matches!(
+            &item.payload,
+            ItemPayload::ToolCall { name, status, .. }
+                if name == "Read" && status.as_deref() == Some("completed")
+        )));
+        // It completes at line 20, and only then is its route dropped.
+        let on_child = turn_completions(&on_thread(&per_line[19], child));
+        assert_eq!(on_child.len(), 1);
+        assert_eq!(on_child[0].2.kind, TurnStatusKind::Completed);
+        assert_eq!(turn_completions(&child_outputs).len(), 1);
+        assert_eq!(routes_closed(&per_line[19]), vec![child]);
+        assert_eq!(routes_closed(&outputs), vec![child]);
+
+        // The outcome row is a late completion of the delegating turn, not of "pong".
+        let outcome = outcome_rows(&per_line[19]);
+        assert_eq!(outcome.len(), 1);
+        assert_eq!(outcome[0].0, begun[0]);
+        assert_eq!(outcome[0].4.action, SubagentAction::Completed);
+        assert_eq!(outcome[0].4.status, Some(SubagentStatus::Completed));
+        assert!(started_items(&on_thread(&per_line[19], primary)).is_empty());
+        assert_eq!(outcome_rows(&outputs).len(), 1);
+        assert!(!mapper.has_routes());
+        assert!(!mapper.has_tasks());
+        assert_eq!(mapper.active_turn(), None);
+
+        logs_assert(lines_with(
+            1,
+            &[" INFO ", r#"action="route_outlives_turn""#],
+        ));
+        logs_assert(a_line_with(&[
+            " INFO ",
+            r#"action="continuation_turn""#,
+            "external=true",
+        ]));
+        logs_assert(a_line_with(&[
+            " INFO ",
+            r#"action="turn_completed""#,
+            "origin=task-notification",
+        ]));
+        logs_assert(a_line_with(&[
+            " INFO ",
+            r#"action="subagent_outcome""#,
+            "late=true",
+        ]));
+        logs_assert(no_line_with(r#"action="hold_result""#));
+    }
+
+    #[test]
+    #[traced_test]
+    fn a_background_sub_agent_ending_while_the_parent_is_idle_is_followed_by_its_continuation() {
+        let mut mapper = new_mapper();
+        let primary = mapper.thread;
+        let (per_line, begun, child) =
+            drive_background(&mut mapper, "delegation-background-idle", &[0, 8], None);
+        let outputs = per_line.concat();
+
+        // "pong" completes at line 15 while the route is live.
+        let pong = turn_completions(&on_thread(&per_line[14], primary));
+        assert_eq!(pong.len(), 1);
+        assert_eq!(pong[0].0, begun[1]);
+        assert!(mapper_route_live_between(&per_line, child, 14, 82));
+
+        // The sub-agent ends at line 83 with no parent turn active: a late row, then the drop.
+        let on_child = turn_completions(&on_thread(&per_line[82], child));
+        assert_eq!(on_child.len(), 1);
+        assert_eq!(on_child[0].2.kind, TurnStatusKind::Completed);
+        let outcome = outcome_rows(&per_line[82]);
+        assert_eq!(outcome.len(), 1);
+        assert_eq!(outcome[0].0, begun[0]);
+        assert_eq!(outcome[0].4.status, Some(SubagentStatus::Completed));
+        assert_eq!(routes_closed(&per_line[82]), vec![child]);
+
+        // The continuation follows directly: an external turn, lines 86–88.
+        let continuation = turn_completions(&on_thread(&per_line[87], primary));
+        assert_eq!(continuation.len(), 1);
+        assert!(!begun.contains(&continuation[0].0));
+        assert_eq!(continuation[0].2.kind, TurnStatusKind::Completed);
+        assert_eq!(turn_completions(&on_thread(&outputs, primary)).len(), 3);
+        logs_assert(a_line_with(&[" INFO ", r#"action="continuation_turn""#]));
+    }
+
+    /// Whether `child`'s route took frames and closed no route on lines `from..to` (0-based).
+    fn mapper_route_live_between(
+        per_line: &[Vec<MapperOutput>],
+        child: ThreadId,
+        from: usize,
+        to: usize,
+    ) -> bool {
+        let span = per_line[from..to].concat();
+        routes_closed(&span).is_empty() && !on_thread(&span, child).is_empty()
+    }
+
+    #[test]
+    #[traced_test]
+    fn a_stopped_background_sub_agent_does_not_wait_for_a_continuation() {
+        // `stop_task` 1 s after the first `result`; the user's next prompt 10 s later (line 25).
+        let mut mapper = new_mapper();
+        let primary = mapper.thread;
+        let (per_line, begun, child) =
+            drive_background(&mut mapper, "delegation-background-stop", &[0, 24], Some(9));
+        let outputs = per_line.concat();
+
+        let first = turn_completions(&on_thread(&per_line[8], primary));
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].0, begun[0]);
+
+        // The route ends interrupted at line 14, and is dropped there.
+        let on_child = turn_completions(&on_thread(&per_line[13], child));
+        assert_eq!(on_child.len(), 1);
+        assert_eq!(on_child[0].2.kind, TurnStatusKind::Interrupted);
+        assert_eq!(routes_closed(&per_line[13]), vec![child]);
+        let outcome = outcome_rows(&per_line[13]);
+        assert_eq!(outcome.len(), 1);
+        assert_eq!(outcome[0].0, begun[0]);
+        assert_eq!(outcome[0].4.action, SubagentAction::Interrupted);
+        assert_eq!(outcome[0].4.status, Some(SubagentStatus::Interrupted));
+        // The sub-agent's trailing interruption frame (line 18) is dropped.
+        assert!(per_line[17].is_empty(), "{:?}", per_line[17]);
+
+        // The continuation (lines 19–24) and the user's turn (25–27) both complete.
+        let continuation = turn_completions(&on_thread(&per_line[23], primary));
+        assert_eq!(continuation.len(), 1);
+        assert!(!begun.contains(&continuation[0].0));
+        let user = turn_completions(&on_thread(&per_line[26], primary));
+        assert_eq!(user.len(), 1);
+        assert_eq!(user[0].0, begun[1]);
+        assert_eq!(turn_completions(&on_thread(&outputs, primary)).len(), 3);
+        assert!(!mapper.has_routes());
+        assert!(!mapper.has_tasks());
+        logs_assert(a_line_with(&[" INFO ", r#"action="continuation_turn""#]));
+    }
+
+    #[test]
+    #[traced_test]
+    fn a_background_agent_ending_before_its_turn_s_result_reports_on_that_turn() {
+        let lines = out_lines("delegation-background");
+        let updated = position(&lines, |frame| frame["subtype"] == "task_updated");
+        let notified = position(&lines, |frame| frame["subtype"] == "task_notification");
+        let result = position(&lines, |frame| frame["type"] == "result");
+        let mut mapper = new_mapper();
+        let primary = mapper.thread;
+        let turn = TurnId::new();
+        let mut outputs = mapper.begin_turn(turn, TurnKind::User);
+        // The call, its task and its launch, then the task's end, all before the `result`.
+        for line in &lines[..5] {
+            outputs.extend(mapper.map_line(line));
+        }
+        let (child, ..) = routes_opened(&outputs)[0].clone();
+        let ended = mapper.map_line(&lines[updated]);
+        let on_parent = on_thread(&ended, primary);
+        let outcome = outcome_rows(&on_parent);
+        assert_eq!(outcome.len(), 1);
+        assert_eq!(outcome[0].0, turn);
+        // Not late: the row starts and completes on the live turn.
+        let starts = started_items(&on_parent);
+        assert_eq!(starts.len(), 1);
+        assert_eq!(starts[0].kind, ItemKind::Activity);
+        assert!(routes_closed(&ended).is_empty());
+        mapper.map_line(&lines[notified]);
+
+        // The `result` ends the turn and drops the route, whose task already ended.
+        let closed = mapper.map_line(&lines[result]);
+        assert_eq!(turn_completions(&on_thread(&closed, primary)).len(), 1);
+        assert_eq!(routes_closed(&closed), vec![child]);
+        assert!(!mapper.has_routes());
+        logs_assert(no_line_with(r#"action="route_outlives_turn""#));
+        logs_assert(a_line_with(&[
+            " INFO ",
+            r#"action="subagent_outcome""#,
+            "late=false",
+        ]));
+    }
+
+    #[test]
+    #[traced_test]
+    fn child_exit_fails_a_background_route_that_outlived_its_turn() {
+        let lines = out_lines("delegation-background");
+        let mut mapper = new_mapper();
+        let per_line = drive_lines(&mut mapper, &lines[..12], 1, TurnKind::User, false);
+        let (child, ..) = routes_opened(&per_line.concat())[0].clone();
+        assert_eq!(mapper.active_turn(), None);
+        assert!(mapper.has_routes());
+
+        let outputs = mapper.child_exited("code 1");
+        let on_child = turn_completions(&on_thread(&outputs, child));
+        assert_eq!(on_child.len(), 1);
+        assert_eq!(on_child[0].2.kind, TurnStatusKind::Failed);
+        assert!(on_child[0].2.message.as_deref().unwrap().contains("code 1"));
+        assert_eq!(routes_closed(&outputs), vec![child]);
+        assert!(!mapper.has_routes());
+        logs_assert(a_line_with(&[
+            " WARN ",
+            r#"action="child_exited""#,
+            "route=task:",
+        ]));
+    }
+
+    #[test]
+    #[traced_test]
+    fn a_result_with_an_unknown_origin_is_logged_and_completes_the_turn() {
+        let mut mapper = new_mapper();
+        let turn = TurnId::new();
+        mapper.begin_turn(turn, TurnKind::User);
+        let mut result = frame_of(&line_of("text-turn", "result"));
+        result["origin"] = json!({"kind": "peer-message", "from": "elsewhere"});
+        let completions = turn_completions(&mapper.map_line(&result.to_string()));
+        assert_eq!(completions.len(), 1);
+        assert_eq!(completions[0].0, turn);
+        assert_eq!(completions[0].2.kind, TurnStatusKind::Completed);
+        logs_assert(a_line_with(&[
+            " INFO ",
+            r#"action="result_origin""#,
+            "origin=peer-message",
+        ]));
+        logs_assert(no_line_with(r#"action="continuation_turn""#));
+    }
+
+    #[test]
+    #[traced_test]
+    fn a_superseded_turn_keeps_its_background_route() {
+        let lines = out_lines("delegation-background");
+        let started = position(&lines, |frame| frame["subtype"] == "task_started");
+        let mut mapper = new_mapper();
+        let per_line = drive_lines(&mut mapper, &lines[..=started], 1, TurnKind::User, false);
+        let (child, ..) = routes_opened(&per_line.concat())[0].clone();
+        let outputs = mapper.begin_turn(TurnId::new(), TurnKind::User);
+        assert!(turn_completions(&on_thread(&outputs, child)).is_empty());
+        assert!(routes_closed(&outputs).is_empty());
+        assert!(mapper.has_routes());
+        logs_assert(a_line_with(&[" INFO ", r#"action="route_outlives_turn""#]));
+        logs_assert(no_line_with(r#"action="route_still_open""#));
     }
 
     #[test]
@@ -7088,11 +7320,11 @@ mod tests {
         );
         assert_eq!(routes_closed(&outputs), vec![child]);
         logs_assert(a_line_with(&[" WARN ", r#"action="route_still_open""#]));
-        // Its agent task is no longer waited for, so it no longer keeps the child busy.
+        // Its agent task keeps the child busy until the CLI reports its end, which then finds no
+        // route left to end.
+        assert!(mapper.has_tasks());
+        let updated = position(&lines, |frame| frame["subtype"] == "task_updated");
+        assert!(events(&mapper.map_line(&lines[updated])).is_empty());
         assert!(!mapper.has_tasks());
-        logs_assert(lines_with(
-            1,
-            &[" WARN ", r#"action="agent_task_abandoned""#],
-        ));
     }
 }

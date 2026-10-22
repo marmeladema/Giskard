@@ -1,6 +1,9 @@
 import { test, expect } from "@playwright/test";
 import {
+  SCRIPTED_BACKGROUND_OUTCOME_TITLE,
+  SCRIPTED_BACKGROUND_SUBAGENT_TRIGGER,
   SCRIPTED_NESTED_SUBAGENT_TRIGGER,
+  SCRIPTED_REPLY,
   SCRIPTED_SUBAGENT_REPLY,
   SCRIPTED_SUBAGENT_TRIGGER,
   login,
@@ -9,6 +12,45 @@ import {
 test.describe("linked sub-agent threads", () => {
   test.beforeEach(async ({ page }) => {
     await login(page);
+  });
+
+  test("places a background sub-agent's late outcome row in its delegating turn", async ({ page }) => {
+    const project = page.locator(".proj", { hasText: "Demo" });
+    await project.locator(".project-add").click();
+    await page.locator("#input").fill(SCRIPTED_BACKGROUND_SUBAGENT_TRIGGER);
+    await page.locator("#sendBtn").click();
+
+    const transcript = page.locator("#transcript");
+    const spawned = transcript.locator(".msg.activity", { hasText: "Sub-agent running" });
+    await expect(spawned).toBeVisible();
+    await expect(page.locator("#stopBtn")).toBeHidden();
+    const delegatingTurn = await spawned.getAttribute("data-turn");
+    expect(delegatingTurn).toBeTruthy();
+
+    // The parent takes its next prompt; the outcome row arrives once that turn completed, for the
+    // delegating turn the server already persisted.
+    const nextPrompt = "Anything else while the child runs?";
+    await page.locator("#input").fill(nextPrompt);
+    await page.locator("#sendBtn").click();
+    await expect(transcript.locator(".msg.agent", { hasText: SCRIPTED_REPLY })).toBeVisible();
+    const outcome = transcript.locator(".msg.activity", { hasText: SCRIPTED_BACKGROUND_OUTCOME_TITLE });
+    await expect(outcome).toHaveCount(1);
+
+    // Live and after a reload, it sits with the delegating turn's rows, above the next prompt.
+    const expectInDelegatingTurn = async () => {
+      await expect(outcome).toHaveAttribute("data-turn", delegatingTurn!);
+      const nextUser = transcript.locator(".msg.user", { hasText: nextPrompt });
+      const aboveNextPrompt = await outcome.evaluate(
+        (row, next) => !!(row.compareDocumentPosition(next as Node) & Node.DOCUMENT_POSITION_FOLLOWING),
+        await nextUser.elementHandle(),
+      );
+      expect(aboveNextPrompt).toBe(true);
+      await expect(outcome.getByRole("button", { name: "Open linked thread" })).toBeVisible();
+    };
+    await expectInDelegatingTurn();
+    await page.reload();
+    await expect(outcome).toHaveCount(1);
+    await expectInDelegatingTurn();
   });
 
   test("opens, restores, and reverse-navigates without losing the parent", async ({ page }) => {

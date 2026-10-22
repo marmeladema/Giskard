@@ -4770,7 +4770,9 @@ function handleEvent(ev) {
       }
       break;
     case "item_completed":
-      if (!finalizeStreamedItem(ev.item, ev.turn)) addItem(ev.item, ev.turn);
+      if (!finalizeStreamedItem(ev.item, ev.turn) && !addLateItemToItsTurn(ev.item, ev.turn)) {
+        addItem(ev.item, ev.turn);
+      }
       // Only the live path: replaying history must not poll git for changes long since made.
       if (ev.item && ((ev.item.payload || ev.item).kind) === "file_change") scheduleGitRefresh();
       break;
@@ -5023,6 +5025,47 @@ function provisionalUserBodyForTurn(turnId) {
 
 function isSyntheticSubagentPrompt(item) {
   return !!(item && String(item.harness_item_id || "").startsWith("subagent_prompt:"));
+}
+
+// A new item for a turn that already ended (a backgrounded sub-agent's outcome row, which the
+// server amends into the delegating turn) joins that turn's rows rather than the end of the
+// transcript, where it would be stamped with whatever turn renders now, or "pending". Returns false,
+// leaving it to the usual path, for the live turn's items, an item already rendered (upserted in
+// place), and a turn with no row on screen (an item ahead of its turn_started, or a turn paged out).
+function addLateItemToItsTurn(item, turnId) {
+  const turn = idKey(turnId);
+  if (!turn || turn === idKey(state.currentRenderTurnId) || state.renderTarget) return false;
+  if (isRenderedItem(item, turnId)) return false;
+  const t = $("transcript");
+  const rows = Array.from(t.children).filter(row =>
+    row.classList && row.classList.contains("msg") && String(row.dataset.turn || "") === turn
+  );
+  const last = rows[rows.length - 1];
+  if (!last) return false;
+  // Rendered as a history page is: into a detached container, stamped with its own turn, without
+  // touching the live turn's task group.
+  const followBottom = transcriptShouldStickToBottom();
+  const container = document.createElement("div");
+  const prevTarget = state.renderTarget;
+  const prevTurnId = state.currentRenderTurnId;
+  const prevTaskGroup = state.activeTaskGroup;
+  state.renderTarget = container;
+  state.currentRenderTurnId = turnId;
+  state.activeTaskGroup = null;
+  try {
+    addItem(item, turnId);
+  } finally {
+    state.renderTarget = prevTarget;
+    state.currentRenderTurnId = prevTurnId;
+    state.activeTaskGroup = prevTaskGroup;
+  }
+  const anchor = last.nextSibling;
+  while (container.firstChild) t.insertBefore(container.firstChild, anchor);
+  // As appendBubble does for a row at the end: a note with rows below it folds, and a reader at the
+  // bottom stays there.
+  collapseSupersededReasoningRows(t);
+  keepTranscriptAtBottom(followBottom);
+  return true;
 }
 
 function placeRowFirstInTurn(row, turnId) {
