@@ -312,6 +312,16 @@ struct RouteSeed {
     model: Option<String>,
 }
 
+/// How a sub-agent's `user` text block relates to its route's delegated prompt.
+enum DelegatedPrompt {
+    /// The prompt, seen for the first time: the route's `UserMessage`.
+    First,
+    /// The prompt, already delivered: nothing new.
+    Repeated,
+    /// Any other text: an `Activity`.
+    No,
+}
+
 /// One sub-agent route: an `Agent` call (or a forked skill's `Skill` call) of this session and
 /// the thread its frames map onto.
 struct RouteState {
@@ -1317,7 +1327,11 @@ impl ClaudeMapper {
         if route.prompt.is_none() && route.run.is_none() {
             route.prompt = task.prompt.clone();
         }
-        if route.ended() || route.turn.is_some() {
+        if route.ended() {
+            return;
+        }
+        if route.turn.is_some() {
+            self.deliver_background_prompt(id, task, out);
             return;
         }
         route.status = SubagentStatus::Running;
@@ -1336,6 +1350,34 @@ impl ClaudeMapper {
             "sub-agent turn started"
         );
         out.push(self.event(AgentEvent::TurnStarted { thread, turn }));
+        self.deliver_background_prompt(id, task, out);
+    }
+
+    /// A backgrounded delegation's prompt opens its turn: unlike a foreground one, the CLI forwards
+    /// no `user` frame with it into the sub-agent (`delegation-background*` fixtures), so the
+    /// prompt the call carried is all there is. A resumed run's message is delivered apart.
+    fn deliver_background_prompt(&mut self, id: &str, task: &TaskStartedMessage, out: &mut Out) {
+        let Some(route) = self.session.routes.get_mut(id) else {
+            return;
+        };
+        if !route.is_backgrounded || route.run.is_some() || route.prompt_delivered {
+            return;
+        }
+        let (Some(turn), Some(prompt)) = (
+            route.turn.as_ref().map(|turn| turn.id),
+            route.prompt.clone(),
+        ) else {
+            return;
+        };
+        route.prompt_delivered = true;
+        let harness_item_id = format!("task_prompt:{}", task.task_id);
+        self.user_message(
+            &Route::Task(id.to_owned()),
+            turn,
+            harness_item_id,
+            prompt,
+            out,
+        );
     }
 
     fn on_task_updated(&mut self, task: TaskUpdatedMessage, out: &mut Out) {
@@ -3472,10 +3514,24 @@ impl ClaudeMapper {
                         "user:{}:{index}",
                         message.uuid.as_deref().unwrap_or("unknown")
                     );
-                    if self.take_delegated_prompt(&route, &text.text) {
-                        self.user_message(&route, turn, harness_item_id, text.text, out);
-                    } else {
-                        self.activity(&route, turn, harness_item_id, text.text, out);
+                    match self.take_delegated_prompt(&route, &text.text) {
+                        DelegatedPrompt::First => {
+                            self.user_message(&route, turn, harness_item_id, text.text, out)
+                        }
+                        // A backgrounded route's prompt was delivered at its `task_started`; a
+                        // CLI that also forwards it would only repeat it.
+                        DelegatedPrompt::Repeated => debug!(
+                            thread_id = %self.thread_of(&route),
+                            harness_thread_id = %self.harness_thread_id,
+                            route = display_opt(route.label()),
+                            turn_id = %turn,
+                            frame_uuid = display_opt(message.uuid.as_deref()),
+                            action = "prompt_repeated",
+                            "skipping the sub-agent's delegated prompt, already delivered"
+                        ),
+                        DelegatedPrompt::No => {
+                            self.activity(&route, turn, harness_item_id, text.text, out)
+                        }
                     }
                 }
                 other => debug!(
@@ -3541,19 +3597,22 @@ impl ClaudeMapper {
         self.user_message(&Route::Primary, turn, harness_item_id, text, out);
     }
 
-    /// Whether `text` is the route's delegated prompt, seen for the first time.
-    fn take_delegated_prompt(&mut self, route: &Route, text: &str) -> bool {
+    /// Whether `text` is the route's delegated prompt, and whether it was already delivered.
+    fn take_delegated_prompt(&mut self, route: &Route, text: &str) -> DelegatedPrompt {
         let Route::Task(id) = route else {
-            return false;
+            return DelegatedPrompt::No;
         };
         let Some(route) = self.session.routes.get_mut(id) else {
-            return false;
+            return DelegatedPrompt::No;
         };
-        if route.prompt_delivered || route.prompt.as_deref() != Some(text) {
-            return false;
+        if route.prompt.as_deref() != Some(text) {
+            return DelegatedPrompt::No;
+        }
+        if route.prompt_delivered {
+            return DelegatedPrompt::Repeated;
         }
         route.prompt_delivered = true;
-        true
+        DelegatedPrompt::First
     }
 
     /// The user message of a turn: a primary turn's prompt, or a sub-agent's delegated prompt.
@@ -7683,6 +7742,7 @@ mod tests {
         }
         let outputs = per_line.concat();
         let child = child.unwrap();
+        assert_opens_with_delegated_prompt(&on_thread(&outputs, child), &lines);
 
         // The call completes at launch, its link still running.
         let (status, _, link) = agent_completion(&on_thread(&outputs, primary));
@@ -7844,6 +7904,7 @@ mod tests {
             }
         }
         let child_outputs = on_thread(&outputs, child);
+        assert_opens_with_delegated_prompt(&child_outputs, &lines);
         assert!(completed_items(&child_outputs).iter().any(|item| matches!(
             &item.payload,
             ItemPayload::ToolCall { name, status, .. }
@@ -7891,6 +7952,131 @@ mod tests {
         logs_assert(no_line_with(r#"action="hold_result""#));
     }
 
+    /// The `Agent` call's `input.prompt` and the `task_started` task id of a recording.
+    fn delegated_prompt_and_task(lines: &[String]) -> (String, String) {
+        let frames: Vec<Value> = lines.iter().map(|line| frame_of(line)).collect();
+        let prompt = frames
+            .iter()
+            .filter(|frame| frame["type"] == "assistant")
+            .flat_map(|frame| {
+                frame["message"]["content"]
+                    .as_array()
+                    .cloned()
+                    .unwrap_or_default()
+            })
+            .find(|block| block["type"] == "tool_use" && block["name"] == AGENT_TOOL)
+            .and_then(|block| block["input"]["prompt"].as_str().map(str::to_owned))
+            .expect("an Agent call");
+        let task = frames
+            .iter()
+            .find(|frame| frame["subtype"] == "task_started")
+            .and_then(|frame| frame["task_id"].as_str().map(str::to_owned))
+            .expect("a task_started");
+        (prompt, task)
+    }
+
+    /// The route's first item is the recording's delegated prompt: the CLI forwards no frame with
+    /// a backgrounded one, so this is what keeps the gap from reopening.
+    fn assert_opens_with_delegated_prompt(child_outputs: &[MapperOutput], lines: &[String]) {
+        let (prompt, _) = delegated_prompt_and_task(lines);
+        assert_eq!(
+            completed_items(child_outputs)[0].payload,
+            ItemPayload::UserMessage { text: prompt }
+        );
+    }
+
+    #[test]
+    fn a_background_sub_agent_opens_with_its_delegated_prompt() {
+        // The CLI forwards no `user` frame with a backgrounded delegation's prompt.
+        for (name, turns) in [
+            ("delegation-background", &[0, 8][..]),
+            ("delegation-background-idle", &[0, 8][..]),
+            ("delegation-interrupted", &[0][..]),
+        ] {
+            let lines = out_lines(name);
+            let (prompt, task) = delegated_prompt_and_task(&lines);
+            assert!(
+                !lines.iter().any(|line| {
+                    let frame = frame_of(line);
+                    frame["type"] == "user"
+                        && frame["parent_tool_use_id"].is_string()
+                        && frame["message"]["content"]
+                            .to_string()
+                            .contains(&prompt[..40])
+                }),
+                "{name}"
+            );
+            let mut mapper = new_mapper();
+            let (per_line, _, child) = drive_background(&mut mapper, name, turns, None);
+            let child_outputs = on_thread(&per_line.concat(), child);
+            assert!(
+                matches!(events(&child_outputs)[0], AgentEvent::TurnStarted { .. }),
+                "{name}"
+            );
+            let items = completed_items(&child_outputs);
+            assert_eq!(
+                items[0].payload,
+                ItemPayload::UserMessage { text: prompt },
+                "{name}"
+            );
+            assert_eq!(
+                items[0].harness_item_id,
+                format!("task_prompt:{task}"),
+                "{name}"
+            );
+            let prompts = items
+                .iter()
+                .filter(|item| matches!(item.payload, ItemPayload::UserMessage { .. }))
+                .count();
+            assert_eq!(prompts, 1, "{name}");
+        }
+    }
+
+    #[test]
+    #[traced_test]
+    fn a_background_sub_agent_s_forwarded_prompt_is_not_repeated() {
+        let name = "delegation-background";
+        let lines = out_lines(name);
+        let (prompt, _) = delegated_prompt_and_task(&lines);
+        let started = lines
+            .iter()
+            .position(|line| frame_of(line)["subtype"] == "task_started")
+            .expect("a task_started");
+        let call = frame_of(&lines[started])["tool_use_id"].clone();
+        let echo = json!({
+            "type": "user",
+            "message": {"role": "user", "content": [{"type": "text", "text": prompt}]},
+            "parent_tool_use_id": call,
+            "session_id": frame_of(&lines[started])["session_id"],
+            "uuid": "00000000-0000-4000-8000-00000000e001",
+        })
+        .to_string();
+        let mut mapper = new_mapper();
+        let begin = mapper.begin_turn(TurnId::new(), TurnKind::User);
+        let mut outputs = begin;
+        for (index, line) in lines.iter().enumerate() {
+            outputs.extend(mapper.map_line(line));
+            if index == started {
+                outputs.extend(mapper.map_line(&echo));
+            }
+        }
+        let (child, ..) = routes_opened(&outputs)[0].clone();
+        let items = completed_items(&on_thread(&outputs, child))
+            .into_iter()
+            .cloned()
+            .collect::<Vec<_>>();
+        let prompts = items
+            .iter()
+            .filter(|item| matches!(item.payload, ItemPayload::UserMessage { .. }))
+            .count();
+        assert_eq!(prompts, 1);
+        assert!(!items.iter().any(|item| matches!(
+            &item.payload,
+            ItemPayload::Activity { title, .. } if *title == prompt
+        )));
+        logs_assert(a_line_with(&[r#"action="prompt_repeated""#]));
+    }
+
     #[test]
     #[traced_test]
     fn a_background_sub_agent_ending_while_the_parent_is_idle_is_followed_by_its_continuation() {
@@ -7899,6 +8085,10 @@ mod tests {
         let (per_line, begun, child) =
             drive_background(&mut mapper, "delegation-background-idle", &[0, 8], None);
         let outputs = per_line.concat();
+        assert_opens_with_delegated_prompt(
+            &on_thread(&outputs, child),
+            &out_lines("delegation-background-idle"),
+        );
 
         // "pong" completes at line 15 while the route is live.
         let pong = turn_completions(&on_thread(&per_line[14], primary));
@@ -7945,6 +8135,10 @@ mod tests {
         let (per_line, begun, child) =
             drive_background(&mut mapper, "delegation-background-stop", &[0, 24], Some(9));
         let outputs = per_line.concat();
+        assert_opens_with_delegated_prompt(
+            &on_thread(&outputs, child),
+            &out_lines("delegation-background-stop"),
+        );
 
         let first = turn_completions(&on_thread(&per_line[8], primary));
         assert_eq!(first.len(), 1);

@@ -7265,6 +7265,10 @@ mod tests {
             .await
             .unwrap();
         let link = spawned_link(&mut stream).await;
+        let link_prompt = link
+            .initial_prompt
+            .clone()
+            .expect("the Agent call's prompt");
         let route = harness
             .claim_native_thread(
                 ThreadId::new(),
@@ -7287,6 +7291,14 @@ mod tests {
         assert_eq!((completed, status), (second, TurnStatusKind::Completed));
         let running = drain(&mut sub).await;
         assert!(matches!(running[0], AgentEvent::TurnStarted { .. }));
+        // The delegated prompt opens the turn, though the CLI forwards no frame with it.
+        assert!(matches!(
+            running.iter().find_map(|event| match event {
+                AgentEvent::ItemCompleted { item, .. } => Some(&item.payload),
+                _ => None,
+            }),
+            Some(giskard_core::item::ItemPayload::UserMessage { text }) if *text == link_prompt
+        ));
         assert!(running.iter().any(|event| matches!(
             event,
             AgentEvent::ItemStarted { item, .. }

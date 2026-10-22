@@ -192,8 +192,10 @@ new page session and alerts again.
 
 ## Prompts and transcript persistence
 
-Only a real native child turn creates a persisted turn. When its native event stream does not expose
-the delegated prompt, Giskard uses `Sub-agent turn` as that real turn's input label. A native turn
+Only a real native child turn creates a persisted turn. A Claude Code sub-agent's first turn opens
+with its delegated prompt: the CLI forwards it into a foreground sub-agent, and for a background one,
+which gets no such frame, the adapter delivers the prompt the delegation carried. When a native
+event stream does not expose the delegated prompt, Giskard uses `Sub-agent turn` as that real turn's input label. A native turn
 observed on a thread that is still a hidden orphan uses `Unclassified native turn` instead, because
 no parent relationship has been proven for it yet; turns already committed under that label keep it
 after classification, the same way they keep their historical mode. Giskard does not derive a prompt
