@@ -6027,11 +6027,13 @@ function syncTaskGroupItem(itemId) {
   task.symbol.className = `task-group-item-symbol cmd-symbol state-${stateName}`;
   task.symbol.textContent = commandStateSymbol(stateName);
   const title = task.msg.querySelector(".cmd-title");
-  task.title.textContent = title ? title.textContent.trim() : (task.kind==="tool_call" ? "tool" : "command");
-  // A described row reads as prose; hovering it shows the exact command line or tool name.
-  const line = task.msg.querySelector(".cmd-line");
-  task.title.classList.toggle("mono", !line);
-  if (line) task.title.title = line.textContent;
+  const label = title ? title.textContent.trim() : (task.kind==="tool_call" ? "tool" : "command");
+  // A described row reads as prose; hovering it shows the exact command line or tool name, which
+  // its expanded detail also heads with.
+  const description = task.msg.dataset.taskDescription || "";
+  task.title.textContent = description || label;
+  task.title.classList.toggle("mono", !description);
+  if (description) task.title.title = label;
   else task.title.removeAttribute("title");
   task.status.textContent = taskStatusText(task.msg);
   syncTaskGroupState(group);
@@ -6282,26 +6284,16 @@ function makeCommandHead() {
   head.className = "cmd-head";
   return { head };
 }
-// A command or tool row's title is the harness's description when it has one, else `label` (the
-// "$ command" line, or "server:tool"). With a description, `label` follows the head on its own
-// line (`line`, null otherwise), so expanding the row still shows exactly what ran.
-function describedTitleNodes(description, label) {
+// The expanded detail of a command or tool heads with exactly what ran (`label`: the "$ command"
+// line, or "server:tool"). Its description titles only the task row above it, so the detail keeps
+// it on `msg` for `syncTaskGroupItem` rather than repeating it.
+function detailTitleNode(msg, description, label) {
+  if (description) msg.dataset.taskDescription = description;
+  else delete msg.dataset.taskDescription;
   const title = document.createElement("div");
-  title.className = description ? "cmd-title" : "cmd-title mono";
-  title.textContent = description || label;
-  let line = null;
-  if (description) {
-    line = document.createElement("div");
-    line.className = "cmd-line mono";
-    line.textContent = label;
-  }
-  return { title, line };
-}
-function commandTitleNodes(description, command) {
-  return describedTitleNodes(description, commandLineText(command));
-}
-function toolTitleNodes(description, server, name) {
-  return describedTitleNodes(description, toolNameText(server, name));
+  title.className = "cmd-title mono";
+  title.textContent = label;
+  return title;
 }
 // A later payload for the same item that brings no description keeps the one an earlier record had
 // (its start, a running record, a previous render), so a row's title does not flip back.
@@ -6508,7 +6500,7 @@ function renderCommandBody(body, cmd) {
   body.replaceChildren();
 
   const { head } = makeCommandHead();
-  const { title, line } = commandTitleNodes(cmd.description, cmd.command);
+  const title = detailTitleNode(msg, cmd.description, commandLineText(cmd.command));
   const status = commandStatusNode(commandStatusLabel(cmd), stateName);
   const actions = document.createElement("div");
   actions.className = "cmd-actions";
@@ -6523,7 +6515,6 @@ function renderCommandBody(body, cmd) {
   actions.append(term);
   head.append(title, status, actions);
   body.append(head);
-  if (line) body.append(line);
 
   if (cmd.cwd) {
     const cwd = document.createElement("div");
@@ -6775,7 +6766,7 @@ function renderEndedCommandBody(body, cmd, status, opts) {
   msg.dataset.commandStartedAtMs = String(cmd.startedAtMs || Date.now());
   body.replaceChildren();
   const { head } = makeCommandHead();
-  const { title, line } = commandTitleNodes(cmd.description, cmd.command);
+  const title = detailTitleNode(msg, cmd.description, commandLineText(cmd.command));
   const meta = document.createElement("div");
   meta.className = "meta cmd-meta";
   const durationMs = Date.now() - (cmd.startedAtMs || Date.now());
@@ -6785,7 +6776,6 @@ function renderEndedCommandBody(body, cmd, status, opts) {
   }
   head.append(title);
   body.append(head);
-  if (line) body.append(line);
   if (meta.childNodes.length) body.append(meta);
   renderCommandOutputBlock(body, { itemId:cmd.id, output:cmd.output || "", phase:"completed" });
   syncTaskGroupItem(cmd.id);
@@ -8485,7 +8475,7 @@ function renderItemBody(body, p) {
     const durationMs = normalizeCommandDuration(p.duration_ms, startedAtMs);
     const outputPhase = commandIsRunningStatus(displayStatus) ? "running" : "completed";
     const { head } = makeCommandHead();
-    const { title: cmd, line } = commandTitleNodes(p.description, p.command);
+    const cmd = detailTitleNode(msg, p.description, commandLineText(p.command));
     const meta = document.createElement("div");
     meta.className = "meta cmd-meta";
     if (p.cwd) appendCommandMetaPart(meta, `cwd: ${p.cwd}`);
@@ -8498,7 +8488,6 @@ function renderItemBody(body, p) {
     if (p.exit_code!==undefined && p.exit_code!==null) appendCommandMetaPart(meta, `exit: ${p.exit_code}`);
     head.append(cmd);
     body.append(head);
-    if (line) body.append(line);
     if (meta.childNodes.length) body.append(meta);
     renderCommandOutputBlock(body, {
       itemId,
@@ -8990,10 +8979,8 @@ function renderToolBody(body, p) {
   }
   const head = document.createElement("div");
   head.className = "cmd-head";
-  const { title, line } = toolTitleNodes(p.description, p.server, p.name);
-  head.append(title);
+  head.append(detailTitleNode(msg, p.description, toolNameText(p.server, p.name)));
   body.append(head);
-  if (line) body.append(line);
 
   const statusLabel = toolStatusLabel(p.status, p.error, msg, stateName);
   if (statusLabel) {

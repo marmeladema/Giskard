@@ -916,7 +916,6 @@
   .cmd-card .cmd-actions { margin-top:6px; display:flex; justify-content:flex-end; }
   .cmd-head { display:flex; align-items:center; gap:8px; margin-bottom:4px; }
   .cmd-head .cmd-title { flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-  .cmd-line { margin-bottom:4px; color:var(--muted); font-size:12px; white-space:pre-wrap; overflow-wrap:anywhere; }
   .cmd-status { font-size:12px; display:inline-flex; align-items:center; gap:5px; white-space:nowrap; color:var(--muted); }
   .cmd-status.state-running { color:#f0d98c; }
   .cmd-status.state-succeeded { color:#7ee787; }

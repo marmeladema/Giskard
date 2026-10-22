@@ -263,7 +263,7 @@ test("command task opens the live transcript output directly", async ({ page }) 
     .toHaveClass(/selected/);
 });
 
-test("a described command is titled by its description and shows the command when expanded", async ({ page }) => {
+test("a described command titles its row; the expanded detail shows only the command", async ({ page }) => {
   await openCommandOutputTestThread(page);
   const command = "rg -n probe src | sort | uniq -c | head -20";
   await page.evaluate(({ command }) => {
@@ -296,8 +296,8 @@ test("a described command is titled by its description and shows the command whe
 
   await row.click();
   const detail = page.locator('[data-command-item-id="turn-described:command-described"]');
-  await expect(detail.locator(".cmd-title")).toHaveText("Count probe matches");
-  await expect(detail.locator(".cmd-line")).toHaveText(`$ ${command}`);
+  await expect(detail.locator(".cmd-title")).toHaveText(`$ ${command}`);
+  await expect(detail).not.toContainText("Count probe matches");
 
   await page.locator("#tasksBtn").click();
   const card = page.locator("#tasksMenu .cmd-card", { hasText: "Count probe matches" });
@@ -316,12 +316,12 @@ test("a described command is titled by its description and shows the command whe
       },
     }, "turn-described", false);
   }, { command });
-  await expect(detail.locator(".cmd-title")).toHaveText("Count probe matches");
-  await expect(detail.locator(".cmd-line")).toHaveText(`$ ${command}`);
+  await expect(detail.locator(".cmd-title")).toHaveText(`$ ${command}`);
+  await expect(detail).not.toContainText("Count probe matches");
   await expect(rowTitle).toHaveText("Count probe matches");
 });
 
-test("a described tool call is titled by its description from start to completion", async ({ page }) => {
+test("a described tool call titles its row from start to completion; the detail shows the tool", async ({ page }) => {
   await openCommandOutputTestThread(page);
   const dispatch = (event: Record<string, unknown>) => page.evaluate(ev => {
     (window as unknown as { handleEvent: (ev: unknown) => void }).handleEvent(ev);
@@ -345,8 +345,8 @@ test("a described tool call is titled by its description from start to completio
 
   await row.click();
   const detail = page.locator('[data-tool-item-id="turn-tool-described:tool-described"]');
-  await expect(detail.locator(".cmd-title")).toHaveText("Read src/main.rs");
-  await expect(detail.locator(".cmd-line")).toHaveText("Read");
+  await expect(detail.locator(".cmd-title")).toHaveText("Read");
+  await expect(detail).not.toContainText("Read src/main.rs");
 
   await dispatch({
     kind: "item_completed",
@@ -362,7 +362,7 @@ test("a described tool call is titled by its description from start to completio
       created_at: new Date().toISOString(),
     },
   });
-  await expect(detail.locator(".cmd-title")).toHaveText("Read src/main.rs");
+  await expect(detail.locator(".cmd-title")).toHaveText("Read");
   await expect(rowTitle).toHaveText("Read src/main.rs");
 });
 
