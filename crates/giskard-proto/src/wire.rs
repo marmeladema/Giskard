@@ -162,6 +162,8 @@ pub struct WireItemStart {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WireToolCallStart {
     pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
     pub input: serde_json::Value,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub server: Option<String>,
@@ -207,6 +209,8 @@ pub enum WireItemPayload {
     },
     CommandExecution {
         command: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        description: Option<String>,
         cwd: String,
         output: WireCommandOutput,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -228,6 +232,8 @@ pub enum WireItemPayload {
     },
     ToolCall {
         name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        description: Option<String>,
         input: serde_json::Value,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         output: Option<WireToolOutput>,
@@ -545,6 +551,7 @@ impl WireItem {
         } = item;
         let ItemPayload::ToolCall {
             name,
+            description,
             input,
             output: _,
             server,
@@ -569,6 +576,7 @@ impl WireItem {
             harness_item_id,
             payload: WireItemPayload::ToolCall {
                 name,
+                description,
                 input,
                 output: tool_output,
                 server,
@@ -584,26 +592,45 @@ impl WireItem {
 
 impl From<ItemStart> for WireItemStart {
     fn from(item: ItemStart) -> Self {
+        let ItemStart {
+            id,
+            harness_item_id,
+            kind,
+            command,
+            tool,
+        } = item;
         Self {
-            id: item.id,
-            harness_item_id: item.harness_item_id,
-            kind: item.kind,
-            command: item.command,
-            tool: item.tool.map(Into::into),
+            id,
+            harness_item_id,
+            kind,
+            command,
+            tool: tool.map(Into::into),
         }
     }
 }
 
 impl From<ToolCallStart> for WireToolCallStart {
     fn from(tool: ToolCallStart) -> Self {
+        // Exhaustive, so a field added to `ToolCallStart` cannot be dropped here unnoticed.
+        let ToolCallStart {
+            name,
+            description,
+            input,
+            server,
+            status,
+            metadata,
+            subagent,
+            started_at_ms,
+        } = tool;
         Self {
-            name: tool.name,
-            input: tool.input,
-            server: tool.server,
-            status: tool.status,
-            metadata: tool.metadata,
-            subagent: tool.subagent.map(Into::into),
-            started_at_ms: tool.started_at_ms,
+            name,
+            description,
+            input,
+            server,
+            status,
+            metadata,
+            subagent: subagent.map(Into::into),
+            started_at_ms,
         }
     }
 }
@@ -631,6 +658,7 @@ impl From<ItemPayload> for WireItemPayload {
             },
             ItemPayload::CommandExecution {
                 command,
+                description,
                 cwd,
                 output,
                 output_truncated,
@@ -652,6 +680,7 @@ impl From<ItemPayload> for WireItemPayload {
                 );
                 Self::CommandExecution {
                     command,
+                    description,
                     cwd: path_to_wire(&cwd),
                     output: CommandOutputDescriptor::from_durable(
                         &output,
@@ -679,6 +708,7 @@ impl From<ItemPayload> for WireItemPayload {
             },
             ItemPayload::ToolCall {
                 name,
+                description,
                 input,
                 output,
                 server,
@@ -701,6 +731,7 @@ impl From<ItemPayload> for WireItemPayload {
                 });
                 Self::ToolCall {
                     name,
+                    description,
                     input,
                     output,
                     server,
@@ -953,6 +984,29 @@ mod tests {
     }
 
     #[test]
+    fn tool_start_description_reaches_the_wire() {
+        let start: WireItemStart = ItemStart {
+            id: ItemId::new(),
+            harness_item_id: "toolu_1".into(),
+            kind: ItemKind::ToolCall,
+            command: None,
+            tool: Some(ToolCallStart {
+                name: "Read".into(),
+                description: Some("Read src/main.rs".into()),
+                input: serde_json::json!({"file_path": "/work/src/main.rs"}),
+                server: None,
+                status: Some("in_progress".into()),
+                metadata: None,
+                subagent: None,
+                started_at_ms: None,
+            }),
+        }
+        .into();
+        let json = serde_json::to_value(&start).unwrap();
+        assert_eq!(json["tool"]["description"], "Read src/main.rs");
+    }
+
+    #[test]
     fn approval_kind_path_becomes_string() {
         let core = ApprovalKind::CommandExecution {
             command: "ls".into(),
@@ -971,6 +1025,7 @@ mod tests {
             id: ItemId::new(),
             harness_item_id: "native-tool".into(),
             payload: ItemPayload::ToolCall {
+                description: None,
                 name: "lookup".into(),
                 input: serde_json::json!({"query": "kept-inline"}),
                 output: Some(serde_json::json!({"secret": sentinel})),
@@ -996,6 +1051,7 @@ mod tests {
             id: ItemId::new(),
             harness_item_id: "native-tool".into(),
             payload: ItemPayload::ToolCall {
+                description: None,
                 name: "lookup".into(),
                 input: serde_json::Value::Null,
                 output: Some(serde_json::json!({"secret": sentinel})),
@@ -1023,6 +1079,7 @@ mod tests {
     fn explicit_json_null_is_available_but_missing_output_is_not() {
         let project = |output| {
             WireItemPayload::from(ItemPayload::ToolCall {
+                description: None,
                 name: "lookup".into(),
                 input: serde_json::Value::Null,
                 output,
@@ -1123,6 +1180,7 @@ mod tests {
     #[test]
     fn command_execution_payload_metadata_becomes_wire() {
         let core = ItemPayload::CommandExecution {
+            description: Some("Run the tests".into()),
             command: "cargo test".into(),
             cwd: PathBuf::from("/tmp/project"),
             output: "ok".into(),
@@ -1138,6 +1196,7 @@ mod tests {
         let json = serde_json::to_value(&wire).unwrap();
         assert_eq!(json["kind"], "command_execution");
         assert_eq!(json["command"], "cargo test");
+        assert_eq!(json["description"], "Run the tests");
         assert_eq!(json["cwd"], "/tmp/project");
         assert_eq!(json["status"], "completed");
         assert_eq!(json["process_id"], "proc_1");
@@ -1149,6 +1208,7 @@ mod tests {
     #[test]
     fn untruncated_command_wire_ignores_original_counts() {
         let wire: WireItemPayload = ItemPayload::CommandExecution {
+            description: None,
             command: "printf ok".into(),
             cwd: PathBuf::from("/tmp/project"),
             output: "ok\n".into(),
@@ -1173,6 +1233,7 @@ mod tests {
         let sentinel = "FULL-OUTPUT-SENTINEL";
         let output = format!("{sentinel}{}tail", "x".repeat(20_000));
         let wire: WireItemPayload = ItemPayload::CommandExecution {
+            description: None,
             command: "generate".into(),
             cwd: PathBuf::from("/tmp/project"),
             output,
@@ -1252,6 +1313,7 @@ mod tests {
                 kind: ItemKind::ToolCall,
                 command: None,
                 tool: Some(ToolCallStart {
+                    description: None,
                     name: "spawn_subagent".into(),
                     input: serde_json::json!({"prompt": "review this"}),
                     server: None,

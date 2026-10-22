@@ -52,6 +52,7 @@ impl RunningTaskState {
                         item_id: item.id,
                         harness_item_id: item.harness_item_id.clone(),
                         command: command.command.clone(),
+                        description: command.description.clone(),
                         cwd: command.cwd.clone(),
                         server: None,
                         status,
@@ -72,6 +73,7 @@ impl RunningTaskState {
                         item_id: item.id,
                         harness_item_id: item.harness_item_id.clone(),
                         command: tool.name.clone(),
+                        description: tool.description.clone(),
                         cwd: String::new(),
                         server: tool.server.clone(),
                         status,
@@ -90,6 +92,7 @@ impl RunningTaskState {
                 let completed = match &item.payload {
                     ItemPayload::CommandExecution {
                         command,
+                        description,
                         cwd,
                         status,
                         process_id,
@@ -97,6 +100,7 @@ impl RunningTaskState {
                     } => CompletedTask {
                         kind: TaskKind::Command,
                         command: command.clone(),
+                        description: description.clone(),
                         cwd: path_to_display(cwd),
                         server: None,
                         status: status.clone(),
@@ -104,12 +108,14 @@ impl RunningTaskState {
                     },
                     ItemPayload::ToolCall {
                         name,
+                        description,
                         server,
                         status,
                         ..
                     } => CompletedTask {
                         kind: TaskKind::Tool,
                         command: name.clone(),
+                        description: description.clone(),
                         cwd: String::new(),
                         server: server.clone(),
                         status: status.clone(),
@@ -142,7 +148,13 @@ impl RunningTaskState {
                     .get(&key)
                     .map(|task| task.terminating)
                     .unwrap_or(false);
+                let description = completed.description.or_else(|| {
+                    self.tasks
+                        .get(&key)
+                        .and_then(|task| task.description.clone())
+                });
                 let task = RunningTask {
+                    description,
                     kind: completed.kind,
                     thread_id: *thread,
                     turn_id: *turn,
@@ -280,6 +292,7 @@ impl RunningTaskState {
 struct CompletedTask {
     kind: TaskKind,
     command: String,
+    description: Option<String>,
     cwd: String,
     server: Option<String>,
     status: Option<String>,
@@ -319,6 +332,7 @@ mod tests {
                 harness_item_id: format!("harness_{process_id}"),
                 kind: ItemKind::CommandExecution,
                 command: Some(CommandExecutionStart {
+                    description: None,
                     command: format!("sleep {process_id}"),
                     cwd: "/tmp/project".into(),
                     status: Some(status.into()),
@@ -344,6 +358,7 @@ mod tests {
                 id: item_id,
                 harness_item_id: format!("harness_{process_id}"),
                 payload: ItemPayload::CommandExecution {
+                    description: None,
                     command: format!("sleep {process_id}"),
                     cwd: "/tmp/project".into(),
                     output: "finished".into(),
@@ -371,6 +386,7 @@ mod tests {
                 kind: ItemKind::ToolCall,
                 command: None,
                 tool: Some(ToolCallStart {
+                    description: None,
                     name: name.into(),
                     input: serde_json::json!({ "q": name }),
                     server: Some("wiki".into()),
@@ -397,6 +413,7 @@ mod tests {
                 id: item_id,
                 harness_item_id: format!("tool_{name}"),
                 payload: ItemPayload::ToolCall {
+                    description: None,
                     name: name.into(),
                     input: serde_json::json!({ "q": name }),
                     output: Some(serde_json::json!("a big result")),
@@ -497,6 +514,7 @@ mod tests {
                 harness_item_id: "cmd1".into(),
                 kind: ItemKind::CommandExecution,
                 command: Some(CommandExecutionStart {
+                    description: None,
                     command: "sleep 60".into(),
                     cwd: "/tmp/project".into(),
                     status: Some("in_progress".into()),
@@ -547,6 +565,7 @@ mod tests {
                 harness_item_id: "cmd_without_process".into(),
                 kind: ItemKind::CommandExecution,
                 command: Some(CommandExecutionStart {
+                    description: None,
                     command: "<command included NUL byte>".into(),
                     cwd: "/tmp/project".into(),
                     status: Some("in_progress".into()),
@@ -621,6 +640,7 @@ mod tests {
                 id: item_id,
                 harness_item_id: "cmd1".into(),
                 payload: ItemPayload::CommandExecution {
+                    description: None,
                     command: "sleep 60".into(),
                     cwd: "/tmp/project".into(),
                     output: "still sleeping".into(),
@@ -656,6 +676,7 @@ mod tests {
                 harness_item_id: "cmd1".into(),
                 kind: ItemKind::CommandExecution,
                 command: Some(CommandExecutionStart {
+                    description: None,
                     command: "cargo test".into(),
                     cwd: "/tmp/project".into(),
                     status: Some("in_progress".into()),
@@ -673,6 +694,7 @@ mod tests {
                 id: item_id,
                 harness_item_id: "cmd1".into(),
                 payload: ItemPayload::CommandExecution {
+                    description: None,
                     command: "cargo test".into(),
                     cwd: "/tmp/project".into(),
                     output: "ok".into(),
@@ -708,6 +730,7 @@ mod tests {
                 harness_item_id: "cmd".into(),
                 kind: ItemKind::CommandExecution,
                 command: Some(CommandExecutionStart {
+                    description: None,
                     command: "sleep 1".into(),
                     cwd: "/tmp".into(),
                     status: Some("in_progress".into()),
@@ -727,6 +750,7 @@ mod tests {
                 harness_item_id: "cmd".into(),
                 kind: ItemKind::CommandExecution,
                 command: Some(CommandExecutionStart {
+                    description: None,
                     command: "sleep 2".into(),
                     cwd: "/tmp".into(),
                     status: Some("in_progress".into()),
@@ -799,6 +823,7 @@ mod tests {
                 harness_item_id: "cmd1".into(),
                 kind: ItemKind::CommandExecution,
                 command: Some(CommandExecutionStart {
+                    description: None,
                     command: "sleep 60".into(),
                     cwd: "/tmp/project".into(),
                     status: Some("in_progress".into()),

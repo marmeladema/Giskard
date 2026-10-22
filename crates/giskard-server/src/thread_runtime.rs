@@ -1616,6 +1616,7 @@ mod tests {
                 id: ItemId::new(),
                 harness_item_id: "command".into(),
                 payload: ItemPayload::CommandExecution {
+                    description: None,
                     command: "printf output".into(),
                     cwd: "/tmp".into(),
                     output: "abcdefgh".into(),
@@ -2774,6 +2775,7 @@ mod tests {
                     id: command_item_id,
                     harness_item_id: "command".into(),
                     payload: ItemPayload::CommandExecution {
+                        description: None,
                         command: "printf retained".into(),
                         cwd: "/tmp".into(),
                         output: "retained command".into(),
@@ -2799,6 +2801,7 @@ mod tests {
                     id: tool_item_id,
                     harness_item_id: "tool".into(),
                     payload: ItemPayload::ToolCall {
+                        description: None,
                         name: "lookup".into(),
                         input: serde_json::json!({}),
                         output: Some(serde_json::json!({"retained": true})),
@@ -2858,6 +2861,7 @@ mod tests {
                 id: item_id,
                 harness_item_id: "command".into(),
                 payload: ItemPayload::CommandExecution {
+                    description: None,
                     command: "produce-output".into(),
                     cwd: "/tmp".into(),
                     output: format!("head\n{}\ntail", "🙂".repeat(20_000)),
@@ -2918,6 +2922,7 @@ mod tests {
                     id: command_item_id,
                     harness_item_id: "command".into(),
                     payload: ItemPayload::CommandExecution {
+                        description: None,
                         command: "printf output".into(),
                         cwd: "/tmp".into(),
                         output: "output".into(),
@@ -2957,6 +2962,7 @@ mod tests {
                     id: tool_item_id,
                     harness_item_id: "tool".into(),
                     payload: ItemPayload::ToolCall {
+                        description: None,
                         name: "lookup".into(),
                         input: serde_json::json!({}),
                         output: Some(serde_json::Value::Null),
@@ -2999,6 +3005,7 @@ mod tests {
                     id: item_id,
                     harness_item_id: "tool".into(),
                     payload: ItemPayload::ToolCall {
+                        description: None,
                         name: "lookup".into(),
                         input: serde_json::json!({}),
                         output,
@@ -3064,6 +3071,7 @@ mod tests {
                 id: item_id,
                 harness_item_id: "bad-command".into(),
                 payload: ItemPayload::CommandExecution {
+                    description: None,
                     command: "bad-output".into(),
                     cwd: "/tmp".into(),
                     output: "retained".into(),
@@ -3124,6 +3132,7 @@ mod tests {
                 id: item_id,
                 harness_item_id: "late-command".into(),
                 payload: ItemPayload::CommandExecution {
+                    description: None,
                     command: "printf late".into(),
                     cwd: "/tmp".into(),
                     output: "late output".into(),
@@ -3176,6 +3185,7 @@ mod tests {
                 id: item,
                 harness_item_id: "runtime-command".into(),
                 payload: ItemPayload::CommandExecution {
+                    description: None,
                     command: "printf runtime".into(),
                     cwd: "/tmp".into(),
                     output: "runtime".into(),

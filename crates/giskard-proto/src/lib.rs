@@ -297,6 +297,9 @@ pub struct RunningTask {
     pub harness_item_id: String,
     /// Primary label: the command line for commands, the tool name for tool calls.
     pub command: String,
+    /// Short human-readable title for the command or tool call, when the harness has one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
     /// Secondary label: the working directory for commands (empty for tools).
     pub cwd: String,
     /// MCP/tool server name, when this is a tool call.
@@ -1301,6 +1304,7 @@ mod tests {
             revision: 3,
             tasks: vec![
                 RunningTask {
+                    description: None,
                     kind: TaskKind::Command,
                     thread_id: tid,
                     turn_id,
@@ -1316,6 +1320,7 @@ mod tests {
                     terminating: true,
                 },
                 RunningTask {
+                    description: None,
                     kind: TaskKind::Tool,
                     thread_id: tid,
                     turn_id,

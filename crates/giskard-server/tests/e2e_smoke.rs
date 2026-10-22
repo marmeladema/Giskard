@@ -374,6 +374,7 @@ async fn emit_external_command_without_completion(
             harness_item_id: format!("external_command_{turn}"),
             kind: ItemKind::CommandExecution,
             command: Some(CommandExecutionStart {
+                description: None,
                 command: command.to_string(),
                 cwd: "/tmp/subagent-command".into(),
                 status: Some("in_progress".into()),
@@ -403,6 +404,7 @@ async fn complete_external_command(
             id: item_id,
             harness_item_id: format!("external_command_{turn}"),
             payload: ItemPayload::CommandExecution {
+                description: None,
                 command: command.to_string(),
                 cwd: "/tmp/subagent-command".into(),
                 output: String::new(),
@@ -736,6 +738,7 @@ impl Script for ActivityScript {
                     kind: ItemKind::ToolCall,
                     command: None,
                     tool: Some(ToolCallStart {
+                        description: None,
                         name: "spawn_subagent".into(),
                         input: serde_json::json!({ "prompt": "recover completed work" }),
                         server: Some("test-harness".into()),
@@ -757,6 +760,7 @@ impl Script for ActivityScript {
                 id: item_id,
                 harness_item_id,
                 payload: ItemPayload::ToolCall {
+                    description: None,
                     name: "spawn_subagent".into(),
                     input: serde_json::json!({ "prompt": "recover completed work" }),
                     output: Some(serde_json::json!({ "status": "completed" })),
@@ -906,6 +910,7 @@ impl Script for ActivityScript {
                         kind: ItemKind::ToolCall,
                         command: None,
                         tool: Some(ToolCallStart {
+                            description: None,
                             name: "spawn_subagent".into(),
                             input: serde_json::json!({ "prompt": "delayed investigate" }),
                             server: Some("test-harness".into()),
@@ -934,6 +939,7 @@ impl Script for ActivityScript {
                     kind: ItemKind::ToolCall,
                     command: None,
                     tool: Some(ToolCallStart {
+                        description: None,
                         name: "spawn_subagent".into(),
                         input: serde_json::json!({ "message": "fallback investigate" }),
                         server: Some("test-harness".into()),
@@ -961,6 +967,7 @@ impl Script for ActivityScript {
                     kind: ItemKind::ToolCall,
                     command: None,
                     tool: Some(ToolCallStart {
+                        description: None,
                         name: "spawn_subagent".into(),
                         input: serde_json::json!({ "prompt": "nested investigate" }),
                         server: Some("test-harness".into()),
@@ -988,6 +995,7 @@ impl Script for ActivityScript {
                     kind: ItemKind::ToolCall,
                     command: None,
                     tool: Some(ToolCallStart {
+                        description: None,
                         name: "spawn_subagent".into(),
                         input: serde_json::json!({ "prompt": "investigate" }),
                         server: Some("test-harness".into()),
@@ -5872,6 +5880,7 @@ async fn thread_archive_and_delete_reject_running_commands() {
                 harness_item_id: "cmd_guard".into(),
                 kind: ItemKind::CommandExecution,
                 command: Some(CommandExecutionStart {
+                    description: None,
                     command: "sleep 60".into(),
                     cwd: "/tmp/thread-actions".into(),
                     status: Some("in_progress".into()),
@@ -5933,6 +5942,7 @@ async fn project_remove_rejects_running_commands() {
                 harness_item_id: "cmd_project_guard".into(),
                 kind: ItemKind::CommandExecution,
                 command: Some(CommandExecutionStart {
+                    description: None,
                     command: "sleep 60".into(),
                     cwd: "/tmp/thread-actions".into(),
                     status: Some("in_progress".into()),

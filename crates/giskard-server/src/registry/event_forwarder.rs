@@ -972,6 +972,8 @@ impl ThreadEventForwarder {
 
     pub(super) async fn run(mut self) -> ForwarderExitReason {
         let exit_reason = loop {
+            // One value per loop pass, consumed at once: not worth boxing the large event.
+            #[allow(clippy::large_enum_variant)]
             enum Step {
                 Cancelled(Result<(), tokio::sync::watch::error::RecvError>),
                 Intent(Option<TurnIntent>),
@@ -3199,6 +3201,7 @@ mod tests {
             id: ItemId::new(),
             harness_item_id: "tool-1".into(),
             payload: ItemPayload::ToolCall {
+                description: None,
                 name: "lookup".into(),
                 input: serde_json::Value::Null,
                 output,
@@ -3230,6 +3233,7 @@ mod tests {
             id: ItemId::new(),
             harness_item_id: "command-1".into(),
             payload: ItemPayload::CommandExecution {
+                description: None,
                 command: "printf ok".into(),
                 cwd: std::path::PathBuf::from("/tmp/project"),
                 output: "ok\n".into(),
@@ -4575,6 +4579,7 @@ mod tests {
                 harness_item_id: "long_running_command".into(),
                 kind: ItemKind::CommandExecution,
                 command: Some(CommandExecutionStart {
+                    description: None,
                     command: "sleep 600".into(),
                     cwd: "/tmp/test".into(),
                     status: Some("running".into()),
@@ -4591,6 +4596,7 @@ mod tests {
                 id: command_item,
                 harness_item_id: "long_running_command".into(),
                 payload: ItemPayload::CommandExecution {
+                    description: None,
                     command: "sleep 600".into(),
                     cwd: "/tmp/test".into(),
                     output: "still running".into(),
@@ -4648,6 +4654,7 @@ mod tests {
                 id: command_item,
                 harness_item_id: "long_running_command".into(),
                 payload: ItemPayload::CommandExecution {
+                    description: None,
                     command: "sleep 600".into(),
                     cwd: "/tmp/test".into(),
                     output: "done".into(),
@@ -4800,6 +4807,7 @@ mod tests {
                 harness_item_id: "partial_command".into(),
                 kind: ItemKind::CommandExecution,
                 command: Some(CommandExecutionStart {
+                    description: None,
                     command: "sleep 600".into(),
                     cwd: "/tmp/test".into(),
                     status: Some("running".into()),
@@ -4929,6 +4937,7 @@ mod tests {
                         id: item_id,
                         harness_item_id: harness_item_id.clone(),
                         payload: ItemPayload::CommandExecution {
+                            description: None,
                             command: "sleep 1".into(),
                             cwd: "/tmp/test".into(),
                             output: "done".into(),
@@ -4981,6 +4990,7 @@ mod tests {
                 harness_item_id,
                 kind: ItemKind::CommandExecution,
                 command: Some(CommandExecutionStart {
+                    description: None,
                     command: "sleep 1".into(),
                     cwd: "/tmp/test".into(),
                     status: Some("in_progress".into()),
@@ -5058,6 +5068,7 @@ mod tests {
                         id: item_id,
                         harness_item_id: harness_item_id.clone(),
                         payload: ItemPayload::CommandExecution {
+                            description: None,
                             command: "<command included NUL byte>".into(),
                             cwd: "/tmp/test".into(),
                             output: String::new(),
@@ -5113,6 +5124,7 @@ mod tests {
                 id: item_id,
                 harness_item_id,
                 payload: ItemPayload::CommandExecution {
+                    description: None,
                     command: "<command included NUL byte>".into(),
                     cwd: "/tmp/test".into(),
                     output: "failed before spawn".into(),
@@ -5715,6 +5727,7 @@ mod tests {
                     harness_item_id: "foreign_command".into(),
                     kind: ItemKind::CommandExecution,
                     command: Some(CommandExecutionStart {
+                        description: None,
                         command: "sleep 60".into(),
                         cwd: "/tmp/test".into(),
                         status: Some("running".into()),

@@ -64,6 +64,7 @@ impl LateScript {
                 harness_item_id: HARNESS_ITEM_ID.into(),
                 kind: ItemKind::CommandExecution,
                 command: Some(CommandExecutionStart {
+                    description: None,
                     command: COMMAND.into(),
                     cwd: ".".into(),
                     status: Some("in_progress".into()),
@@ -78,6 +79,7 @@ impl LateScript {
                 kind: ItemKind::ToolCall,
                 command: None,
                 tool: Some(ToolCallStart {
+                    description: None,
                     name: "search".into(),
                     input: serde_json::json!({ "q": "late" }),
                     server: Some("wiki".into()),
@@ -94,6 +96,7 @@ impl LateScript {
     fn settled_item(&self, output: &str) -> Item {
         let payload = match self.kind {
             LateKind::Command => ItemPayload::CommandExecution {
+                description: None,
                 command: COMMAND.into(),
                 cwd: ".".into(),
                 output: output.into(),
@@ -106,6 +109,7 @@ impl LateScript {
                 duration_ms: Some(92_000),
             },
             LateKind::Tool => ItemPayload::ToolCall {
+                description: None,
                 name: "search".into(),
                 input: serde_json::json!({ "q": "late" }),
                 output: Some(serde_json::json!({ "hits": ["late completion"] })),

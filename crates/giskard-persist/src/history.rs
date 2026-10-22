@@ -916,6 +916,7 @@ mod lazy_diff_tests {
                 id: ItemId::new(),
                 harness_item_id: "malformed-command".into(),
                 payload: ItemPayload::CommandExecution {
+                    description: None,
                     command: "printf output".into(),
                     cwd: ".".into(),
                     output:
@@ -1077,6 +1078,7 @@ mod amendment_tests {
             id,
             harness_item_id: format!("harness-{id}"),
             payload: ItemPayload::CommandExecution {
+                description: None,
                 command: "cargo test".into(),
                 cwd: "/tmp/project".into(),
                 output: if status == "completed" {

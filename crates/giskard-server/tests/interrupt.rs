@@ -68,6 +68,7 @@ impl InterruptScript {
                     id: item_id,
                     harness_item_id: "cmd1".into(),
                     payload: ItemPayload::CommandExecution {
+                        description: None,
                         command: "sleep 60".into(),
                         cwd: "/tmp/project".into(),
                         output: "started\nfinished".into(),
@@ -108,6 +109,7 @@ impl Script for InterruptScript {
                 harness_item_id: "cmd1".into(),
                 kind: ItemKind::CommandExecution,
                 command: Some(CommandExecutionStart {
+                    description: None,
                     command: "sleep 60".into(),
                     cwd: "/tmp/project".into(),
                     status: Some("in_progress".into()),

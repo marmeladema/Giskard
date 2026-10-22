@@ -527,6 +527,7 @@ mod tests {
             id: giskard_core::ids::ItemId::new(),
             harness_item_id: "command-1".into(),
             payload: ItemPayload::CommandExecution {
+                description: None,
                 command: "printf ok".into(),
                 cwd: std::path::PathBuf::from("/tmp/project"),
                 output: "ok\n".into(),
@@ -625,6 +626,7 @@ mod tests {
                     harness_item_id: "command-1".into(),
                     kind: ItemKind::CommandExecution,
                     command: Some(CommandExecutionStart {
+                        description: None,
                         command: "sleep 1".into(),
                         cwd: "/tmp/project".into(),
                         status: Some("in_progress".into()),

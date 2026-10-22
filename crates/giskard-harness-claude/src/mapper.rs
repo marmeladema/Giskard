@@ -23,7 +23,7 @@ use giskard_core::event::AgentEvent;
 use giskard_core::ids::{ApprovalId, ItemId, ServerRequestId, ThreadId, TurnId};
 use giskard_core::item::{
     CommandExecutionStart, FileChangeEntry, FileChangeKind, Item, ItemDelta, ItemKind, ItemPayload,
-    ItemStart, SubagentAction, SubagentLink, SubagentStatus, ToolCallStart,
+    ItemStart, SubagentAction, SubagentLink, SubagentStatus, ToolCallStart, command_description,
 };
 use giskard_core::model::ModelRef;
 use giskard_core::server_request::ServerRequest;
@@ -288,6 +288,7 @@ struct BackgroundCommand {
     /// The `tool_use` id, the item's `harness_item_id`.
     tool_use_id: String,
     command: String,
+    description: Option<String>,
     /// When the item started, for its duration.
     started_at_ms: Option<i64>,
     /// The output file the `tool_result` text names ("Output is being written to: …"), for a
@@ -472,6 +473,8 @@ struct OpenBlock {
 struct OpenTool {
     item_id: ItemId,
     call: ToolKind,
+    /// The item's human-readable title (`tool_description`), for every item the call produces.
+    description: Option<String>,
     /// When its `ItemStarted` was emitted.
     started_at_ms: Option<i64>,
 }
@@ -1434,6 +1437,7 @@ impl ClaudeMapper {
             item_id: open.item_id,
             tool_use_id: tool_use_id.to_owned(),
             command: command.clone(),
+            description: open.description.clone(),
             started_at_ms: open.started_at_ms,
             output_file: None,
             terminal: None,
@@ -1670,6 +1674,7 @@ impl ClaudeMapper {
                 id: command.item_id,
                 harness_item_id: command.tool_use_id,
                 payload: ItemPayload::CommandExecution {
+                    description: command.description,
                     command: command.command,
                     cwd: self.workspace_root.clone(),
                     output: output.text,
@@ -2744,7 +2749,8 @@ impl ClaudeMapper {
                 .routes
                 .get(&tool_use_id)
                 .map(|nested| nested.link(nested.outcome_action()));
-            let payload = interrupted_payload(open.call, &self.workspace_root, link);
+            let payload =
+                interrupted_payload(open.call, open.description, &self.workspace_root, link);
             out.push(self.event(AgentEvent::ItemCompleted {
                 thread,
                 turn: turn.id,
@@ -3330,6 +3336,7 @@ impl ClaudeMapper {
         };
         let id = self.resolve_item(route, &key);
         let started_at_ms = Some(Utc::now().timestamp_millis());
+        let description = tool_description(&tool_use.name, &tool_use.input, &self.workspace_root);
         let call = classify_tool(&tool_use.name, tool_use.input);
         let item = match &call {
             ToolKind::Command { command } => ItemStart {
@@ -3337,6 +3344,7 @@ impl ClaudeMapper {
                 harness_item_id: tool_use.id.clone(),
                 kind: ItemKind::CommandExecution,
                 command: Some(CommandExecutionStart {
+                    description: description.clone(),
                     command: command.clone(),
                     cwd: self.workspace_root.display().to_string(),
                     status: Some("in_progress".into()),
@@ -3362,6 +3370,7 @@ impl ClaudeMapper {
                 kind: ItemKind::ToolCall,
                 command: None,
                 tool: Some(ToolCallStart {
+                    description: description.clone(),
                     name: name.clone(),
                     input: input.clone(),
                     server: server.clone(),
@@ -3378,6 +3387,7 @@ impl ClaudeMapper {
                 OpenTool {
                     item_id: id,
                     call,
+                    description,
                     started_at_ms,
                 },
             );
@@ -3687,6 +3697,7 @@ impl ClaudeMapper {
                 )
             })
             .flatten();
+        let description = open.description;
         let payload = match open.call {
             ToolKind::Command { command } if background_task.is_some() => {
                 info!(
@@ -3702,6 +3713,7 @@ impl ClaudeMapper {
                     "the command runs in the background; its item stays running"
                 );
                 ItemPayload::CommandExecution {
+                    description,
                     command,
                     cwd: self.workspace_root.clone(),
                     output: String::new(),
@@ -3715,6 +3727,7 @@ impl ClaudeMapper {
                 }
             }
             ToolKind::Command { command } => ItemPayload::CommandExecution {
+                description,
                 command,
                 cwd: self.workspace_root.clone(),
                 output: command_output(tool_use_result)
@@ -3754,6 +3767,7 @@ impl ClaudeMapper {
                 server,
                 input,
             } => ItemPayload::ToolCall {
+                description,
                 name,
                 input,
                 output: result.content.as_ref().map(tool_result_json),
@@ -3822,6 +3836,7 @@ impl ClaudeMapper {
             item_id: open.item_id,
             tool_use_id: tool_use_id.to_owned(),
             command: command.clone(),
+            description: open.description.clone(),
             started_at_ms: open.started_at_ms,
             output_file: None,
             terminal: None,
@@ -4145,12 +4160,14 @@ fn assistant_token_usage(usage: &AssistantUsage) -> TokenUsage {
 /// no output. An `Agent` call carries its route's link.
 fn interrupted_payload(
     call: ToolKind,
+    description: Option<String>,
     workspace_root: &std::path::Path,
     subagent: Option<SubagentLink>,
 ) -> ItemPayload {
     const INTERRUPTED: &str = "interrupted";
     match call {
         ToolKind::Command { command } => ItemPayload::CommandExecution {
+            description,
             command,
             cwd: workspace_root.to_path_buf(),
             output: String::new(),
@@ -4178,6 +4195,7 @@ fn interrupted_payload(
             server,
             input,
         } => ItemPayload::ToolCall {
+            description,
             name,
             input,
             output: None,
@@ -4268,6 +4286,51 @@ fn classify_tool(name: &str, input: Value) -> ToolKind {
                 input,
             },
         },
+    }
+}
+
+/// A tool call's human-readable title: the call's own `description` for the tools that take one
+/// (`Bash`, `Monitor`, `Agent`), else one built from the input's main argument ("Read src/main.rs",
+/// `Grep "foo" in src`). MCP tools (`mcp__server__tool`) have no common argument to name: none.
+fn tool_description(name: &str, input: &Value, workspace_root: &std::path::Path) -> Option<String> {
+    let text = |key: &str| {
+        input
+            .get(key)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+    };
+    let path = |key: &str| text(key).map(|value| workspace_relative(value, workspace_root));
+    let scoped = |title: String| match path("path") {
+        Some(path) => format!("{title} in {path}"),
+        None => title,
+    };
+    let title = match name {
+        "Bash" | "Monitor" | "Agent" | "Task" => text("description")?.to_owned(),
+        "Read" => format!("Read {}", path("file_path")?),
+        "Grep" => {
+            let title = format!("Grep \"{}\"", text("pattern")?);
+            match (path("path"), text("glob")) {
+                (Some(path), Some(glob)) => format!("{title} in {path} ({glob})"),
+                (None, Some(glob)) => format!("{title} in {glob}"),
+                _ => scoped(title),
+            }
+        }
+        "Glob" => scoped(format!("Glob {}", text("pattern")?)),
+        "WebFetch" => format!("Fetch {}", text("url")?),
+        "WebSearch" => format!("Web search \"{}\"", text("query")?),
+        "Skill" => format!("Skill {}", text("skill")?),
+        _ => return None,
+    };
+    command_description(Some(&title))
+}
+
+/// `path` relative to the workspace when it lies inside it, as typed otherwise.
+fn workspace_relative(path: &str, workspace_root: &std::path::Path) -> String {
+    match std::path::Path::new(path).strip_prefix(workspace_root) {
+        Ok(relative) if relative.as_os_str().is_empty() => ".".to_owned(),
+        Ok(relative) => relative.display().to_string(),
+        Err(_) => path.to_owned(),
     }
 }
 
@@ -5255,8 +5318,19 @@ mod tests {
             .collect();
         assert_eq!(commands.len(), 1);
         assert_eq!(commands[0].command, "touch probe.txt");
+        assert_eq!(
+            commands[0].description.as_deref(),
+            Some("Create an empty file named probe.txt")
+        );
         assert_eq!(commands[0].cwd, WORKSPACE);
         assert_eq!(commands[0].status.as_deref(), Some("in_progress"));
+        let completions = command_completions(&outputs);
+        assert_eq!(completions.len(), 1);
+        assert!(matches!(
+            &completions[0].1.payload,
+            ItemPayload::CommandExecution { description: Some(description), .. }
+                if description == "Create an empty file named probe.txt"
+        ));
 
         let approvals: Vec<_> = events(&outputs)
             .into_iter()
@@ -5306,6 +5380,93 @@ mod tests {
         assert_eq!(
             command_statuses(&outputs),
             vec![("touch probe.txt".into(), Some("completed".into()))]
+        );
+    }
+
+    #[test]
+    fn generic_tools_get_a_title_from_their_main_argument() {
+        let root = std::path::Path::new(WORKSPACE);
+        let title = |name: &str, input: Value| tool_description(name, &input, root);
+        assert_eq!(
+            title("Read", json!({"file_path": "/work/project/src/main.rs"})).as_deref(),
+            Some("Read src/main.rs")
+        );
+        assert_eq!(
+            title("Read", json!({"file_path": "/etc/hosts"})).as_deref(),
+            Some("Read /etc/hosts")
+        );
+        assert_eq!(
+            title(
+                "Grep",
+                json!({"pattern": "fn main", "path": "/work/project/src"})
+            )
+            .as_deref(),
+            Some(r#"Grep "fn main" in src"#)
+        );
+        assert_eq!(
+            title("Grep", json!({"pattern": "todo", "glob": "*.rs"})).as_deref(),
+            Some(r#"Grep "todo" in *.rs"#)
+        );
+        assert_eq!(
+            title(
+                "Grep",
+                json!({"pattern": "todo", "path": "/work/project/src", "glob": "*.rs"})
+            )
+            .as_deref(),
+            Some(r#"Grep "todo" in src (*.rs)"#)
+        );
+        assert_eq!(
+            title(
+                "Glob",
+                json!({"pattern": "**/*.toml", "path": "/work/project"})
+            )
+            .as_deref(),
+            Some("Glob **/*.toml in .")
+        );
+        assert_eq!(
+            title("WebFetch", json!({"url": "https://docs.rs", "prompt": "x"})).as_deref(),
+            Some("Fetch https://docs.rs")
+        );
+        assert_eq!(
+            title("WebSearch", json!({"query": "tokio 1.54"})).as_deref(),
+            Some(r#"Web search "tokio 1.54""#)
+        );
+        assert_eq!(
+            title(
+                "Monitor",
+                json!({"description": "CI run", "command": "gh run watch"})
+            )
+            .as_deref(),
+            Some("CI run")
+        );
+        assert_eq!(
+            title(
+                "Agent",
+                json!({"description": "reader", "prompt": "Read it"})
+            )
+            .as_deref(),
+            Some("reader")
+        );
+        assert_eq!(
+            title("Skill", json!({"skill": "init"})).as_deref(),
+            Some("Skill init")
+        );
+        // No main argument, an unknown tool, or an MCP tool: the tool name stays the title.
+        assert_eq!(title("Read", json!({})), None);
+        assert_eq!(title("Monitor", json!({"description": " "})), None);
+        assert_eq!(title("TodoWrite", json!({"todos": []})), None);
+        assert_eq!(title("mcp__brave__search", json!({"query": "q"})), None);
+    }
+
+    #[test]
+    fn a_blank_bash_description_is_dropped() {
+        let root = std::path::Path::new(WORKSPACE);
+        let input = json!({"command": "ls", "description": "  "});
+        assert_eq!(tool_description("Bash", &input, root), None);
+        let input = json!({"command": "ls", "description": " List files "});
+        assert_eq!(
+            tool_description("Bash", &input, root).as_deref(),
+            Some("List files")
         );
     }
 
@@ -5559,6 +5720,19 @@ mod tests {
         let first = turn_completions(&per_line[results[0]]);
         assert_eq!(first.len(), 1);
         assert_eq!(first[0].2.kind, TurnStatusKind::Completed);
+        // Both the running completion and the terminal one keep the `Bash` description.
+        let all: Vec<MapperOutput> = per_line.iter().flatten().cloned().collect();
+        let descriptions: Vec<_> = command_completions(&all)
+            .into_iter()
+            .map(|(_, item)| match &item.payload {
+                ItemPayload::CommandExecution { description, .. } => description.clone(),
+                _ => unreachable!(),
+            })
+            .collect();
+        assert_eq!(
+            descriptions,
+            vec![Some("Background sleep command".to_owned()); 2]
+        );
 
         let outputs: Vec<MapperOutput> = per_line[results[0] + 1..]
             .iter()

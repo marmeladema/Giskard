@@ -59,6 +59,7 @@ impl Script for RunningItemScript {
                 harness_item_id: "command-1".into(),
                 kind: ItemKind::CommandExecution,
                 command: Some(CommandExecutionStart {
+                    description: None,
                     command: "printf live".into(),
                     cwd: "/tmp/project".into(),
                     status: Some("in_progress".into()),
@@ -76,6 +77,7 @@ impl Script for RunningItemScript {
                 id: self.item_id,
                 harness_item_id: "command-1".into(),
                 payload: ItemPayload::CommandExecution {
+                    description: None,
                     command: "printf live".into(),
                     cwd: "/tmp/project".into(),
                     output: "live output".into(),

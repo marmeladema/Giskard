@@ -378,6 +378,7 @@ impl ScriptedHarness {
                     kind: ItemKind::ToolCall,
                     command: None,
                     tool: Some(giskard_core::item::ToolCallStart {
+                        description: None,
                         name: "wait".into(),
                         input: serde_json::json!({}),
                         server: Some("collab-agent".into()),

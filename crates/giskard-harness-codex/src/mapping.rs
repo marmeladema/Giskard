@@ -15,7 +15,7 @@ use giskard_core::event::AgentEvent;
 use giskard_core::ids::{ApprovalId, ItemId, ServerRequestId, ThreadId, TurnId};
 use giskard_core::item::{
     CommandExecutionStart, FileChangeEntry, FileChangeKind, Item, ItemDelta, ItemKind, ItemPayload,
-    ItemStart, SubagentAction, SubagentLink, SubagentStatus, ToolCallStart,
+    ItemStart, SubagentAction, SubagentLink, SubagentStatus, ToolCallStart, command_description,
     command_status_is_running, normalized_command_status,
 };
 use giskard_core::model::ModelRef;
@@ -1926,6 +1926,66 @@ fn add_command_action_metadata(
     }
 }
 
+/// Most file names a run of consecutive reads lists before it collapses the rest into `+N`.
+const COMMAND_TITLE_READ_NAMES: usize = 3;
+
+/// A short title for a command from Codex's parse of it: "Read a.rs, b.rs · Search \"foo\" in src".
+/// Codex sends no description of its own, so only a command whose every action it recognized gets
+/// a title; any `Unknown` action leaves the raw command line as the row's title.
+fn command_title_from_actions(actions: &[codex_codes::protocol::CommandAction]) -> Option<String> {
+    use codex_codes::protocol::CommandAction;
+
+    let mut fragments: Vec<String> = Vec::new();
+    let mut reads: Vec<&str> = Vec::new();
+    let flush_reads = |reads: &mut Vec<&str>, fragments: &mut Vec<String>| {
+        if reads.is_empty() {
+            return;
+        }
+        let shown = reads
+            .iter()
+            .take(COMMAND_TITLE_READ_NAMES)
+            .copied()
+            .collect::<Vec<_>>()
+            .join(", ");
+        let hidden = reads.len().saturating_sub(COMMAND_TITLE_READ_NAMES);
+        fragments.push(if hidden > 0 {
+            format!("Read {shown} +{hidden}")
+        } else {
+            format!("Read {shown}")
+        });
+        reads.clear();
+    };
+    for action in actions {
+        match action {
+            CommandAction::Read { name, path, .. } => {
+                let name = Some(name.trim())
+                    .filter(|name| !name.is_empty())
+                    .or_else(|| Some(path.0.trim()).filter(|path| !path.is_empty()))?;
+                reads.push(name);
+            }
+            CommandAction::ListFiles { path, .. } => {
+                flush_reads(&mut reads, &mut fragments);
+                let path = path.as_deref().map(str::trim).filter(|p| !p.is_empty());
+                fragments.push(format!("List {}", path.unwrap_or(".")));
+            }
+            CommandAction::Search { path, query, .. } => {
+                flush_reads(&mut reads, &mut fragments);
+                let mut fragment = String::from("Search");
+                if let Some(query) = query.as_deref().map(str::trim).filter(|q| !q.is_empty()) {
+                    fragment.push_str(&format!(" \"{query}\""));
+                }
+                if let Some(path) = path.as_deref().map(str::trim).filter(|p| !p.is_empty()) {
+                    fragment.push_str(&format!(" in {path}"));
+                }
+                fragments.push(fragment);
+            }
+            CommandAction::Unknown { .. } => return None,
+        }
+    }
+    flush_reads(&mut reads, &mut fragments);
+    command_description(Some(&fragments.join(" · ")))
+}
+
 fn add_parsed_command_metadata(
     metadata: &mut Vec<ApprovalMetadata>,
     workspace_root: &Path,
@@ -2625,11 +2685,13 @@ fn map_thread_item_start(
     let command = match item {
         codex_codes::ThreadItem::CommandExecution {
             command,
+            command_actions,
             cwd,
             process_id,
             status,
             ..
         } => Some(CommandExecutionStart {
+            description: command_title_from_actions(command_actions),
             command: command.clone(),
             cwd: json_display(cwd),
             status: Some(command_status_string(status)),
@@ -2647,6 +2709,7 @@ fn map_thread_item_start(
             status,
             ..
         } => Some(ToolCallStart {
+            description: None,
             name: tool.clone(),
             input: arguments.clone(),
             server: Some(server.clone()),
@@ -2662,6 +2725,7 @@ fn map_thread_item_start(
             namespace,
             ..
         } => Some(ToolCallStart {
+            description: None,
             name: tool.clone(),
             input: arguments.clone(),
             server: namespace.clone(),
@@ -2679,6 +2743,7 @@ fn map_thread_item_start(
             receiver_thread_ids,
             ..
         } => Some(ToolCallStart {
+            description: None,
             name: json_display(tool),
             input: json!({
                 "prompt": prompt,
@@ -2736,6 +2801,7 @@ fn map_thread_item_complete(
         }
         codex_codes::ThreadItem::CommandExecution {
             command,
+            command_actions,
             cwd,
             aggregated_output,
             exit_code,
@@ -2747,6 +2813,7 @@ fn map_thread_item_complete(
             let output = aggregated_output.clone().unwrap_or_default();
             let exit = exit_code.map(|c| c as i32);
             ItemPayload::CommandExecution {
+                description: command_title_from_actions(command_actions),
                 command: command.clone(),
                 cwd: path_from_json_value(cwd),
                 output,
@@ -2783,6 +2850,7 @@ fn map_thread_item_complete(
             status,
             ..
         } => ItemPayload::ToolCall {
+            description: None,
             name: tool.clone(),
             input: arguments.clone(),
             output: result.as_ref().and_then(json_value),
@@ -2801,6 +2869,7 @@ fn map_thread_item_complete(
             success,
             ..
         } => ItemPayload::ToolCall {
+            description: None,
             name: tool.clone(),
             input: arguments.clone(),
             output: content_items
@@ -2822,6 +2891,7 @@ fn map_thread_item_complete(
             receiver_thread_ids,
             ..
         } => ItemPayload::ToolCall {
+            description: None,
             name: json_display(tool),
             input: json!({
                 "prompt": prompt,
@@ -2950,6 +3020,7 @@ fn map_thread_item_complete(
             output,
             ..
         } => ItemPayload::ToolCall {
+            description: None,
             name: name.clone(),
             // Codex injects this item to carry a tool result the client supplied on turn start
             // (`turn/start` `toolOutput`); the matching call and its arguments are not part of the
@@ -5609,6 +5680,92 @@ mod tests {
                 )
                 .is_none()
         );
+    }
+
+    fn command_actions(actions: serde_json::Value) -> Vec<codex_codes::protocol::CommandAction> {
+        serde_json::from_value(actions).unwrap()
+    }
+
+    #[test]
+    fn command_title_names_recognized_actions() {
+        let title = |actions| command_title_from_actions(&command_actions(actions));
+        assert_eq!(title(serde_json::json!([])), None);
+        assert_eq!(
+            title(serde_json::json!([
+                {"type": "read", "command": "cat a.rs", "name": "a.rs", "path": "/w/a.rs"},
+                {"type": "read", "command": "cat b.rs", "name": "b.rs", "path": "/w/b.rs"}
+            ])),
+            Some("Read a.rs, b.rs".into())
+        );
+        assert_eq!(
+            title(serde_json::json!([
+                {"type": "read", "command": "cat a", "name": "a", "path": "a"},
+                {"type": "read", "command": "cat b", "name": "b", "path": "b"},
+                {"type": "read", "command": "cat c", "name": "c", "path": "c"},
+                {"type": "read", "command": "cat d", "name": "d", "path": "d"},
+                {"type": "read", "command": "cat e", "name": "e", "path": "e"}
+            ])),
+            Some("Read a, b, c +2".into())
+        );
+        assert_eq!(
+            title(serde_json::json!([
+                {"type": "search", "command": "rg foo src", "query": "foo", "path": "src"},
+                {"type": "listFiles", "command": "ls"},
+                {"type": "search", "command": "rg bar", "query": "bar"},
+                {"type": "read", "command": "cat a.rs", "name": "a.rs", "path": "a.rs"}
+            ])),
+            Some(r#"Search "foo" in src · List . · Search "bar" · Read a.rs"#.into())
+        );
+        // One unrecognized action and the raw command line stays the title.
+        assert_eq!(
+            title(serde_json::json!([
+                {"type": "read", "command": "cat a.rs", "name": "a.rs", "path": "a.rs"},
+                {"type": "unknown", "command": "cargo test"}
+            ])),
+            None
+        );
+    }
+
+    #[test]
+    fn command_item_carries_a_title_from_its_actions() {
+        let mut mapper = CodexMapper::new(PathBuf::from("/tmp"));
+        let thread = ThreadId::new();
+        let item = serde_json::json!({
+            "type": "commandExecution",
+            "id": "cmd1",
+            "command": "rg -n foo src | head",
+            "cwd": "/tmp/project",
+            "commandActions": [
+                {"type": "search", "command": "rg -n foo src", "query": "foo", "path": "src"}
+            ],
+            "status": "inProgress"
+        });
+        match mapper
+            .map_notification(&started_item(item.clone()), thread)
+            .unwrap()
+        {
+            AgentEvent::ItemStarted { item, .. } => assert_eq!(
+                item.command
+                    .expect("command metadata")
+                    .description
+                    .as_deref(),
+                Some(r#"Search "foo" in src"#)
+            ),
+            other => panic!("expected command item start, got {other:?}"),
+        }
+        let mut done = item;
+        done["status"] = "completed".into();
+        match mapper
+            .map_notification(&completed_item(done), thread)
+            .unwrap()
+        {
+            AgentEvent::ItemCompleted { item, .. } => assert!(matches!(
+                item.payload,
+                ItemPayload::CommandExecution { description: Some(description), .. }
+                    if description == r#"Search "foo" in src"#
+            )),
+            other => panic!("expected command item completion, got {other:?}"),
+        }
     }
 
     #[test]

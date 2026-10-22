@@ -2355,6 +2355,7 @@ mod tests {
             id: item_id,
             harness_item_id: "persisted-command".into(),
             payload: ItemPayload::CommandExecution {
+                description: None,
                 command: "printf persisted".into(),
                 cwd: workspace.path().to_path_buf(),
                 output: "persisted output".into(),
@@ -2400,6 +2401,7 @@ mod tests {
                 id: item_id,
                 harness_item_id: "runtime-command".into(),
                 payload: ItemPayload::CommandExecution {
+                    description: None,
                     command: "printf runtime".into(),
                     cwd: workspace.path().to_path_buf(),
                     output: "runtime output".into(),

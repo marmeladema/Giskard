@@ -269,6 +269,7 @@ impl Script for RecordingScript {
                     id: ItemId::new(),
                     harness_item_id: format!("spawn_{}", call.turn),
                     payload: ItemPayload::ToolCall {
+                        description: None,
                         name: "spawn_subagent".into(),
                         input: serde_json::json!({}),
                         output: None,

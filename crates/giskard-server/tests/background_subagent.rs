@@ -70,6 +70,7 @@ impl Script for BackgroundDelegation {
                     id: ItemId::new(),
                     harness_item_id: "toolu_background".into(),
                     payload: ItemPayload::ToolCall {
+                        description: None,
                         name: "Agent".into(),
                         input: serde_json::json!({ "run_in_background": true }),
                         output: Some(serde_json::json!("Async agent launched successfully")),

@@ -52,6 +52,7 @@ impl Script for ToolScript {
                 kind: ItemKind::ToolCall,
                 command: None,
                 tool: Some(ToolCallStart {
+                    description: None,
                     name: "search".into(),
                     input: serde_json::json!({ "q": "cats" }),
                     server: Some("wiki".into()),

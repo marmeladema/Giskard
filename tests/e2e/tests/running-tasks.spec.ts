@@ -263,6 +263,109 @@ test("command task opens the live transcript output directly", async ({ page }) 
     .toHaveClass(/selected/);
 });
 
+test("a described command is titled by its description and shows the command when expanded", async ({ page }) => {
+  await openCommandOutputTestThread(page);
+  const command = "rg -n probe src | sort | uniq -c | head -20";
+  await page.evaluate(({ command }) => {
+    const app = window as unknown as {
+      addItem: (item: unknown, turnId: string, fromHistory: boolean) => void;
+      renderRunningCommandSnapshot: (tasks: unknown[]) => void;
+    };
+    app.addItem({
+      id: "command-described", harness_item_id: "native-command-described",
+      payload: {
+        kind: "command_execution", command, description: "Count probe matches",
+        cwd: "/tmp/project", output: "", exit_code: null, status: "in_progress",
+        process_id: "proc-described", duration_ms: null,
+      },
+    }, "turn-described", false);
+    app.renderRunningCommandSnapshot([{
+      kind: "command", thread_id: "browser-thread", turn_id: "turn-described",
+      item_id: "command-described", harness_item_id: "native-command-described",
+      command, description: "Count probe matches", cwd: "/tmp/project", status: "in_progress",
+      process_id: "proc-described", started_at_ms: Date.now(),
+      after_turn: false, terminating: false,
+    }]);
+  }, { command });
+
+  const row = page.locator(".task-group-item", { hasText: "Count probe matches" });
+  const rowTitle = row.locator(".task-group-item-title");
+  await expect(rowTitle).toHaveText("Count probe matches");
+  await expect(rowTitle).not.toHaveClass(/mono/);
+  await expect(rowTitle).toHaveAttribute("title", `$ ${command}`);
+
+  await row.click();
+  const detail = page.locator('[data-command-item-id="turn-described:command-described"]');
+  await expect(detail.locator(".cmd-title")).toHaveText("Count probe matches");
+  await expect(detail.locator(".cmd-line")).toHaveText(`$ ${command}`);
+
+  await page.locator("#tasksBtn").click();
+  const card = page.locator("#tasksMenu .cmd-card", { hasText: "Count probe matches" });
+  await expect(card.locator(".cmd-title")).toHaveAttribute("title", `$ ${command}`);
+
+  // A completion without a description keeps the title the start gave the row.
+  await page.evaluate(({ command }) => {
+    const app = window as unknown as {
+      addItem: (item: unknown, turnId: string, fromHistory: boolean) => void;
+    };
+    app.addItem({
+      id: "command-described", harness_item_id: "native-command-described",
+      payload: {
+        kind: "command_execution", command, cwd: "/tmp/project", output: "3 probe\n",
+        exit_code: 0, status: "completed", process_id: "proc-described", duration_ms: 20,
+      },
+    }, "turn-described", false);
+  }, { command });
+  await expect(detail.locator(".cmd-title")).toHaveText("Count probe matches");
+  await expect(detail.locator(".cmd-line")).toHaveText(`$ ${command}`);
+  await expect(rowTitle).toHaveText("Count probe matches");
+});
+
+test("a described tool call is titled by its description from start to completion", async ({ page }) => {
+  await openCommandOutputTestThread(page);
+  const dispatch = (event: Record<string, unknown>) => page.evaluate(ev => {
+    (window as unknown as { handleEvent: (ev: unknown) => void }).handleEvent(ev);
+  }, event);
+  const input = { file_path: "/tmp/project/src/main.rs" };
+  // The live start: its title comes from the start's own metadata, before any completion.
+  await dispatch({
+    kind: "item_started",
+    turn: "turn-tool-described",
+    item: {
+      id: "tool-described", harness_item_id: "native-tool-described", kind: "tool_call",
+      tool: { name: "Read", description: "Read src/main.rs", input, status: "in_progress" },
+    },
+  });
+
+  const row = page.locator(".task-group-item", { hasText: "Read src/main.rs" });
+  const rowTitle = row.locator(".task-group-item-title");
+  await expect(rowTitle).toHaveText("Read src/main.rs");
+  await expect(rowTitle).not.toHaveClass(/mono/);
+  await expect(rowTitle).toHaveAttribute("title", "Read");
+
+  await row.click();
+  const detail = page.locator('[data-tool-item-id="turn-tool-described:tool-described"]');
+  await expect(detail.locator(".cmd-title")).toHaveText("Read src/main.rs");
+  await expect(detail.locator(".cmd-line")).toHaveText("Read");
+
+  await dispatch({
+    kind: "item_completed",
+    turn: "turn-tool-described",
+    item: {
+      id: "tool-described", harness_item_id: "native-tool-described",
+      // No description on the completion: the row keeps the start's.
+      payload: {
+        kind: "tool_call", name: "Read", input,
+        output: null, server: null, status: "completed", metadata: null, subagent: null,
+        error: null,
+      },
+      created_at: new Date().toISOString(),
+    },
+  });
+  await expect(detail.locator(".cmd-title")).toHaveText("Read src/main.rs");
+  await expect(rowTitle).toHaveText("Read src/main.rs");
+});
+
 test("failed command and tool stops clear stop-requested presentation state", async ({ page }) => {
   await openCommandOutputTestThread(page);
   const text = await page.evaluate(() => {

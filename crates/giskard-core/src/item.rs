@@ -72,10 +72,20 @@ pub fn command_status_is_running(status: &str) -> bool {
     )
 }
 
+/// Normalizes a harness-supplied command description: trims it and drops empty values.
+pub fn command_description(raw: Option<&str>) -> Option<String> {
+    raw.map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+}
+
 /// Command metadata available when a command item starts.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CommandExecutionStart {
     pub command: String,
+    /// Short human-readable title for the command, when the harness has one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
     pub cwd: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub status: Option<String>,
@@ -89,6 +99,9 @@ pub struct CommandExecutionStart {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolCallStart {
     pub name: String,
+    /// Short human-readable title for the call, when the harness has or derives one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
     pub input: serde_json::Value,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub server: Option<String>,
@@ -171,6 +184,9 @@ pub enum ItemPayload {
     },
     CommandExecution {
         command: String,
+        /// Short human-readable title for the command, when the harness has one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        description: Option<String>,
         cwd: PathBuf,
         output: String,
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -199,6 +215,9 @@ pub enum ItemPayload {
     },
     ToolCall {
         name: String,
+        /// Short human-readable title for the call, when the harness has or derives one.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        description: Option<String>,
         input: serde_json::Value,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         output: Option<serde_json::Value>,
@@ -514,6 +533,7 @@ mod tests {
     #[test]
     fn command_execution_serde() {
         let payload = ItemPayload::CommandExecution {
+            description: Some("Run the tests".into()),
             command: "cargo test".into(),
             cwd: "/tmp/project".into(),
             output: "all passed".into(),
@@ -541,9 +561,20 @@ mod tests {
                 output_truncated: false,
                 output_original_bytes: None,
                 output_original_lines: None,
+                description: None,
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn command_description_drops_blank_values() {
+        assert_eq!(command_description(None), None);
+        assert_eq!(command_description(Some("  ")), None);
+        assert_eq!(
+            command_description(Some(" Run tests \n")),
+            Some("Run tests".into())
+        );
     }
 
     #[test]
@@ -559,6 +590,7 @@ mod tests {
             kind: ItemKind::ToolCall,
             command: None,
             tool: Some(ToolCallStart {
+                description: None,
                 name: "jira_search".into(),
                 input: serde_json::json!({ "jql": "project = ERE" }),
                 server: Some("cf-tools".into()),

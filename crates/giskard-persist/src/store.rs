@@ -5038,6 +5038,7 @@ mod layout_tests {
             id,
             harness_item_id: format!("native-{id}"),
             payload: ItemPayload::CommandExecution {
+                description: None,
                 command: "cargo test".into(),
                 cwd: "/tmp/project".into(),
                 output: String::new(),
@@ -5056,6 +5057,7 @@ mod layout_tests {
     fn settled_command_item(id: giskard_core::ItemId) -> Item {
         let mut item = running_command_item(id);
         item.payload = ItemPayload::CommandExecution {
+            description: None,
             command: "cargo test".into(),
             cwd: "/tmp/project".into(),
             output: "all tests passed".into(),

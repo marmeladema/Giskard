@@ -1033,6 +1033,7 @@ mod tests {
             harness_item_id: "cmd_1".into(),
             kind: ItemKind::CommandExecution,
             command: Some(CommandExecutionStart {
+                description: None,
                 command: "yes".into(),
                 cwd: "/tmp/project".into(),
                 status: Some("in_progress".into()),
@@ -1075,6 +1076,7 @@ mod tests {
                     id: item_id,
                     harness_item_id: "cmd_1".into(),
                     payload: ItemPayload::CommandExecution {
+                        description: None,
                         command: "yes".into(),
                         cwd: "/tmp/project".into(),
                         output: "done".into(),
@@ -1119,6 +1121,7 @@ mod tests {
                     id: item_id,
                     harness_item_id: "tool_1".into(),
                     payload: ItemPayload::ToolCall {
+                        description: None,
                         name: "lookup".into(),
                         input: serde_json::Value::Null,
                         output: Some(serde_json::json!({"secret": true})),
@@ -1337,6 +1340,7 @@ mod tests {
                     id: item_id,
                     harness_item_id: "cmd_1".into(),
                     payload: ItemPayload::CommandExecution {
+                        description: None,
                         command: "yes".into(),
                         cwd: "/tmp/project".into(),
                         output,
@@ -1407,6 +1411,7 @@ mod tests {
                     id: item_id,
                     harness_item_id: "cmd_1".into(),
                     payload: ItemPayload::CommandExecution {
+                        description: None,
                         command: "yes".into(),
                         cwd: "/tmp/project".into(),
                         output,
@@ -1920,6 +1925,7 @@ mod tests {
                 id,
                 harness_item_id: "cmd_1".into(),
                 payload: ItemPayload::CommandExecution {
+                    description: None,
                     command: "yes".into(),
                     cwd: "/tmp/project".into(),
                     output: "done".into(),
@@ -2379,6 +2385,7 @@ mod tests {
                     id: tool,
                     harness_item_id: "tool_lookup".into(),
                     payload: ItemPayload::ToolCall {
+                        description: None,
                         name: "lookup".into(),
                         input: serde_json::Value::Null,
                         output: Some(serde_json::json!({"found": true})),
@@ -2525,6 +2532,7 @@ mod tests {
 
     fn tool_call(status: &str) -> ItemPayload {
         ItemPayload::ToolCall {
+            description: None,
             name: "lookup".into(),
             input: serde_json::Value::Null,
             output: None,

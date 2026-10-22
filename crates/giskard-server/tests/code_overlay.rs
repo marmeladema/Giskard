@@ -105,6 +105,7 @@ fn command_turn(output: &str, status: Option<&str>) -> (Turn, ItemId) {
                 id: item_id,
                 harness_item_id: format!("native-{item_id}"),
                 payload: ItemPayload::CommandExecution {
+                    description: None,
                     command: "test command".into(),
                     cwd: ".".into(),
                     output: output.into(),

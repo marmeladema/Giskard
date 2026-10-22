@@ -6028,6 +6028,11 @@ function syncTaskGroupItem(itemId) {
   task.symbol.textContent = commandStateSymbol(stateName);
   const title = task.msg.querySelector(".cmd-title");
   task.title.textContent = title ? title.textContent.trim() : (task.kind==="tool_call" ? "tool" : "command");
+  // A described row reads as prose; hovering it shows the exact command line or tool name.
+  const line = task.msg.querySelector(".cmd-line");
+  task.title.classList.toggle("mono", !line);
+  if (line) task.title.title = line.textContent;
+  else task.title.removeAttribute("title");
   task.status.textContent = taskStatusText(task.msg);
   syncTaskGroupState(group);
 }
@@ -6099,6 +6104,7 @@ function startRunningCommand(item, turnId) {
     turnId:idKey(turnId),
     harnessItemId:item.harness_item_id || "",
     command:command.command || "",
+    description:command.description || "",
     cwd:command.cwd || "",
     status:command.status || "in_progress",
     processId:command.process_id || "",
@@ -6124,6 +6130,7 @@ function commandFromParts(parts) {
     turnId:parts.turnId || "",
     harnessItemId:parts.harnessItemId || "",
     command:parts.command || "",
+    description:parts.description || "",
     cwd:parts.cwd || "",
     server:parts.server || "",
     status:parts.status || "in_progress",
@@ -6134,10 +6141,14 @@ function commandFromParts(parts) {
     terminating:!!parts.terminating
   };
 }
-// Right-panel label for a running task: a shell command shows "$ cmd"; a tool shows "server:tool".
+// Right-panel label for a running task: its description when it has one, else "$ cmd" for a shell
+// command and "server:tool" for a tool.
 function taskTitleText(cmd) {
-  if (cmd.kind === "tool") return (cmd.server ? cmd.server + ":" : "") + (cmd.command || "tool");
-  return "$ " + (cmd.command || "(command)");
+  return cmd.description || taskDetailText(cmd);
+}
+// What a described task's title hides: the exact command line, or the tool's name.
+function taskDetailText(cmd) {
+  return cmd.kind === "tool" ? toolNameText(cmd.server, cmd.command) : commandLineText(cmd.command);
 }
 // The client accumulates the full running output from command_output deltas, while replayed item
 // payloads may carry only a bounded preview. Keep whichever is longer so replay never shrinks the
@@ -6154,6 +6165,7 @@ function commandFromItem(item, p, turnId, key, existing) {
     turnId:existing ? existing.turnId : idKey(turnId),
     harnessItemId:(item && item.harness_item_id) || (existing && existing.harnessItemId) || "",
     command:p.command || "",
+    description:p.description || (existing && existing.description) || "",
     cwd:p.cwd || "",
     status:p.status || "in_progress",
     processId:p.process_id || (existing && existing.processId) || "",
@@ -6269,6 +6281,40 @@ function makeCommandHead() {
   const head = document.createElement("div");
   head.className = "cmd-head";
   return { head };
+}
+// A command or tool row's title is the harness's description when it has one, else `label` (the
+// "$ command" line, or "server:tool"). With a description, `label` follows the head on its own
+// line (`line`, null otherwise), so expanding the row still shows exactly what ran.
+function describedTitleNodes(description, label) {
+  const title = document.createElement("div");
+  title.className = description ? "cmd-title" : "cmd-title mono";
+  title.textContent = description || label;
+  let line = null;
+  if (description) {
+    line = document.createElement("div");
+    line.className = "cmd-line mono";
+    line.textContent = label;
+  }
+  return { title, line };
+}
+function commandTitleNodes(description, command) {
+  return describedTitleNodes(description, commandLineText(command));
+}
+function toolTitleNodes(description, server, name) {
+  return describedTitleNodes(description, toolNameText(server, name));
+}
+// A later payload for the same item that brings no description keeps the one an earlier record had
+// (its start, a running record, a previous render), so a row's title does not flip back.
+function keepEarlierDescription(p, ...earlier) {
+  if (p.description) return p;
+  const found = earlier.find(record => record && record.description);
+  return found ? { ...p, description: found.description } : p;
+}
+function commandLineText(command) {
+  return "$ " + (command || "(command)");
+}
+function toolNameText(server, name) {
+  return (server ? server + ":" : "") + (name || "tool");
 }
 function clearRowToggle(msg) {
   msg.classList.remove("toggleable", "collapsed", "expanded");
@@ -6462,9 +6508,7 @@ function renderCommandBody(body, cmd) {
   body.replaceChildren();
 
   const { head } = makeCommandHead();
-  const title = document.createElement("div");
-  title.className = "cmd-title mono";
-  title.textContent = "$ " + (cmd.command || "(command)");
+  const { title, line } = commandTitleNodes(cmd.description, cmd.command);
   const status = commandStatusNode(commandStatusLabel(cmd), stateName);
   const actions = document.createElement("div");
   actions.className = "cmd-actions";
@@ -6479,6 +6523,7 @@ function renderCommandBody(body, cmd) {
   actions.append(term);
   head.append(title, status, actions);
   body.append(head);
+  if (line) body.append(line);
 
   if (cmd.cwd) {
     const cwd = document.createElement("div");
@@ -6652,6 +6697,7 @@ function renderRunningCommandSnapshot(commands) {
       turnId:idKey(info.turn_id),
       harnessItemId:info.harness_item_id || "",
       command:info.command || "",
+      description:info.description || "",
       cwd:info.cwd || "",
       server:info.server || "",
       status:info.status || "in_progress",
@@ -6729,9 +6775,7 @@ function renderEndedCommandBody(body, cmd, status, opts) {
   msg.dataset.commandStartedAtMs = String(cmd.startedAtMs || Date.now());
   body.replaceChildren();
   const { head } = makeCommandHead();
-  const title = document.createElement("div");
-  title.className = "cmd-title mono";
-  title.textContent = "$ " + (cmd.command || "(command)");
+  const { title, line } = commandTitleNodes(cmd.description, cmd.command);
   const meta = document.createElement("div");
   meta.className = "meta cmd-meta";
   const durationMs = Date.now() - (cmd.startedAtMs || Date.now());
@@ -6741,6 +6785,7 @@ function renderEndedCommandBody(body, cmd, status, opts) {
   }
   head.append(title);
   body.append(head);
+  if (line) body.append(line);
   if (meta.childNodes.length) body.append(meta);
   renderCommandOutputBlock(body, { itemId:cmd.id, output:cmd.output || "", phase:"completed" });
   syncTaskGroupItem(cmd.id);
@@ -7703,8 +7748,9 @@ function renderTaskCards(box, cmds, emptyText) {
       if (e.key==="Enter" || e.key===" ") { e.preventDefault(); navigateToTask(cmd.id); }
     };
     const title = document.createElement("div");
-    title.className = "cmd-title mono";
+    title.className = cmd.description ? "cmd-title" : "cmd-title mono";
     title.textContent = taskTitleText(cmd);
+    if (cmd.description) title.title = taskDetailText(cmd);
     const meta = document.createElement("div");
     meta.className = "meta cmd-meta";
     appendCommandMetaPart(meta, commandStatusNode(commandStatusLabel(cmd), stateName));
@@ -7984,6 +8030,7 @@ function startToolCall(item, turnId) {
   renderItemBody(body, {
     kind:"tool_call",
     name:tool.name || "tool",
+    description:tool.description || null,
     input:tool.input,
     output:null,
     server:tool.server || null,
@@ -8423,6 +8470,8 @@ function renderItemBody(body, p) {
   if (p.kind==="command_execution") {
     const itemId = msg.dataset.commandItemId || "";
     if (itemId) {
+      const running = state.runningCommands.get(itemId);
+      p = keepEarlierDescription(p, running, state.commandPayloadsByItemId.get(itemId));
       state.commandPayloadsByItemId.set(itemId, p);
       state.commandBodyElsByItemId.set(itemId, body);
       state.commandMsgElsByItemId.set(itemId, msg);
@@ -8436,9 +8485,7 @@ function renderItemBody(body, p) {
     const durationMs = normalizeCommandDuration(p.duration_ms, startedAtMs);
     const outputPhase = commandIsRunningStatus(displayStatus) ? "running" : "completed";
     const { head } = makeCommandHead();
-    const cmd = document.createElement("div");
-    cmd.className = "cmd-title mono";
-    cmd.textContent = "$ " + (p.command || "");
+    const { title: cmd, line } = commandTitleNodes(p.description, p.command);
     const meta = document.createElement("div");
     meta.className = "meta cmd-meta";
     if (p.cwd) appendCommandMetaPart(meta, `cwd: ${p.cwd}`);
@@ -8451,6 +8498,7 @@ function renderItemBody(body, p) {
     if (p.exit_code!==undefined && p.exit_code!==null) appendCommandMetaPart(meta, `exit: ${p.exit_code}`);
     head.append(cmd);
     body.append(head);
+    if (line) body.append(line);
     if (meta.childNodes.length) body.append(meta);
     renderCommandOutputBlock(body, {
       itemId,
@@ -8935,17 +8983,17 @@ function renderToolBody(body, p) {
   const msg = body.parentElement;
   const itemId = idKey(msg.dataset.toolItemId);
   if (itemId) {
+    p = keepEarlierDescription(p, state.toolPayloadsByItemId.get(itemId));
     state.toolPayloadsByItemId.set(itemId, p);
     state.toolBodyElsByItemId.set(itemId, body);
     state.commandMsgElsByItemId.set(itemId, msg);
   }
   const head = document.createElement("div");
   head.className = "cmd-head";
-  const title = document.createElement("div");
-  title.className = "cmd-title mono";
-  title.textContent = `${p.server ? p.server + ":" : ""}${p.name || "tool"}`;
+  const { title, line } = toolTitleNodes(p.description, p.server, p.name);
   head.append(title);
   body.append(head);
+  if (line) body.append(line);
 
   const statusLabel = toolStatusLabel(p.status, p.error, msg, stateName);
   if (statusLabel) {
