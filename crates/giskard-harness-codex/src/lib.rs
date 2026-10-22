@@ -5952,6 +5952,7 @@ mod tests {
             tools_error: None,
             name: "cf-mcp".into(),
             plugin_id: None,
+            tool_list_meta: None,
             resource_templates: vec![codex_codes::ResourceTemplate {
                 annotations: None,
                 description: Some("Issue by key".into()),

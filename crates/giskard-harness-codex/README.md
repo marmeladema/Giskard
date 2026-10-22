@@ -618,9 +618,12 @@ configured `codex_path`, and reports through the `log` crate, which Giskard does
 notifications and requests — but it is the first thing to check when Codex behavior looks
 truncated.
 
-The adapter is pinned to `codex-codes` 0.160.1, tested against Codex CLI 0.160.0. Giskard uses the
-new explicit inline image-reference shape but does not yet expose the release's thread-attachment,
-plugin-selection, MCP App UI, MCP capability, model access-program, or plugin-onboarding metadata.
+The adapter is pinned to `codex-codes` 0.163.4, tested against Codex CLI 0.163.0. Giskard uses the
+explicit inline image-reference shape for attachments. A generated image's detail names its inline
+result or its stored file reference, plus any local input images it read, and a sub-agent activity
+names the model and reasoning effort Codex resolved for it. Giskard does not yet expose the
+release's thread-attachment, plugin-selection, MCP App UI, MCP capability, model access-program,
+or plugin-onboarding metadata, nor its message phases, turn lineage, or `feedback/save` bundle.
 The crate's cancellation-safe `AsyncClient` framing does not replace Giskard's transport, whose
 retained inbox, frame limit, continuous reader, request correlation, and shutdown behavior are
 part of the adapter's ownership contract. Effective `[model_providers]` also remains a narrow local

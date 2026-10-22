@@ -2855,10 +2855,12 @@ fn map_thread_item_complete(
             agent_path,
             agent_thread_id,
             kind,
+            model,
+            reasoning_effort,
             ..
         } => ItemPayload::Activity {
             title: subagent_activity_title(agent_path, kind),
-            detail: None,
+            detail: subagent_activity_detail(model.as_deref(), reasoning_effort.as_ref()),
             metadata: None,
             subagent: Some(SubagentLink {
                 harness_thread_id: agent_thread_id.clone(),
@@ -2889,9 +2891,10 @@ fn map_thread_item_complete(
         },
         codex_codes::ThreadItem::ImageGeneration {
             status,
-            result,
+            image,
             revised_prompt,
             saved_path,
+            input_images,
             ..
         } => ItemPayload::Activity {
             title: "Image generation".into(),
@@ -2900,10 +2903,23 @@ fn map_thread_item_complete(
                     Some(format!("status: {status}")),
                     saved_path.as_ref().map(|p| format!("saved: {}", p.0)),
                     revised_prompt.as_ref().map(|p| format!("prompt: {p}")),
-                    (!result.trim().is_empty()).then(|| format!("result: {result}")),
+                    match image {
+                        codex_codes::GeneratedImageRef::File { file_id } => {
+                            Some(format!("file: {file_id}"))
+                        }
+                        codex_codes::GeneratedImageRef::Inline { result } => {
+                            (!result.trim().is_empty()).then(|| format!("result: {result}"))
+                        }
+                    },
                 ]
                 .into_iter()
                 .flatten()
+                .chain(
+                    input_images
+                        .iter()
+                        .flatten()
+                        .map(|input| format!("input: {}", input.path.0)),
+                )
                 .collect::<Vec<_>>()
                 .join("\n"),
             ),
@@ -3090,6 +3106,20 @@ fn subagent_activity_title(agent_path: &str, kind: &codex_codes::SubAgentActivit
         Some(task_name) => format!("Sub-agent {task_name} {action}"),
         None => format!("Sub-agent {action}"),
     }
+}
+
+/// The model and reasoning effort Codex resolved when it created the sub-agent. Older records and
+/// activities other than creation carry neither, and then there is no detail line at all.
+fn subagent_activity_detail(
+    model: Option<&str>,
+    reasoning_effort: Option<&codex_codes::ReasoningEffort>,
+) -> Option<String> {
+    let parts = [
+        model.map(|model| format!("model: {model}")),
+        reasoning_effort.map(|effort| format!("effort: {}", effort.0)),
+    ];
+    let detail = parts.into_iter().flatten().collect::<Vec<_>>().join(" · ");
+    (!detail.is_empty()).then_some(detail)
 }
 
 fn enum_string<T: Serialize>(value: &T) -> String {
@@ -6374,6 +6404,35 @@ mod tests {
     }
 
     #[test]
+    fn subagent_activity_detail_names_the_resolved_model_and_effort() {
+        let mut mapper = CodexMapper::new(PathBuf::from("/tmp"));
+        let notif = completed_item(serde_json::json!({
+            "type": "subAgentActivity",
+            "id": "subagent-model",
+            "kind": "started",
+            "agentThreadId": "child-native",
+            "agentPath": "/root/explorer",
+            "model": "gpt-6-sol",
+            "reasoningEffort": "high"
+        }));
+
+        match mapper.map_notification(&notif, ThreadId::new()).unwrap() {
+            AgentEvent::ItemCompleted { item, .. } => match item.payload {
+                ItemPayload::Activity { detail, .. } => {
+                    assert_eq!(detail.as_deref(), Some("model: gpt-6-sol · effort: high"));
+                }
+                other => panic!("expected activity, got {other:?}"),
+            },
+            other => panic!("expected item completion, got {other:?}"),
+        }
+
+        assert_eq!(
+            subagent_activity_detail(None, Some(&codex_codes::ReasoningEffort("low".into()))),
+            Some("effort: low".into())
+        );
+    }
+
+    #[test]
     fn current_subagent_started_activity_maps_without_inventing_a_prompt() {
         let mut mapper = CodexMapper::new(PathBuf::from("/tmp"));
         let notif = completed_item(serde_json::json!({
@@ -6496,6 +6555,75 @@ mod tests {
             },
             other => panic!("expected item completion, got {other:?}"),
         }
+    }
+
+    fn image_generation_detail(item: Value) -> String {
+        let mut mapper = CodexMapper::new(PathBuf::from("/tmp"));
+        match mapper
+            .map_notification(&completed_item(item), ThreadId::new())
+            .unwrap()
+        {
+            AgentEvent::ItemCompleted { item, .. } => match item.payload {
+                ItemPayload::Activity { title, detail, .. } => {
+                    assert_eq!(title, "Image generation");
+                    detail.expect("image generation always has a detail")
+                }
+                other => panic!("expected activity, got {other:?}"),
+            },
+            other => panic!("expected item completion, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn image_generation_shows_an_inline_result_or_a_file_reference() {
+        assert_eq!(
+            image_generation_detail(serde_json::json!({
+                "type": "imageGeneration",
+                "id": "gen-inline",
+                "status": "completed",
+                "result": "aGVsbG8="
+            })),
+            "status: completed\nresult: aGVsbG8="
+        );
+        assert_eq!(
+            image_generation_detail(serde_json::json!({
+                "type": "imageGeneration",
+                "id": "gen-file",
+                "status": "completed",
+                "fileId": "file_abc",
+                "savedPath": "/tmp/project/out.png"
+            })),
+            "status: completed\nsaved: /tmp/project/out.png\nfile: file_abc"
+        );
+        // A migration-era item with both an empty `result` and a `fileId` resolves to the file.
+        assert_eq!(
+            image_generation_detail(serde_json::json!({
+                "type": "imageGeneration",
+                "id": "gen-both",
+                "status": "completed",
+                "result": "",
+                "fileId": "file_abc"
+            })),
+            "status: completed\nfile: file_abc"
+        );
+    }
+
+    #[test]
+    fn image_generation_lists_the_input_images_it_read() {
+        assert_eq!(
+            image_generation_detail(serde_json::json!({
+                "type": "imageGeneration",
+                "id": "gen-edit",
+                "status": "completed",
+                "result": "",
+                "revisedPrompt": "a red bicycle",
+                "inputImages": [
+                    {"path": "/tmp/project/a.png", "sha256": "00"},
+                    {"path": "/tmp/project/b.png", "sha256": "11"}
+                ]
+            })),
+            "status: completed\nprompt: a red bicycle\ninput: /tmp/project/a.png\ninput: /tmp/project/b.png"
+        );
     }
 
     #[test]
