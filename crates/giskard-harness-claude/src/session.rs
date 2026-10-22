@@ -362,6 +362,7 @@ fn output_kind(output: &MapperOutput) -> &'static str {
         MapperOutput::PendingServerRequest { .. } => "pending_server_request",
         MapperOutput::CancelRequest { .. } => "cancel_request",
         MapperOutput::RouteOpened { .. } => "route_opened",
+        MapperOutput::RouteReopened { .. } => "route_reopened",
         MapperOutput::RouteClosed { .. } => "route_closed",
     }
 }
@@ -1069,6 +1070,7 @@ impl Supervisor {
                     | MapperOutput::PendingApproval { .. }
                     | MapperOutput::PendingServerRequest { .. }
                     | MapperOutput::RouteOpened { .. }
+                    | MapperOutput::RouteReopened { .. }
             )
         {
             // Mapped all the same, so the mapper stays consistent; nothing reaches the thread.
@@ -1198,6 +1200,7 @@ impl Supervisor {
                 agent_name,
                 model,
             ),
+            MapperOutput::RouteReopened { thread } => self.reopen_route(thread),
             MapperOutput::RouteClosed { thread } => self.close_route(thread),
         }
         Ok(())
@@ -1217,16 +1220,22 @@ impl Supervisor {
         agent_name: Option<String>,
         model: Option<ModelRef>,
     ) {
-        let log = Arc::new(EventLog::new());
-        self.route_logs.insert(thread, log.clone());
         let commands = self.commands_sender.upgrade();
-        let live_routes = {
+        let (log, adopted, live_routes) = {
             let mut routes = lock(&self.routes);
+            // A thread an earlier child of the session bound (the mapper resolved this native id
+            // to it: a sub-agent this child resumed) keeps its log, so its owner reads on.
+            let existing = routes
+                .get(&thread)
+                .filter(|route| route.harness_thread_id == harness_thread_id)
+                .map(|route| route.log.clone());
+            let adopted = existing.is_some();
+            let log = existing.unwrap_or_else(|| Arc::new(EventLog::new()));
             routes.insert(
                 thread,
                 RouteHandle {
                     harness_thread_id: harness_thread_id.clone(),
-                    log,
+                    log: log.clone(),
                     owner: Some(self.thread),
                     commands,
                     parent_harness_thread_id: Some(parent_harness_thread_id.clone()),
@@ -1235,8 +1244,10 @@ impl Supervisor {
                     generation: Some(self.generation),
                 },
             );
-            routes.len()
+            (log, adopted, routes.len())
         };
+        self.route_logs.insert(thread, log);
+        self.route_logs_missing.remove(&thread);
         info!(
             project_id = display_opt(self.context.project_id),
             thread_id = %thread,
@@ -1245,10 +1256,50 @@ impl Supervisor {
             route = %harness_thread_id,
             parent_harness_thread_id = %parent_harness_thread_id,
             requested_model = display_opt(model.as_ref().map(|model| model.model.as_str())),
+            adopted,
             live_routes,
             action = "route_opened",
             "sub-agent route published"
         );
+    }
+
+    /// The mapper revived a route it had dropped (the CLI resumed its sub-agent): append to the
+    /// route's retained log again, and own the route again in case the façade had cooled it.
+    /// A route the sub-agent thread's delete or archive already removed has no log left: its
+    /// events are reported once as having none (`append`).
+    fn reopen_route(&mut self, thread: ThreadId) {
+        let commands = self.commands_sender.upgrade();
+        let log = {
+            let mut routes = lock(&self.routes);
+            routes.get_mut(&thread).map(|route| {
+                route.owner = Some(self.thread);
+                route.commands = commands;
+                route.generation = Some(self.generation);
+                route.log.clone()
+            })
+        };
+        let found = log.is_some();
+        if let Some(log) = log {
+            self.route_logs.insert(thread, log);
+            self.route_logs_missing.remove(&thread);
+        }
+        if found {
+            info!(
+                thread_id = %thread,
+                owner_thread_id = %self.thread,
+                harness_thread_id = display_opt(self.context.harness_thread_id.as_deref()),
+                action = "route_reopened",
+                "sub-agent route reopened on its retained log"
+            );
+        } else {
+            warn!(
+                thread_id = %thread,
+                owner_thread_id = %self.thread,
+                harness_thread_id = display_opt(self.context.harness_thread_id.as_deref()),
+                action = "route_reopened",
+                "a resumed sub-agent's route has no log left; the sub-agent thread is gone"
+            );
+        }
     }
 
     /// The mapper dropped a route: this supervisor stops appending to its log and drops its asks.

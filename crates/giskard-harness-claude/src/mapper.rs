@@ -7,6 +7,7 @@
 use std::collections::{HashMap, HashSet};
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use chrono::Utc;
 use claude_codes::io::{AssistantMessage, AssistantUsage, ResultMessage, UserMessage};
@@ -146,6 +147,11 @@ pub enum MapperOutput {
         /// the call named none (or `inherit`): an agent definition or the CLI's default decides.
         model: Option<ModelRef>,
     },
+    /// A dropped route runs again (the CLI resumed its sub-agent): the supervisor appends to the
+    /// route's retained log again, which `RouteClosed` had left open.
+    RouteReopened {
+        thread: ThreadId,
+    },
     /// A route was dropped: no further event is mapped onto it and its asks are gone. Its log stays
     /// open for the sub-agent thread.
     RouteClosed {
@@ -168,12 +174,18 @@ pub enum MapperOutput {
 ///   thinking blocks, open tool calls).
 ///
 /// A new field joins the struct whose cleanup site matches its lifetime.
+/// The thread a sub-agent native id (`task:<tool_use_id>`) is already bound to in this harness
+/// instance, if any: a route an earlier child of the session opened, kept by the façade.
+pub type RouteThreads = Arc<dyn Fn(&str) -> Option<ThreadId> + Send + Sync>;
+
 pub struct ClaudeMapper {
     thread: ThreadId,
     harness_thread_id: String,
     workspace_root: PathBuf,
     turn: Option<TurnState>,
     session: SessionState,
+    /// Set by the façade (`set_route_threads`); `None` binds every route to a new thread.
+    route_threads: Option<RouteThreads>,
 }
 
 /// Session-lifetime state: lives as long as the mapper.
@@ -221,16 +233,40 @@ struct SessionState {
     //   `child_exited` completes and drops the rest.
     routes: HashMap<String, RouteState>,
     // ENTITY-AUTHORITY-EXCEPTION:
-    // Role: Recognise the frames that trail a dropped route (a killed sub-agent's rejection and
-    //   interruption marker), so they are dropped as trailing frames, with the route's thread.
-    // Source of truth: Dropping a route records its tool-use id and thread.
-    // Structural reason: The CLI emits those frames after the terminal `task_updated`, which may
-    //   be after the spawning turn ended and dropped the route.
+    // Role: Hold a `SendMessage` run of a sub-agent this process never ran (an earlier child of
+    //   the session did), until its first frame names the call its route must be keyed by.
+    // Source of truth: `task_started` of an unknown task, named by an open `SendMessage` call.
+    // Structural reason: The run's frames name the original `Agent` call (`parent_tool_use_id`),
+    //   which no frame of this process carried before.
     // Synchronization: The single adapter task that owns the child process owns the mapper.
-    // Invalidation/removal: Session lifetime (one entry per delegation); `child_exited` clears it.
-    ended_routes: HashMap<String, ThreadId>,
+    // Invalidation/removal: The run's first frame opens the route and removes the entry; a
+    //   terminal `task_updated` of the task removes it; `child_exited` clears the rest.
+    pending_resumes: HashMap<String, PendingResume>,
+    // ENTITY-AUTHORITY-EXCEPTION:
+    // Role: Recognise the frames that trail a dropped route (a killed sub-agent's rejection and
+    //   interruption marker), so they are dropped as trailing frames, with the route's thread;
+    //   and revive the route when the CLI resumes its sub-agent (`resume_route`).
+    // Source of truth: Dropping a route records it under its tool-use id.
+    // Structural reason: The CLI emits those frames after the terminal `task_updated`, which may
+    //   be after the spawning turn ended and dropped the route; a resumed run's frames still name
+    //   the route's call.
+    // Synchronization: The single adapter task that owns the child process owns the mapper.
+    // Invalidation/removal: Session lifetime (one entry per delegation); a resume moves the entry
+    //   back to `routes`; `child_exited` clears it.
+    ended_routes: HashMap<String, RouteState>,
     /// `(type, subtype)` pairs of unknown frames already logged at `warn`.
     unknown_seen: HashSet<(String, Option<String>)>,
+}
+
+/// A resumed sub-agent run waiting for its first frame (`SessionState::pending_resumes`).
+struct PendingResume {
+    /// The route the `SendMessage` call was made on.
+    parent: Route,
+    /// The call's tool name, for the parent's resume row.
+    call: String,
+    /// The call's turn on `parent`, which the run's rows report on.
+    turn: Option<TurnId>,
+    task: TaskStartedMessage,
 }
 
 /// One Claude Code task the session reported.
@@ -304,6 +340,10 @@ struct RouteState {
     /// The spawning turn ended while the route still ran (a backgrounded delegation): the route
     /// is dropped at its own end.
     turn_ended: bool,
+    /// The `run_id` of a resumed run (`resume_route`, `adopt_pending_resume`): its rows on the
+    /// parent are keyed by it, since one turn may see several runs of one task. `None` for the
+    /// first run.
+    run: Option<String>,
     /// `input.description` of the `Agent` call, the outcome activity's title.
     description: Option<String>,
     /// The child's turn: the same `TurnState` the primary uses, items included.
@@ -496,7 +536,14 @@ impl ClaudeMapper {
             workspace_root,
             turn: None,
             session: SessionState::default(),
+            route_threads: None,
         }
+    }
+
+    /// How a route's native id finds the thread an earlier child of this session bound it to, so
+    /// a sub-agent this process resumes runs on that thread (`adopt_pending_resume`).
+    pub fn set_route_threads(&mut self, route_threads: RouteThreads) {
+        self.route_threads = Some(route_threads);
     }
 
     /// The adapter opened a turn for a user message it just wrote. Returns the `TurnStarted`.
@@ -594,7 +641,12 @@ impl ClaudeMapper {
             }
             return Ok(route.task_id.clone());
         }
-        if self.session.ended_routes.values().any(|t| *t == thread) {
+        if self
+            .session
+            .ended_routes
+            .values()
+            .any(|route| route.thread == thread)
+        {
             return Err(RouteLookup::Ended);
         }
         Err(RouteLookup::NotARoute)
@@ -778,6 +830,7 @@ impl ClaudeMapper {
             self.drop_route(&id, &mut out);
         }
         self.session.ended_routes.clear();
+        self.session.pending_resumes.clear();
         out
     }
 
@@ -1194,10 +1247,20 @@ impl ClaudeMapper {
             .unwrap_or_else(|| TaskType::Unknown(String::new()));
         let agent = matches!(task_type, TaskType::LocalAgent);
         // A `local_agent` task names the `Agent` call that minted its route, or another open call
-        // that runs a sub-agent (a forked skill's `Skill` call), whose route is minted now.
+        // that runs a sub-agent (a forked skill's `Skill` call), whose route is minted now. A
+        // task that already has a route is a resumed sub-agent (`SendMessage`): a new run of the
+        // same task, whose frames still name the route's call.
+        let mut resumed_with_prompt = false;
         let route = match &task.tool_use_id {
-            Some(id) if agent && self.session.routes.contains_key(id) => Some(id.clone()),
-            Some(id) if agent => self.mint_task_route(id, &task, out),
+            Some(id) if agent => match self.resume_route(id, &task, out) {
+                Some((route, with_prompt)) => {
+                    resumed_with_prompt = with_prompt;
+                    Some(route)
+                }
+                None if self.session.routes.contains_key(id) => Some(id.clone()),
+                None if self.defer_resume(id, &task) => None,
+                None => self.mint_task_route(id, &task, out),
+            },
             _ => None,
         };
         // A backgrounded `local_bash` task names the background `Bash` call it runs. A foreground
@@ -1233,6 +1296,9 @@ impl ClaudeMapper {
         );
         if let Some(id) = &route {
             self.start_route(id, &task, out);
+            if resumed_with_prompt {
+                self.deliver_resumed_prompt(id, &task, out);
+            }
         }
     }
 
@@ -1243,7 +1309,9 @@ impl ClaudeMapper {
         };
         route.task_id = Some(task.task_id.clone());
         route.is_backgrounded = task.is_backgrounded == Some(true);
-        if route.prompt.is_none() {
+        // A resumed run's prompt is its message (or the `<task-notification>` that woke it), not
+        // the delegated prompt the link reports.
+        if route.prompt.is_none() && route.run.is_none() {
             route.prompt = task.prompt.clone();
         }
         if route.ended() || route.turn.is_some() {
@@ -1312,6 +1380,7 @@ impl ClaudeMapper {
         if !terminal {
             return;
         }
+        self.drop_pending_resume(&task.task_id);
         if background {
             if let Some(command) = self
                 .session
@@ -1376,6 +1445,9 @@ impl ClaudeMapper {
     /// `task_notification`: for a background command, its end, with the output file to read; for
     /// an agent task still open (a forked skill's, which gets no terminal update), its end.
     fn on_task_notification(&mut self, task: TaskNotificationMessage, out: &mut Out) {
+        if is_terminal(&task.status) {
+            self.drop_pending_resume(&task.task_id);
+        }
         let entry = self.session.tasks.get(&task.task_id);
         if is_terminal(&task.status)
             && entry.is_some_and(|entry| entry.kind == TaskType::LocalAgent)
@@ -2023,6 +2095,346 @@ impl ClaudeMapper {
         Some(tool_use_id.to_owned())
     }
 
+    /// A new run of a task that already has a route: the CLI resumed its sub-agent, with
+    /// `SendMessage` (whose call `tool_use_id` then names), or on its own when a background task
+    /// it waited on finished (`tool_use_id` names the route's own call). The route runs again on
+    /// its own thread rather than a new route being minted; a dropped route is revived
+    /// (`RouteReopened`). Its frames still name the route's call. Returns the route's key and
+    /// whether the run opens with `task_started.prompt` (only a run another call resumed: a run
+    /// the sub-agent started itself was woken by a `<task-notification>`), or `None` when no
+    /// route runs this task.
+    fn resume_route(
+        &mut self,
+        tool_use_id: &str,
+        task: &TaskStartedMessage,
+        out: &mut Out,
+    ) -> Option<(String, bool)> {
+        let of_task = |route: &RouteState| route.task_id.as_deref() == Some(task.task_id.as_str());
+        let live = self
+            .session
+            .routes
+            .iter()
+            .find(|(_, route)| of_task(route))
+            .map(|(id, _)| id.clone());
+        let ended = self
+            .session
+            .ended_routes
+            .iter()
+            .find(|(_, route)| of_task(route))
+            .map(|(id, _)| id.clone());
+        let key = live.clone().or(ended)?;
+        if let Some(route) = self.session.routes.get(&key)
+            && (!route.ended() || route.turn.is_some())
+        {
+            warn!(
+                thread_id = %route.thread,
+                harness_thread_id = %self.harness_thread_id,
+                route = %route.harness_thread_id,
+                task_id = %task.task_id,
+                native_item_id = %tool_use_id,
+                action = "route_resumed",
+                "a sub-agent task started again while its route still runs; keeping that run"
+            );
+            return Some((key, false));
+        }
+        // The call that resumed the sub-agent, open on some turn. A run the sub-agent started
+        // itself has none.
+        let resuming = self.open_call(tool_use_id);
+        let resumed_by = resuming.as_ref().and_then(|(_, name)| name.clone());
+        let reopened = live.is_none();
+        let mut route = match live {
+            Some(key) => self.session.routes.remove(&key)?,
+            None => self.session.ended_routes.remove(&key)?,
+        };
+        // The run belongs to the turn of the route that resumed it: the route is dropped once both
+        // that turn and the run have ended, and reports its outcome there, since no tool result of
+        // the route's own call follows. A run the sub-agent started itself keeps its parent while
+        // that parent's turn runs, else falls to the primary.
+        let parent = match resuming {
+            Some((parent, _)) => parent,
+            None if self.turn_of(&route.parent).is_some() => route.parent.clone(),
+            None => Route::Primary,
+        };
+        let parent_changed = parent != route.parent;
+        route.parent = parent;
+        route.call_open = false;
+        route.stop_sent = false;
+        route.status = SubagentStatus::Pending;
+        route.run = Some(
+            task.run_id
+                .clone()
+                .unwrap_or_else(|| tool_use_id.to_owned()),
+        );
+        // The run's outcome row lands on the turn that resumed it (late once that turn ended). With
+        // no parent turn running, the route keeps the turn that delegated to it, whose outcome row
+        // then arrives late, and nothing but the run's own end drops it.
+        // A turn of another thread (the parent fell to the primary) is no turn to report on.
+        match self.turn_of(&route.parent).map(|turn| turn.id) {
+            Some(turn) => {
+                route.spawned_turn = Some(turn);
+                route.turn_ended = false;
+            }
+            None => {
+                if parent_changed {
+                    route.spawned_turn = None;
+                }
+                route.turn_ended = true;
+            }
+        }
+        let parent = route.parent.clone();
+        let thread = route.thread;
+        let link = route.link(SubagentAction::Started);
+        let description = route.description.clone();
+        let spawned_turn = route.spawned_turn;
+        let parent_turn = self.turn_of(&parent).map(|turn| turn.id);
+        info!(
+            thread_id = %thread,
+            harness_thread_id = %self.harness_thread_id,
+            route = %route.harness_thread_id,
+            parent_route = display_opt(parent.label()),
+            turn_id = display_opt(parent_turn),
+            task_id = %task.task_id,
+            run_id = display_opt(task.run_id.as_deref()),
+            native_item_id = %tool_use_id,
+            resumed_by = display_opt(resumed_by.as_deref()),
+            reopened,
+            action = "route_resumed",
+            "the sub-agent was resumed; its route runs again"
+        );
+        self.session.routes.insert(key.clone(), route);
+        if reopened {
+            out.push(MapperOutput::RouteReopened { thread });
+        }
+        self.resume_row(
+            &parent,
+            spawned_turn,
+            link,
+            description,
+            task,
+            tool_use_id,
+            resumed_by.as_deref(),
+            out,
+        );
+        Some((key, resumed_by.is_some()))
+    }
+
+    /// The row a resumed run adds on `turn`, the parent's turn it reports on, carrying the
+    /// route's link: a late completion alone once that turn ended (the server amends a late row
+    /// carrying a sub-agent link into the persisted turn), none without a turn.
+    #[allow(clippy::too_many_arguments)]
+    fn resume_row(
+        &self,
+        parent: &Route,
+        turn: Option<TurnId>,
+        link: SubagentLink,
+        description: Option<String>,
+        task: &TaskStartedMessage,
+        tool_use_id: &str,
+        resumed_by: Option<&str>,
+        out: &mut Out,
+    ) {
+        let Some(parent_turn) = turn else {
+            return;
+        };
+        let late = self.turn_of(parent).map(|turn| turn.id) != Some(parent_turn);
+        let parent_thread = self.thread_of(parent);
+        let id = ItemId::new();
+        let harness_item_id = format!(
+            "task_started:{}:{}",
+            task.task_id,
+            task.run_id.as_deref().unwrap_or(tool_use_id)
+        );
+        if !late {
+            out.push(self.event(AgentEvent::ItemStarted {
+                thread: parent_thread,
+                turn: parent_turn,
+                item: ItemStart {
+                    id,
+                    harness_item_id: harness_item_id.clone(),
+                    kind: ItemKind::Activity,
+                    command: None,
+                    tool: None,
+                },
+            }));
+        }
+        let detail = match resumed_by {
+            Some(name) => format!("resumed by {name}"),
+            None => "resumed".to_owned(),
+        };
+        out.push(self.event(AgentEvent::ItemCompleted {
+            thread: parent_thread,
+            turn: parent_turn,
+            item: Item {
+                id,
+                harness_item_id,
+                payload: ItemPayload::Activity {
+                    title: description.unwrap_or_else(|| "Sub-agent".to_owned()),
+                    detail: Some(detail),
+                    metadata: None,
+                    subagent: Some(link),
+                },
+                created_at: Utc::now(),
+            },
+        }));
+    }
+
+    /// A held resume whose run ended before any frame of it arrived opens no route.
+    fn drop_pending_resume(&mut self, task_id: &str) {
+        if self.session.pending_resumes.remove(task_id).is_some() {
+            debug!(
+                thread_id = %self.thread,
+                harness_thread_id = %self.harness_thread_id,
+                task_id = %task_id,
+                action = "route_resume_pending",
+                "a held sub-agent resume ended without a frame; no route opened"
+            );
+        }
+    }
+
+    /// The open call `tool_use_id`: the route it was made on, and its tool name (`None` for a
+    /// command or file call).
+    fn open_call(&self, tool_use_id: &str) -> Option<(Route, Option<String>)> {
+        let call_name = |tool: &OpenTool| match &tool.call {
+            ToolKind::Call { name, .. } => Some(name.clone()),
+            _ => None,
+        };
+        if let Some(tool) = self
+            .turn
+            .as_ref()
+            .and_then(|turn| turn.items.tools.get(tool_use_id))
+        {
+            return Some((Route::Primary, call_name(tool)));
+        }
+        let route = self.route_with_open_tool(tool_use_id)?;
+        let name = call_name(self.turn_of(&route)?.items.tools.get(tool_use_id)?);
+        Some((route, name))
+    }
+
+    /// A `SendMessage` run of a sub-agent this process never ran: hold it until its first frame
+    /// names the call its route is keyed by (`adopt_pending_resume`). `false` when the task is
+    /// not started by an open `SendMessage` call.
+    fn defer_resume(&mut self, tool_use_id: &str, task: &TaskStartedMessage) -> bool {
+        let Some((parent, Some(call))) = self.open_call(tool_use_id) else {
+            return false;
+        };
+        if call != "SendMessage" {
+            return false;
+        }
+        info!(
+            thread_id = %self.thread_of(&parent),
+            harness_thread_id = %self.harness_thread_id,
+            turn_id = display_opt(self.turn_of(&parent).map(|turn| turn.id)),
+            task_id = %task.task_id,
+            run_id = display_opt(task.run_id.as_deref()),
+            native_item_id = %tool_use_id,
+            action = "route_resume_pending",
+            "a sub-agent an earlier child ran was resumed; its route opens with its first frame"
+        );
+        self.session.pending_resumes.insert(
+            task.task_id.clone(),
+            PendingResume {
+                turn: self.turn_of(&parent).map(|turn| turn.id),
+                parent,
+                call,
+                task: task.clone(),
+            },
+        );
+        true
+    }
+
+    /// A sub-agent frame whose `parent_tool_use_id` names no route, from a run held in
+    /// `pending_resumes`: open the route under that call, on the thread an earlier child bound it
+    /// to when there is one, and start the run there as `on_task_started` would have.
+    fn adopt_pending_resume(
+        &mut self,
+        parent_tool_use_id: Option<&str>,
+        agent_id: Option<&str>,
+        out: &mut Out,
+    ) {
+        let (Some(call), Some(agent_id)) = (parent_tool_use_id, agent_id) else {
+            return;
+        };
+        if self.session.routes.contains_key(call) {
+            return;
+        }
+        let Some(pending) = self.session.pending_resumes.remove(agent_id) else {
+            return;
+        };
+        let task = pending.task;
+        // This process never saw the delegated prompt; the run's message is delivered apart.
+        let seed = RouteSeed {
+            prompt: None,
+            subagent_type: task.subagent_type.clone(),
+            description: Some(task.description.clone()).filter(|text| !text.is_empty()),
+            is_backgrounded: task.is_backgrounded == Some(true),
+            model: None,
+        };
+        self.open_route(&pending.parent, call, seed, out);
+        let active = self.turn_of(&pending.parent).map(|turn| turn.id);
+        if let Some(route) = self.session.routes.get_mut(call) {
+            // No tool result of this call follows in this process: the outcome is reported on
+            // the `SendMessage` call's turn, as for any resumed run, late once that turn ended,
+            // which leaves the run's own end to drop the route.
+            route.call_open = false;
+            route.run = Some(task.run_id.clone().unwrap_or_else(|| call.to_owned()));
+            route.spawned_turn = pending.turn;
+            route.turn_ended = pending.turn.is_none() || active != pending.turn;
+        }
+        if let Some(entry) = self.session.tasks.get_mut(&task.task_id) {
+            entry.route = Some(call.to_owned());
+        }
+        info!(
+            harness_thread_id = %self.harness_thread_id,
+            route = %format_args!("{TASK_ID_PREFIX}{call}"),
+            task_id = %task.task_id,
+            action = "route_resumed",
+            resumed_by = %pending.call,
+            reopened = true,
+            "the sub-agent was resumed; its route runs again"
+        );
+        self.start_route(call, &task, out);
+        self.deliver_resumed_prompt(call, &task, out);
+        if let Some(route) = self.session.routes.get(call) {
+            let link = route.link(SubagentAction::Started);
+            let description = route.description.clone();
+            self.resume_row(
+                &pending.parent,
+                pending.turn,
+                link,
+                description,
+                &task,
+                call,
+                Some(&pending.call),
+                out,
+            );
+        }
+    }
+
+    /// A resumed run's message (the `SendMessage` text, `task_started.prompt`) opens its turn: the
+    /// CLI echoes no user frame into the sub-agent for it.
+    fn deliver_resumed_prompt(&mut self, id: &str, task: &TaskStartedMessage, out: &mut Out) {
+        let Some(route) = self.session.routes.get_mut(id) else {
+            return;
+        };
+        let (Some(turn), Some(prompt)) =
+            (route.turn.as_ref().map(|turn| turn.id), task.prompt.clone())
+        else {
+            return;
+        };
+        route.prompt_delivered = true;
+        let harness_item_id = format!(
+            "task_prompt:{}",
+            task.run_id.as_deref().unwrap_or(&task.task_id)
+        );
+        self.user_message(
+            &Route::Task(id.to_owned()),
+            turn,
+            harness_item_id,
+            prompt,
+            out,
+        );
+    }
+
     /// Record a new route for the call `tool_use_id` made on `parent` and announce it
     /// (`RouteOpened`). Returns the link the call's item carries.
     fn open_route(
@@ -2037,9 +2449,17 @@ impl ClaudeMapper {
             Route::Task(outer) => format!("{TASK_ID_PREFIX}{outer}"),
         };
         let spawned_turn = self.turn_of(parent).map(|turn| turn.id);
+        let harness_thread_id = format!("{TASK_ID_PREFIX}{tool_use_id}");
+        // A native id an earlier child of the session bound keeps its thread; any other gets a
+        // new one.
+        let thread = self
+            .route_threads
+            .as_ref()
+            .and_then(|route_threads| route_threads(&harness_thread_id))
+            .unwrap_or_default();
         let route = RouteState {
-            thread: ThreadId::new(),
-            harness_thread_id: format!("{TASK_ID_PREFIX}{tool_use_id}"),
+            thread,
+            harness_thread_id,
             parent: parent.clone(),
             prompt: seed.prompt,
             prompt_delivered: false,
@@ -2051,6 +2471,7 @@ impl ClaudeMapper {
             status: SubagentStatus::Pending,
             spawned_turn,
             turn_ended: false,
+            run: None,
             description: seed.description,
             turn: None,
             counted_messages: HashSet::new(),
@@ -2218,6 +2639,7 @@ impl ClaudeMapper {
         }
         let parent = route.parent.clone();
         let spawned_turn = route.spawned_turn;
+        let run = route.run.clone();
         let title = route
             .description
             .clone()
@@ -2258,7 +2680,11 @@ impl ClaudeMapper {
             "sub-agent outcome reported on the spawning turn"
         );
         let id = ItemId::new();
-        let harness_item_id = format!("task_updated:{task_id}");
+        // A resumed run's row is its run's: one turn may report several runs of one task.
+        let harness_item_id = match &run {
+            Some(run) => format!("task_updated:{task_id}:{run}"),
+            None => format!("task_updated:{task_id}"),
+        };
         // The server ignores a start for a persisted turn: a late row is its completion alone.
         if !late {
             out.push(self.event(AgentEvent::ItemStarted {
@@ -2455,9 +2881,6 @@ impl ClaudeMapper {
                 entry.route = None;
             }
         }
-        self.session
-            .ended_routes
-            .insert(id.to_owned(), route.thread);
         info!(
             thread_id = %route.thread,
             harness_thread_id = %self.harness_thread_id,
@@ -2470,6 +2893,7 @@ impl ClaudeMapper {
         out.push(MapperOutput::RouteClosed {
             thread: route.thread,
         });
+        self.session.ended_routes.insert(id.to_owned(), route);
     }
 
     /// Record the model a route's `assistant` frame names on the route's turn, logging the first
@@ -2548,8 +2972,8 @@ impl ClaudeMapper {
             return Some(Route::Task(parent.to_owned()));
         }
         match self.session.ended_routes.get(parent) {
-            Some(thread) => debug!(
-                thread_id = %thread,
+            Some(ended) => debug!(
+                thread_id = %ended.thread,
                 harness_thread_id = %self.harness_thread_id,
                 route = %format_args!("{TASK_ID_PREFIX}{parent}"),
                 frame_type,
@@ -2581,6 +3005,11 @@ impl ClaudeMapper {
     // ---- assistant, stream and user frames -----------------------------------------------------
 
     fn on_assistant(&mut self, message: AssistantMessage, out: &mut Out) {
+        self.adopt_pending_resume(
+            message.parent_tool_use_id.as_deref(),
+            message.agent_id.as_deref(),
+            out,
+        );
         let Some(route) = self.route(message.parent_tool_use_id.as_deref(), "assistant") else {
             return;
         };
@@ -2966,6 +3395,11 @@ impl ClaudeMapper {
     }
 
     fn on_user(&mut self, message: UserMessage, out: &mut Out) {
+        self.adopt_pending_resume(
+            message.parent_tool_use_id.as_deref(),
+            message.agent_id.as_deref(),
+            out,
+        );
         let Some(route) = self.route(message.parent_tool_use_id.as_deref(), "user") else {
             return;
         };
@@ -4210,6 +4644,463 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    fn routes_reopened(outputs: &[MapperOutput]) -> Vec<ThreadId> {
+        outputs
+            .iter()
+            .filter_map(|output| match output {
+                MapperOutput::RouteReopened { thread } => Some(*thread),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// `(kind, text)` of the user and agent messages completed in `events`, in order.
+    fn messages(events: &[&AgentEvent]) -> Vec<(&'static str, String)> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                AgentEvent::ItemCompleted { item, .. } => match &item.payload {
+                    ItemPayload::UserMessage { text } => Some(("user", text.clone())),
+                    ItemPayload::AgentMessage { text } => Some(("agent", text.clone())),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The resumed run of `name` (a delegation, then `SendMessage` to the same sub-agent): one
+    /// route, whose thread gets a second turn opening with the message the sub-agent was sent.
+    fn assert_resumed_on_one_thread(name: &str, outputs: &[MapperOutput]) -> ThreadId {
+        let opened = routes_opened(outputs);
+        assert_eq!(opened.len(), 1, "{name}: {opened:?}");
+        let child = opened[0].0;
+        let child_events: Vec<MapperOutput> = on_thread(outputs, child);
+        let turns = per_turn(&child_events);
+        assert_eq!(turns.len(), 2, "{name}: {turns:?}");
+        let statuses: Vec<TurnStatusKind> = turn_completions(&child_events)
+            .into_iter()
+            .map(|(_, _, status)| status.kind)
+            .collect();
+        assert_eq!(
+            statuses,
+            [TurnStatusKind::Completed, TurnStatusKind::Completed],
+            "{name}"
+        );
+        let resumed = messages(&turns[1]);
+        let sent = out_lines(name)
+            .iter()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .filter(|frame| frame["subtype"] == "task_started")
+            .nth(1)
+            .and_then(|frame| frame["prompt"].as_str().map(str::to_owned))
+            .unwrap();
+        assert_eq!(
+            resumed.first(),
+            Some(&("user", sent)),
+            "{name}: {resumed:?}"
+        );
+        assert!(
+            resumed
+                .iter()
+                .any(|(kind, text)| *kind == "agent" && text.contains("4272")),
+            "{name}: {resumed:?}"
+        );
+
+        // The parent links the resumed run to the same thread, under the `SendMessage` call.
+        let link = completed_items(outputs)
+            .into_iter()
+            .find_map(|item| match &item.payload {
+                ItemPayload::Activity {
+                    detail: Some(detail),
+                    subagent: Some(link),
+                    ..
+                } if detail == "resumed by SendMessage" => Some(link.clone()),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("{name}: no resume row"));
+        assert_eq!(link.harness_thread_id, opened[0].1);
+        assert_eq!(link.action, SubagentAction::Started);
+        child
+    }
+
+    #[test]
+    #[traced_test]
+    fn a_resumed_background_sub_agent_runs_again_on_its_thread() {
+        // The first run was backgrounded, and ended before `SendMessage` resumes it.
+        let outputs = run_fixture("subagent-resume", TurnKind::User);
+        let child = assert_resumed_on_one_thread("subagent-resume", &outputs);
+        // The route outlived the delegating turn and was dropped at its own end: the resume
+        // reopens it.
+        assert_eq!(routes_reopened(&outputs), [child]);
+        logs_assert(lines_with(
+            1,
+            &[" INFO ", r#"action="route_resumed""#, "reopened=true"],
+        ));
+        logs_assert(lines_with(0, &["route_trailing_frame"]));
+    }
+
+    #[test]
+    #[traced_test]
+    fn a_resumed_sub_agent_whose_route_was_dropped_is_reopened() {
+        // Background tasks disabled: the first run was a foreground delegation, so its route was
+        // dropped with the first turn. The resume runs awaited, in the second turn.
+        let outputs = run_fixture("subagent-resume-awaited", TurnKind::User);
+        let child = assert_resumed_on_one_thread("subagent-resume-awaited", &outputs);
+        assert_eq!(routes_reopened(&outputs), [child]);
+        assert_eq!(routes_closed(&outputs), [child, child]);
+        let reopened = outputs
+            .iter()
+            .position(|output| matches!(output, MapperOutput::RouteReopened { .. }))
+            .unwrap();
+        let resumed_turn = outputs
+            .iter()
+            .enumerate()
+            .filter(|(_, output)| matches!(output, MapperOutput::Event(AgentEvent::TurnStarted { thread, .. }) if *thread == child))
+            .nth(1)
+            .map(|(index, _)| index)
+            .unwrap();
+        assert!(
+            reopened < resumed_turn,
+            "the log is back before the turn starts"
+        );
+        logs_assert(lines_with(
+            1,
+            &[" INFO ", r#"action="route_resumed""#, "reopened=true"],
+        ));
+        logs_assert(lines_with(0, &["route_trailing_frame"]));
+    }
+
+    #[test]
+    #[traced_test]
+    fn a_resumed_foreground_sub_agent_is_reopened_as_a_background_run() {
+        // Background tasks enabled, the first run in the foreground: its route was dropped with
+        // the first turn, and `SendMessage` resumes it as a background run of the second.
+        let outputs = run_fixture("subagent-resume-foreground", TurnKind::User);
+        let child = assert_resumed_on_one_thread("subagent-resume-foreground", &outputs);
+        assert_eq!(routes_reopened(&outputs), [child]);
+        logs_assert(lines_with(0, &["route_trailing_frame"]));
+    }
+
+    #[test]
+    #[traced_test]
+    fn a_sub_agent_that_starts_its_own_run_runs_again_on_its_thread() {
+        // A message `SendMessage` queued for a running sub-agent starts no run; later the
+        // sub-agent's background command finishes and wakes it: a second run of the same task,
+        // named by the route's own `Agent` call, after the route was dropped.
+        let name = "subagent-message-running";
+        let outputs = run_fixture(name, TurnKind::User);
+        let opened = routes_opened(&outputs);
+        assert_eq!(opened.len(), 1, "{opened:?}");
+        let child = opened[0].0;
+        assert_eq!(routes_reopened(&outputs), [child]);
+        let child_events = on_thread(&outputs, child);
+        let turns = per_turn(&child_events);
+        assert_eq!(turns.len(), 2, "{turns:?}");
+        // The woken run opens with no user message: what woke it is a `<task-notification>`.
+        let resumed = messages(&turns[1]);
+        assert!(
+            resumed.iter().all(|(kind, _)| *kind == "agent"),
+            "{resumed:?}"
+        );
+        assert!(
+            resumed.iter().any(|(_, text)| text.contains("4272")),
+            "{resumed:?}"
+        );
+        // No parent turn runs when it wakes: its resume row and its outcome reach the delegating
+        // turn as late rows, after the first run's outcome there, each with an id of its own.
+        let rows: Vec<(TurnId, &Item)> = events(&outputs)
+            .into_iter()
+            .filter_map(|event| match event {
+                AgentEvent::ItemCompleted { turn, item, .. } => match &item.payload {
+                    ItemPayload::Activity {
+                        subagent: Some(link),
+                        ..
+                    } if link.harness_thread_id == opened[0].1 => Some((*turn, item)),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect();
+        let details: Vec<Option<&str>> = rows
+            .iter()
+            .map(|(_, item)| match &item.payload {
+                ItemPayload::Activity { detail, .. } => detail.as_deref(),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            details,
+            [Some("completed"), Some("resumed"), Some("completed")],
+            "{rows:?}"
+        );
+        assert!(rows.iter().all(|(turn, _)| *turn == rows[0].0), "{rows:?}");
+        let ids: HashSet<&str> = rows
+            .iter()
+            .map(|(_, item)| item.harness_item_id.as_str())
+            .collect();
+        assert_eq!(ids.len(), 3, "{ids:?}");
+        // The link keeps the delegated prompt, never the `<task-notification>` that woke the run.
+        let prompts: HashSet<Option<&str>> = rows
+            .iter()
+            .filter_map(|(_, item)| match &item.payload {
+                ItemPayload::Activity {
+                    subagent: Some(link),
+                    ..
+                } => Some(link.initial_prompt.as_deref()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(prompts.len(), 1, "{prompts:?}");
+        assert!(
+            prompts
+                .iter()
+                .all(|prompt| prompt.is_some_and(|text| !text.starts_with("<task-notification>"))),
+            "{prompts:?}"
+        );
+        logs_assert(lines_with(
+            1,
+            &[" INFO ", r#"action="route_resumed""#, "reopened=true"],
+        ));
+        logs_assert(a_line_with(&[r#"action="subagent_outcome""#, "late=true"]));
+        logs_assert(lines_with(0, &["route_trailing_frame"]));
+    }
+
+    /// The `Agent` call of `subagent-resume-respawn-first`, which the respawned child's frames
+    /// name.
+    fn respawn_route() -> String {
+        out_lines("subagent-resume-respawn-first")
+            .iter()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .find(|frame| frame["subtype"] == "task_started")
+            .and_then(|frame| {
+                frame["tool_use_id"]
+                    .as_str()
+                    .map(|id| format!("{TASK_ID_PREFIX}{id}"))
+            })
+            .unwrap()
+    }
+
+    #[test]
+    #[traced_test]
+    fn a_sub_agent_an_earlier_child_ran_resumes_on_its_thread() {
+        // A respawned child (`--resume`) resumes a sub-agent the previous child ran: the run is
+        // held until its first frame names that child's `Agent` call, then runs on the thread
+        // the façade still binds to it.
+        let name = "subagent-resume-respawn";
+        let bound = ThreadId::new();
+        let native = respawn_route();
+        let mut mapper = new_mapper();
+        let resolved = native.clone();
+        mapper.set_route_threads(Arc::new(move |id: &str| (id == resolved).then_some(bound)));
+        let outputs: Vec<MapperOutput> = drive(&mut mapper, name, TurnKind::User)
+            .into_iter()
+            .flatten()
+            .collect();
+        let opened = routes_opened(&outputs);
+        assert_eq!(opened.len(), 1, "{opened:?}");
+        assert_eq!(opened[0].0, bound);
+        assert_eq!(opened[0].1, native);
+        let child_events = on_thread(&outputs, bound);
+        let turns = per_turn(&child_events);
+        assert_eq!(turns.len(), 1, "{turns:?}");
+        let resumed = messages(&turns[0]);
+        let sent = out_lines(name)
+            .iter()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .find(|frame| frame["subtype"] == "task_started")
+            .and_then(|frame| frame["prompt"].as_str().map(str::to_owned))
+            .unwrap();
+        assert_eq!(resumed.first(), Some(&("user", sent)), "{resumed:?}");
+        assert!(
+            resumed
+                .iter()
+                .any(|(kind, text)| *kind == "agent" && text.contains("4272")),
+            "{resumed:?}"
+        );
+        assert!(completed_items(&outputs).iter().any(|item| matches!(
+            &item.payload,
+            ItemPayload::Activity { detail: Some(detail), subagent: Some(link), .. }
+                if detail == "resumed by SendMessage" && link.harness_thread_id == native
+        )));
+        logs_assert(lines_with(1, &[r#"action="route_resume_pending""#]));
+        logs_assert(lines_with(
+            0,
+            &["no route was minted for its parent tool use"],
+        ));
+    }
+
+    #[test]
+    fn a_sub_agent_an_earlier_child_ran_gets_a_thread_when_none_is_bound() {
+        // No thread bound to the native id (a façade that never saw it): the route still opens
+        // under the original call, on a new thread, rather than under `SendMessage`.
+        let outputs = run_fixture("subagent-resume-respawn", TurnKind::User);
+        let opened = routes_opened(&outputs);
+        assert_eq!(opened.len(), 1, "{opened:?}");
+        assert_eq!(opened[0].1, respawn_route());
+        assert_eq!(per_turn(&on_thread(&outputs, opened[0].0)).len(), 1);
+    }
+
+    /// The turns started on threads other than `child`, in order.
+    fn primary_turns(outputs: &[MapperOutput], child: ThreadId) -> Vec<TurnId> {
+        events(outputs)
+            .into_iter()
+            .filter_map(|event| match event {
+                AgentEvent::TurnStarted { thread, turn } if *thread != child => Some(*turn),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// `lines` with every occurrence of each `(from, to)` pair replaced.
+    fn renamed(lines: &[String], renames: &[(String, String)]) -> Vec<String> {
+        lines
+            .iter()
+            .map(|line| {
+                renames
+                    .iter()
+                    .fold(line.clone(), |line, (from, to)| line.replace(from, to))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn two_runs_reported_on_one_turn_get_rows_of_their_own() {
+        // `subagent-resume-awaited` with its `SendMessage` resume made twice in the second turn
+        // (lines 20–26 again, under new call, run and message ids): both runs report on that
+        // turn, which the server keys by `harness_item_id`.
+        let lines = out_lines("subagent-resume-awaited");
+        let frame = |index: usize| serde_json::from_str::<Value>(&lines[index]).unwrap();
+        let call = frame(19)["message"]["content"][0]["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let run = frame(21)["run_id"].as_str().unwrap().to_owned();
+        let mut renames = vec![
+            (call.clone(), format!("{call}2")),
+            (run.clone(), format!("{run}2")),
+        ];
+        for index in [19, 22] {
+            let id = frame(index)["message"]["id"].as_str().unwrap().to_owned();
+            renames.push((id.clone(), format!("{id}2")));
+        }
+        let again: Vec<String> = [19, 21, 22, 23, 24, 25]
+            .iter()
+            .map(|index| lines[*index].clone())
+            .collect();
+        let mut driven: Vec<String> = lines[..26].to_vec();
+        driven.extend(renamed(&again, &renames));
+        driven.extend(lines[26..].iter().cloned());
+        let outputs: Vec<MapperOutput> =
+            drive_lines(&mut new_mapper(), &driven, 2, TurnKind::User, false)
+                .into_iter()
+                .flatten()
+                .collect();
+        let child = routes_opened(&outputs)[0].0;
+        let second = primary_turns(&outputs, child)[1];
+        let outcomes: Vec<&str> = events(&outputs)
+            .into_iter()
+            .filter_map(|event| match event {
+                AgentEvent::ItemCompleted { turn, item, .. }
+                    if *turn == second && item.harness_item_id.starts_with("task_updated:") =>
+                {
+                    Some(item.harness_item_id.as_str())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(outcomes.len(), 2, "{outcomes:?}");
+        assert_ne!(outcomes[0], outcomes[1]);
+        assert!(outcomes[0].ends_with(&run) && outcomes[1].ends_with(&format!("{run}2")));
+    }
+
+    #[test]
+    #[traced_test]
+    fn a_held_resume_adopted_after_its_turn_ended_reports_late_and_closes() {
+        // `subagent-resume-respawn` with the `SendMessage` turn's `result` (line 21) before the
+        // run's frames: the run is adopted once its turn ended. Its rows reach that turn late,
+        // and its own end drops the route, which would otherwise keep the child from idling.
+        let lines = out_lines("subagent-resume-respawn");
+        let mut driven: Vec<String> = lines[..11].to_vec();
+        driven.push(lines[20].clone());
+        driven.extend(lines[11..15].iter().cloned());
+        driven.extend(lines[21..].iter().cloned());
+        let mut mapper = new_mapper();
+        let outputs: Vec<MapperOutput> =
+            drive_lines(&mut mapper, &driven, 1, TurnKind::User, false)
+                .into_iter()
+                .flatten()
+                .collect();
+        assert!(!mapper.has_routes());
+        let sent_turn = primary_turns(&outputs, routes_opened(&outputs)[0].0)[0];
+        let rows: Vec<&str> = events(&outputs)
+            .into_iter()
+            .filter_map(|event| match event {
+                AgentEvent::ItemCompleted { turn, item, .. }
+                    if *turn == sent_turn && item.harness_item_id.starts_with("task_") =>
+                {
+                    Some(item.harness_item_id.as_str())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        assert!(rows[0].starts_with("task_started:") && rows[1].starts_with("task_updated:"));
+        // Late rows are completions alone.
+        assert!(
+            !started_items(&outputs)
+                .iter()
+                .any(|start| start.harness_item_id.starts_with("task_started:")
+                    || start.harness_item_id.starts_with("task_updated:"))
+        );
+        logs_assert(a_line_with(&[r#"action="subagent_outcome""#, "late=true"]));
+    }
+
+    #[test]
+    fn a_held_resume_that_ends_on_its_notification_opens_nothing() {
+        // `subagent-resume-respawn` without the run's frames and `task_updated` (lines 12–14):
+        // its notification ends the held run, and a stray frame of it afterwards opens no route.
+        let lines = out_lines("subagent-resume-respawn");
+        let mut driven: Vec<String> = lines[..11].to_vec();
+        driven.extend(lines[14..].iter().cloned());
+        driven.push(lines[11].clone());
+        let outputs: Vec<MapperOutput> =
+            drive_lines(&mut new_mapper(), &driven, 1, TurnKind::User, false)
+                .into_iter()
+                .flatten()
+                .collect();
+        assert!(routes_opened(&outputs).is_empty());
+    }
+
+    #[test]
+    fn a_stop_of_an_earlier_run_does_not_mark_the_resumed_one() {
+        // The user stops the first run of `subagent-resume-awaited` (which completes anyway);
+        // the resumed run, ended by a child exit, fails rather than reading as interrupted.
+        let lines = out_lines("subagent-resume-awaited");
+        let mut mapper = new_mapper();
+        let mut outputs: Vec<MapperOutput> =
+            drive_lines(&mut mapper, &lines[..4], 2, TurnKind::User, false)
+                .into_iter()
+                .flatten()
+                .collect();
+        let child = routes_opened(&outputs)[0].0;
+        mapper.note_stop_sent(child);
+        outputs.extend(
+            drive_lines(&mut mapper, &lines[4..24], 1, TurnKind::User, false)
+                .into_iter()
+                .flatten(),
+        );
+        outputs.extend(mapper.child_exited("exit status 1"));
+        let statuses: Vec<TurnStatusKind> = turn_completions(&on_thread(&outputs, child))
+            .into_iter()
+            .map(|(_, _, status)| status.kind)
+            .collect();
+        assert_eq!(
+            statuses,
+            [TurnStatusKind::Completed, TurnStatusKind::Failed]
+        );
     }
 
     fn routes_closed(outputs: &[MapperOutput]) -> Vec<ThreadId> {

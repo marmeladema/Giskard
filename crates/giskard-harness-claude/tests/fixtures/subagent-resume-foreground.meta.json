@@ -1,0 +1,28 @@
+{
+ "scenario": "subagent-resume-foreground",
+ "argv": [
+  "claude",
+  "-p",
+  "--input-format",
+  "stream-json",
+  "--output-format",
+  "stream-json",
+  "--verbose",
+  "--permission-prompt-tool",
+  "stdio",
+  "--setting-sources",
+  "",
+  "--model",
+  "haiku",
+  "--permission-mode",
+  "acceptEdits",
+  "--forward-subagent-text",
+  "--session-id",
+  "391b61c4-07a7-40bb-bf71-cbc482a031c6"
+ ],
+ "cwd": "/work/project",
+ "exit": 0,
+ "results": 2,
+ "asks": 0,
+ "elapsed_s": 17.2
+}

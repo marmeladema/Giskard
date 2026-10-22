@@ -117,7 +117,7 @@ routes*). A child idle for `idle_shutdown_secs` is stopped and its thread respaw
 | `ThreadId` of a sub-agent thread | minted by the mapper when the `Agent` block is mapped (a forked skill's at its `task_started`), and adopted by `claim_native_thread` whatever id the server proposed; a route whose session is gone is bound cold under the proposed id |
 | `TurnId` | minted by Giskard at `start_turn` (`begin_turn`), or by the mapper for a continuation turn the CLI started on its own |
 | `ItemId` | minted on first sight of a native key: a `tool_use` block's `id`, or `(message.id, block index)` for a text or thinking block; reused for the item's start, deltas and completion within the turn |
-| `Item.harness_item_id` | the tool-use id, `<message_id>:<index>`, `compact_boundary:<uuid>`, `user:<uuid>:<index>` for a user-frame activity or a sub-agent's delegated prompt, `user:<turn_id>:sent` for a primary turn's prompt, `task_started:<task_id>` for the activity announcing a forked skill's sub-agent, or `task_updated:<task_id>` for a backgrounded sub-agent's outcome |
+| `Item.harness_item_id` | the tool-use id, `<message_id>:<index>`, `compact_boundary:<uuid>`, `user:<uuid>:<index>` for a user-frame activity or a sub-agent's delegated prompt, `user:<turn_id>:sent` for a primary turn's prompt, `task_started:<task_id>` for the activity announcing a forked skill's sub-agent, `task_started:<task_id>:<run_id>` for a resumed run's row, `task_prompt:<run_id>` for a resumed run's message, or `task_updated:<task_id>` for a backgrounded sub-agent's outcome (`task_updated:<task_id>:<run_id>` for a resumed run's) |
 | `ApprovalId`, `ServerRequestId` | the `control_request`'s `request_id`, a UUID the CLI mints and the reply must carry; the trait's instance-wide uniqueness across children rests on the CLI minting UUIDs |
 
 `assistant` frames arrive **one content block per frame**, each repeating the whole message
@@ -640,7 +640,8 @@ route's thread and turn and recorded with the route's thread and the primary as 
 ## Sub-agent routes
 
 - **Mint.** An `Agent` `tool_use` block mints a route keyed by its tool-use id, on whichever route
-  the block arrived (the primary, or an outer route for a nested delegation): a fresh `ThreadId`,
+  the block arrived (the primary, or an outer route for a nested delegation): a fresh `ThreadId`
+  (or, for a native id an earlier child of the session bound, that thread: *Resume*),
   `task:<id>`, the parent's native id (the session id, or `task:<outer>`), the name
   (`input.description`), the prompt (`input.prompt`) and the requested model (`input.model`, an
   alias such as `haiku`; `inherit` names none). `MapperOutput::RouteOpened` comes before
@@ -733,6 +734,54 @@ route's thread and turn and recorded with the route's thread and the primary as 
   `stop_task`, else `Failed` naming the exit) and drops every route; the supervisor then turns its
   published routes cold (logged as `routes_cooled` on the exit line). A route's mapper state never
   outlives its child; its log lives until the sub-agent thread's own delete or archive, or shutdown.
+- **Resume.** A sub-agent's `task_id` (its frames' `agent_id`) is stable across *runs*: the CLI
+  starts a new run of the same task, with a new `run_id`, when the model sends the sub-agent a
+  message with `SendMessage` (the `task_started` names the `SendMessage` call, `prompt` is the
+  message), or when the sub-agent wakes on its own because a background command it launched
+  finished (the `task_started` names the route's own `Agent` call, `prompt` is the
+  `<task-notification>`). Either way the run's frames name the **original** `Agent` call in
+  `parent_tool_use_id`. So a `local_agent` `task_started` whose task already has a route, live or
+  dropped, runs that route again rather than minting one (`info`, `action = "route_resumed"`,
+  with `resumed_by` and `reopened`), and `task_started` opens a new turn on the same thread:
+  - A dropped route is revived (`MapperOutput::RouteReopened`: the supervisor appends to the
+    route's retained log again, which `RouteClosed` left open).
+  - Its parent becomes the route of the resuming call, and its spawning turn that call's turn. A
+    self-started run keeps its parent while that parent's turn runs; else it keeps the turn that
+    delegated to it (dropped if the parent falls to the primary, a thread that turn is not on), so
+    its rows arrive there late and only its own end drops the route.
+  - A stop the user sent to an earlier run does not carry over (`stop_sent` is reset), and the
+    link keeps the delegated prompt: a run's message never replaces it.
+  - A run `SendMessage` started opens with the message as a `UserMessage` (`task_prompt:<run_id>`):
+    the CLI echoes no user frame into the sub-agent for it.
+  - The parent's turn gets an `Activity` (`task_started:<task_id>:<run_id>`, the route's
+    description, `resumed by <tool>` or `resumed`) carrying the link, and the run's end reports its
+    outcome there as a backgrounded delegation's does, keyed by the run
+    (`task_updated:<task_id>:<run_id>`): one turn may report several runs of one task, and the
+    server keys a turn's items by `harness_item_id`. A row whose turn has ended is a late
+    completion alone, which the server amends into the persisted turn (BS4).
+  - A message sent to a sub-agent that is still running is queued by the CLI ("Message queued for
+    delivery"): no `task_started`, no frame shows it, and the run goes on. A task that starts again
+    while its route still runs keeps that run (`warn`).
+  - A child respawned with `--resume` (after a reap) has never seen the task: its `SendMessage`
+    `task_started` is held (`info`, `action = "route_resume_pending"`) until the run's first frame
+    names the original call, which then opens the route under `task:<that call>`, reporting on the
+    `SendMessage` call's turn (late once that turn ended, the run's own end then dropping the
+    route). The façade gives the mapper a resolver (`set_route_threads`) over its routes, so that
+    native id keeps the thread the earlier child bound, and the supervisor's `RouteOpened` reuses
+    that route's retained log (`adopted=true`): the sub-agent thread's owner reads the resumed run
+    on its open stream. After a server restart the façade knows every persisted sub-agent thread
+    from its construction (*Claim*), so the resumed run lands on the persisted thread whether or not
+    anything opened it since; the server would refuse a second thread for the native id anyway
+    (spec 1.104). A held resume whose task ends, on its update or its notification, before any
+    frame opens nothing (`debug`).
+  - The route's parent becomes the resuming call's route. So if a nested sub-agent sends
+    `SendMessage` to a top-level one, the top-level route is re-parented under the nested route, and
+    is failed with it if it still runs when the nested route is dropped. Unusual, and accepted.
+  - A resumed run whose sub-agent thread was deleted or archived has no log: `RouteReopened`
+    reports it at `warn`, and its events are counted as for any missing route log.
+
+  Recorded on 2.1.306: `subagent-resume`, `subagent-resume-awaited`, `subagent-resume-foreground`,
+  `subagent-message-running`, `subagent-resume-respawn-first` and `subagent-resume-respawn`.
 - **`stop_task`.** `interrupt` on a sub-agent thread sends `StopTask` to the owning child; the
   supervisor writes `{"subtype":"stop_task","task_id":…}`, resolves the call when its answer comes
   (the façade bounds it by 10 s), and logs `stop_task` at `info`. The stop is noted on the route
@@ -744,9 +793,14 @@ route's thread and turn and recorded with the route's thread and the primary as 
 - **Claim.** `claim_native_thread` accepts only a `task:` id (anything else is `Protocol`). A live
   route is **adopted**: the handle's thread is the mapper's, with `agent_name`, `resumed_model`
   (the model the `Agent` call asked for, if any) and `parent_harness_thread_id`. Otherwise the session that produced the
-  route is gone (a persisted sub-agent reopened after a restart), and a **cold route** is bound
-  under the proposed thread: an open, silent stream, no child. A route whose child exited is
-  already cold, and the claim adopts it with its retained history.
+  route is gone, and a **cold route** is bound under the proposed thread: an open, silent stream,
+  no child. A route whose child exited is already cold, and the claim adopts it with its retained
+  history. **At construction** (`ClaudeHarness::new`), the server's `HarnessBootstrap` binds every
+  persisted sub-agent thread (each `task:` binding) as such a cold route under its `ThreadId`
+  (`install_known_threads`, logged at `info` with `sub_agent_routes`), so a claim after a restart
+  adopts the persisted thread whatever it proposes, and a child that resumes that sub-agent finds
+  it (*Resume*). Primary bindings need nothing: each child is spawned from its own stored session
+  id.
   `interrupt` on it is `Unsupported("this Claude Code sub-agent is no longer running")`. The claim
   never spawns, resumes or writes anything, is idempotent for the same id, and refuses a proposed
   thread already bound to another native id. Logged at `info` with `action =

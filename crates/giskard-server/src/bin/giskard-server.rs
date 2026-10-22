@@ -131,8 +131,9 @@ impl HarnessKind for ClaudeCodeKind {
             declaration: Some(spec.name.to_owned()),
             idle_timeout,
         };
-        // A per-thread-process adapter needs no bootstrap: each thread's child is spawned from
-        // its own stored session id at `open_thread`. Logged so a surprising count is visible.
+        // A primary thread's child is spawned from its own stored session id at `open_thread`;
+        // the bootstrap binds the persisted sub-agent threads, whose `task:` native ids the
+        // adapter could otherwise learn only from a live route.
         debug!(
             project_id = %spec.project_id,
             harness = spec.name,
@@ -140,7 +141,7 @@ impl HarnessKind for ClaudeCodeKind {
             idle_timeout_ms = idle_timeout.map(|timeout| timeout.as_millis() as u64),
             "claude-code instance created"
         );
-        Ok(ClaudeHarness::new(spec.workspace_root, launch))
+        Ok(ClaudeHarness::new(spec.workspace_root, launch, &bootstrap))
     }
 }
 

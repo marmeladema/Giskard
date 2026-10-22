@@ -9,7 +9,22 @@
 
 **Document status:** Implementation-ready specification.
 **Audience:** An AI coding agent (and its human reviewer) implementing the system.
-**Version:** 1.103
+**Version:** 1.104
+
+> **Amendment — a resumed Claude Code sub-agent (1.104).** Claude Code can run a sub-agent again
+> after its first run ended: when the model sends it a message with `SendMessage`, or when the
+> sub-agent wakes because a background command it launched finished. Each run is a new turn on
+> the **same** sub-agent thread, the one its `Agent` call created, which stays read-only for the
+> user. A run opened by `SendMessage` starts with that message as its user message, and the
+> parent's turn shows a row linking the thread. This holds across a reap: a child respawned with
+> `--resume` that resumes a sub-agent an earlier child ran finds the thread the harness instance
+> still binds to the sub-agent's native id, and across a server restart: the Claude Code adapter
+> now installs the durable bindings of its `HarnessBootstrap` (1.77), binding every persisted
+> sub-agent thread before any child runs. Previously such a run opened an empty second
+> sub-agent thread and its frames were dropped. Admission enforces the bootstrap's bijection for
+> every harness: a native id the project already persists under another thread is never
+> materialized as a second thread (refused with a warning), since the next construction would
+> reject the duplicate and fail the project's harness.
 
 > **Amendment — a background sub-agent runs beside its parent (1.103).** A Claude Code sub-agent
 > delegated in the background no longer keeps its parent thread busy. The delegating turn ends at
@@ -295,8 +310,8 @@
   `origin.kind: "task-notification"`) is an external turn on the parent, classified and persisted
   as any external turn. Nothing waits for it: it may or may not follow a stopped sub-agent.
 - **BS4:** The sub-agent's outcome row (an `Activity` with `harness_item_id =
-  task_updated:<task_id>` carrying the sub-agent link and its final status) belongs to the
-  delegating turn. When that turn is still active it is an ordinary item; once the turn was
+  task_updated:<task_id>`, or `task_updated:<task_id>:<run_id>` for a resumed run (1.104),
+  carrying the sub-agent link and its final status) belongs to the delegating turn. When that turn is still active it is an ordinary item; once the turn was
   persisted it arrives as a late `ItemCompleted`, which the server amends into the turn's payload
   (LA1, LA5), broadcasts to open clients, and passes through the sub-agent link admission like an
   owned item's link. A late `Activity` without a link is not amended. The browser places a new
@@ -2606,7 +2621,7 @@ verified protocol is recorded in [`claude-code-harness-plan.md`](claude-code-har
 | `AskUserQuestion` and other inbound control requests | `ServerRequestReceived` / `ServerRequestResolved` |
 | `result` (held while the CLI's agent tasks still run) | `TurnCompleted` |
 | `interrupt` control request | `interrupt` |
-| `Agent` tool call + `system/task_started` / `task_updated` of its `local_agent` task | a sub-agent thread (`task:<tool_use_id>`, the §7 sub-agent model) whose items are the frames forwarded with `--forward-subagent-text`; read-only and never resumable |
+| `Agent` tool call + `system/task_started` / `task_updated` of its `local_agent` task | a sub-agent thread (`task:<tool_use_id>`, the §7 sub-agent model) whose items are the frames forwarded with `--forward-subagent-text`; read-only, and never resumed by Giskard: a further run the CLI starts (`SendMessage`, or a sub-agent woken by its own background command) is a further turn on the same thread |
 | `Agent` call `input.model`, then `message.model` of the sub-agent's forwarded `assistant` frames | the sub-agent thread's `current_model`: requested, then reported (SM1–SM3) |
 | `stop_task` control request | `interrupt` on a sub-agent thread |
 | `/compact` user line | `compact_thread` |

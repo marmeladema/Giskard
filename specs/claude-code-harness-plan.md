@@ -683,6 +683,17 @@ Admission does the rest once the claim succeeds: it sets `file.parent_thread_id`
 parent and `file.kind = ThreadKind::Subagent`, which is what the Sub-agents card and subtree
 navigation key on. The adapter supplies identity and a stream; it does not build the thread graph.
 
+**And the bindings must survive a restart.** `claim_native_thread` answers with the thread the
+façade already binds to a native id, else the proposed one, and admission trusts that answer. A
+façade that knows nothing after a restart would therefore bind a sub-agent the CLI resumes to a
+fresh `ThreadId`, and admission would write a second thread file for the same `task:` id, which the
+next construction's `HarnessBootstrap` validation rejects ("native thread id … is bound more than
+once"), failing the project's Claude Code harness. So `ClaudeHarness::new` takes the server's
+`HarnessBootstrap` and binds every `task:` binding as a cold route under its persisted `ThreadId`
+(`install_known_threads`); primary bindings need nothing, since each child is spawned from its own
+stored session id. Admission also refuses, for any harness, to materialize a second thread for a
+native id the project already persists (spec 1.104).
+
 **The "never `--resume` a `task:` id" rule belongs in `open_thread`, not here.** Refusing the claim
 would destroy the feature; refusing the *resume* is the actual invariant. `open_thread` on a `task:`
 id must never reach `--resume`, and should surface the thread through the existing read-only path

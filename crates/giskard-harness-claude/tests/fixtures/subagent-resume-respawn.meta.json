@@ -1,0 +1,28 @@
+{
+ "scenario": "subagent-resume-respawn",
+ "argv": [
+  "claude",
+  "-p",
+  "--input-format",
+  "stream-json",
+  "--output-format",
+  "stream-json",
+  "--verbose",
+  "--permission-prompt-tool",
+  "stdio",
+  "--setting-sources",
+  "",
+  "--model",
+  "haiku",
+  "--permission-mode",
+  "acceptEdits",
+  "--forward-subagent-text",
+  "--resume",
+  "6a087b47-9985-48c9-81ed-44644d6561a7"
+ ],
+ "cwd": "/work/project",
+ "exit": 0,
+ "results": 2,
+ "asks": 0,
+ "elapsed_s": 52.6
+}

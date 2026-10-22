@@ -17,8 +17,9 @@ use giskard_core::server_request::ServerRequestResponse;
 use giskard_core::turn::{Mode, PermissionPreset, TurnOverrides};
 use giskard_core::user_input::UserInput;
 use giskard_harness::{
-    AgentEventStream, AgentHarness, EventLog, HarnessCapabilities, HarnessNotice, HarnessProvider,
-    OpenThreadOptions, ProviderHttpHeaders, ThreadHandle, ThreadUpdate, ThreadUpdateSendError,
+    AgentEventStream, AgentHarness, EventLog, HarnessBootstrap, HarnessCapabilities, HarnessNotice,
+    HarnessProvider, OpenThreadOptions, ProviderHttpHeaders, ThreadHandle, ThreadUpdate,
+    ThreadUpdateSendError,
 };
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -120,7 +121,8 @@ pub struct ClaudeHarness {
     // ENTITY-AUTHORITY-EXCEPTION:
     // Role: Reach a sub-agent route's retained log and owning child from the trait methods.
     // Source of truth: A supervisor inserts a live route on the mapper's `RouteOpened`;
-    //   `claim_native_thread` inserts a cold route for a route whose session is gone.
+    //   `claim_native_thread` inserts a cold route for a route whose session is gone; the
+    //   server's bootstrap seeds a cold route for every persisted sub-agent thread.
     // Structural reason: The harness crate cannot depend on the server's thread authority, and a
     //   sub-agent thread has no child of its own.
     // Synchronization: A std mutex guards insert, lookup and removal; nothing awaits under it.
@@ -141,12 +143,56 @@ pub struct ClaudeHarness {
 
 impl ClaudeHarness {
     /// Build an instance. Spawns nothing: the first child is the first `open_thread` or the
-    /// first `list_models`.
-    pub fn new(workspace_root: PathBuf, launch: ClaudeLaunchOptions) -> Arc<Self> {
+    /// first `list_models`. `bootstrap` is the server's durable bindings for this harness: each
+    /// sub-agent thread among them is bound as a cold route (`install_known_threads`).
+    pub fn new(
+        workspace_root: PathBuf,
+        launch: ClaudeLaunchOptions,
+        bootstrap: &HarnessBootstrap,
+    ) -> Arc<Self> {
         let spawner = Arc::new(ProcessSpawner {
             options: launch.clone(),
         });
-        Arc::new(Self::with_parts(workspace_root, launch, spawner))
+        let harness = Self::with_parts(workspace_root, launch, spawner);
+        harness.install_known_threads(bootstrap);
+        Arc::new(harness)
+    }
+
+    /// Bind each persisted sub-agent thread (a `task:` native id) as a cold route, as
+    /// `claim_native_thread` would: a fresh retained log, no owner. A child that resumes one of
+    /// these sub-agents then finds its thread through the mapper's resolver
+    /// (`seed_route_threads`) and its route adopts this log, so the run lands on the persisted
+    /// thread instead of a new one bound to the same native id. Primary threads need nothing:
+    /// each child is spawned from its own stored session id.
+    pub(crate) fn install_known_threads(&self, bootstrap: &HarnessBootstrap) {
+        let mut routes = lock(&self.routes);
+        let mut installed = 0usize;
+        for binding in &bootstrap.known_threads {
+            if !is_task_native_id(&binding.harness_thread_id) {
+                continue;
+            }
+            routes
+                .entry(binding.thread_id)
+                .or_insert_with(|| RouteHandle {
+                    harness_thread_id: binding.harness_thread_id.clone(),
+                    log: Arc::new(EventLog::new()),
+                    owner: None,
+                    commands: None,
+                    parent_harness_thread_id: None,
+                    agent_name: None,
+                    model: None,
+                    generation: None,
+                });
+            installed += 1;
+        }
+        info!(
+            project_id = display_opt(self.launch.project_id),
+            harness = display_opt(self.launch.declaration.as_deref()),
+            known_threads = bootstrap.known_threads.len(),
+            sub_agent_routes = installed,
+            action = "install_known_threads",
+            "persisted sub-agent threads bound as cold routes"
+        );
     }
 
     fn with_parts(
@@ -214,6 +260,18 @@ impl ClaudeHarness {
                     .map(|resolved| (entry.value.clone(), resolved))
             }));
         }
+    }
+
+    /// Let the mapper find the thread a sub-agent native id is bound to: a route an earlier child
+    /// of the session opened, live or cold, so a sub-agent this child resumes runs on it.
+    fn seed_route_threads(&self, mapper: &mut ClaudeMapper) {
+        let routes = self.routes.clone();
+        mapper.set_route_threads(Arc::new(move |harness_thread_id: &str| {
+            lock(&routes)
+                .iter()
+                .find(|(_, route)| route.harness_thread_id == harness_thread_id)
+                .map(|(thread, _)| *thread)
+        }));
     }
 
     /// Threads whose child runs.
@@ -917,6 +975,7 @@ impl ClaudeHarness {
         let mut mapper =
             ClaudeMapper::new(thread, session_id.clone(), target.workspace_root.clone());
         self.seed_catalog(&mut mapper);
+        self.seed_route_threads(&mut mapper);
         // The handshake set `default`; a `status` it emitted (mapped from `early_lines`) is not
         // drift.
         mapper.set_expected_mode("default");
@@ -1886,6 +1945,7 @@ impl AgentHarness for ClaudeHarness {
         let mut mapper =
             ClaudeMapper::new(opts.thread, session_id.clone(), opts.workspace_root.clone());
         self.seed_catalog(&mut mapper);
+        self.seed_route_threads(&mut mapper);
         // The handshake set `default`; a `status` it emitted (mapped from `early_lines`) is not
         // drift.
         mapper.set_expected_mode("default");
@@ -6025,6 +6085,7 @@ mod tests {
                 env: env.clone(),
                 ..ClaudeLaunchOptions::default()
             },
+            &giskard_harness::HarnessBootstrap::default(),
         );
         let providers = harness.list_providers().await.unwrap();
         assert_eq!(providers.len(), 1);
@@ -6061,6 +6122,7 @@ mod tests {
                 idle_timeout,
                 ..ClaudeLaunchOptions::default()
             },
+            &giskard_harness::HarnessBootstrap::default(),
         );
         (harness, workspace)
     }
@@ -6218,6 +6280,7 @@ mod tests {
                 args: vec!["--permission-mode".into(), "bogus".into()],
                 ..harness.launch.clone()
             },
+            &giskard_harness::HarnessBootstrap::default(),
         );
         let (options, _updates) = real_options(&workspace, None);
         let error = harness.open_thread(options).await.unwrap_err();
@@ -6440,6 +6503,113 @@ mod tests {
             .await
             .unwrap();
         (harness, handle, stream, route, record, injector)
+    }
+
+    #[tokio::test]
+    #[traced_test]
+    async fn a_resumed_sub_agent_reopens_its_route_on_the_same_log() {
+        // Up to `task_started`: the foreground delegation's route is minted and claimed.
+        const FIXTURE: &str = "subagent-resume-awaited";
+        let lines = fixture_lines(FIXTURE);
+        let first_result = lines
+            .iter()
+            .position(|line| serde_json::from_str::<Value>(line).unwrap()["type"] == "result")
+            .unwrap();
+        let (harness, handle, mut stream, route, _, injector) = delegating(
+            FIXTURE,
+            3,
+            vec![Step::OnStdin(
+                user(),
+                vec![Action::EmitFixtureFrom {
+                    name: FIXTURE,
+                    from: first_result + 1,
+                }],
+            )],
+        )
+        .await;
+        let mut child = harness.subscribe(&route);
+        for line in &lines[3..=first_result] {
+            injector.emit(line.clone());
+        }
+        let first = until_completed(&mut child).await;
+        assert_eq!(completion(&first).1, TurnStatusKind::Completed);
+        assert_eq!(
+            completion(&until_completed(&mut stream).await).1,
+            TurnStatusKind::Completed
+        );
+        logs_assert(a_line_with(&[" INFO ", r#"action="route_closed""#]));
+
+        // The second message makes the CLI resume the sub-agent: the same thread, read through
+        // the same subscription, gets the resumed run as its second turn.
+        harness
+            .start_turn(&handle, text("follow up"), overrides())
+            .await
+            .unwrap();
+        let resumed = until_completed(&mut child).await;
+        assert_eq!(completion(&resumed).1, TurnStatusKind::Completed);
+        assert!(resumed.iter().any(|event| matches!(
+            event,
+            AgentEvent::ItemCompleted { item, .. }
+                if matches!(&item.payload, giskard_core::item::ItemPayload::AgentMessage { text } if text.contains("4272"))
+        )));
+        assert_eq!(
+            completion(&until_completed(&mut stream).await).1,
+            TurnStatusKind::Completed
+        );
+        logs_assert(a_line_with(&[
+            " INFO ",
+            r#"action="route_reopened""#,
+            &format!("thread_id={}", route.thread),
+        ]));
+        harness.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    #[traced_test]
+    async fn a_resumed_sub_agent_whose_thread_was_deleted_reaches_no_thread() {
+        // The sub-agent thread is deleted between the runs: the resumed run has no log to reopen,
+        // which is reported once, and the parent's turn completes as usual.
+        const FIXTURE: &str = "subagent-resume-awaited";
+        let lines = fixture_lines(FIXTURE);
+        let first_result = lines
+            .iter()
+            .position(|line| serde_json::from_str::<Value>(line).unwrap()["type"] == "result")
+            .unwrap();
+        let (harness, handle, mut stream, route, _, injector) = delegating(
+            FIXTURE,
+            3,
+            vec![Step::OnStdin(
+                user(),
+                vec![Action::EmitFixtureFrom {
+                    name: FIXTURE,
+                    from: first_result + 1,
+                }],
+            )],
+        )
+        .await;
+        for line in &lines[3..=first_result] {
+            injector.emit(line.clone());
+        }
+        until_completed(&mut stream).await;
+        harness.delete_thread(&route).await.unwrap();
+
+        harness
+            .start_turn(&handle, text("follow up"), overrides())
+            .await
+            .unwrap();
+        let events = until_completed(&mut stream).await;
+        assert_eq!(completion(&events).1, TurnStatusKind::Completed);
+        assert!(
+            events
+                .iter()
+                .all(|event| crate::session::event_thread(event) == handle.thread)
+        );
+        logs_assert(a_line_with(&[
+            " WARN ",
+            r#"action="route_reopened""#,
+            "the sub-agent thread is gone",
+        ]));
+        harness.shutdown().await.unwrap();
     }
 
     #[tokio::test]
@@ -7253,6 +7423,166 @@ mod tests {
         injector.emit(pong_result);
         let (completed, status, _) = completion(&until_completed(&mut stream).await);
         assert_eq!((completed, status), (second, TurnStatusKind::Completed));
+        harness.shutdown().await.unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_respawned_child_resumes_a_sub_agent_on_its_thread() {
+        // The first child delegates in the foreground and is reaped; the respawned child
+        // (`--resume`) resumes that sub-agent with `SendMessage`. Its run reaches the sub-agent
+        // thread the first child opened, through the same subscription.
+        let emit = |name: &'static str| {
+            vec![Step::OnStdin(
+                user(),
+                vec![Action::EmitFixturePrefix {
+                    name,
+                    count: fixture_lines(name).len(),
+                }],
+            )]
+        };
+        let (first, first_record) = scripted(
+            handshake_steps("sonnet"),
+            emit("subagent-resume-respawn-first"),
+        );
+        let (second, _) = scripted(resume_steps("sonnet"), emit("subagent-resume-respawn"));
+        let (harness, spawner) = harness_with(reaping(), vec![first, second]);
+        let (options, _updates) = open_options(ThreadId::new(), None, "sonnet");
+        let handle = harness.open_thread(options).await.unwrap();
+        let mut stream = harness.subscribe(&handle);
+        harness
+            .start_turn(&handle, text("delegate"), overrides())
+            .await
+            .unwrap();
+        let link = spawned_link(&mut stream).await;
+        let route = harness
+            .claim_native_thread(
+                ThreadId::new(),
+                link.harness_thread_id.clone(),
+                PathBuf::from(WORKSPACE),
+            )
+            .await
+            .unwrap();
+        let mut child = harness.subscribe(&route);
+        assert_eq!(
+            completion(&until_completed(&mut child).await).1,
+            TurnStatusKind::Completed
+        );
+        until_completed(&mut stream).await;
+        tokio::time::sleep(IDLE).await;
+        reaped(&harness, &first_record).await;
+
+        harness
+            .start_turn(&handle, text("follow up"), overrides())
+            .await
+            .unwrap();
+        assert_eq!(spawner.spawns().len(), 2);
+        let resumed = until_completed(&mut child).await;
+        assert!(
+            resumed
+                .iter()
+                .all(|event| crate::session::event_thread(event) == route.thread)
+        );
+        assert_eq!(completion(&resumed).1, TurnStatusKind::Completed);
+        assert!(resumed.iter().any(|event| matches!(
+            event,
+            AgentEvent::ItemCompleted { item, .. }
+                if matches!(&item.payload, giskard_core::item::ItemPayload::UserMessage { .. })
+        )));
+        assert!(resumed.iter().any(|event| matches!(
+            event,
+            AgentEvent::ItemCompleted { item, .. }
+                if matches!(&item.payload, giskard_core::item::ItemPayload::AgentMessage { text } if text.contains("4272"))
+        )));
+        until_completed(&mut stream).await;
+        // No second sub-agent thread: the resumed run reused the first child's route.
+        assert_eq!(
+            lock(&harness.routes)
+                .values()
+                .filter(|route| route.harness_thread_id == link.harness_thread_id)
+                .count(),
+            1
+        );
+        assert_eq!(lock(&harness.routes).len(), 1);
+        harness.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    #[traced_test]
+    async fn after_a_restart_a_resumed_sub_agent_runs_on_its_persisted_thread() {
+        // A fresh instance (a server restart) bound with the server's bootstrap: the persisted
+        // sub-agent thread of the earlier session's `Agent` call. The resumed child's run lands on
+        // that thread, never on a new one bound to the same native id.
+        let native = fixture_lines("subagent-resume-respawn-first")
+            .iter()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .find(|frame| frame["subtype"] == "task_started")
+            .and_then(|frame| frame["tool_use_id"].as_str().map(|id| format!("task:{id}")))
+            .unwrap();
+        let persisted = ThreadId::new();
+        let (child, _) = scripted(
+            resume_steps("sonnet"),
+            vec![Step::OnStdin(
+                user(),
+                vec![Action::EmitFixture {
+                    name: "subagent-resume-respawn",
+                    skip_types: &[],
+                }],
+            )],
+        );
+        let (harness, _) = harness(vec![child]);
+        harness.install_known_threads(&giskard_harness::HarnessBootstrap {
+            known_threads: vec![
+                giskard_harness::KnownThreadBinding {
+                    harness_thread_id: RESUME_ID.into(),
+                    thread_id: ThreadId::new(),
+                },
+                giskard_harness::KnownThreadBinding {
+                    harness_thread_id: native.clone(),
+                    thread_id: persisted,
+                },
+            ],
+        });
+        assert_eq!(
+            harness.live_routes(),
+            1,
+            "only the sub-agent thread is a route"
+        );
+        // Nothing opened the sub-agent thread since the restart: the resume comes first.
+        let (options, _updates) = open_options(ThreadId::new(), Some(RESUME_ID), "sonnet");
+        let handle = harness.open_thread(options).await.unwrap();
+        let mut stream = harness.subscribe(&handle);
+        harness
+            .start_turn(&handle, text("follow up"), overrides())
+            .await
+            .unwrap();
+        until_completed(&mut stream).await;
+        // Then the server admits the link as it does any: a fresh proposed thread, which the
+        // claim answers with the persisted one.
+        let route = harness
+            .claim_native_thread(ThreadId::new(), native.clone(), PathBuf::from(WORKSPACE))
+            .await
+            .unwrap();
+        assert_eq!(route.thread, persisted);
+        let mut sub_agent = harness.subscribe(&route);
+        let resumed = until_completed(&mut sub_agent).await;
+        assert!(
+            resumed
+                .iter()
+                .all(|event| crate::session::event_thread(event) == persisted)
+        );
+        assert!(resumed.iter().any(|event| matches!(
+            event,
+            AgentEvent::ItemCompleted { item, .. }
+                if matches!(&item.payload, giskard_core::item::ItemPayload::AgentMessage { text } if text.contains("4272"))
+        )));
+        // One route for the native id, under the persisted thread.
+        let bound: Vec<ThreadId> = lock(&harness.routes)
+            .iter()
+            .filter(|(_, route)| route.harness_thread_id == native)
+            .map(|(thread, _)| *thread)
+            .collect();
+        assert_eq!(bound, [persisted]);
+        logs_assert(a_line_with(&[r#"action="route_opened""#, "adopted=true"]));
         harness.shutdown().await.unwrap();
     }
 

@@ -3476,6 +3476,88 @@ mod tests {
     }
 
     #[tokio::test]
+    #[traced_test]
+    async fn admission_never_binds_a_persisted_native_id_to_a_second_thread() {
+        // A sub-agent materialized in one server lifetime, then, after a restart, linked again
+        // by a harness that lost its bindings and answers the claim with a new thread (what the
+        // Claude Code adapter did before it installed its bootstrap). The second thread is
+        // refused: its file would make the next bootstrap reject the project's harness.
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(PersistStore::new(tmp.path().to_path_buf()));
+        let (project, config) = create_test_project(&store, "duplicate-native-id").await;
+        let parent = ThreadId::new();
+        store
+            .save_thread(
+                project,
+                &test_thread_file(
+                    project,
+                    parent,
+                    "native-parent",
+                    giskard_core::ThreadKind::Primary,
+                ),
+            )
+            .await
+            .unwrap();
+
+        // First lifetime: the link materializes the sub-agent thread.
+        let (first, _, _) = discovery_registry(store.clone()).await;
+        first
+            .get_or_create_harness(project, &config, "codex")
+            .await
+            .unwrap();
+        attach_test_primary(&first, project, parent, "native-parent").await;
+        let persisted = start_gated_link(&first, project, parent)
+            .await
+            .await
+            .unwrap()
+            .unwrap()
+            .expect("the first link materializes the sub-agent");
+        first.shutdown().await.unwrap();
+
+        // After the restart: a second registry over the same store, whose harness forgot the
+        // binding the bootstrap gave it.
+        let (second, factory, _) = discovery_registry(store.clone()).await;
+        second
+            .get_or_create_harness(project, &config, "codex")
+            .await
+            .unwrap();
+        let harness = factory.harness.lock().unwrap().clone().unwrap();
+        harness.routes.lock().unwrap().remove("native-child");
+        attach_test_primary(&second, project, parent, "native-parent").await;
+        let refused = start_gated_link(&second, project, parent)
+            .await
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(refused, None);
+        let graph = crate::thread_graph::load_thread_graph(&store, project)
+            .await
+            .unwrap();
+        assert_eq!(
+            graph
+                .values()
+                .filter(|thread| thread.harness_thread_id == "native-child")
+                .map(|thread| thread.id)
+                .collect::<Vec<_>>(),
+            [persisted]
+        );
+        logs_assert(a_line_with(&[
+            " WARN ",
+            "refusing to materialize a second thread for a native id the project already binds",
+            &format!("existing_thread_id={persisted}"),
+        ]));
+        second.shutdown().await.unwrap();
+
+        // The next lifetime still constructs the project's harness.
+        let (third, _, _) = discovery_registry(store.clone()).await;
+        third
+            .get_or_create_harness(project, &config, "codex")
+            .await
+            .unwrap();
+        third.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn discovered_native_thread_becomes_a_hidden_orphan_with_an_owner() {
         let tmp = tempfile::tempdir().unwrap();
         let store = Arc::new(PersistStore::new(tmp.path().to_path_buf()));

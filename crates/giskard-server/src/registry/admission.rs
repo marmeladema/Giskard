@@ -176,6 +176,23 @@ pub(super) async fn admit(
     {
         Some(file) => file,
         None => {
+            // A native id is bound to one thread per harness (the bootstrap rejects a duplicate
+            // and would then fail the harness's construction): a harness answering with a new
+            // thread for a native id the project already persists is refused, not materialized.
+            let graph = load_thread_graph(&shared.services.store, project_id)
+                .await
+                .map_err(protocol)?;
+            if let Some(existing) = graph.values().find(|thread| {
+                thread.harness == harness_name
+                    && thread.harness_thread_id == handle.harness_thread_id
+                    && thread.id != handle.thread
+            }) {
+                warn!(%project_id, harness = harness_name, thread_id = %handle.thread,
+                    existing_thread_id = %existing.id,
+                    harness_thread_id = %handle.harness_thread_id,
+                    "refusing to materialize a second thread for a native id the project already binds");
+                return Ok(None);
+            }
             let current_model = handle
                 .resumed_model
                 .clone()
@@ -189,9 +206,6 @@ pub(super) async fn admit(
                 current_model,
             );
             if let Some((link, parent)) = link.as_ref() {
-                let graph = load_thread_graph(&shared.services.store, project_id)
-                    .await
-                    .map_err(protocol)?;
                 if !parent_chain_is_valid(&graph, parent.id) {
                     warn!(%project_id, parent_thread_id = %parent.id,
                         linked_harness_thread_id = %handle.harness_thread_id,

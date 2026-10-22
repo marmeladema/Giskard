@@ -1,0 +1,2 @@
+{"type": "user", "message": {"role": "user", "content": [{"type": "text", "text": "Use the Agent tool to delegate this: read data.txt in the current directory and report the magic number. Then tell me the number."}]}}
+{"type": "user", "message": {"role": "user", "content": [{"type": "text", "text": "Send a follow-up message to that same sub-agent you already ran (continue it, do not start a new one) asking it for the magic number plus one. Then tell me its answer."}]}}
