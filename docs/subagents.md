@@ -15,14 +15,21 @@ one directly, following a link, or reloading it restores the normal transcript v
 a child, the header shows a **Parent** button that returns to its immediate owning thread. The
 button follows `parent_thread_id`, so it also works after a reload and for nested child threads.
 
-A reverse activity from a child to its parent navigates to the existing parent. It never creates a
-second thread or changes ownership.
+A transcript link between already classified threads in the same agent family navigates to the
+existing target, including siblings, cousins, and ancestors. Both ownership chains must be valid
+and reach the same primary root within the same project and harness declaration. Navigation never
+creates a second thread or changes ownership, titles, or spawning metadata.
+
+The root ID is derived in memory on each thread's authority, never persisted. A primary uses its
+own ID; a classified child inherits its parent's root; an orphan has no root yet. Existing ownership
+is validated when metadata is loaded, then link checks compare registered roots without walking
+parent chains. The cache survives event-owner detachment and is rebuilt after server restart.
 
 The harness-neutral activity link is intentionally direction-neutral: a harness identifies the
 related native thread but does not reliably label the relationship from the source thread's
 perspective. Giskard resolves the direction from its persisted ownership graph. Automatic activity
-aimed at the direct parent is therefore treated as navigation-only rather than as a failed child
-import; genuinely incompatible ownership remains a warning.
+aimed at an established family member is therefore treated as navigation-only rather than as a
+failed child import; genuinely incompatible ownership remains a warning.
 
 The browser opens a transcript link with the Giskard parent-thread and item IDs. The server reads
 the authoritative live or persisted item, extracts the native routing ID and lifecycle evidence,

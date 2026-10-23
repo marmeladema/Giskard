@@ -9,7 +9,20 @@
 
 **Document status:** Implementation-ready specification.
 **Audience:** An AI coding agent (and its human reviewer) implementing the system.
-**Version:** 1.104
+**Version:** 1.105
+
+> **Amendment — agent family navigation (1.105).** Transcript links to already classified threads
+> are navigation when both valid ownership chains reach the same primary root in the same project
+> and harness declaration. This includes siblings, cousins, ancestors, and descendants. Explicit
+> opens resolve authoritative live or persisted items and return the existing thread even without
+> a live source owner. Automatic activity does not import, reparent, retitle, or attach an event
+> owner for an established family target. Self-links, orphans, invalid chains, and unrelated
+> families do not qualify. Admission of genuinely new children retains its existing requirements.
+> Family roots are process-local derived state on `ThreadAuthority`, not persisted metadata:
+> primaries register themselves, children inherit their parent's root at admission/classification,
+> and orphans remain unknown. Loading existing records derives roots from validated ownership;
+> warm navigation compares cached roots rather than traversing ancestry. Native lookup also uses
+> those authorities, with a direct target existence check to exclude deleted records.
 
 > **Amendment — a resumed Claude Code sub-agent (1.104).** Claude Code can run a sub-agent again
 > after its first run ended: when the model sends it a message with `SendMessage`, or when the
@@ -4157,9 +4170,10 @@ latest persisted turn timestamp; it never uses the repair time.
   The browser supplies only Giskard-owned coordinates. The server resolves the raw item from the
   parent's live buffer or persisted turns, derives its native child ID, prompt, lifecycle evidence,
   and containing `TurnId`, then idempotently materializes or returns the linked thread. Unknown and
-  non-link items return `409 Conflict`. The parent must already have a live event owner; a request
-  against a cold, detaching, or failed parent returns `409 Conflict`. A reverse child-to-parent item
-  returns the existing parent without changing ownership.
+  non-link items return `409 Conflict`. New child admission requires the source to have a live event owner; a request
+  against a cold, detaching, or failed source returns `409 Conflict` for that admission. A link to
+  an already classified thread in the same validated agent family returns the existing target
+  without changing ownership or requiring a live source owner.
 
 Linked-thread ownership is immutable once persisted. Existing primary threads are not reclassified,
 and existing children are not reparented. New child imports reject invalid/cyclic parent chains and

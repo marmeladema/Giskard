@@ -428,6 +428,135 @@ impl RegistryShared {
         Ok(authority)
     }
 
+    /// Register a newly loaded/admitted thread. Established children inherit the parent's cached
+    /// root; only a cold ancestor chain needs metadata reads. Unknown roots remain retryable.
+    async fn register_thread_family(&self, file: &ThreadFile) -> Result<(), HarnessError> {
+        let mut pending = Vec::new();
+        let mut seen = HashSet::new();
+        let mut current = file.clone();
+        let root = loop {
+            if !seen.insert(current.id)
+                || current.project_id != file.project_id
+                || current.harness != file.harness
+            {
+                warn!(project_id = %file.project_id, thread_id = %file.id,
+                    "cannot establish agent family from invalid ownership chain");
+                break None;
+            }
+            if let Some(authority) = self.thread_authority(current.id).await
+                && let Some(family) = authority.family().await
+                && family.root_thread_id.is_some()
+            {
+                if family.harness != current.harness {
+                    return Err(HarnessError::Protocol(format!(
+                        "thread {} has conflicting native family identity",
+                        current.id
+                    )));
+                }
+                break family.root_thread_id;
+            }
+            let kind = current.kind;
+            let parent = current.parent_thread_id;
+            let id = current.id;
+            pending.push(current);
+            match (kind, parent) {
+                (ThreadKind::Primary, None) => break Some(id),
+                (ThreadKind::Subagent, Some(parent)) => {
+                    let Some(parent_file) = self
+                        .services
+                        .store
+                        .load_thread(file.project_id, parent)
+                        .await
+                        .map_err(|error| HarnessError::Protocol(error.to_string()))?
+                    else {
+                        warn!(project_id = %file.project_id, thread_id = %file.id, %parent,
+                            "cannot establish agent family from missing parent");
+                        break None;
+                    };
+                    current = parent_file;
+                }
+                (ThreadKind::Orphan, None) => break None,
+                _ => {
+                    warn!(project_id = %file.project_id, thread_id = %file.id,
+                        "cannot establish agent family from invalid ownership metadata");
+                    break None;
+                }
+            }
+        };
+        for thread in pending.into_iter().rev() {
+            let authority = self
+                .intern_thread_authority(thread.id, thread.project_id)
+                .await
+                .map_err(|error| HarnessError::Protocol(error.to_string()))?;
+            authority
+                .register_family(thread::ThreadFamily {
+                    harness: thread.harness,
+                    native_thread_id: thread.harness_thread_id,
+                    root_thread_id: root,
+                })
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// Startup/cold navigation already needs a metadata inventory for native-id lookup. Derive
+    /// family membership there, never in a warm navigation check.
+    async fn register_family_graph(
+        &self,
+        graph: &HashMap<ThreadId, ThreadFile>,
+    ) -> Result<(), HarnessError> {
+        for file in graph.values() {
+            let authority = self
+                .intern_thread_authority(file.id, file.project_id)
+                .await
+                .map_err(|error| HarnessError::Protocol(error.to_string()))?;
+            authority
+                .register_family(thread::ThreadFamily {
+                    harness: file.harness.clone(),
+                    native_thread_id: file.harness_thread_id.clone(),
+                    root_thread_id: crate::thread_graph::agent_family_root(graph, file.id),
+                })
+                .await?;
+        }
+        Ok(())
+    }
+
+    async fn cached_family_target(
+        &self,
+        project: ProjectId,
+        source: ThreadId,
+        native: &str,
+    ) -> Option<Option<ThreadId>> {
+        let source_authority = self.thread_authority(source).await?;
+        if source_authority.project_id() != project {
+            return Some(None);
+        }
+        let source_family = source_authority.family().await?;
+        let authorities = self
+            .threads
+            .lock()
+            .await
+            .threads
+            .values()
+            .filter(|authority| authority.project_id() == project)
+            .cloned()
+            .collect::<Vec<_>>();
+        for target in authorities {
+            let Some(family) = target.family().await else {
+                continue;
+            };
+            if family.harness == source_family.harness && family.native_thread_id == native {
+                return Some(
+                    (target.thread_id() != source
+                        && source_family.root_thread_id.is_some()
+                        && source_family.root_thread_id == family.root_thread_id)
+                        .then_some(target.thread_id()),
+                );
+            }
+        }
+        None
+    }
+
     async fn coordinator(&self, thread_id: ThreadId) -> Option<ThreadBinding> {
         let authority = self.thread_authority(thread_id).await?;
         authority.coordinator().await
@@ -853,6 +982,7 @@ impl HarnessRegistry {
                 thread_id: thread.id,
             });
         }
+        self.shared.register_family_graph(&graph).await?;
         Ok(HarnessBootstrap { known_threads })
     }
 
@@ -1351,7 +1481,7 @@ impl HarnessRegistry {
         else {
             return Ok(None);
         };
-        if let Some(parent_target) = resolve_reverse_subagent_target(
+        if let Some(family_target) = resolve_family_subagent_target(
             &self.shared,
             project_id,
             parent_thread_id,
@@ -1359,7 +1489,9 @@ impl HarnessRegistry {
         )
         .await?
         {
-            return Ok(Some(parent_target));
+            debug!(%project_id, source_thread_id = %parent_thread_id, target_thread_id = %family_target,
+                "opening existing agent family thread");
+            return Ok(Some(family_target));
         }
 
         // A child is admitted by the instance that ran its parent, which is named by the parent's
@@ -1931,26 +2063,42 @@ async fn resolve_subagent_link_info(
     Ok(None)
 }
 
-async fn resolve_reverse_subagent_target(
+async fn resolve_family_subagent_target(
     shared: &RegistryShared,
     project_id: ProjectId,
     source_thread_id: ThreadId,
     native_thread_id: &str,
 ) -> Result<Option<ThreadId>, HarnessError> {
+    if let Some(target) = shared
+        .cached_family_target(project_id, source_thread_id, native_thread_id)
+        .await
+    {
+        // Authorities outlive ordinary detach and can also outlive deletion. Verify the target
+        // still exists; this reads one record, never its ancestry or the project inventory.
+        if let Some(target) = target {
+            return Ok(shared
+                .services
+                .store
+                .load_thread(project_id, target)
+                .await
+                .map_err(|error| HarnessError::Protocol(error.to_string()))?
+                .map(|_| target));
+        }
+        return Ok(None);
+    }
+    // Cold navigation may precede harness creation. Populate existing authorities from metadata
+    // without starting a harness; subsequent links use their registered roots and native ids.
     let graph = load_thread_graph(&shared.services.store, project_id)
         .await
         .map_err(|error| HarnessError::Protocol(error.to_string()))?;
-    let Some(source) = graph.get(&source_thread_id) else {
+    if !graph.contains_key(&source_thread_id) {
         return Err(HarnessError::ThreadNotFound(source_thread_id));
-    };
-    // Native ids are namespaced by the harness that minted them: with two declarations in one
-    // project, a thread of another declaration carrying the same id is not this source's parent.
-    let target = graph.values().find(|thread| {
-        thread.harness_thread_id == native_thread_id && thread.harness == source.harness
-    });
-    Ok(target
-        .filter(|target| source.parent_thread_id == Some(target.id))
-        .map(|target| target.id))
+    }
+    shared.register_family_graph(&graph).await?;
+    Ok(shared
+        .cached_family_target(project_id, source_thread_id, native_thread_id)
+        .await
+        .flatten())
 }
 
 fn subagent_start_info(item: &giskard_core::item::ItemStart) -> Option<SubagentActivityInfo> {
@@ -3075,7 +3223,7 @@ mod tests {
 
         // Only a `b` thread carries the id: no target, even though it is the recorded parent.
         assert_eq!(
-            super::resolve_reverse_subagent_target(
+            super::resolve_family_subagent_target(
                 &registry.shared,
                 project,
                 source,
@@ -3091,7 +3239,7 @@ mod tests {
         child.parent_thread_id = Some(parent);
         store.save_thread(project, &child).await.unwrap();
         assert_eq!(
-            super::resolve_reverse_subagent_target(
+            super::resolve_family_subagent_target(
                 &registry.shared,
                 project,
                 source,
@@ -3100,6 +3248,96 @@ mod tests {
             .await
             .unwrap(),
             Some(parent)
+        );
+    }
+
+    #[tokio::test]
+    async fn family_roots_are_rebuilt_on_load_and_warm_links_do_not_read_ancestors() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(PersistStore::new(tmp.path().to_path_buf()));
+        let (project, _) = create_test_project(&store, "cached-family").await;
+        let root = ThreadId::new();
+        save_thread_on(&store, project, root, "root-native", "a").await;
+        let source = ThreadId::new();
+        let target = ThreadId::new();
+        for (id, native) in [(source, "source-native"), (target, "target-native")] {
+            let mut child =
+                test_thread_file(project, id, native, giskard_core::ThreadKind::Subagent);
+            child.harness = "a".into();
+            child.parent_thread_id = Some(root);
+            store.save_thread(project, &child).await.unwrap();
+        }
+        for _ in 0..2 {
+            let (registry, _, _) = discovery_registry(store.clone()).await;
+            assert_eq!(
+                super::resolve_family_subagent_target(
+                    &registry.shared,
+                    project,
+                    source,
+                    "target-native"
+                )
+                .await
+                .unwrap(),
+                Some(target)
+            );
+            let authority = registry.shared.thread_authority(target).await.unwrap();
+            assert_eq!(authority.family().await.unwrap().root_thread_id, Some(root));
+        }
+        let (registry, _, _) = discovery_registry(store.clone()).await;
+        assert_eq!(
+            super::resolve_family_subagent_target(
+                &registry.shared,
+                project,
+                source,
+                "target-native"
+            )
+            .await
+            .unwrap(),
+            Some(target)
+        );
+        let root_path = store
+            .data_dir()
+            .join("projects")
+            .join(project.to_string())
+            .join("threads")
+            .join(root.to_string())
+            .join("thread.json");
+        // This is deliberate fixture corruption: any new metadata inventory/ancestry read fails.
+        tokio::fs::write(root_path, b"not json").await.unwrap();
+        assert_eq!(
+            super::resolve_family_subagent_target(
+                &registry.shared,
+                project,
+                source,
+                "target-native"
+            )
+            .await
+            .unwrap(),
+            Some(target)
+        );
+        // Family identity is derived state; no extra metadata field is written.
+        let target_path = store
+            .data_dir()
+            .join("projects")
+            .join(project.to_string())
+            .join("threads")
+            .join(target.to_string())
+            .join("thread.json");
+        let raw: serde_json::Value =
+            serde_json::from_slice(&tokio::fs::read(target_path).await.unwrap()).unwrap();
+        assert!(raw.get("root_thread_id").is_none());
+        store.delete_thread(project, target).await.unwrap();
+        assert_eq!(
+            super::resolve_family_subagent_target(
+                &registry.shared,
+                project,
+                source,
+                "target-native"
+            )
+            .await
+            .unwrap(),
+            None,
+            "a cached native id must not reopen a deleted target"
         );
     }
 

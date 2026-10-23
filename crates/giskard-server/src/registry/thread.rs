@@ -300,6 +300,14 @@ struct CoordinatorSlot {
     current: AsyncMutex<Option<ThreadBinding>>,
 }
 
+/// Derived relationship identity. Root is unknown until a valid ownership chain is established.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct ThreadFamily {
+    pub(super) harness: String,
+    pub(super) native_thread_id: String,
+    pub(super) root_thread_id: Option<ThreadId>,
+}
+
 /// Owns immutable identity and all process-local state for one verified thread.
 pub(crate) struct ThreadAuthority {
     thread_id: ThreadId,
@@ -307,6 +315,9 @@ pub(crate) struct ThreadAuthority {
     owner: OwnerLock,
     coordinator: CoordinatorSlot,
     runtime: ThreadRuntimeSlot,
+    /// Derived at load/admission, retained across owner detaches, removed with this authority.
+    /// Never persisted; an orphan's unknown root is filled when ownership is established.
+    family: AsyncMutex<Option<ThreadFamily>>,
 }
 
 impl ThreadAuthority {
@@ -318,12 +329,62 @@ impl ThreadAuthority {
             owner,
             coordinator: CoordinatorSlot::default(),
             runtime: ThreadRuntimeSlot::new(),
+            family: AsyncMutex::new(None),
         }
     }
 
     #[cfg(test)]
     pub(crate) fn new_for_test(thread_id: ThreadId, project_id: ProjectId) -> Self {
         Self::new(thread_id, project_id, OwnerLock::new())
+    }
+
+    pub(super) async fn family(&self) -> Option<ThreadFamily> {
+        self.family.lock().await.clone()
+    }
+
+    pub(super) async fn register_family(&self, family: ThreadFamily) -> Result<(), HarnessError> {
+        self.register_family_inner(family, false).await
+    }
+
+    pub(super) async fn register_primary_family(
+        &self,
+        family: ThreadFamily,
+    ) -> Result<(), HarnessError> {
+        self.register_family_inner(family, true).await
+    }
+
+    async fn register_family_inner(
+        &self,
+        family: ThreadFamily,
+        replace_native: bool,
+    ) -> Result<(), HarnessError> {
+        let mut current = self.family.lock().await;
+        // A metadata inventory may overlap classification or native resume fallback. Once a root
+        // is established, only a validated primary attachment may replace its native routing id.
+        if let Some(existing) = current.as_ref()
+            && existing.root_thread_id.is_some()
+            && !replace_native
+        {
+            if existing != &family {
+                tracing::debug!(thread_id = %self.thread_id,
+                    "retaining established agent family over a metadata snapshot");
+            }
+            return Ok(());
+        }
+        if let Some(existing) = current.as_ref()
+            && existing.root_thread_id.is_some()
+            && (existing.harness != family.harness
+                || existing.root_thread_id != family.root_thread_id
+                || (existing.native_thread_id != family.native_thread_id
+                    && (!replace_native || existing.root_thread_id != Some(self.thread_id))))
+        {
+            return Err(HarnessError::Protocol(format!(
+                "thread {} has conflicting established family identity",
+                self.thread_id
+            )));
+        }
+        *current = Some(family);
+        Ok(())
     }
 
     /// Returns the authority's immutable thread identity.
@@ -419,6 +480,46 @@ mod tests {
             },
             ClassificationPhase::Primary,
         ))
+    }
+
+    #[tokio::test]
+    async fn family_registration_fills_unknown_roots_and_preserves_established_ownership() {
+        let id = ThreadId::new();
+        let root = ThreadId::new();
+        let authority = ThreadAuthority::new_for_test(id, ProjectId::new());
+        let mut family = ThreadFamily {
+            harness: "codex".into(),
+            native_thread_id: "child".into(),
+            root_thread_id: None,
+        };
+        authority.register_family(family.clone()).await.unwrap();
+        family.root_thread_id = Some(root);
+        authority.register_family(family.clone()).await.unwrap();
+        assert_eq!(authority.family().await, Some(family.clone()));
+        family.root_thread_id = Some(ThreadId::new());
+        assert!(authority.register_primary_family(family).await.is_err());
+        assert_eq!(authority.family().await.unwrap().root_thread_id, Some(root));
+    }
+
+    #[tokio::test]
+    async fn primary_native_replacement_keeps_its_family_root() {
+        let id = ThreadId::new();
+        let authority = ThreadAuthority::new_for_test(id, ProjectId::new());
+        for native in ["original", "replacement"] {
+            authority
+                .register_primary_family(ThreadFamily {
+                    harness: "codex".into(),
+                    native_thread_id: native.into(),
+                    root_thread_id: Some(id),
+                })
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            authority.family().await.unwrap().native_thread_id,
+            "replacement"
+        );
+        assert_eq!(authority.family().await.unwrap().root_thread_id, Some(id));
     }
 
     #[test]

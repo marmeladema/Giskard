@@ -645,6 +645,43 @@ impl ProjectEventDriver {
             )));
             return;
         };
+        // Metadata may not exist yet for a primary opened before its first commit. Its root is
+        // nevertheless known at native creation; persisted children are validated on attachment.
+        let family_result = match self
+            .shared
+            .services
+            .store
+            .load_thread(project_id, thread_id)
+            .await
+        {
+            Ok(file) if attach.classification == ClassificationPhase::Primary => {
+                let valid_primary = file.as_ref().is_none_or(|file| {
+                    file.kind == giskard_core::ThreadKind::Primary
+                        && file.parent_thread_id.is_none()
+                });
+                if valid_primary {
+                    authority
+                        .register_primary_family(super::thread::ThreadFamily {
+                            harness: attach.binding.harness.clone(),
+                            native_thread_id: attach.binding.handle.harness_thread_id.clone(),
+                            root_thread_id: Some(thread_id),
+                        })
+                        .await
+                } else if let Some(file) = file {
+                    self.shared.register_thread_family(&file).await
+                } else {
+                    Ok(())
+                }
+            }
+            Ok(Some(file)) => self.shared.register_thread_family(&file).await,
+            Ok(None) => Ok(()),
+            Err(error) => Err(HarnessError::Protocol(error.to_string())),
+        };
+        if let Err(error) = family_result {
+            warn!(%project_id, %thread_id, %error, "thread family registration failed on attachment");
+            let _ = attach.reply.send(Err(error));
+            return;
+        }
         let stream = harness.subscribe(&attach.binding.handle);
         drop(harness);
         let (cancel_tx, cancel_rx) = watch::channel(false);
@@ -2099,11 +2136,16 @@ mod tests {
         let spawned_by_turn_id = request.spawned_by_turn_id;
         driver.link(request).await.unwrap();
         let child = response.await.unwrap().unwrap().unwrap();
+        let authority = shared.thread_authority(child).await.unwrap();
         let file = load_thread(&store, project_id, child).await.unwrap();
         assert_eq!(file.revision, 1);
         assert_eq!(file.kind, giskard_core::thread::ThreadKind::Subagent);
         assert_eq!(file.parent_thread_id, Some(parent));
         assert_eq!(file.spawned_by_turn_id, Some(spawned_by_turn_id));
+        assert_eq!(
+            authority.family().await.unwrap().root_thread_id,
+            Some(parent)
+        );
         assert!(shared.coordinator(child).await.is_some());
         assert_eq!(harness.claim_calls.load(Ordering::SeqCst), 1);
     }
@@ -2152,6 +2194,8 @@ mod tests {
             }
             tokio::task::yield_now().await;
         };
+        let authority = shared.thread_authority(child).await.unwrap();
+        assert_eq!(authority.family().await.unwrap().root_thread_id, None);
         let (request, response) = link(parent, "child-native");
         let spawned_by_turn_id = request.spawned_by_turn_id;
         driver.link(request).await.unwrap();
@@ -2160,6 +2204,10 @@ mod tests {
         assert_eq!(file.kind, giskard_core::thread::ThreadKind::Subagent);
         assert_eq!(file.parent_thread_id, Some(parent));
         assert_eq!(file.spawned_by_turn_id, Some(spawned_by_turn_id));
+        assert_eq!(
+            authority.family().await.unwrap().root_thread_id,
+            Some(parent)
+        );
         assert!(Arc::ptr_eq(
             &before,
             &shared.coordinator(child).await.unwrap()
@@ -2306,6 +2354,53 @@ mod tests {
         driver.link(request).await.unwrap();
         assert_eq!(response.await.unwrap().unwrap(), None);
         assert_eq!(store.list_threads(project_id).await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn sibling_activity_does_not_claim_or_attach_the_target() {
+        let (shared, harness, driver, project_id, store, _sink) = setup();
+        store
+            .create_project(project_id, "project", "/tmp/test", "codex")
+            .await
+            .unwrap();
+        let root = ThreadId::new();
+        let source = ThreadId::new();
+        let target = ThreadId::new();
+        for (id, native, kind, parent) in [
+            (root, "root-native", giskard_core::ThreadKind::Primary, None),
+            (
+                source,
+                "source-native",
+                giskard_core::ThreadKind::Subagent,
+                Some(root),
+            ),
+            (
+                target,
+                "target-native",
+                giskard_core::ThreadKind::Subagent,
+                Some(root),
+            ),
+        ] {
+            save_thread(&store, project_id, id, native, kind, parent).await;
+        }
+        driver
+            .attach(
+                binding(project_id, source, "source-native"),
+                ClassificationPhase::Subagent,
+            )
+            .await
+            .unwrap();
+        let before = load_thread(&store, project_id, target).await.unwrap();
+        let (request, response) = link(source, "target-native");
+        driver.link(request).await.unwrap();
+        assert_eq!(response.await.unwrap().unwrap(), None);
+        assert_eq!(harness.claim_calls.load(Ordering::SeqCst), 0);
+        assert!(shared.coordinator(target).await.is_none());
+        let after = load_thread(&store, project_id, target).await.unwrap();
+        assert_eq!(before.revision, after.revision);
+        assert_eq!(before.parent_thread_id, after.parent_thread_id);
+        assert_eq!(before.spawned_by_turn_id, after.spawned_by_turn_id);
+        assert_eq!(store.list_threads(project_id).await.unwrap().len(), 3);
     }
 
     #[tokio::test]

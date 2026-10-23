@@ -28,6 +28,12 @@ WebSocket. Highlights: `POST /api/login`, `POST /api/logout`, `GET /api/ws-ticke
 `giskard-proto`. See
 [§13.6](../specs/giskard-specification.md) for the message protocol.
 
+The sub-agent link open route resolves the item from live or persisted history. For an already
+classified target in the source's agent family, it returns the existing thread without requiring
+a live source owner or changing ownership. Both chains must reach the same primary root within
+the same project and harness declaration. New child imports still require a live source owner;
+unknown items and incompatible relationships return `409 Conflict`.
+
 The MCP routes address one harness instance of the project: `{name}` is a `[harnesses.<name>]`
 declaration, and an undeclared name is a `404`. The browser addresses the open thread's harness and
 hides the MCP menu on a draft, which has no instance yet. There are no project-wide

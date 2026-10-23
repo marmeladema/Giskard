@@ -5280,6 +5280,167 @@ async fn reverse_subagent_activity_preserves_parent_and_uses_one_forwarder() {
 }
 
 #[tokio::test]
+async fn sibling_links_open_live_and_persisted_without_changing_ownership() {
+    let harness = FakeHarness::new(ActivityScript::default());
+    let server = start_activity_server_on_available_port(harness.clone()).await;
+    let state = &server.state;
+    let client = reqwest::Client::new();
+    let cookie = auth::login(&client, &server.base).await;
+    let project = create_project_only(&client, &server.base, &cookie).await;
+    let root = fixtures::persist_primary_thread(
+        &state.store,
+        project,
+        ThreadId::new(),
+        "family-root",
+        fake_native_model(),
+    )
+    .await;
+    let root_file = state
+        .store
+        .load_thread(project, root)
+        .await
+        .unwrap()
+        .unwrap();
+    let mut children = Vec::new();
+    for native in ["family-a", "family-b"] {
+        let mut child = root_file.clone();
+        child.id = ThreadId::new();
+        child.harness_thread_id = native.into();
+        child.kind = giskard_core::ThreadKind::Subagent;
+        child.parent_thread_id = Some(root);
+        child.spawned_by_turn_id = Some(TurnId::new());
+        state.store.save_thread(project, &child).await.unwrap();
+        children.push(child);
+    }
+    let source = &children[0];
+    let target = &children[1];
+    let opened = client
+        .post(format!("{}/api/projects/{project}/threads", server.base))
+        .header("cookie", &cookie)
+        .json(&serde_json::json!({"thread_id": source.id}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(opened.status(), 200);
+    harness.core.wait_for_readers(source.id, 1).await;
+    let mut socket = ws::connect(server.addr, &cookie).await;
+    socket
+        .send(tokio_tungstenite::tungstenite::Message::Text(
+            serde_json::to_string(&ClientMessage::Subscribe {
+                thread_id: source.id,
+                since: None,
+            })
+            .unwrap()
+            .into(),
+        ))
+        .await
+        .unwrap();
+    wait_for_thread_state(&mut socket, source.id).await;
+    let turn = TurnId::new();
+    let item_id = ItemId::new();
+    let log = harness.core.try_log(source.id).unwrap();
+    log.append(AgentEvent::TurnStarted {
+        thread: source.id,
+        turn,
+    });
+    log.append(AgentEvent::ItemCompleted {
+        thread: source.id,
+        turn,
+        item: Item {
+            id: item_id,
+            harness_item_id: "sibling-link".into(),
+            created_at: chrono::Utc::now(),
+            payload: ItemPayload::Activity {
+                title: "Sub-agent interacted".into(),
+                detail: None,
+                metadata: None,
+                subagent: Some(SubagentLink {
+                    harness_thread_id: target.harness_thread_id.clone(),
+                    path: None,
+                    initial_prompt: None,
+                    action: SubagentAction::Interacted,
+                    status: None,
+                    message: None,
+                }),
+            },
+        },
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        loop {
+            let Some(Ok(tokio_tungstenite::tungstenite::Message::Text(text))) = socket.next().await else { continue };
+            if let Ok(ServerMessage::Event { agent_event, .. }) = serde_json::from_str(&text)
+                && matches!(*agent_event, WireAgentEvent::ItemCompleted { ref item, .. } if item.id == item_id) {
+                break;
+            }
+        }
+    }).await.unwrap();
+    assert!(
+        state
+            .store
+            .load_all_turns(project, source.id)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    for persisted in [false, true] {
+        if persisted {
+            harness.core.complete_turn(source.id, turn);
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                while state
+                    .store
+                    .load_all_turns(project, source.id)
+                    .await
+                    .unwrap()
+                    .is_empty()
+                {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .unwrap();
+        }
+        let response =
+            open_subagent_link(&client, &server.base, &cookie, project, source.id, item_id).await;
+        assert_eq!(response.status(), 200);
+        assert_eq!(
+            response.json::<serde_json::Value>().await.unwrap()["thread_id"],
+            target.id.to_string()
+        );
+        for child in &children {
+            let saved = state
+                .store
+                .load_thread(project, child.id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(saved.parent_thread_id, child.parent_thread_id);
+            assert_eq!(saved.spawned_by_turn_id, child.spawned_by_turn_id);
+            assert_eq!(saved.title, child.title);
+        }
+        assert_eq!(state.store.list_threads(project).await.unwrap().len(), 3);
+    }
+    // Clear the live owner and its runtime: opening now depends entirely on persisted evidence.
+    state.registry.retire_thread(source.id).await;
+    let cold =
+        open_subagent_link(&client, &server.base, &cookie, project, source.id, item_id).await;
+    assert_eq!(cold.status(), 200);
+    assert_eq!(
+        cold.json::<serde_json::Value>().await.unwrap()["thread_id"],
+        target.id.to_string()
+    );
+    let unknown = open_subagent_link(
+        &client,
+        &server.base,
+        &cookie,
+        project,
+        source.id,
+        ItemId::new(),
+    )
+    .await;
+    assert_eq!(unknown.status(), 409);
+}
+
+#[tokio::test]
 async fn route_rejects_native_child_with_a_different_parent() {
     let harness = FakeHarness::new(ActivityScript::default());
     let server = start_activity_server_on_available_port(harness).await;

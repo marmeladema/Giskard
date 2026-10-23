@@ -175,6 +175,39 @@ pub(crate) fn parent_chain_is_valid(
     }
 }
 
+/// Derive a root once when loading ownership metadata, rejecting invalid or foreign chains.
+pub(crate) fn agent_family_root(
+    graph: &HashMap<ThreadId, ThreadFile>,
+    start: ThreadId,
+) -> Option<ThreadId> {
+    let first = graph.get(&start)?;
+    let mut current = start;
+    let mut seen = HashSet::new();
+    while seen.insert(current) {
+        let thread = graph.get(&current)?;
+        if thread.harness != first.harness || thread.project_id != first.project_id {
+            return None;
+        }
+        match (thread.kind, thread.parent_thread_id) {
+            (ThreadKind::Subagent, Some(parent)) => current = parent,
+            (ThreadKind::Primary, None) => return Some(current),
+            _ => return None,
+        }
+    }
+    None
+}
+
+#[cfg(test)]
+fn same_agent_family(
+    graph: &HashMap<ThreadId, ThreadFile>,
+    source: ThreadId,
+    target: ThreadId,
+) -> bool {
+    source != target
+        && agent_family_root(graph, source)
+            .is_some_and(|root| agent_family_root(graph, target) == Some(root))
+}
+
 pub(crate) fn graph_issue(
     graph: &HashMap<ThreadId, ThreadFile>,
     thread: &ThreadFile,
@@ -293,6 +326,43 @@ mod tests {
             archived: false,
             git_workspace: None,
         }
+    }
+
+    #[test]
+    fn family_navigation_requires_valid_matching_roots() {
+        let root = ThreadId::new();
+        let a = ThreadId::new();
+        let b = ThreadId::new();
+        let cousin = ThreadId::new();
+        let other = ThreadId::new();
+        let project = ProjectId::new();
+        let mut graph = HashMap::new();
+        for (id, kind, parent) in [
+            (root, ThreadKind::Primary, None),
+            (a, ThreadKind::Subagent, Some(root)),
+            (b, ThreadKind::Subagent, Some(root)),
+            (cousin, ThreadKind::Subagent, Some(b)),
+            (other, ThreadKind::Primary, None),
+        ] {
+            let mut file = thread(id, kind, parent);
+            file.project_id = project;
+            graph.insert(id, file);
+        }
+        for (source, target) in [(a, b), (a, cousin), (cousin, root), (root, cousin)] {
+            assert!(same_agent_family(&graph, source, target));
+        }
+        assert!(!same_agent_family(&graph, a, a));
+        assert!(!same_agent_family(&graph, a, other));
+        graph.get_mut(&b).unwrap().harness = "other".into();
+        assert!(!same_agent_family(&graph, a, cousin));
+        graph.get_mut(&b).unwrap().harness = "codex".into();
+        graph.get_mut(&b).unwrap().kind = ThreadKind::Orphan;
+        assert!(!same_agent_family(&graph, a, cousin));
+        graph.get_mut(&b).unwrap().kind = ThreadKind::Subagent;
+        graph.get_mut(&b).unwrap().parent_thread_id = Some(cousin);
+        assert!(!same_agent_family(&graph, a, cousin));
+        graph.remove(&b);
+        assert!(!same_agent_family(&graph, a, cousin));
     }
 
     fn worktree(path: &str) -> ThreadGitWorkspace {

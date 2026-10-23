@@ -147,6 +147,26 @@ pub(super) async fn admit(
                 .await
                 .map_err(protocol)?
                 .ok_or(HarnessError::ThreadNotFound(link.parent_thread_id))?;
+            // References between established relatives are navigation, not ownership evidence.
+            // Resolve before claiming so they cannot attach an owner or alter target metadata.
+            if parent.kind == ThreadKind::Subagent
+                && let Some(target) = super::resolve_family_subagent_target(
+                    &shared,
+                    project_id,
+                    parent.id,
+                    &link.info.native_thread_id,
+                )
+                .await?
+            {
+                if parent.parent_thread_id == Some(target) {
+                    debug!(%project_id, source_thread_id = %parent.id, parent_thread_id = %target,
+                        "recognized reverse sub-agent activity targeting the existing parent");
+                } else {
+                    debug!(%project_id, source_thread_id = %parent.id, target_thread_id = %target,
+                        origin = link.origin, "recognized existing agent family navigation");
+                }
+                return Ok(None);
+            }
             let root = effective_thread_workspace_root(&shared.services.store, &project, &parent)
                 .await
                 .map_err(protocol)?;
@@ -355,6 +375,7 @@ pub(super) async fn admit(
                     file.id
                 )));
             }
+            shared.register_thread_family(&file).await?;
             if let Some(coordinator) = shared.coordinator(file.id).await {
                 coordinator.classify_orphan_as_subagent().await?;
             }

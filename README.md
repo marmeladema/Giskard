@@ -169,7 +169,8 @@ Then open **http://127.0.0.1:8787**, log in, and:
    For a thread isolated in a worktree, the row reports that worktree rather than the project's
    checkout.
 4. Linked child threads appear in the **Sub-agents** monitor and can be opened from their activity
-   rows; their header **Parent** button returns to the owning thread. See
+   rows; transcript links also open siblings and other established threads in the same agent family.
+   Their header **Parent** button returns to the owning thread. See
    [Sub-agent threads](docs/subagents.md) for spawning protocols, read-only event ownership,
    prompts, approvals, and deletion behavior.
 
