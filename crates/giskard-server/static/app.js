@@ -150,7 +150,7 @@ const THREAD_DELETE_TIMEOUT_MS = 30000;
 const THREAD_LIST_RETRY_BASE_MS = 500;
 const THREAD_LIST_RETRY_MAX_MS = 10000;
 let state = {
-  projectId:null, threadId:null, activeViewGeneration:0, mode:"build", ws:null, wsStatus:"closed", wsConnectId:0,
+  appStarted:false, projectId:null, threadId:null, activeViewGeneration:0, mode:"build", ws:null, wsStatus:"closed", wsConnectId:0,
   wsReconnectTimer:null, wsReconnectAttempt:0, wsStatusDetail:"WebSocket disconnected",
   updateRequired:false, uiVersionCheckPending:false,
   wsLastProblem:"", wsLastProblemNotice:"", wsLastProblemNoticeAt:0,
@@ -167,7 +167,7 @@ let state = {
   partialTurn:null, loadingTurnItems:false,
   models:[], modelsProject:null, modelsLoadingProject:null, streamEl:null, streamItemId:null, pendingUserEl:null, pendingUserText:null,
   streamElsByItemId:new Map(), renderedItemIds:new Set(), renderedHarnessItemIds:new Set(), renderedItemBodyByKey:new Map(), itemKindsByItemId:new Map(),
-  pendingApprovals:new Map(), answeredApprovals:new Map(), answeredApprovalsById:new Map(), renderedApprovalStateKeys:new Set(), pendingServerRequests:new Map(), answeredServerRequests:new Set(), requestStates:new Map(), runtimeOverviewRevision:-1,
+  pendingApprovals:new Map(), answeredApprovals:new Map(), answeredApprovalsById:new Map(), renderedApprovalStateKeys:new Set(), pendingServerRequests:new Map(), answeredServerRequests:new Set(), requestStates:new Map(), runtimeOverviewRevision:-1, storageStatus:null, storageRevision:-1,
   runningCommands:new Map(), runningTasks:new Map(), runningTasksRevision:-1, lateItemWatch:new Map(), commandBodyElsByItemId:new Map(), commandMsgElsByItemId:new Map(), commandStopRequestedByItemId:new Set(), selectedCommandId:null, pendingTaskNavigation:null, pendingTaskOpen:null, taskIntentSeq:0, taskHistoryLoading:false, taskHistoryOwner:0,
   commandPayloadsByItemId:new Map(), endedCommandsByItemId:new Map(),
   toolPayloadsByItemId:new Map(), toolBodyElsByItemId:new Map(),
@@ -329,6 +329,7 @@ $("loginForm").onsubmit = async (e) => {
 };
 
 async function startApp() {
+  state.appStarted = true;
   $("login").style.display="none";
   $("app").classList.add("open");
   initServiceWorkerNotifications();
@@ -336,6 +337,7 @@ async function startApp() {
   renderModelSelect();
   await loadDeclaredHarnesses();
   await loadProjects();
+  if (!state.ws && !state.threadId) connectWs();
 }
 
 // The declared harnesses, learned once at start so a sidebar row can name its thread's harness
@@ -2280,6 +2282,7 @@ function clearThreadView(tid) {
   // The row that was open is no longer selected; a stale highlight would also hold an archived
   // section open around it.
   syncActiveThreadHighlight();
+  connectWs();
 }
 
 function clearStoredLastThreadForProject(pid) {
@@ -2768,6 +2771,7 @@ function openDraftThread(pid) {
   closeDrawers();
   restoreComposerDraft();
   $("input").focus();
+  connectWs();
 }
 
 /* ---------- thread view + websocket ---------- */
@@ -2937,10 +2941,7 @@ function markWsForegroundRecovered(ws) {
 }
 function scheduleWsReconnect(reason) {
   if (state.updateRequired) return;
-  if (!state.threadId) {
-    setWsStatus("closed", "No thread selected.");
-    return;
-  }
+  if (!state.appStarted) return;
   if (navigator.onLine === false) {
     setWsStatus("reconnecting", "Network is offline. Reconnect will resume when the network returns.");
     surfaceWsProblem("Network is offline. Reconnect will resume when the network returns.", "warning");
@@ -2960,10 +2961,7 @@ function scheduleWsReconnect(reason) {
 async function connectWs(opts) {
   opts = opts || {};
   if (state.updateRequired) return;
-  if (!state.threadId) {
-    setWsStatus("closed", "No thread selected.");
-    return;
-  }
+  if (!state.appStarted) return;
   clearWsReconnectTimer();
   clearWsProbeTimer();
   state.wsProbeToken++;
@@ -3027,6 +3025,7 @@ async function connectWs(opts) {
   ws.onopen = () => {
     if (state.ws !== ws) return;
     state.runtimeOverviewRevision = -1;
+    state.storageRevision = -1;
     // Both revisions number a server-side snapshot sequence, not a global clock: a restarted
     // server numbers from zero again, and holding the old high-water mark would make us discard
     // its first snapshot — and with it the running-task set the late-item reconciliation reads.
@@ -3037,6 +3036,7 @@ async function connectWs(opts) {
     markWsForegroundRecovered(ws);
     recordReconnectDiagnostic(ws, "ws_socket_open", { ready_state:wsReadyStateLabel(ws) });
     refreshKnownThreadLists();
+    if (!state.projectId || !state.threadId) return;
     // Incremental resync: if we already have persisted history rendered, ask only for the turns
     // after our newest one (`since`). The server replies with a HistoryDelta and we keep the
     // immutable completed-turn DOM. If a live snapshot follows, the stale live DOM stays visible
@@ -3271,12 +3271,12 @@ function send(obj) {
   return false;
 }
 function reconnectIfNeeded(reason) {
-  if (!state.threadId || wsIsOpen()) return;
+  if (!state.appStarted || wsIsOpen()) return;
   state.wsReconnectAttempt = 0;
   connectWs({ reconnect:true, reason });
 }
 function probeWsBeforeReconnect(reason) {
-  if (!state.threadId) return;
+  if (!state.appStarted) return;
   const ws = state.ws;
   if (!ws || ws.readyState !== WebSocket.OPEN) {
     reconnectIfNeeded(reason);
@@ -3347,7 +3347,7 @@ window.addEventListener("online", () => {
   probeWsBeforeReconnect("network online");
 });
 window.addEventListener("offline", () => {
-  if (!state.threadId || state.wsStatus === "closed") return;
+  if (!state.appStarted || state.wsStatus === "closed") return;
   clearWsReconnectTimer();
   clearWsProbeTimer();
   setWsStatus("reconnecting", "Network is offline. Reconnect will resume when the network returns.");
@@ -3415,6 +3415,10 @@ function handleServer(msg, ws) {
     return;
   }
   finishWsProbe(ws, "ws_probe_message");
+  if (msg && msg.type === "storage_status") {
+    handleStorageStatus(msg);
+    return;
+  }
   if (msg && msg.type === "thread_runtime_overview") {
     handleThreadRuntimeOverview(msg);
     return;
@@ -3486,6 +3490,59 @@ function handleServer(msg, ws) {
     recordReconnectDiagnostic(ws, "ws_resync_complete", {});
     metrics.resyncComplete = true;
   }
+}
+
+// Full replacement snapshots are revisioned within a server process, like runtime overviews.
+function handleStorageStatus(status) {
+  if (!Number.isSafeInteger(status.revision) || status.revision < state.storageRevision) return;
+  state.storageRevision = status.revision;
+  state.storageStatus = status;
+  const banner = $("storageBanner");
+  const expanded = banner.querySelector("details")?.open || false;
+  banner.replaceChildren();
+  const filesystems = status.enabled ? (status.filesystems || []) : [];
+  const affected = filesystems.filter(fs => fs.low || fs.error);
+  const issues = status.enabled ? (status.issues || []) : [];
+  banner.hidden = affected.length === 0 && issues.length === 0;
+  if (banner.hidden) return;
+  const summary = document.createElement("div");
+  const low = affected.filter(fs => fs.low);
+  const gib = bytes => `${(Number(bytes) / (1024 ** 3)).toFixed(1)} GiB`;
+  summary.textContent = low.length === 1
+    ? `Low disk space: ${low[0].available_bytes === null ? "last reading unavailable" : gib(low[0].available_bytes) + " available"}. Warning threshold: ${gib(low[0].minimum_available_bytes)}.`
+    : low.length > 1 ? `Low disk space at ${low.length} locations.` : "";
+  if (issues.length || affected.some(fs => fs.error)) {
+    summary.textContent += `${summary.textContent ? " " : ""}Some locations could not be checked.`;
+  }
+  const details = document.createElement("details");
+  details.open = expanded;
+  const toggle = document.createElement("summary");
+  toggle.textContent = "Affected locations";
+  details.append(toggle);
+  for (const fs of affected) {
+    const entry = document.createElement("div");
+    entry.className = "storage-location";
+    const paths = document.createElement("div");
+    paths.className = "mono";
+    paths.textContent = (fs.paths || []).join(" · ");
+    const reading = document.createElement("div");
+    reading.textContent = fs.available_bytes === null ? "Capacity unavailable." :
+      `${gib(fs.available_bytes)} available; warning threshold ${gib(fs.minimum_available_bytes)}.${fs.error ? " Last successful reading." : ""}`;
+    entry.append(paths, reading);
+    if (fs.error) {
+      const error = document.createElement("div");
+      error.textContent = fs.error;
+      entry.append(error);
+    }
+    details.append(entry);
+  }
+  for (const issue of issues) {
+    const entry = document.createElement("div");
+    entry.className = "storage-location";
+    entry.textContent = `${issue.path}: ${issue.message}`;
+    details.append(entry);
+  }
+  banner.append(summary, details);
 }
 
 function handleThreadRuntimeOverview(overview) {

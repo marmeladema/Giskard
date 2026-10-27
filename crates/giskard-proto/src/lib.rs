@@ -345,6 +345,8 @@ pub struct ErrorInfo {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ServerMessage {
+    /// Global filesystem-capacity snapshot, independent of the selected project or thread.
+    StorageStatus(StorageStatus),
     Event {
         thread_id: ThreadId,
         agent_event: Box<WireAgentEvent>,
@@ -386,6 +388,34 @@ pub enum ServerMessage {
         error: ErrorInfo,
     },
     Pong,
+}
+
+/// Process-local replacement state. A new connection resets its revision baseline.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StorageStatus {
+    pub revision: u64,
+    pub checked_at: Option<DateTime<Utc>>,
+    pub enabled: bool,
+    pub filesystems: Vec<StorageFilesystem>,
+    pub issues: Vec<StorageIssue>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StorageFilesystem {
+    pub id: String,
+    pub paths: Vec<String>,
+    pub available_bytes: Option<u64>,
+    pub total_bytes: Option<u64>,
+    pub minimum_available_bytes: u64,
+    pub low: bool,
+    /// When set, capacity values are from the last successful sample, if any.
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StorageIssue {
+    pub path: String,
+    pub message: String,
 }
 
 // ---- HTTP API types ----

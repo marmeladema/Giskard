@@ -151,6 +151,19 @@ model, and permission messages require a `request_id`; the initiating browser re
 `ThreadMetadataResult` after commit, including for no-op changes, or an `Error` carrying that id.
 `TokenUpdate` no longer exists; thread totals use the revisioned metadata snapshot.
 
+`StorageStatus { revision, checked_at, enabled, filesystems, issues }` is an app-wide WebSocket
+replacement snapshot, delivered on connection and after storage checks. `revision` is process-local;
+clients reset their ordering baseline on reconnect and ignore older snapshots within a connection.
+Each entry in `filesystems` represents one independently monitored path, with an opaque path-based
+`id`, a single-element `paths` array, optional `available_bytes` and `total_bytes`,
+`minimum_available_bytes`, `low`, and optional `error`. Paths sharing a filesystem remain separate
+entries. `issues` carries any additional diagnostics with `path` and `message`. `checked_at` is
+`null` before the first check. Failed or timed-out sampling reports an entry error and retains any
+previous measurement and low-space state instead of implying recovery. Checks taking more than 10
+seconds become stale while checks of other paths continue; at most one check per path is
+outstanding. Empty warning state clears the global banner. Snapshots use a coalescing replacement lane, including bootstrap, so a
+slow socket cannot permanently lose the latest status. Storage monitoring adds no HTTP route.
+
 An internal `orphan` native thread is omitted from thread lists and returns not-found from detail,
 history, and browser mutation routes until authoritative relationship evidence classifies the same
 ID as a read-only sub-agent. It cannot be opened or imported as a primary. Model or mode fields may

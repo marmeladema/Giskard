@@ -5,7 +5,7 @@ use tokio::sync::{Notify, mpsc};
 use tracing::{debug, error};
 
 use giskard_core::ids::ThreadId;
-use giskard_proto::{ServerMessage, ThreadRuntimeOverview, ThreadState};
+use giskard_proto::{ServerMessage, StorageStatus, ThreadRuntimeOverview, ThreadState};
 
 use crate::hub::ClientId;
 
@@ -76,6 +76,14 @@ impl ClientDelivery {
         self.replacements.insert_runtime_overview(overview);
         true
     }
+
+    pub(crate) fn publish_storage_status(&self, status: StorageStatus) -> bool {
+        if self.ordered.is_closed() {
+            return false;
+        }
+        self.replacements.insert_storage_status(status);
+        true
+    }
 }
 
 impl ReplacementReceiver {
@@ -95,6 +103,7 @@ enum ReplacementKey {
     Thread(ThreadId),
     ThreadCatalog,
     RuntimeOverview,
+    Storage,
 }
 
 #[derive(Default)]
@@ -122,6 +131,31 @@ struct ReplacementMailbox {
 }
 
 impl ReplacementMailbox {
+    fn insert_storage_status(&self, status: StorageStatus) {
+        let key = ReplacementKey::Storage;
+        let mut pending = self.lock_pending();
+        if let Some(ServerMessage::StorageStatus(current)) = pending.messages.get(&key)
+            && current.revision > status.revision
+        {
+            debug!(
+                client_id = self.client_id,
+                pending_revision = current.revision,
+                ignored_revision = status.revision,
+                action = "coalesce_storage_status",
+                "ignoring an older pending storage snapshot"
+            );
+            return;
+        }
+        if !pending.messages.contains_key(&key) {
+            pending.order.push_back(key);
+        }
+        pending
+            .messages
+            .insert(key, ServerMessage::StorageStatus(status));
+        drop(pending);
+        self.changed.notify_one();
+    }
+
     fn new(client_id: ClientId) -> Self {
         Self {
             client_id,
@@ -275,6 +309,31 @@ mod tests {
     use tokio::time::{Duration, timeout};
 
     use super::*;
+
+    #[tokio::test]
+    async fn storage_replacement_ignores_older_bootstrap_and_bypasses_full_fifo() {
+        let (tx, mut rx) = mpsc::channel(1);
+        tx.send(ServerMessage::Pong).await.unwrap();
+        let (delivery, replacements) = ClientDelivery::new(1, tx);
+        let snapshot = |revision, enabled| StorageStatus {
+            revision,
+            enabled,
+            checked_at: None,
+            filesystems: vec![],
+            issues: vec![],
+        };
+        assert!(delivery.publish_storage_status(snapshot(5, true)));
+        assert!(delivery.publish_storage_status(snapshot(4, false)));
+        assert!(
+            matches!(replacements.try_recv(), Some(ServerMessage::StorageStatus(s)) if s.revision == 5 && s.enabled)
+        );
+        assert!(delivery.publish_storage_status(snapshot(6, false)));
+        assert!(
+            matches!(replacements.try_recv(), Some(ServerMessage::StorageStatus(s)) if s.revision == 6 && !s.enabled)
+        );
+        assert!(matches!(rx.try_recv(), Ok(ServerMessage::Pong)));
+        assert!(replacements.try_recv().is_none());
+    }
 
     fn thread_state(thread_id: ThreadId, revision: u64) -> ThreadState {
         ThreadState {

@@ -2084,7 +2084,8 @@ async fn wait_for_thread_activity(
                             };
                         }
                     }
-                    ServerMessage::ThreadState(_)
+                    ServerMessage::StorageStatus(_)
+                    | ServerMessage::ThreadState(_)
                     | ServerMessage::ThreadMetadataResult { .. }
                     | ServerMessage::ThreadCatalogChanged
                     | ServerMessage::Error { .. }
@@ -2972,7 +2973,8 @@ async fn inactive_thread_progress_sends_activity_without_full_event_subscription
                             saw_final_empty_runtime = true;
                         }
                     }
-                    ServerMessage::ThreadCatalogChanged
+                    ServerMessage::StorageStatus(_)
+                    | ServerMessage::ThreadCatalogChanged
                     | ServerMessage::ThreadMetadataResult { .. }
                     | ServerMessage::Error { .. }
                     | ServerMessage::Pong => {}

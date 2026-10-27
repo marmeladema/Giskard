@@ -261,6 +261,10 @@ async fn handle_ws(socket: WebSocket, state: AppState) {
     let (mut ws_sender, mut ws_receiver) = socket.split();
 
     let replacements = state.hub.register_client(client_id, tx.clone()).await;
+    state
+        .hub
+        .bootstrap_storage_status(client_id, state.storage_monitor.current())
+        .await;
     let (writer_done_tx, mut writer_done_rx) = oneshot::channel();
     let writer_shutdown = state.shutdown.clone();
 

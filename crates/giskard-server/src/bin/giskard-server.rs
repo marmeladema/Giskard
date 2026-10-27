@@ -441,7 +441,7 @@ async fn run(
     let catalog = harness_catalog(&startup.config)?;
     let factory = Arc::new(production_factory(catalog)?);
 
-    let state = AppState::new_with_config(
+    let mut state = AppState::new_with_config(
         startup.store,
         factory,
         session_key,
@@ -452,21 +452,33 @@ async fn run(
     let registry = state.registry.clone();
     let app_shutdown = state.shutdown.clone();
 
-    let app = build_app(state);
     let listener = tokio::net::TcpListener::bind(&bind)
         .await
         .map_err(|e| format!("cannot bind {bind}: {e}"))?;
+    let (monitor, monitor_task) = giskard_server::storage_monitor::StorageMonitor::spawn(
+        startup.data_dir,
+        startup.config.storage_monitor,
+        state.hub.clone(),
+        app_shutdown.clone(),
+    );
+    state.storage_monitor = monitor;
+    let app = build_app(state);
     info!(bind = %bind, "listening");
-    common::shutdown::serve_then_shutdown_registry(
+    let result = common::shutdown::serve_then_shutdown_registry(
         listener,
         app,
-        app_shutdown,
+        app_shutdown.clone(),
         shutdown,
         HTTP_GRACEFUL_SHUTDOWN_TIMEOUT,
         "giskard-server",
         &registry,
     )
-    .await
+    .await;
+    app_shutdown.trigger();
+    if let Err(error) = monitor_task.await {
+        error!(action = "join_storage_monitor", %error, "storage monitor task failed during shutdown");
+    }
+    result
 }
 
 #[cfg(test)]

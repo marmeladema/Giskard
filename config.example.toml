@@ -26,6 +26,17 @@ secure_cookies = false
 enabled = false
 path = "logs/giskard-server.log"
 
+# Optional in full: existing configs automatically monitor the data-directory filesystem.
+[storage_monitor]
+enabled = true
+check_interval_seconds = 60
+minimum_available_gib = 10
+# Add absolute paths to monitor independently, even when they share a filesystem. Omitted
+# thresholds inherit minimum_available_gib above; each entry affects only its own warning.
+# [[storage_monitor.additional_filesystems]]
+# path = "/mnt/builds"
+# minimum_available_gib = 30
+
 [auth]
 # Argon2 hash of the single shared app password (never the plaintext). Generate via
 # `giskard-admin set-password`. May instead be provided via the GISKARD_PASSWORD_HASH env var.

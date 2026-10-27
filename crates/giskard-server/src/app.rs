@@ -56,6 +56,8 @@ pub struct AppState {
     pub login_throttle: Arc<LoginThrottle>,
     /// Process-shutdown notification for long-lived upgraded connections.
     pub shutdown: AppShutdown,
+    /// Global filesystem-capacity projection; no project or thread identities are owned here.
+    pub storage_monitor: crate::storage_monitor::StorageMonitor,
 }
 
 impl AppState {
@@ -114,6 +116,7 @@ impl AppState {
             session_key: session_key.into(),
             login_throttle: Arc::new(LoginThrottle::new()),
             shutdown: AppShutdown::default(),
+            storage_monitor: crate::storage_monitor::StorageMonitor::default(),
         }
     }
 }

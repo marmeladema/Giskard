@@ -16,6 +16,7 @@ pub struct Config {
     pub viz: VizConfig,
     pub history: HistoryConfig,
     pub retention: RetentionConfig,
+    pub storage_monitor: StorageMonitorConfig,
     /// Declared providers, keyed by routing id — the same shape Codex uses for
     /// `[model_providers.<id>]`. An `IndexMap` rather than a `HashMap` because the declaration
     /// order is the model picker's order (§8.3): a hashed order would reshuffle the picker on
@@ -272,6 +273,89 @@ impl Default for FileLoggingConfig {
             path: "logs/giskard-server.log".into(),
         }
     }
+}
+
+/// Filesystem-capacity monitoring. Omitted sections enable monitoring with these defaults.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct StorageMonitorConfig {
+    pub enabled: bool,
+    #[serde(deserialize_with = "deserialize_monitor_interval")]
+    pub check_interval_seconds: u64,
+    #[serde(deserialize_with = "deserialize_available_gib")]
+    pub minimum_available_gib: u64,
+    pub additional_filesystems: Vec<MonitoredFilesystemConfig>,
+}
+
+impl Default for StorageMonitorConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            check_interval_seconds: 60,
+            minimum_available_gib: 10,
+            additional_filesystems: Vec::new(),
+        }
+    }
+}
+
+/// An absolute representative path on a filesystem, with an optional threshold override.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MonitoredFilesystemConfig {
+    #[serde(deserialize_with = "deserialize_monitor_path")]
+    pub path: std::path::PathBuf,
+    #[serde(default, deserialize_with = "deserialize_optional_available_gib")]
+    pub minimum_available_gib: Option<u64>,
+}
+
+fn validate_available_gib<E: serde::de::Error>(value: u64) -> Result<u64, E> {
+    if value == 0 || value.checked_mul(1_u64 << 30).is_none() {
+        return Err(E::custom(
+            "minimum_available_gib must be positive and fit in bytes (u64)",
+        ));
+    }
+    Ok(value)
+}
+
+fn deserialize_available_gib<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<u64, D::Error> {
+    validate_available_gib(u64::deserialize(deserializer)?)
+}
+
+fn deserialize_optional_available_gib<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<u64>, D::Error> {
+    Option::<u64>::deserialize(deserializer)?
+        .map(validate_available_gib)
+        .transpose()
+}
+
+fn deserialize_monitor_interval<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<u64, D::Error> {
+    let value = u64::deserialize(deserializer)?;
+    if value == 0
+        || std::time::Instant::now()
+            .checked_add(std::time::Duration::from_secs(value))
+            .is_none()
+    {
+        return Err(serde::de::Error::custom(
+            "check_interval_seconds must be positive and fit a monotonic deadline",
+        ));
+    }
+    Ok(value)
+}
+
+fn deserialize_monitor_path<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<std::path::PathBuf, D::Error> {
+    let path = std::path::PathBuf::deserialize(deserializer)?;
+    if !path.is_absolute() {
+        return Err(serde::de::Error::custom(
+            "storage monitor path must be absolute",
+        ));
+    }
+    Ok(path)
 }
 
 /// Retention limits for agent-produced content (spec Appendix C).
@@ -893,5 +977,66 @@ roots = []
         assert!(!debug.contains("/very/secret/home"), "{debug}");
         let declaration_debug = format!("{:?}", config.harnesses["x"]);
         assert!(!declaration_debug.contains("/very/secret/home"));
+    }
+}
+
+#[cfg(test)]
+mod storage_monitor_tests {
+    use super::Config;
+
+    #[test]
+    fn old_configs_and_partial_sections_enable_default_monitoring() {
+        for text in ["", "[storage_monitor]", "[storage_monitor]\nenabled = true"] {
+            let config: Config = toml::from_str(text).unwrap();
+            assert!(config.storage_monitor.enabled);
+            assert_eq!(config.storage_monitor.check_interval_seconds, 60);
+            assert_eq!(config.storage_monitor.minimum_available_gib, 10);
+            assert!(config.storage_monitor.additional_filesystems.is_empty());
+        }
+    }
+
+    #[test]
+    fn explicit_paths_can_inherit_or_override_thresholds() {
+        let config: Config = toml::from_str(
+            r#"
+[storage_monitor]
+enabled = false
+check_interval_seconds = 5
+minimum_available_gib = 20
+[[storage_monitor.additional_filesystems]]
+path = "/mnt/builds"
+[[storage_monitor.additional_filesystems]]
+path = "/mnt/small"
+minimum_available_gib = 2
+"#,
+        )
+        .unwrap();
+        assert!(!config.storage_monitor.enabled);
+        assert_eq!(config.storage_monitor.check_interval_seconds, 5);
+        assert_eq!(config.storage_monitor.minimum_available_gib, 20);
+        assert_eq!(
+            config.storage_monitor.additional_filesystems[0].minimum_available_gib,
+            None
+        );
+        assert_eq!(
+            config.storage_monitor.additional_filesystems[1].minimum_available_gib,
+            Some(2)
+        );
+    }
+
+    #[test]
+    fn invalid_thresholds_intervals_and_paths_fail_deserialization() {
+        for text in [
+            "[storage_monitor]\nminimum_available_gib = 0",
+            "[storage_monitor]\nminimum_available_gib = 17179869184",
+            "[storage_monitor]\ncheck_interval_seconds = 0",
+            "[storage_monitor]\ncheck_interval_seconds = 9223372036854775807",
+            "[[storage_monitor.additional_filesystems]]\npath = 'relative'",
+            "[[storage_monitor.additional_filesystems]]\npath = ''",
+            "[[storage_monitor.additional_filesystems]]\npath = '/mnt'\nminimum_available_gib = 0",
+            "[[storage_monitor.additional_filesystems]]\npath = '/mnt'\nminimum_available_gib = 17179869184",
+        ] {
+            assert!(toml::from_str::<Config>(text).is_err(), "accepted {text}");
+        }
     }
 }

@@ -9,8 +9,8 @@ use giskard_core::event::AgentEvent;
 use giskard_core::ids::{ProjectId, ThreadId};
 use giskard_core::user_input::UserInput;
 use giskard_proto::{
-    ErrorInfo, RunningTask, ServerMessage, ThreadRuntimeOverview, ThreadState, WireAgentEvent,
-    WireCommandOutput, WireItem,
+    ErrorInfo, RunningTask, ServerMessage, StorageStatus, ThreadRuntimeOverview, ThreadState,
+    WireAgentEvent, WireCommandOutput, WireItem,
 };
 
 use crate::delivery::{ClientDelivery, DeliverySendError, ReplacementReceiver};
@@ -60,6 +60,28 @@ pub struct Hub {
 }
 
 impl Hub {
+    /// The caller registers first, then snapshots the monitor. Revisions fence a bootstrap
+    /// racing with a live publication both here and in the browser.
+    pub(crate) async fn bootstrap_storage_status(
+        &self,
+        client_id: ClientId,
+        status: StorageStatus,
+    ) {
+        if let Some(delivery) = self.clients.lock().await.get(&client_id) {
+            delivery.publish_storage_status(status);
+        }
+    }
+
+    pub async fn publish_storage_status(&self, status: StorageStatus) {
+        self.clients.lock().await.retain(|client_id, delivery| {
+            let retained = delivery.publish_storage_status(status.clone());
+            if !retained {
+                warn!(%client_id, action = "publish_storage_status", "client outbound queue closed; removing global client");
+            }
+            retained
+        });
+    }
+
     pub fn new() -> Self {
         Self {
             clients: Mutex::new(HashMap::new()),
@@ -356,6 +378,7 @@ impl Default for Hub {
 
 fn server_message_kind(msg: &ServerMessage) -> &'static str {
     match msg {
+        ServerMessage::StorageStatus(_) => "storage_status",
         ServerMessage::Event { .. } => "event",
         ServerMessage::RequestState(_) => "request_state",
         ServerMessage::ThreadRuntimeOverview(_) => "thread_runtime_overview",

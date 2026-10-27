@@ -9,7 +9,32 @@
 
 **Document status:** Implementation-ready specification.
 **Audience:** An AI coding agent (and its human reviewer) implementing the system.
-**Version:** 1.104
+**Version:** 1.105
+
+> **Amendment — filesystem-capacity warnings (1.105).** A process-wide storage monitor samples
+> the data-directory filesystem at startup and every 60 seconds by default, warning below 10 GiB
+> available to an ordinary user. Existing configurations enable these defaults automatically.
+> Optional `[[storage_monitor.additional_filesystems]]` entries specify absolute representative
+> paths and optional per-path thresholds, inheriting the global threshold when omitted.
+> Follow symlinks and check every path independently, including paths sharing a filesystem.
+> The data-directory threshold remains the global threshold; each additional entry affects only
+> its own warning. Missing or inaccessible paths report an error rather than sampling an ancestor.
+> No harness startup or automatic harness/project path discovery is involved. This measures filesystem
+> capacity, not directory sizes or quotas. The monitor neither deletes files nor blocks work.
+>
+> One monitor task owns sampling and per-path low-space state. Blocking filesystem calls run
+> outside async runtime workers, with at most one outstanding check per configured path. After 10
+> seconds, a pending check reports an error and marks prior measurements stale; other paths continue
+> sampling on schedule. A blocked check gets no replacement worker and cannot delay server shutdown.
+> Enter low space strictly below the path threshold; clear at threshold plus 1 GiB. A failed check
+> retains its prior measurement and low state. Failures and low/recovery transitions produce
+> contextual logs. Shutdown stops the monitor.
+> Revisioned global `StorageStatus` replacement snapshots bootstrap each authenticated WebSocket
+> and update a persistent global banner, including when no project/thread is selected. Recovery
+> publishes a replacement that clears the warning. No browser notification or new HTTP route is
+> required. Configuration is startup-loaded, with positive, byte-representable GiB thresholds,
+> positive monotonic-deadline-representable intervals, and absolute additional paths validated
+> during deserialization.
 
 > **Amendment — a resumed Claude Code sub-agent (1.104).** Claude Code can run a sub-agent again
 > after its first run ended: when the model sends it a message with `SendMessage`, or when the
@@ -611,7 +636,17 @@
   `pending → responding → resolved`, or back to `pending` on harness failure. Each transition
   increments the request's process-local revision; revision-gated `RequestState` replacement
   messages keep tabs aligned and preserve simultaneous requests independently.
-- **RT3:** `ThreadRuntimeOverview { revision, threads }` replaces additive `ThreadActivity` state.
+- **RT3:** `StorageStatus { revision, checked_at, enabled, filesystems, issues }` is a global replacement
+snapshot from the process-wide storage monitor. Each entry in `filesystems` represents one
+independently monitored path, even when paths share a filesystem. It carries an opaque path-based
+`id`, a single-element `paths` array, optional `available_bytes`/`total_bytes`,
+`minimum_available_bytes`, `low`, and optional `error`. Failed or timed-out checks retain prior
+measurements and low state with an entry error. Issues carry `path` and `message`. `checked_at` is
+`null` before an initial check. The browser
+resets revision ordering on reconnect and ignores older snapshots within a connection. Bootstrap
+and live updates share the replacement lane, preventing stale bootstrap from replacing newer state.
+
+`ThreadRuntimeOverview { revision, threads }` replaces additive `ThreadActivity` state.
   It is sent to every connection, including when `threads` is empty, so stale badges are cleared.
   Notifications remain transition side effects and are not the state authority.
 - **RT4:** `RunningTasks` carries its own process-local `revision` and owns only the Tasks menu and
@@ -4095,6 +4130,7 @@ than claiming that the current transitional stores already provide those clocks.
 | Requests | thread-owned runtime component | request state transition | ordered + runtime replacement |
 | Cross-thread runtime overview | root runtime overview projection | process-local overview revision | revisioned replacement |
 | Direct action result | action handler | domain identity | direct control response |
+| Filesystem capacity | process-wide storage monitor | process-local storage revision | global revisioned replacement |
 | Background notice | notice authority | notice identity/revision | revisioned replacement |
 
 The turn items route (LP3) is the first HTTP read of the Active transcript authority. It needs no
@@ -4687,6 +4723,15 @@ secure_cookies = true          # set false only for local plain-HTTP dev
 # prune old daily files; deployments may apply external retention.
 enabled = false
 path = "logs/giskard-server.log"
+
+[storage_monitor]
+# Optional section; defaults also apply to existing configs with no section.
+enabled = true
+check_interval_seconds = 60
+minimum_available_gib = 10
+# [[storage_monitor.additional_filesystems]]
+# path = "/mnt/builds"          # absolute; missing paths are unavailable, not ancestor estimates
+# minimum_available_gib = 30    # omitted: inherit global threshold
 
 [auth]
 # generate with: giskard-admin set-password

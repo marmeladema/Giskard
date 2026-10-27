@@ -274,6 +274,10 @@ service does not silently run with an empty provider list.
 | | `secure_cookies` | `true` | `Secure` flag on the session cookie. **Set `false` for plain-HTTP local dev.** |
 | `[logging.file]` | `enabled` | `false` | Write the console-filtered events to daily rolling files as well. |
 | | `path` | `logs/giskard-server.log` | Absolute rolling filename prefix, or one relative to `GISKARD_DATA_DIR`. |
+| `[storage_monitor]` | `enabled` | `true` | Monitor available capacity on the data-directory filesystem. |
+| | `check_interval_seconds` | `60` | Sampling interval in seconds; must be positive and fit a monotonic deadline. |
+| | `minimum_available_gib` | `10` | Warn below this available capacity, in GiB (1,073,741,824 bytes); must be positive and fit in `u64` bytes. |
+| `[[storage_monitor.additional_filesystems]]` | `path` / `minimum_available_gib` | no entries / inherited threshold | Absolute paths to monitor independently, each with an optional threshold. |
 | `[auth]` | `password_hash` | — | Argon2 hash of the shared password (or env `GISKARD_PASSWORD_HASH`). Generate with `giskard-admin set-password`. |
 | | `session_days` | `30` | Session lifetime, sliding: requests in the second half of the window re-issue the cookie for a full window. |
 | `[browse]` | `roots` | `[]` (whole FS) | Confine the filesystem picker **and project creation** to these absolute subtrees (see [Security](#security)). |
@@ -291,6 +295,29 @@ service does not silently run with an empty provider list.
 | | `profile` | Codex's own | **Codex only.** Passed as `-c profile=<name>`. Any other Codex key is a startup error. |
 | | `idle_shutdown_secs` | `600` | **Claude Code only.** Seconds a thread's `claude` process may sit idle (no turn, no pending approval or question, no running sub-agent or background command) before it is stopped; the thread stays open and its next message resumes the session. `0` keeps every process until its thread is archived, deleted or the server stops. Any other kind-specific key is a startup error. |
 | `[providers.<id>]` | `model_listing`, `[[providers.<id>.models]]` | — | **Optional.** Models are found without it: every provider Codex has a `base_url` for is discovered from `GET {base_url}/models` with the key Codex holds for it, and the provider Codex routes to also contributes its `model/list` catalog. A built-in Codex has no endpoint for and does not route to — `ollama` or `lmstudio` when you use neither — has nothing to contribute and is not offered; declare models for it if you want it in the picker. Declare a provider only to turn discovery off (`model_listing = false`), to add models by hand for an endpoint with no `/models` route, to override metadata, or to pin picker order — declared providers come first in the order written, the rest by id. Keyed by routing id, the same way Codex keys `[model_providers.<id>]`; the id must name a provider Codex knows (see below). |
+
+Storage monitoring is enabled for existing configurations without any edits. It checks at startup
+and every 60 seconds by default, measuring capacity available to an ordinary user rather than
+scanning directory sizes. To cover another drive, add an entry:
+
+```toml
+[[storage_monitor.additional_filesystems]]
+path = "/mnt/builds"
+minimum_available_gib = 30
+```
+
+Each configured path is checked independently, even when paths share a filesystem. The global
+threshold applies to the data directory; an additional entry uses its own threshold or inherits the
+global value when omitted. Thresholds are read at startup. Low space produces a persistent app-wide
+banner and server log; recovery clears it after available capacity reaches the threshold plus 1 GiB.
+Failed checks remain visible and do not clear an existing warning. A check taking more than 10
+seconds is reported as unavailable, with any previous reading marked stale, while other paths
+continue updating. Only one check per path can be outstanding; a blocked check never causes
+replacement workers to accumulate or delay server shutdown. Missing paths are reported as
+unavailable rather than falling back to their parent filesystem. Monitoring does not start a
+harness, discover project or harness paths, block work, or delete files. Configure other drives
+explicitly; filesystem capacity does not fully represent per-user/directory quotas or independently
+limited subvolumes. Set `[storage_monitor].enabled = false` to disable it.
 
 Harness declarations are read once at startup and validated before the server listens: a blank
 name (`[harnesses.""]`), an unknown `kind`, two `default = true` entries, a blank `command` or
