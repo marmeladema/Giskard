@@ -172,11 +172,6 @@ async fn ws_ticket_is_not_a_session_and_vice_versa() {
         .json::<serde_json::Value>()
         .await
         .unwrap();
-    assert!(
-        ticket_response["ui_version"]
-            .as_str()
-            .is_some_and(|version| !version.is_empty())
-    );
     let ticket: String = ticket_response["ticket"].as_str().unwrap().to_string();
 
     // A ticket presented as a session cookie must not authenticate API requests.

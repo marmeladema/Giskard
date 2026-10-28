@@ -403,7 +403,39 @@ pub struct LoginResponse {
 #[derive(Debug, Clone, Serialize)]
 pub struct WsTicketResponse {
     pub ticket: String,
+}
+
+/// `GET /api/status`: process-wide health. The browser reads it on a timer, before it opens a
+/// WebSocket, and before it creates a thread from a draft. It carries no project or thread state.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AppStatus {
+    /// Content identity of the server's embedded JavaScript. A tab whose page carries a different
+    /// identity predates a server upgrade and must reload before it talks to the server again.
     pub ui_version: String,
+    pub disk_usage: DiskUsage,
+}
+
+/// The disk usage monitor's latest projection. `checked_at` is `None` until the first sample.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DiskUsage {
+    pub enabled: bool,
+    /// The monitor's sampling interval, which is also the browser's polling cadence.
+    pub check_interval_seconds: u64,
+    pub checked_at: Option<DateTime<Utc>>,
+    /// One entry per configured path, in configuration order (the data directory first). Paths
+    /// that share a filesystem stay separate entries with their own thresholds.
+    pub paths: Vec<DiskUsagePath>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DiskUsagePath {
+    pub path: String,
+    pub available_bytes: Option<u64>,
+    pub total_bytes: Option<u64>,
+    pub min_available_bytes: u64,
+    pub low: bool,
+    /// When set, the capacity fields and `low` are from the last successful sample, if any.
+    pub error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]

@@ -40,6 +40,7 @@ regex = { workspace = true }
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls"] }
 pulldown-cmark = { version = "0.13.4", default-features = false }
 indexmap = { workspace = true }
+rustix = { version = "1", features = ["fs"] }
 
 [build-dependencies]
 sha2 = { workspace = true }

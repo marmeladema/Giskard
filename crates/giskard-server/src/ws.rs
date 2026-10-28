@@ -31,7 +31,7 @@ use crate::hub::Outbound;
 use crate::log_fields::display_opt;
 use crate::registry::SteerTurnError;
 use crate::routes::{
-    ApiError, ReadOnlyProviderContext, UI_VERSION, history_limit_or_default, load_thread,
+    ApiError, ReadOnlyProviderContext, history_limit_or_default, load_thread,
     normalize_persisted_thread_model, project_model_catalog, provider_is_known, read_only_info,
     thread_workspace, validate_user_attachments, warning_info,
 };
@@ -49,10 +49,7 @@ pub(crate) async fn ws_ticket(
     let expiry = (Utc::now().timestamp() as u64) + 60;
     let ticket = sign_token(TokenPurpose::WsTicket, expiry, &state.session_key)
         .map_err(|e| ApiError::Internal(format!("failed to sign websocket ticket: {e}")))?;
-    Ok(Json(WsTicketResponse {
-        ticket,
-        ui_version: UI_VERSION.to_owned(),
-    }))
+    Ok(Json(WsTicketResponse { ticket }))
 }
 
 #[derive(Deserialize)]

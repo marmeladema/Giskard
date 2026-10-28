@@ -61,7 +61,8 @@ async fn index_page_is_served_and_public() {
         "app fetches a WS auth ticket"
     );
     assert!(
-        body.contains("ticketResponse.ui_version")
+        body.contains("/api/status")
+            && body.contains("appStatus.ui_version")
             && body.contains("serverVersion !== browserVersion")
             && body.contains("requireUiReload(browserVersion, serverVersion);")
             && body.find("serverVersion !== browserVersion") < body.find("new WebSocket("),
@@ -1113,7 +1114,7 @@ async fn index_page_is_served_and_public() {
             && body.contains("!hasThreadSurface || (!ready && !draft)")
             && body.contains("if (isDraftThread()) {")
             && body.contains("startDraftThread(text, attachments);")
-            && body.contains("const ticketResponse = await api(\"GET\", \"/api/ws-ticket\")")
+            && body.contains("const { appStatus, sequence } = await fetchAppStatus();")
             && body.contains("state.draftThread !== draft"),
         "UI allows draft first sends without a WebSocket, blocks existing-thread sends until open, \
          rejects stale draft sends, and blocks sends on read-only threads"

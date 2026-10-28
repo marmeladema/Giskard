@@ -9,7 +9,39 @@
 
 **Document status:** Implementation-ready specification.
 **Audience:** An AI coding agent (and its human reviewer) implementing the system.
-**Version:** 1.104
+**Version:** 1.105
+
+> **Amendment — disk usage warnings and the status route (1.105).** A process-wide disk usage
+> monitor (`[disk_usage]`) samples the data-directory filesystem at startup and every 60 seconds
+> by default, warning below 10 GiB available to an ordinary user. Existing configurations enable
+> these defaults automatically. Optional `[disk_usage.paths."<path>"]` tables, keyed by absolute
+> representative path as `[harnesses.<name>]` is keyed by name, carry an optional per-path
+> threshold, inheriting the global threshold when omitted. Follow symlinks and check every path independently, including paths
+> sharing a filesystem. The data-directory threshold remains the global threshold; each
+> additional entry affects only its own warning. Missing or inaccessible paths report an error
+> rather than sampling an ancestor. No harness startup or automatic harness/project path discovery
+> is involved. This measures filesystem capacity, not directory sizes or quotas. The monitor
+> neither deletes files nor blocks work.
+>
+> One monitor task owns sampling and per-path low-space state. Blocking filesystem calls run
+> outside async runtime workers, with at most one outstanding check per configured path. After 10
+> seconds, a pending check reports an error and marks prior measurements stale; other paths continue
+> sampling on schedule. A blocked check gets no replacement worker and cannot delay server shutdown.
+> Enter low space strictly below the path threshold; clear at threshold plus 1 GiB. A failed check
+> retains its prior measurement and low state. Failures and low/recovery transitions produce
+> contextual logs. Shutdown stops the monitor.
+>
+> The monitor is read, never pushed: `GET /api/status` (see `docs/api-endpoints.md`) returns the
+> process-wide health — the UI version identity and the disk usage snapshot with its sampling
+> interval — and the browser polls it on that interval from login onward, with no thread open and
+> no WebSocket. The same read is the version gate before every WebSocket open and before a draft
+> creates a thread, so `GET /api/ws-ticket` carries only the ticket. A low or unreadable path
+> shows a persistent app-wide banner that the next poll clears on recovery. A failed poll keeps
+> the last banner and keeps polling. Disk usage is not an entity authority and adds no
+> WebSocket message.
+> Configuration is startup-loaded, with positive, byte-representable GiB thresholds, positive
+> monotonic-deadline-representable intervals, and absolute additional paths validated during
+> deserialization.
 
 > **Amendment — a resumed Claude Code sub-agent (1.104).** Claude Code can run a sub-agent again
 > after its first run ended: when the model sends it a message with `SendMessage`, or when the
@@ -4687,6 +4719,14 @@ secure_cookies = true          # set false only for local plain-HTTP dev
 # prune old daily files; deployments may apply external retention.
 enabled = false
 path = "logs/giskard-server.log"
+
+[disk_usage]
+# Optional section; defaults also apply to existing configs with no section.
+enabled = true
+check_interval_seconds = 60
+min_available_gib = 10
+# [disk_usage.paths."/mnt/builds"]   # absolute; a missing path is unavailable, not an ancestor estimate
+# min_available_gib = 30            # omitted: inherit global threshold
 
 [auth]
 # generate with: giskard-admin set-password

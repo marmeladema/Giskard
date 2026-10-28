@@ -16,6 +16,7 @@ pub struct Config {
     pub viz: VizConfig,
     pub history: HistoryConfig,
     pub retention: RetentionConfig,
+    pub disk_usage: DiskUsageConfig,
     /// Declared providers, keyed by routing id — the same shape Codex uses for
     /// `[model_providers.<id>]`. An `IndexMap` rather than a `HashMap` because the declaration
     /// order is the model picker's order (§8.3): a hashed order would reshuffle the picker on
@@ -272,6 +273,95 @@ impl Default for FileLoggingConfig {
             path: "logs/giskard-server.log".into(),
         }
     }
+}
+
+/// Filesystem-capacity monitoring. Omitted sections enable monitoring with these defaults. Unknown
+/// keys are rejected: a misspelled threshold would otherwise silently fall back to the default.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct DiskUsageConfig {
+    pub enabled: bool,
+    #[serde(deserialize_with = "deserialize_check_interval")]
+    pub check_interval_seconds: u64,
+    #[serde(deserialize_with = "deserialize_available_gib")]
+    pub min_available_gib: u64,
+    /// Extra paths to watch, keyed by the path itself (`[disk_usage.paths."/mnt/builds"]`), the
+    /// same shape as `[harnesses.<name>]`: a path is an identity, so a duplicate is a parse
+    /// error rather than a second threshold. An `IndexMap` keeps declaration order, which is the
+    /// order the status route reports them in.
+    #[serde(deserialize_with = "deserialize_disk_usage_paths")]
+    pub paths: IndexMap<std::path::PathBuf, DiskUsagePathConfig>,
+}
+
+impl Default for DiskUsageConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            check_interval_seconds: 60,
+            min_available_gib: 10,
+            paths: IndexMap::new(),
+        }
+    }
+}
+
+/// Per-path settings; an empty table inherits the global threshold. Unknown keys are rejected so
+/// a stray `path = ...` (the path is the table key) fails at startup instead of being ignored.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct DiskUsagePathConfig {
+    #[serde(deserialize_with = "deserialize_optional_available_gib")]
+    pub min_available_gib: Option<u64>,
+}
+
+fn validate_available_gib<E: serde::de::Error>(value: u64) -> Result<u64, E> {
+    if value == 0 || value.checked_mul(1_u64 << 30).is_none() {
+        return Err(E::custom(
+            "min_available_gib must be positive and fit in bytes (u64)",
+        ));
+    }
+    Ok(value)
+}
+
+fn deserialize_available_gib<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<u64, D::Error> {
+    validate_available_gib(u64::deserialize(deserializer)?)
+}
+
+fn deserialize_optional_available_gib<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<u64>, D::Error> {
+    Option::<u64>::deserialize(deserializer)?
+        .map(validate_available_gib)
+        .transpose()
+}
+
+fn deserialize_check_interval<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<u64, D::Error> {
+    let value = u64::deserialize(deserializer)?;
+    if value == 0
+        || std::time::Instant::now()
+            .checked_add(std::time::Duration::from_secs(value))
+            .is_none()
+    {
+        return Err(serde::de::Error::custom(
+            "check_interval_seconds must be positive and fit a monotonic deadline",
+        ));
+    }
+    Ok(value)
+}
+
+fn deserialize_disk_usage_paths<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<IndexMap<std::path::PathBuf, DiskUsagePathConfig>, D::Error> {
+    let paths = IndexMap::<std::path::PathBuf, DiskUsagePathConfig>::deserialize(deserializer)?;
+    if let Some(path) = paths.keys().find(|path| !path.is_absolute()) {
+        return Err(serde::de::Error::custom(format!(
+            "disk usage path {path:?} must be absolute"
+        )));
+    }
+    Ok(paths)
 }
 
 /// Retention limits for agent-produced content (spec Appendix C).
@@ -893,5 +983,85 @@ roots = []
         assert!(!debug.contains("/very/secret/home"), "{debug}");
         let declaration_debug = format!("{:?}", config.harnesses["x"]);
         assert!(!declaration_debug.contains("/very/secret/home"));
+    }
+}
+
+#[cfg(test)]
+mod disk_usage_tests {
+    use super::Config;
+
+    #[test]
+    fn old_configs_and_partial_sections_enable_default_monitoring() {
+        for text in ["", "[disk_usage]", "[disk_usage]\nenabled = true"] {
+            let config: Config = toml::from_str(text).unwrap();
+            assert!(config.disk_usage.enabled);
+            assert_eq!(config.disk_usage.check_interval_seconds, 60);
+            assert_eq!(config.disk_usage.min_available_gib, 10);
+            assert!(config.disk_usage.paths.is_empty());
+        }
+    }
+
+    #[test]
+    fn explicit_paths_can_inherit_or_override_thresholds_in_declaration_order() {
+        let config: Config = toml::from_str(
+            r#"
+[disk_usage]
+enabled = false
+check_interval_seconds = 5
+min_available_gib = 20
+[disk_usage.paths."/mnt/small"]
+min_available_gib = 2
+[disk_usage.paths."/mnt/builds"]
+"#,
+        )
+        .unwrap();
+        assert!(!config.disk_usage.enabled);
+        assert_eq!(config.disk_usage.check_interval_seconds, 5);
+        assert_eq!(config.disk_usage.min_available_gib, 20);
+        let paths: Vec<_> = config
+            .disk_usage
+            .paths
+            .iter()
+            .map(|(path, entry)| (path.to_str().unwrap(), entry.min_available_gib))
+            .collect();
+        assert_eq!(paths, [("/mnt/small", Some(2)), ("/mnt/builds", None)]);
+
+        let inline: Config = toml::from_str(
+            r#"
+[disk_usage]
+paths = { "/mnt/builds" = { min_available_gib = 30 }, "/mnt/scratch" = {} }
+"#,
+        )
+        .unwrap();
+        assert_eq!(inline.disk_usage.paths.len(), 2);
+        assert_eq!(
+            inline.disk_usage.paths[std::path::Path::new("/mnt/builds")].min_available_gib,
+            Some(30)
+        );
+    }
+
+    #[test]
+    fn a_path_declared_twice_is_rejected() {
+        let text =
+            "[disk_usage.paths.\"/mnt\"]\nmin_available_gib = 2\n[disk_usage.paths.\"/mnt\"]\n";
+        assert!(toml::from_str::<Config>(text).is_err());
+    }
+
+    #[test]
+    fn invalid_thresholds_intervals_and_paths_fail_deserialization() {
+        for text in [
+            "[disk_usage]\nmin_available_gib = 0",
+            "[disk_usage]\nmin_available_gib = 17179869184",
+            "[disk_usage]\ncheck_interval_seconds = 0",
+            "[disk_usage]\ncheck_interval_seconds = 9223372036854775807",
+            "[disk_usage]\nmin_avail_gib = 5",
+            "[disk_usage.paths.relative]",
+            "[disk_usage.paths.\"\"]",
+            "[disk_usage.paths.\"/mnt\"]\nmin_available_gib = 0",
+            "[disk_usage.paths.\"/mnt\"]\nmin_available_gib = 17179869184",
+            "[disk_usage.paths.\"/mnt\"]\npath = \"/mnt\"",
+        ] {
+            assert!(toml::from_str::<Config>(text).is_err(), "accepted {text}");
+        }
     }
 }
