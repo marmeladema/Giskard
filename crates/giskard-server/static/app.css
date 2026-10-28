@@ -1211,3 +1211,8 @@
   @media (max-width:480px) {
     .git-line .git-sync { display:none; }
   }
+
+  .disk-usage-banner { flex:0 0 auto; min-width:0; max-height:30vh; overflow:auto; margin:6px 12px; padding:8px 12px; border:1px solid #d29922; border-radius:8px; background:var(--panel); color:var(--fg); font-size:13px; overflow-wrap:anywhere; }
+  .disk-usage-banner[hidden] { display:none; }
+  .disk-usage-banner summary { cursor:pointer; }
+  .disk-usage-path { margin-top:8px; min-width:0; }

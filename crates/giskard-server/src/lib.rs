@@ -1,6 +1,7 @@
 pub mod app;
 pub mod auth;
 mod delivery;
+pub mod disk_usage;
 pub mod harness_kinds;
 pub mod headers;
 pub mod highlight;

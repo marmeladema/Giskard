@@ -1,9 +1,9 @@
 # HTTP / WebSocket API
 
 The browser (and any client) drives everything through a small REST surface plus one multiplexed
-WebSocket. Highlights: `POST /api/login`, `POST /api/logout`, `GET /api/ws-ticket`, `GET /api/ws`,
-`GET/POST /api/projects`, `GET /api/harnesses`, `GET/DELETE /api/projects/{id}`, `GET/POST
-/api/projects/{id}/threads`, `POST /api/projects/{id}/threads/start`, `DELETE
+WebSocket. Highlights: `POST /api/login`, `POST /api/logout`, `GET /api/status`,
+`GET /api/ws-ticket`, `GET /api/ws`, `GET/POST /api/projects`, `GET /api/harnesses`,
+`GET/DELETE /api/projects/{id}`, `GET/POST /api/projects/{id}/threads`, `POST /api/projects/{id}/threads/start`, `DELETE
 /api/projects/{id}/threads/{thread_id}`, `POST
 /api/projects/{id}/threads/{parent_thread_id}/subagent-links/{item_id}/open`, `PATCH
 /api/projects/{id}/threads/{thread_id}/title`,
@@ -52,11 +52,25 @@ harness cannot report them, which is the case for Claude Code, whose stdio host 
 resource listing; an empty array means the harness reported none. Codex reports both, and
 `connection` from its `runtimeStatus`.
 
-`GET /api/ws-ticket` returns the short-lived `ticket` and `ui_version`, the content identity of the
-server's embedded JavaScript. The browser compares `ui_version` with the identity embedded in its
-loaded page before opening or reopening a WebSocket. A mismatch means the tab predates a server
-upgrade, so it stops reconnecting and asks the user to reload before version-sensitive messages can
-reach stale JavaScript.
+`GET /api/status` returns process-wide health: `ui_version`, the content identity of the server's
+embedded JavaScript, and `disk_usage`, the disk usage monitor's latest projection. The browser compares
+`ui_version` with the identity embedded in its loaded page before opening or reopening a WebSocket
+and before a draft creates a thread. A mismatch means the tab predates a server upgrade, so it stops
+reconnecting and polling and asks the user to reload before version-sensitive messages can reach
+stale JavaScript. `disk_usage { enabled, check_interval_seconds, checked_at, paths }` lists one
+entry per configured path in configuration order, the data directory first, each with `path`,
+optional `available_bytes` and `total_bytes`, `min_available_bytes`, `low`, and optional
+`error`. Paths sharing a filesystem remain separate entries. `checked_at` is `null` before the first
+check. A failed or timed-out sample sets the entry's `error` and keeps its previous measurement and
+`low` state instead of implying recovery; a check taking more than 10 seconds reports that way while
+other paths continue, and at most one check per path is outstanding. The route reads the monitor's
+projection and never samples the filesystem itself. The browser polls it every
+`check_interval_seconds` (capped at about 24 days, the browser timer limit) from login onward,
+without a thread or a WebSocket, whether or not monitoring is enabled, and shows an app-wide banner
+while any entry is low or unreadable. A failed poll keeps the last banner and the cadence. Disk
+usage is never sent over the WebSocket.
+
+`GET /api/ws-ticket` returns only the short-lived `ticket`.
 
 `POST /api/projects` takes a name, a directory, an optional `workspace_root`, and an optional
 `harness`: the name of a `[harnesses.<name>]` declaration in `config.toml`. Omitted, the project is

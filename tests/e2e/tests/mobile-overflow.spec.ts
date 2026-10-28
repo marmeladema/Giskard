@@ -84,6 +84,17 @@ for (const appearance of APPEARANCES) {
     test("no row runs off the right edge, reasoning expanded or collapsed", async ({ page }) => {
       await openThread(page);
       await expect(page.locator("html")).toHaveAttribute("data-appearance", appearance);
+      await page.evaluate(path => {
+        (window as unknown as { renderDiskUsageBanner: (storage: unknown) => void }).renderDiskUsageBanner({
+          enabled: true, check_interval_seconds: 60, checked_at: new Date().toISOString(),
+          paths: [{ path, available_bytes: 1024 ** 3,
+            total_bytes: 100 * 1024 ** 3, min_available_bytes: 10 * 1024 ** 3,
+            low: true, error: null }],
+        });
+      }, LONG_TOKEN);
+      await page.locator("#diskUsageBanner summary").click();
+      expect(await page.locator("#diskUsageBanner").evaluate(el => el.scrollWidth - el.clientWidth))
+        .toBeLessThanOrEqual(1);
 
       // The reasoning note is the newest row, so it renders expanded.
       await complete(page, "reasoning-overflow", { kind: "reasoning", text: REASONING_TEXT });

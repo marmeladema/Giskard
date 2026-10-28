@@ -184,6 +184,7 @@ pub fn protected_routes(state: AppState) -> Router<AppState> {
             "/api/projects/{id}/harnesses/{name}/mcp/oauth-login",
             post(start_mcp_oauth_login),
         )
+        .route("/api/status", get(app_status))
         .route("/api/tokens", get(global_tokens))
         .route("/api/projects/{id}/tokens", get(project_tokens))
         .route("/api/logout", post(logout))
@@ -212,7 +213,7 @@ pub fn public_routes() -> Router<AppState> {
 /// `-dirty` suffix for uncommitted builds) shown in the Settings panel, and content hashes of the
 /// two assets used as cache-busting path segments.
 const GIT_HASH: &str = env!("GISKARD_GIT_HASH");
-pub(crate) const UI_VERSION: &str = env!("GISKARD_JS_HASH");
+const UI_VERSION: &str = env!("GISKARD_JS_HASH");
 const APP_JS_PATH: &str = concat!("/app.", env!("GISKARD_JS_HASH"), ".js");
 const APP_CSS_PATH: &str = concat!("/app.", env!("GISKARD_CSS_HASH"), ".css");
 
@@ -4559,6 +4560,16 @@ fn harness_api_error(error: HarnessError) -> ApiError {
         HarnessError::Timeout(message) => ApiError::Unavailable(message),
         other => ApiError::Internal(other.to_string()),
     }
+}
+
+/// `GET /api/status` — process-wide health for the browser's status poll and its pre-connect
+/// version check. Reads the disk usage monitor's current projection; it never samples the filesystem
+/// itself.
+async fn app_status(State(state): State<AppState>) -> Json<AppStatus> {
+    Json(AppStatus {
+        ui_version: UI_VERSION.to_owned(),
+        disk_usage: state.disk_usage.current(),
+    })
 }
 
 /// `GET /api/tokens` — the global token dashboard (day/week/month/total, §10.2).

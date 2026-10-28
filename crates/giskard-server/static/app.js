@@ -167,7 +167,7 @@ let state = {
   partialTurn:null, loadingTurnItems:false,
   models:[], modelsProject:null, modelsLoadingProject:null, streamEl:null, streamItemId:null, pendingUserEl:null, pendingUserText:null,
   streamElsByItemId:new Map(), renderedItemIds:new Set(), renderedHarnessItemIds:new Set(), renderedItemBodyByKey:new Map(), itemKindsByItemId:new Map(),
-  pendingApprovals:new Map(), answeredApprovals:new Map(), answeredApprovalsById:new Map(), renderedApprovalStateKeys:new Set(), pendingServerRequests:new Map(), answeredServerRequests:new Set(), requestStates:new Map(), runtimeOverviewRevision:-1,
+  pendingApprovals:new Map(), answeredApprovals:new Map(), answeredApprovalsById:new Map(), renderedApprovalStateKeys:new Set(), pendingServerRequests:new Map(), answeredServerRequests:new Set(), requestStates:new Map(), runtimeOverviewRevision:-1, appStatus:null, appStatusTimer:null, appStatusPoll:0, appStatusSequence:0, appStatusApplied:0,
   runningCommands:new Map(), runningTasks:new Map(), runningTasksRevision:-1, lateItemWatch:new Map(), commandBodyElsByItemId:new Map(), commandMsgElsByItemId:new Map(), commandStopRequestedByItemId:new Set(), selectedCommandId:null, pendingTaskNavigation:null, pendingTaskOpen:null, taskIntentSeq:0, taskHistoryLoading:false, taskHistoryOwner:0,
   commandPayloadsByItemId:new Map(), endedCommandsByItemId:new Map(),
   toolPayloadsByItemId:new Map(), toolBodyElsByItemId:new Map(),
@@ -334,8 +334,130 @@ async function startApp() {
   initServiceWorkerNotifications();
   initNotificationSettings();
   renderModelSelect();
+  // Before the project list: a failed project load must not leave the page without its poll.
+  refreshAppStatus();
   await loadDeclaredHarnesses();
   await loadProjects();
+}
+
+/* ---------- app status: UI version + disk usage ---------- */
+
+// Process-wide health lives behind `GET /api/status`, not the thread socket: the disk usage warning
+// must show with no thread open, and a minute of staleness is fine for a disk-space warning. The
+// poll runs on the server's own sampling interval; every socket open and draft send also reads
+// it, so an open thread sees the latest sample as soon as it (re)connects.
+const APP_STATUS_DEFAULT_POLL_MS = 60000;
+// setTimeout treats a delay above 2^31-1 ms as zero, which would turn a very long configured
+// interval into a tight request loop.
+const APP_STATUS_MAX_POLL_MS = 2147483647;
+// A read that never settles would otherwise hold the poll loop open for the rest of the session.
+const APP_STATUS_REQUEST_TIMEOUT_MS = 15000;
+
+function clearAppStatusTimer() {
+  if (state.appStatusTimer) clearTimeout(state.appStatusTimer);
+  state.appStatusTimer = null;
+}
+
+// Every status read, from the poll, a socket open or a draft send, is numbered when it starts so
+// that `applyAppStatus` can refuse a response that overtook a newer one.
+function fetchAppStatus() {
+  const sequence = ++state.appStatusSequence;
+  return api("GET", "/api/status", undefined, { timeoutMs:APP_STATUS_REQUEST_TIMEOUT_MS })
+    .then(appStatus => ({ appStatus, sequence }));
+}
+
+// The one place the page decides whether its JavaScript may keep talking to this server. False
+// means the update banner is up and the caller must stop whatever it was about to do.
+function passesUiVersionGate(appStatus) {
+  const browserVersion = browserUiVersion();
+  const serverVersion = appStatus && typeof appStatus.ui_version === "string" ? appStatus.ui_version.trim() : "";
+  if (!browserVersion || serverVersion !== browserVersion) {
+    requireUiReload(browserVersion, serverVersion);
+    return false;
+  }
+  return true;
+}
+
+// Returns the status when the server answered with one the page may act on, else null. Only the
+// newest call re-arms the timer, so overlapping calls never leave two poll loops behind.
+async function refreshAppStatus(opts) {
+  opts = opts || {};
+  clearAppStatusTimer();
+  if (state.updateRequired) return null;
+  const poll = ++state.appStatusPoll;
+  let appStatus = null, sequence = 0;
+  try {
+    ({ appStatus, sequence } = await fetchAppStatus());
+  } catch (e) {
+    if (!opts.quiet) notice("Could not read the server status: " + e.message, "error");
+    recordBrowserDiagnostic("status", "app_status_failed", { error:e && e.message ? e.message : String(e) });
+  }
+  if (poll !== state.appStatusPoll || state.updateRequired) return null;
+  if (appStatus) {
+    if (!passesUiVersionGate(appStatus)) return null;
+    applyAppStatus(appStatus, sequence);
+  }
+  // Poll on the server's cadence whether or not monitoring is enabled (so a server restarted
+  // with monitoring turned on is noticed), and after a failed read too: a restarting server comes
+  // back on the same interval, and the last banner stays up meanwhile rather than flickering off.
+  const usage = (appStatus && appStatus.disk_usage) || (state.appStatus && state.appStatus.disk_usage) || null;
+  const seconds = usage && Number.isFinite(Number(usage.check_interval_seconds)) && Number(usage.check_interval_seconds) > 0
+    ? Number(usage.check_interval_seconds) * 1000 : APP_STATUS_DEFAULT_POLL_MS;
+  state.appStatusTimer = setTimeout(() => refreshAppStatus({ quiet:true }), Math.min(seconds, APP_STATUS_MAX_POLL_MS));
+  return appStatus;
+}
+
+function applyAppStatus(appStatus, sequence) {
+  if (sequence < state.appStatusApplied) return;
+  state.appStatusApplied = sequence;
+  state.appStatus = appStatus;
+  renderDiskUsageBanner(appStatus && appStatus.disk_usage);
+}
+
+function renderDiskUsageBanner(usage) {
+  const banner = $("diskUsageBanner");
+  if (!banner) return;
+  const expanded = banner.querySelector("details")?.open || false;
+  // Re-rendering on every poll replaces the summary a keyboard user may be on.
+  const summaryHadFocus = banner.querySelector("summary") === document.activeElement;
+  banner.replaceChildren();
+  const paths = usage && usage.enabled ? (usage.paths || []) : [];
+  const affected = paths.filter(fs => fs.low || fs.error);
+  banner.hidden = affected.length === 0;
+  if (banner.hidden) return;
+  const summary = document.createElement("div");
+  const low = affected.filter(fs => fs.low);
+  const gib = bytes => `${(Number(bytes) / (1024 ** 3)).toFixed(1)} GiB`;
+  summary.textContent = low.length === 1
+    ? `Low disk space: ${low[0].available_bytes === null ? "last reading unavailable" : gib(low[0].available_bytes) + " available"}. Warning threshold: ${gib(low[0].min_available_bytes)}.`
+    : low.length > 1 ? `Low disk space at ${low.length} locations.` : "";
+  if (affected.some(fs => fs.error)) {
+    summary.textContent += `${summary.textContent ? " " : ""}Some locations could not be checked.`;
+  }
+  const details = document.createElement("details");
+  details.open = expanded;
+  const toggle = document.createElement("summary");
+  toggle.textContent = "Affected locations";
+  details.append(toggle);
+  for (const fs of affected) {
+    const entry = document.createElement("div");
+    entry.className = "disk-usage-path";
+    const path = document.createElement("div");
+    path.className = "mono";
+    path.textContent = fs.path || "";
+    const reading = document.createElement("div");
+    reading.textContent = fs.available_bytes === null ? "Capacity unavailable." :
+      `${gib(fs.available_bytes)} available; warning threshold ${gib(fs.min_available_bytes)}.${fs.error ? " Last successful reading." : ""}`;
+    entry.append(path, reading);
+    if (fs.error) {
+      const error = document.createElement("div");
+      error.textContent = fs.error;
+      entry.append(error);
+    }
+    details.append(entry);
+  }
+  banner.append(summary, details);
+  if (summaryHadFocus) toggle.focus({ preventScroll:true });
 }
 
 // The declared harnesses, learned once at start so a sidebar row can name its thread's harness
@@ -2993,30 +3115,32 @@ async function connectWs(opts) {
     firstMessageAtMs: 0
   };
   recordBrowserDiagnostic("websocket", "ws_connect_started", reconnectDiagnosticBase(reconnectMetrics));
-  let ticketResponse;
+  // The status read is the version gate: a tab that predates a server upgrade must not open a
+  // socket, because version-sensitive messages would reach stale JavaScript. It also refreshes
+  // the disk usage banner, so a reconnect never shows a reading older than the socket. The ticket
+  // does not depend on it, so both go out together and cost one round trip.
+  let appStatus, sequence, ticketResponse;
+  // Each request names itself on its rejection so the diagnostic says which one failed.
+  const named = (request, promise) => promise.catch(e => { throw Object.assign(e instanceof Error ? e : new Error(String(e)), { giskardRequest:request }); });
   try {
-    ticketResponse = await api("GET","/api/ws-ticket");
+    [{ appStatus, sequence }, ticketResponse] = await Promise.all([named("status", fetchAppStatus()), named("ticket", api("GET","/api/ws-ticket"))]);
   } catch (e) {
     if (connectId !== state.wsConnectId) return;
-    recordBrowserDiagnostic("websocket", "ws_ticket_failed", {
+    const statusFailed = e && e.giskardRequest === "status";
+    recordBrowserDiagnostic("websocket", statusFailed ? "ws_status_failed" : "ws_ticket_failed", {
       ...reconnectDiagnosticBase(reconnectMetrics),
       error:e && e.message ? e.message : String(e)
     });
-    const message = "WebSocket authorization failed: "+e.message;
+    const message = (statusFailed ? "Server status check failed: " : "WebSocket authorization failed: ")+e.message;
     setWsStatus("reconnecting", message);
     surfaceWsProblem(message, "error");
     scheduleWsReconnect(message);
     return;
   }
-  if (connectId !== state.wsConnectId) return;
-  const browserVersion = browserUiVersion();
-  const serverVersion = ticketResponse && typeof ticketResponse.ui_version === "string"
-    ? ticketResponse.ui_version.trim()
-    : "";
-  if (!browserVersion || serverVersion !== browserVersion) {
-    requireUiReload(browserVersion, serverVersion);
-    return;
-  }
+  // A poll that ran while these were in flight may already have demanded a reload.
+  if (connectId !== state.wsConnectId || state.updateRequired) return;
+  if (!passesUiVersionGate(appStatus)) return;
+  applyAppStatus(appStatus, sequence);
   const ticket = ticketResponse.ticket;
   recordBrowserDiagnostic("websocket", "ws_ticket_received", reconnectDiagnosticBase(reconnectMetrics));
   const ws = new WebSocket(`${proto}://${location.host}/api/ws?ticket=${encodeURIComponent(ticket)}`);
@@ -3110,6 +3234,7 @@ function requireUiReload(browserVersion, serverVersion) {
   state.updateRequired = true;
   clearWsReconnectTimer();
   clearWsProbeTimer();
+  clearAppStatusTimer();
   state.wsProbeToken++;
   setWsStatus("closed", "Giskard was updated. Reload before reconnecting.");
   const banner = $("updateBanner");
@@ -10675,15 +10800,9 @@ async function startDraftThread(text, attachments) {
   state.uiVersionCheckPending = true;
   renderPendingAttachments();
   try {
-    const ticketResponse = await api("GET", "/api/ws-ticket");
-    const browserVersion = browserUiVersion();
-    const serverVersion = ticketResponse && typeof ticketResponse.ui_version === "string"
-      ? ticketResponse.ui_version.trim()
-      : "";
-    if (!browserVersion || serverVersion !== browserVersion) {
-      requireUiReload(browserVersion, serverVersion);
-      return;
-    }
+    const { appStatus, sequence } = await fetchAppStatus();
+    if (state.updateRequired || !passesUiVersionGate(appStatus)) return;
+    applyAppStatus(appStatus, sequence);
   } catch (e) {
     notice("Could not verify the Giskard UI version: " + e.message, "error");
     return;

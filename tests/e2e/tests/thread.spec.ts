@@ -6,6 +6,9 @@ import {
   recordedNotices,
 } from "./helpers";
 
+/** What `GET /api/status` reports for disk usage on the replay server (no monitor is running). */
+const DISABLED_DISK_USAGE = { enabled: false, check_interval_seconds: 60, checked_at: null, paths: [] };
+
 test.describe("projects and threads", () => {
   test.beforeEach(async ({ page }) => {
     await login(page);
@@ -56,7 +59,7 @@ test.describe("projects and threads", () => {
   });
 
   test("stale UI stops before websocket reconnect and preserves its text draft", async ({ page }) => {
-    let ticketReads = 0;
+    let statusReads = 0;
     const sockets: string[] = [];
     page.on("websocket", socket => sockets.push(socket.url()));
     const project = page.locator(".proj", { hasText: "Demo" });
@@ -68,12 +71,12 @@ test.describe("projects and threads", () => {
 
     const draft = "Keep this draft across the required reload.";
     await page.locator("#input").fill(draft);
-    await page.route("**/api/ws-ticket", async route => {
-      ticketReads++;
+    await page.route("**/api/status", async route => {
+      statusReads++;
       await route.fulfill({
         status: 200,
         contentType: "application/json",
-        body: JSON.stringify({ ticket: "unused", ui_version: "stale-ui-version" }),
+        body: JSON.stringify({ ui_version: "stale-ui-version", disk_usage: DISABLED_DISK_USAGE }),
       });
     });
 
@@ -86,7 +89,7 @@ test.describe("projects and threads", () => {
     await expect(page.locator("#sendBtn")).toBeDisabled();
     await expect(page.locator("#attachBtn")).toBeDisabled();
     expect(sockets).toHaveLength(initialSocketCount);
-    expect(ticketReads).toBe(1);
+    expect(statusReads).toBe(1);
 
     const stalePaste = await page.locator("#input").evaluate((element) => {
       const transfer = new DataTransfer();
@@ -104,10 +107,10 @@ test.describe("projects and threads", () => {
 
     await page.evaluate(() => window.dispatchEvent(new Event("online")));
     await page.waitForTimeout(100);
-    expect(ticketReads).toBe(1);
+    expect(statusReads).toBe(1);
     await expect(page.locator("#updateBanner")).toBeVisible();
 
-    await page.unroute("**/api/ws-ticket");
+    await page.unroute("**/api/status");
     await page.locator("#reloadUpdateBtn").click();
     await expect(page.locator("#wsStatusBadge")).toHaveText("Connected");
     await expect(page.locator("#input")).toHaveValue(draft);
@@ -125,11 +128,11 @@ test.describe("projects and threads", () => {
       startRequests++;
       await route.continue();
     });
-    await page.route("**/api/ws-ticket", async route => {
+    await page.route("**/api/status", async route => {
       await route.fulfill({
         status: 200,
         contentType: "application/json",
-        body: JSON.stringify({ ticket: "unused", ui_version: "stale-ui-version" }),
+        body: JSON.stringify({ ui_version: "stale-ui-version", disk_usage: DISABLED_DISK_USAGE }),
       });
     });
 
@@ -139,7 +142,7 @@ test.describe("projects and threads", () => {
     await expect(page.locator("#input")).toHaveValue(draft);
     expect(startRequests).toBe(0);
 
-    await page.unroute("**/api/ws-ticket");
+    await page.unroute("**/api/status");
     await page.locator("#reloadUpdateBtn").click();
     await expect(page.locator("#input")).toHaveValue(draft);
   });
@@ -149,18 +152,18 @@ test.describe("projects and threads", () => {
     await project.locator(".project-add").click();
     await page.locator("#input").fill("Initial draft");
 
-    let releaseTicket: (() => void) | null = null;
-    let ticketObserved: (() => void) | null = null;
-    const ticketStarted = new Promise<void>(resolve => { ticketObserved = resolve; });
-    let ticketReads = 0;
-    await page.route("**/api/ws-ticket", async route => {
-      ticketReads++;
-      if (ticketReads > 1) {
+    let releaseStatus: (() => void) | null = null;
+    let statusObserved: (() => void) | null = null;
+    const statusStarted = new Promise<void>(resolve => { statusObserved = resolve; });
+    let statusReads = 0;
+    await page.route("**/api/status", async route => {
+      statusReads++;
+      if (statusReads > 1) {
         await route.continue();
         return;
       }
-      ticketObserved?.();
-      await new Promise<void>(resolve => { releaseTicket = resolve; });
+      statusObserved?.();
+      await new Promise<void>(resolve => { releaseStatus = resolve; });
       await route.continue();
     });
     let submittedText = "";
@@ -170,11 +173,11 @@ test.describe("projects and threads", () => {
     });
 
     await page.locator("#sendBtn").click();
-    await ticketStarted;
+    await statusStarted;
     await expect(page.locator("#attachBtn")).toBeDisabled();
     await page.locator("#input").fill("Edited while checking the UI version");
-    if (!releaseTicket) throw new Error("ticket request was not intercepted");
-    releaseTicket();
+    if (!releaseStatus) throw new Error("ticket request was not intercepted");
+    releaseStatus();
 
     await expect(page.locator("#transcript .msg.agent", { hasText: SCRIPTED_REPLY })).toBeVisible();
     expect(submittedText).toBe("Edited while checking the UI version");
