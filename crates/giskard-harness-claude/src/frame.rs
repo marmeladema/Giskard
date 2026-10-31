@@ -42,7 +42,7 @@ pub enum Frame {
     User(Box<UserMessage>),
     Stream(StreamEvent),
     Result(Box<ResultMessage>),
-    RateLimit(RateLimitEvent),
+    RateLimit(Box<RateLimitEvent>),
     /// The top-level `{type: "autocompact_state", value: {...}}` frame `claude-codes` cannot type.
     AutocompactState {
         effective_window: u64,
@@ -130,7 +130,9 @@ impl Frame {
             "assistant" => typed(value, "assistant", None).map(|m| Frame::Assistant(Box::new(m))),
             "user" => typed(value, "user", None).map(|m| Frame::User(Box::new(m))),
             "result" => typed(value, "result", None).map(|m| Frame::Result(Box::new(m))),
-            "rate_limit_event" => typed(value, "rate_limit_event", None).map(Frame::RateLimit),
+            "rate_limit_event" => {
+                typed(value, "rate_limit_event", None).map(|m| Frame::RateLimit(Box::new(m)))
+            }
             "stream_event" => StreamEvent::parse(value).map(Frame::Stream),
             "autocompact_state" => Self::parse_autocompact_state(&value),
             "control_request" => Self::parse_control_request(value),
