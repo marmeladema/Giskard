@@ -611,3 +611,571 @@ async fn prune_forgets_a_worktree_whose_directory_was_deleted() {
         "a worktree whose directory is gone must not stay listed"
     );
 }
+
+/// A repository that ignores the usual local files, with them present in the checkout, and a
+/// `.worktreeinclude` naming some of them.
+fn repo_with_local_files(tmp: &TempDir, include: &str) -> std::path::PathBuf {
+    let repo = repo_with_commit(tmp);
+    std::fs::write(
+        repo.join(".gitignore"),
+        ".env\n*.log\ntarget/\nlocal/\nsecrets/\n",
+    )
+    .unwrap();
+    git::run(&repo, &["add", ".gitignore"]);
+    git::run(&repo, &["commit", "-qm", "ignore local files"]);
+    for (file, content) in [
+        (".env", "TOKEN=1\n"),
+        ("local/sub/dev.toml", "port = 1\n"),
+        ("pkg/debug.log", "log\n"),
+        ("pkg/.env", "NESTED=1\n"),
+        ("target/debug/build", "artifact\n"),
+        ("secrets/key.pem", "key\n"),
+        ("scratch.txt", "work in progress\n"),
+    ] {
+        let path = repo.join(file);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, content).unwrap();
+    }
+    if !include.is_empty() {
+        std::fs::write(repo.join(worktree::WORKTREE_INCLUDE_FILE), include).unwrap();
+    }
+    repo
+}
+
+/// The include file selects among *ignored* files, by `.gitignore` rules: a bare name matches at
+/// any depth, a directory pattern takes everything under it, `**/` reaches into subdirectories and
+/// `!` takes a match back. An ignored file it does not name stays behind, and so does an untracked
+/// file that is not ignored even when the include file names it — that is work in progress, not
+/// local configuration.
+#[tokio::test]
+async fn create_copies_the_ignored_files_the_include_file_names() {
+    let tmp = TempDir::new().unwrap();
+    let repo = repo_with_local_files(&tmp, ".env\n!pkg/.env\nlocal/\n**/*.log\nscratch.txt\n");
+    let path = tmp.path().join("wt");
+
+    worktree::create(&repo, &path, "giskard/worktree-01seed")
+        .await
+        .expect("create worktree");
+
+    assert_eq!(
+        std::fs::read_to_string(path.join(".env")).unwrap(),
+        "TOKEN=1\n"
+    );
+    assert!(path.join("local/sub/dev.toml").is_file());
+    assert!(path.join("pkg/debug.log").is_file());
+    assert!(!path.join("pkg/.env").exists(), "`!` takes the match back");
+    assert!(
+        !path.join("target").exists(),
+        "an ignored file not named stays behind"
+    );
+    assert!(
+        !path.join("secrets").exists(),
+        "an ignored file not named stays behind"
+    );
+    assert!(
+        !path.join("scratch.txt").exists(),
+        "an untracked file that is not ignored is never copied"
+    );
+    // Copied files are ignored in the worktree just as in the checkout, so seeding leaves the
+    // thread's Git status row clean.
+    assert_eq!(stdout(&git::run(&path, &["status", "--porcelain"])), "");
+}
+
+#[tokio::test]
+async fn without_an_include_file_no_ignored_file_comes_across() {
+    let tmp = TempDir::new().unwrap();
+    let repo = repo_with_local_files(&tmp, "");
+    let path = tmp.path().join("wt");
+
+    worktree::create(&repo, &path, "giskard/worktree-01noseed")
+        .await
+        .expect("create worktree");
+
+    for absent in [".env", "local", "pkg", "target", "secrets", "scratch.txt"] {
+        assert!(!path.join(absent).exists(), "{absent} came across");
+    }
+}
+
+/// `ls-files -z` prints names verbatim, so a path with a space or a newline in it is copied to the
+/// same name rather than to a quoted or split one.
+#[tokio::test]
+async fn an_included_path_with_a_space_or_a_newline_is_copied_verbatim() {
+    let tmp = TempDir::new().unwrap();
+    let repo = repo_with_local_files(&tmp, "local/\n");
+    std::fs::write(repo.join("local/dev config.toml"), "a\n").unwrap();
+    std::fs::write(repo.join("local/odd\nname"), "b\n").unwrap();
+    let path = tmp.path().join("wt");
+
+    worktree::create(&repo, &path, "giskard/worktree-01spaces")
+        .await
+        .expect("create worktree");
+
+    assert!(path.join("local/dev config.toml").is_file());
+    assert!(path.join("local/odd\nname").is_file());
+}
+
+/// A file the checkout has stopped tracking can still be in the commit the worktree starts from.
+/// The committed content wins: seeding adds files the checkout cannot have, and never replaces
+/// one it does.
+#[tokio::test]
+async fn an_included_file_never_overwrites_committed_content() {
+    let tmp = TempDir::new().unwrap();
+    let repo = repo_with_local_files(&tmp, ".env\n");
+    std::fs::write(repo.join(".env"), "COMMITTED=1\n").unwrap();
+    git::run(&repo, &["add", "-f", ".env"]);
+    git::run(&repo, &["commit", "-qm", "commit a .env by mistake"]);
+    git::run(&repo, &["rm", "-q", "--cached", ".env"]);
+    std::fs::write(repo.join(".env"), "LOCAL=1\n").unwrap();
+    let path = tmp.path().join("wt");
+
+    worktree::create(&repo, &path, "giskard/worktree-01keep")
+        .await
+        .expect("create worktree");
+
+    assert_eq!(
+        std::fs::read_to_string(path.join(".env")).unwrap(),
+        "COMMITTED=1\n"
+    );
+}
+
+/// A symlink is copied as the link, not as what it points at — which may be anywhere on disk.
+/// The permission bits come across too, so a local script stays runnable.
+#[cfg(unix)]
+#[tokio::test]
+async fn an_included_symlink_stays_a_symlink_and_modes_are_kept() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let tmp = TempDir::new().unwrap();
+    let outside = tmp.path().join("outside.toml");
+    std::fs::write(&outside, "elsewhere\n").unwrap();
+    let repo = repo_with_local_files(&tmp, "local/\n");
+    std::os::unix::fs::symlink(&outside, repo.join("local/linked.toml")).unwrap();
+    let script = repo.join("local/run.sh");
+    std::fs::write(&script, "#!/bin/sh\n").unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let path = tmp.path().join("wt");
+
+    worktree::create(&repo, &path, "giskard/worktree-01links")
+        .await
+        .expect("create worktree");
+
+    let link = path.join("local/linked.toml");
+    assert!(link.symlink_metadata().unwrap().file_type().is_symlink());
+    assert_eq!(std::fs::read_link(&link).unwrap(), outside);
+    let mode = std::fs::metadata(path.join("local/run.sh"))
+        .unwrap()
+        .permissions()
+        .mode();
+    assert_eq!(mode & 0o111, 0o111, "the script lost its executable bits");
+}
+
+/// The include file belongs to the repository, like the checkout it fills: a project rooted in a
+/// subdirectory still reads it from the top level, and its paths stay relative to the top level.
+#[tokio::test]
+async fn a_project_in_a_subdirectory_reads_the_include_file_at_the_top_level() {
+    let tmp = TempDir::new().unwrap();
+    let repo = repo_with_local_files(&tmp, ".env\n");
+    let project = repo.join("packages/api");
+    std::fs::create_dir_all(&project).unwrap();
+    std::fs::write(project.join("service.rs"), "fn serve() {}\n").unwrap();
+    std::fs::write(project.join(".env"), "API=1\n").unwrap();
+    git::run(&repo, &["add", "packages"]);
+    git::run(&repo, &["commit", "-qm", "add the package"]);
+    let path = tmp.path().join("wt");
+
+    let wt = worktree::create(&project, &path, "giskard/worktree-01subseed")
+        .await
+        .expect("create worktree");
+
+    assert!(path.join(".env").is_file(), "the top level's .env");
+    assert_eq!(
+        std::fs::read_to_string(Path::new(wt.workspace_root()).join(".env")).unwrap(),
+        "API=1\n",
+        "and the package's own, beneath the workspace"
+    );
+}
+
+/// A file the project lists but the server cannot copy fails the creation, like every other
+/// failure after the checkout exists: a thread missing the file it was promised would fail later,
+/// further from the cause. Nothing is left behind.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_file_that_cannot_be_copied_fails_the_creation_and_rolls_it_back() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let tmp = TempDir::new().unwrap();
+    let repo = repo_with_local_files(&tmp, ".env\n");
+    let env = repo.join(".env");
+    std::fs::set_permissions(&env, std::fs::Permissions::from_mode(0o000)).unwrap();
+    if std::fs::read(&env).is_ok() {
+        // Running as root, which reads through any mode: there is no failure to provoke.
+        return;
+    }
+    let path = tmp.path().join("wt");
+    let branch = "giskard/worktree-01unreadable";
+
+    let error = worktree::create(&repo, &path, branch)
+        .await
+        .expect_err("an unreadable included file must fail the creation");
+
+    assert!(error.to_string().contains(".env"), "{error}");
+    assert!(!path.exists(), "the checkout survived the failed creation");
+    assert_eq!(stdout(&git::run(&repo, &["branch", "--list", branch])), "");
+}
+
+/// A Unix file name is bytes. One that is not UTF-8 is still a local file the project named, and is
+/// copied to exactly the same name.
+#[cfg(unix)]
+#[tokio::test]
+async fn an_included_path_that_is_not_utf8_is_copied_byte_for_byte() {
+    use std::os::unix::ffi::OsStrExt;
+
+    let tmp = TempDir::new().unwrap();
+    let repo = repo_with_local_files(&tmp, "local/\n");
+    let name = std::ffi::OsStr::from_bytes(b"caf\xe9.toml");
+    std::fs::write(repo.join("local").join(name), "latin-1\n").unwrap();
+    let path = tmp.path().join("wt");
+
+    worktree::create(&repo, &path, "giskard/worktree-01bytes")
+        .await
+        .expect("create worktree");
+
+    assert_eq!(
+        std::fs::read_to_string(path.join("local").join(name)).unwrap(),
+        "latin-1\n"
+    );
+}
+
+/// The directories seeding creates take their checkout's mode and timestamps, not the server's
+/// defaults: a `0700` secrets directory stays private. A directory with no write permission is the
+/// case that decides the order — its files have to be written before its mode is applied.
+#[cfg(unix)]
+#[tokio::test]
+async fn created_directories_and_files_keep_their_modes_and_times() {
+    use std::os::unix::fs::PermissionsExt;
+    use std::time::{Duration, SystemTime};
+
+    let tmp = TempDir::new().unwrap();
+    let repo = repo_with_local_files(&tmp, "secrets/\nlocal/\n");
+    let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o7777;
+    let set_mode = |path: &Path, mode: u32| {
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap()
+    };
+    let past = SystemTime::UNIX_EPOCH + Duration::from_secs(1_600_000_000);
+    let key = repo.join("secrets/key.pem");
+    std::fs::File::options()
+        .write(true)
+        .open(&key)
+        .unwrap()
+        .set_modified(past)
+        .unwrap();
+    set_mode(&key, 0o600);
+    set_mode(&repo.join("secrets"), 0o700);
+    // `local/sub` holds a file and has no write permission of its own.
+    set_mode(&repo.join("local/sub"), 0o555);
+    std::fs::File::open(repo.join("local/sub"))
+        .unwrap()
+        .set_modified(past)
+        .unwrap();
+    let path = tmp.path().join("wt");
+
+    let created = worktree::create(&repo, &path, "giskard/worktree-01modes").await;
+
+    // Restore before asserting, so the temporary directory can be cleaned up either way.
+    set_mode(&repo.join("local/sub"), 0o755);
+    if path.join("local/sub").exists() {
+        let copied_mode = mode(&path.join("local/sub"));
+        set_mode(&path.join("local/sub"), 0o755);
+        assert_eq!(copied_mode, 0o555, "the read-only directory's mode");
+    }
+    created.expect("a read-only directory in the checkout must not stop the copy");
+    assert!(path.join("local/sub/dev.toml").is_file());
+    assert_eq!(mode(&path.join("secrets")), 0o700);
+    assert_eq!(mode(&path.join("secrets/key.pem")), 0o600);
+    let modified = |path: &Path| std::fs::metadata(path).unwrap().modified().unwrap();
+    assert_eq!(modified(&path.join("secrets/key.pem")), past);
+    assert_eq!(
+        modified(&path.join("local/sub")),
+        past,
+        "a directory's time is set after its files are written into it"
+    );
+}
+
+/// A relative link that stays inside the repository means the same file in the worktree. One that
+/// climbs out of it would land somewhere else from the worktree's location, so it is rewritten to
+/// the absolute path it reaches from the checkout.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_relative_link_out_of_the_repository_is_made_absolute() {
+    let tmp = TempDir::new().unwrap();
+    let repo = repo_with_local_files(&tmp, "local/\n");
+    std::os::unix::fs::symlink("../../shared.env", repo.join("local/out.env")).unwrap();
+    std::os::unix::fs::symlink("sub/dev.toml", repo.join("local/in.toml")).unwrap();
+    let path = tmp.path().join("wt");
+
+    worktree::create(&repo, &path, "giskard/worktree-01rellinks")
+        .await
+        .expect("create worktree");
+
+    let toplevel = repo.canonicalize().unwrap();
+    assert_eq!(
+        std::fs::read_link(path.join("local/out.env")).unwrap(),
+        toplevel.parent().unwrap().join("shared.env")
+    );
+    assert_eq!(
+        std::fs::read_link(path.join("local/in.toml")).unwrap(),
+        Path::new("sub/dev.toml"),
+        "a link inside the repository is left relative"
+    );
+}
+
+/// `ls-files` reports a nested repository as a directory entry, not its files. It is someone else's
+/// checkout, and is skipped rather than copied or failed on.
+#[tokio::test]
+async fn a_nested_repository_the_include_file_matches_is_skipped() {
+    let tmp = TempDir::new().unwrap();
+    let repo = repo_with_local_files(&tmp, "local/\n");
+    let nested = repo.join("local/nested");
+    std::fs::create_dir_all(&nested).unwrap();
+    git::run(&nested, &["init", "-q", "-b", "main"]);
+    std::fs::write(nested.join("file"), "x\n").unwrap();
+    let path = tmp.path().join("wt");
+
+    worktree::create(&repo, &path, "giskard/worktree-01nested")
+        .await
+        .expect("a nested repository must not fail the creation");
+
+    assert!(path.join("local/sub/dev.toml").is_file());
+    assert!(!path.join("local/nested").exists());
+}
+
+/// The repository and file set both runs below were measured on, against Claude Code 2.1.316.
+const REACH_FILES: [&str; 13] = [
+    ".env",
+    "sub/.env",
+    "config/app.local.toml",
+    "target/.env",
+    "target/deep/.env",
+    "target/cfg/app.local.toml",
+    "target/keep/x.txt",
+    "target/notes.md",
+    "node_modules/pkg/.env",
+    "node_modules/pkg/app.local.toml",
+    "vendor/a/config.json",
+    "vendor/b/config.json",
+    "cache/all/of/it.bin",
+];
+
+/// Seed a worktree of the measured repository with `include`, and list what came across.
+async fn files_copied_with(include: &str, branch: &str) -> Vec<&'static str> {
+    let tmp = TempDir::new().unwrap();
+    let repo = tmp.path().join("project");
+    std::fs::create_dir_all(&repo).unwrap();
+    git::run(&repo, &["init", "-q", "-b", "main"]);
+    std::fs::write(
+        repo.join(".gitignore"),
+        "target/\nnode_modules/\nvendor/\ncache/\n.env\n*.local.toml\n",
+    )
+    .unwrap();
+    git::run(&repo, &["add", ".gitignore"]);
+    git::run(&repo, &["commit", "-qm", "initial"]);
+    for file in REACH_FILES {
+        let path = repo.join(file);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, file).unwrap();
+    }
+    std::fs::write(repo.join(worktree::WORKTREE_INCLUDE_FILE), include).unwrap();
+    let path = tmp.path().join("wt");
+    worktree::create(&repo, &path, branch)
+        .await
+        .expect("create worktree");
+    REACH_FILES
+        .into_iter()
+        .filter(|file| path.join(file).exists())
+        .collect()
+}
+
+/// Inside a directory the repository ignores as a whole, nothing is copied unless a pattern opens
+/// the directory — Claude Code's rule, and both expectations below are what Claude Code 2.1.316
+/// produced for the same repository and include file. A bare `.env` does not empty `target/` and
+/// `node_modules/` of their `.env` files, and `**/keep/x.txt` does not open `target/`, because
+/// `keep` is not a name in `target`'s path. `vendor/**/…` names the directory it goes into.
+#[tokio::test]
+async fn a_directory_ignored_as_a_whole_stays_closed_unless_a_pattern_opens_it() {
+    let copied = files_copied_with(
+        ".env\n*.local.toml\n**/keep/x.txt\nvendor/**/config.json\n",
+        "giskard/worktree-01closed",
+    )
+    .await;
+    assert_eq!(
+        copied,
+        vec![
+            ".env",
+            "sub/.env",
+            "config/app.local.toml",
+            "vendor/a/config.json",
+            "vendor/b/config.json",
+        ]
+    );
+}
+
+/// The decision is per directory. `**/target/notes.md` opens `target/` — `target` is a name in its
+/// path — and once it is open, every pattern applies inside it: the bare `.env` and
+/// `*.local.toml` now copy from `target/` too, and so does `**/keep/x.txt`. `cache/` matches the
+/// directory itself. `node_modules/` stays closed. Again Claude Code 2.1.316's own result.
+#[tokio::test]
+async fn a_pattern_that_opens_a_directory_lets_every_pattern_apply_inside_it() {
+    let copied = files_copied_with(
+        ".env\n*.local.toml\n**/keep/x.txt\nvendor/**/config.json\n**/target/notes.md\ncache/\n",
+        "giskard/worktree-01opened",
+    )
+    .await;
+    assert_eq!(
+        copied,
+        vec![
+            ".env",
+            "sub/.env",
+            "config/app.local.toml",
+            "target/.env",
+            "target/deep/.env",
+            "target/cfg/app.local.toml",
+            "target/keep/x.txt",
+            "target/notes.md",
+            "vendor/a/config.json",
+            "vendor/b/config.json",
+            "cache/all/of/it.bin",
+        ]
+    );
+}
+
+/// A path line opens the directory its literal text leads into, and a line leading somewhere else
+/// opens nothing. A trailing `**` is a way in as well.
+#[tokio::test]
+async fn a_path_line_opens_only_the_directory_it_leads_into() {
+    assert_eq!(
+        files_copied_with("vend*/a/config.json\n", "giskard/worktree-01glob").await,
+        vec!["vendor/a/config.json"]
+    );
+    assert_eq!(
+        files_copied_with("vendor/**\n", "giskard/worktree-01tail").await,
+        vec!["vendor/a/config.json", "vendor/b/config.json"]
+    );
+    assert!(
+        files_copied_with("elsewhere/a/config.json\n", "giskard/worktree-01away")
+            .await
+            .is_empty()
+    );
+}
+
+/// `check-ignore` reads its input as pathspecs, so a file named like pathspec magic must reach it
+/// as a plain path: one such name would otherwise fail the whole batch, and the thread's start.
+#[tokio::test]
+async fn a_file_named_like_pathspec_magic_is_copied() {
+    let tmp = TempDir::new().unwrap();
+    let repo = repo_with_local_files(&tmp, "*.log\n");
+    let names = [
+        ":!weird.log",
+        ":(x)y.log",
+        ":plain.log",
+        "a*b.log",
+        "q?z.log",
+    ];
+    for name in names {
+        std::fs::write(repo.join(name), name).unwrap();
+    }
+    std::fs::create_dir_all(repo.join(":dir")).unwrap();
+    std::fs::write(repo.join(":dir/f.log"), "f").unwrap();
+    let path = tmp.path().join("wt");
+
+    worktree::create(&repo, &path, "giskard/worktree-01magic")
+        .await
+        .expect("a file's name must not fail the creation");
+
+    for name in names {
+        assert!(path.join(name).is_file(), "{name} did not come across");
+    }
+    assert!(path.join(":dir/f.log").is_file());
+}
+
+/// Each row is one repository run through Claude Code (2.1.316 or 2.1.317) with `claude -p
+/// --worktree`, and what it copied: which lines open a directory the repository ignores as a whole.
+/// Claude Code documents only part of this, so the measurements are the specification.
+#[tokio::test]
+async fn which_lines_open_a_directory_matches_claude_code() {
+    const VENDOR: &[&str] = &["vendor/a/config.json"];
+    const WITH_ENV: &[&str] = &["vendor/a/config.json", "vendor/.env"];
+    const NESTED: &[&str] = &["x/vendor/a/config.json"];
+    #[rustfmt::skip]
+    let rows: &[(&str, &str, &[&str], &[&str])] = &[
+        // A first name opens by the literal text before any wildcard, and not without any.
+        ("vendor/\n", "**/vendor/a/config.json\n", VENDOR, VENDOR),
+        ("vendor/\n", "**/vend*/a/config.json\n", VENDOR, VENDOR),
+        ("vendor/\n", "**/v*/a/config.json\n", VENDOR, VENDOR),
+        ("vendor/\n", "**/vend?r/a/config.json\n", VENDOR, VENDOR),
+        ("vendor/\n", "**/vendor*/a/config.json\n", VENDOR, VENDOR),
+        ("vendor/\n", "**/*/a/config.json\n", VENDOR, &[]),
+        ("vendor/\n", "**/*dor/a/config.json\n", VENDOR, &[]),
+        ("vendor/\n", "**/*end*/a/config.json\n", VENDOR, &[]),
+        ("vendor/\n", "**/?endor/a/config.json\n", VENDOR, &[]),
+        ("vendor/\n", "**/[v]endor/a/config.json\n", VENDOR, &[]),
+        ("vendor/\n", "**/*/config.json\n", VENDOR, &[]),
+        ("vendor/\n", "**/config.json\n", VENDOR, &[]),
+        // So does a path, and a leading wildcard opens nothing there either.
+        ("vendor/\n", "vend*/a/config.json\n", VENDOR, VENDOR),
+        ("vendor/\n", "*/a/config.json\n", VENDOR, &[]),
+        // Only the literal text counts. These open `vendor`, which `.env` shows, without the line
+        // itself selecting anything there.
+        ("vendor/\n.env\n", "**/v*x/a/config.json\n.env\n", WITH_ENV, &["vendor/.env"]),
+        ("vendor/\n.env\n", "v*x/a/config.json\n.env\n", WITH_ENV, &["vendor/.env"]),
+        ("vendor/\n.env\n", "vendor/nope/missing\n.env\n", WITH_ENV, &["vendor/.env"]),
+        ("vendor/\n.env\n", "w*/a/config.json\n.env\n", WITH_ENV, &[]),
+        // A directory further down, where its parent is not ignored.
+        ("x/vendor/\n", "x/*/a/config.json\n", NESTED, NESTED),
+        ("x/vendor/\n", "x/v*/a/config.json\n", NESTED, NESTED),
+        ("x/vendor/\n", "x/**/config.json\n", NESTED, NESTED),
+        ("x/vendor/\n", "*/vendor/a/config.json\n", NESTED, &[]),
+        ("x/vendor/\n", "**/x/*/a/config.json\n", NESTED, NESTED),
+        ("x/vendor/\n", "**/vendor/a/config.json\n", NESTED, NESTED),
+        ("x/vendor/\n", "**/x/config.json\n", NESTED, &[]),
+        // A directory whose contents are ignored is not itself ignored, so it was never closed.
+        ("logs/*\n", ".env\n", &["logs/.env"], &["logs/.env"]),
+        ("star/**\n", ".env\n", &["star/.env"], &["star/.env"]),
+        // A negation still takes back what an open directory would have given.
+        (
+            "vendor/\n",
+            "vendor/**/config.json\n!vendor/b/config.json\n",
+            &["vendor/a/config.json", "vendor/b/config.json"],
+            &["vendor/a/config.json"],
+        ),
+    ];
+    for (gitignore, include, files, expected) in rows {
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path().join("project");
+        std::fs::create_dir_all(&repo).unwrap();
+        git::run(&repo, &["init", "-q", "-b", "main"]);
+        std::fs::write(repo.join(".gitignore"), gitignore).unwrap();
+        git::run(&repo, &["add", ".gitignore"]);
+        git::run(&repo, &["commit", "-qm", "initial"]);
+        for file in *files {
+            let path = repo.join(file);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, file).unwrap();
+        }
+        std::fs::write(repo.join(worktree::WORKTREE_INCLUDE_FILE), include).unwrap();
+        let path = tmp.path().join("wt");
+
+        worktree::create(&repo, &path, "giskard/worktree-01row")
+            .await
+            .expect("create worktree");
+
+        let copied: Vec<&str> = files
+            .iter()
+            .copied()
+            .filter(|file| path.join(file).exists())
+            .collect();
+        assert_eq!(
+            &copied, expected,
+            "gitignore {gitignore:?}, include {include:?}"
+        );
+    }
+}

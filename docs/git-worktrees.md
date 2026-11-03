@@ -75,7 +75,9 @@ worktree is still a working link rather than plain text.
 
 ## What does not come across
 
-A new worktree is `HEAD`, exactly. Nothing else follows it:
+A new worktree is `HEAD`, exactly — plus, if the repository has one, the ignored files its
+`.worktreeinclude` names (see [Local files the project names](#local-files-the-project-names)).
+Nothing else follows it:
 
 (A repository with no commits yet is supported and is the one case with no `HEAD` to start from:
 Git puts the worktree on an orphan branch, and the checkout is simply empty. Everything below still
@@ -87,16 +89,86 @@ holds — nothing comes across, because there is nothing committed to come acros
 | tracked file, edited but not committed | present **as committed** — your edit is not there |
 | tracked file, staged but not committed | present as committed — the staged version is not there |
 | untracked file (a scratch script, a fixture) | absent |
-| ignored file (`.env`, `node_modules/`, `target/`, `.venv/`) | absent |
+| ignored file (`.env`, `node_modules/`, `target/`, `.venv/`) | absent — unless `.worktreeinclude` names it |
 
 The toggle says so at the point of decision: with uncommitted work in the project, the hint reads
 *"Starts from the last commit, on a branch of its own. Your 3 uncommitted changes stay in the
 project's checkout."* If the agent needs an edit you have not committed, commit it — or stash and
 re-apply it in the worktree — before starting the thread.
 
+### Local files the project names
+
+Some ignored files are not build output but what the project needs in order to run at all: a
+`.env`, a `config.local.toml`, a development certificate. A fresh checkout cannot have them, since
+they are not committed. A repository can list them in a **`.worktreeinclude`** file at its top
+level, and Giskard copies them into every worktree it creates, for every harness:
+
+```text
+# .worktreeinclude — .gitignore syntax
+.env
+config/*.local.toml
+certs/
+!certs/production.pem
+```
+
+The name and the rules are Claude Code's, adopted unchanged; Git itself has no such convention, and
+Codex has none either. A repository that already keeps the file for Claude Code gets the same files
+in a Giskard thread, whichever harness runs it.
+
+- **Only ignored files.** A file is copied when it matches `.worktreeinclude` *and* the repository
+  ignores it. An untracked file that is not ignored — a scratch script — is work in progress, not
+  local configuration, and stays behind even when the file names it: commit it, or ignore it.
+- **The patterns are `.gitignore` patterns.** Both questions are put to Git (`git ls-files -z
+  --others --ignored --exclude-from=.worktreeinclude`, then `git check-ignore -z --stdin`), so a line
+  means what it would mean in a `.gitignore`: a bare name matches at any depth, a trailing `/` takes
+  a whole directory, `!` takes a match back.
+- **A directory ignored as a whole stays closed unless a line opens it** — Claude Code's rule, so
+  one file gives the same worktree under both. A bare `.env` copies `.env` and `config/.env`, but
+  not `target/debug/.env` or `node_modules/pkg/.env`, which would otherwise come across from every
+  build directory and dependency tree. A line opens such a directory when it matches the directory
+  itself (`target/`), when it starts with `**/` and its next name is in the directory's path
+  (`**/target/notes.md`), or when it is a path leading into it (`vendor/**/config.json`). With a
+  wildcard, only the literal text before it is compared: `**/vend*/x` and `vend?r/x` open `vendor/`,
+  while `**/*/x` and `*/x` open nothing, and neither do `?endor/x` or `[v]endor/x`. Once open, every
+  line applies inside it, as anywhere else:
+
+  ```text
+  .env                    # .env, sub/.env — not target/.env
+  **/target/notes.md      # opens target/: now target/.env comes across too
+  ```
+
+  "Ignored as a whole" means the directory itself is ignored (`target/`), not merely what is in it
+  (`logs/*`, `logs/**`, `logs/*.log`); Git answers which, with `git check-ignore`. Claude Code
+  documents only the `**/` case. The rest matches what it was measured doing, and could change with
+  it.
+- **Read at the repository's top level.** For a project in a subdirectory of its repository the
+  file is still the one at the top, and its paths are relative to the top: the checkout it fills is
+  the whole repository.
+- **Copied once, never synced.** The copy is made when the thread starts. Editing the original later
+  does not reach the thread, and an edit the agent makes to its copy does not reach yours.
+- **Never over committed content.** A file already in the checkout — one committed by mistake and
+  ignored since — keeps its committed version.
+- **Metadata comes across as far as it can.** Files and the directories created for them keep their
+  mode, modification and access times, and — where the server's user is allowed to set it — their
+  group; only root could also keep a different owner. A `0700` secrets directory stays private and a
+  local script stays executable. Extended attributes and ACLs are not copied.
+- **Symlinks stay symlinks**, never followed. A relative link that stays inside the repository is
+  copied as it is; one that climbs out of it (`../../shared.env`) would land somewhere else from the
+  worktree's location under the data directory, so it is rewritten to the absolute path it reaches
+  from your checkout.
+- **Any file name works**, including one that is not valid UTF-8: paths are handled as the bytes Git
+  prints. A nested repository the patterns match is someone else's checkout, and is skipped.
+- **A file that cannot be copied fails the thread's start**, and the worktree and its branch are
+  rolled back, as for any other creation failure. A thread missing a file the project said it needs
+  would only fail later, further from the cause.
+
+A copied file is ignored in the worktree just as in your checkout, so it does not show in the Git
+status row — and, being ignored, it is **not counted** by the deletion warning either. Deleting the
+thread deletes the copies with it, including anything the agent changed in them.
+
 ### The first build is cold, on purpose
 
-Because ignored files do not come across, build output does not either. A worked example, a Rust
+Ignored files the project does not name do not come across, so build output does not either. A worked example, a Rust
 project:
 
 ```text
@@ -108,7 +180,8 @@ The thread's first `cargo build` compiles all 380 dependencies. Likewise a Node 
 `npm ci` before anything runs, and a service that reads `.env` will fail to start until the agent is
 given the values it needs.
 
-This is deliberate and is not a gap waiting to be filled. Copying build state across would make every
+This is deliberate and is not a gap waiting to be filled — and it is why `.worktreeinclude` is for
+configuration, not for `target/` or `node_modules/`. Copying build state across would make every
 thread's build depend on the state of your checkout at the moment the thread happened to start —
 which is precisely the class of "works here, not there" failure the isolation exists to remove. The
 first build in a worktree is hermetic, and a hermetic build that takes four minutes is a better
@@ -375,6 +448,16 @@ exactly as they do anywhere else, and are exempted here exactly as they are anyw
 **Auto approve**, which put network behind an approval; under **⚠ Full Access** it simply runs. None
 of that is worktree-specific — it is the preset.
 
+**A file `.worktreeinclude` names is missing from the worktree.** Check, in this order, that the
+file is at the repository's top level rather than in the project's subdirectory; that the missing
+file is ignored (`git check-ignore -v <path>` in your checkout prints the rule that ignores it, and
+nothing if none does); and that it existed when the thread started — copies are made once.
+
+**Starting the thread failed because Git timed out working out what `.worktreeinclude` names.** Git
+walks every untracked file to answer, including `node_modules/` and `target/`, and has 30 seconds.
+Nothing is left behind, and a retry usually succeeds because the disk cache is warmer by then. If it
+keeps happening, that tree is too large for its disk to walk in time.
+
 **The first build in a thread is slow, or a shared cache is not being used.** Expected for the first;
 for the second, check the cache directory is in Codex's `sandbox_workspace_write.writable_roots`, and
 that the thread runs under **Auto approve**.
@@ -393,9 +476,10 @@ worktree owns it, so deleting the sub-agent leaves it alone.
 
 ## v1 limits
 
-- **No seeding.** Uncommitted, untracked and ignored files do not come across, and there is no
-  opt-in to carry them. Ignored files are a permanent non-goal (see above); carrying uncommitted
-  tracked edits may become an opt-in later.
+- **No seeding beyond `.worktreeinclude`.** Uncommitted edits and untracked files that are not
+  ignored do not come across, and there is no opt-in to carry them; carrying uncommitted tracked
+  edits may become one later. Ignored files come across only when `.worktreeinclude` names them, and
+  copying build state is a permanent non-goal (see above).
 - **No submodule initialisation.** A repository with submodules gets an empty submodule directory in
   the worktree.
 - **No merge or PR affordance.** Giskard will not merge the thread's branch or open a pull request;
