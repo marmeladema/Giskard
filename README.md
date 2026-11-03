@@ -142,7 +142,8 @@ Then open **http://127.0.0.1:8787**, log in, and:
    available only on the draft — the workspace is fixed once the thread exists. Isolation changes where the thread works, not what it
    is allowed to do: its permission preset still applies unchanged. See
    [Per-thread Git worktrees](docs/git-worktrees.md) for what does and does not come across, branch
-   naming, and what deleting an isolated thread destroys.
+   naming, and what deleting an isolated thread destroys. A repository can list ignored local files,
+   such as `.env`, in a `.worktreeinclude` to have them copied in.
 3. Type in the composer (Enter to send). The composer grows as you type, up to about 30% of the
    screen, and scrolls beyond that — long prompts stay readable while you write them. Use the
    attachment button, drop files onto the composer, or paste files and screenshots into the
