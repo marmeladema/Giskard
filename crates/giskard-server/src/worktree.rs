@@ -9,13 +9,24 @@
 //! and branches are visible from the project's checkout immediately — that is the point, since it is
 //! how work gets out. See `docs/git-worktrees.md`.
 
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
+use std::process::Stdio;
 use std::time::Duration;
 
 use giskard_core::ids::ThreadId;
 use giskard_persist::store::ThreadWorktree;
+use tokio::io::AsyncWriteExt;
 use tokio::process::Command as TokioCommand;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
+
+/// The file, at the top level of a repository, that names ignored files to copy into every new
+/// worktree — `.env`, a local config, a certificate: files a fresh checkout cannot have, because
+/// they are not committed, and without which the project does not run.
+///
+/// The name and its rules are Claude Code's, adopted as they are. Git has no such convention, and a
+/// project that already keeps the file for Claude Code then behaves the same in Giskard, under every
+/// harness, with nothing to keep in sync.
+pub const WORKTREE_INCLUDE_FILE: &str = ".worktreeinclude";
 
 /// Read-only queries answer in milliseconds; `worktree add` writes a whole working tree and
 /// `worktree remove` deletes one, so both scale with the repository rather than with the request.
@@ -23,6 +34,10 @@ use tracing::{debug, warn};
 /// allow, and timing it out would leave a half-created worktree behind.
 const GIT_CHECKOUT_TIMEOUT: Duration = Duration::from_secs(300);
 const GIT_QUERY_TIMEOUT: Duration = Duration::from_secs(10);
+/// The Git commands that seed a worktree, which scale with the tree and the paths listed but only
+/// read. Half a million paths take 0.4s to list and 0.6s to check with a warm disk cache, so this
+/// leaves a wide margin for a cold one, and a stuck Git cannot hold up a thread's start for long.
+const GIT_SEED_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// How many characters of the thread ULID name the branch.
 ///
@@ -107,7 +122,7 @@ pub async fn create(
     // works in the same subdirectory beneath it. Resolved before anything is created, because a
     // project directory that is not in the repository's committed content has no counterpart in a
     // worktree and the thread would have nowhere to run.
-    let relative_root = project_root_within_repository(repo_root).await?;
+    let (toplevel, relative_root) = project_root_within_repository(repo_root).await?;
 
     if let Some(parent) = path.parent() {
         tokio::fs::create_dir_all(parent).await.map_err(|error| {
@@ -188,11 +203,22 @@ pub async fn create(
         }
     };
 
+    // From the repository's top level, whatever the project's subdirectory: the include file is a
+    // property of the repository, as the checkout it fills is, and its paths are relative to it.
+    let seeded = match seed_included_files(&toplevel, path).await {
+        Ok(seeded) => seeded,
+        Err(error) => {
+            rollback_worktree(repo_root, path, branch).await;
+            return Err(error);
+        }
+    };
+
     debug!(
         worktree = %path.display(),
         branch,
         base_commit = base_commit.as_deref().unwrap_or("(unborn)"),
         workspace = workspace.as_deref().unwrap_or("(worktree root)"),
+        seeded,
         "created thread worktree"
     );
 
@@ -207,30 +233,577 @@ pub async fn create(
     })
 }
 
-/// Where the project directory sits inside its repository, or `None` when it *is* the top level.
+/// The top level of the project's repository, and where the project directory sits inside it —
+/// `None` when it *is* the top level.
 ///
 /// Both sides are canonicalized before subtracting: `--show-toplevel` resolves symlinks, and a
 /// project path that reaches its repository through one would otherwise fail to match a prefix it
 /// genuinely has.
 async fn project_root_within_repository(
     repo_root: &Path,
-) -> Result<Option<PathBuf>, WorktreeError> {
+) -> Result<(PathBuf, Option<PathBuf>), WorktreeError> {
     let toplevel = PathBuf::from(rev_parse(repo_root, "--show-toplevel").await?);
     let canonical_toplevel = toplevel.canonicalize().unwrap_or(toplevel);
     let canonical_project = repo_root
         .canonicalize()
         .unwrap_or_else(|_| repo_root.to_path_buf());
-    match canonical_project.strip_prefix(&canonical_toplevel) {
-        Ok(relative) if relative.as_os_str().is_empty() => Ok(None),
-        Ok(relative) => Ok(Some(relative.to_path_buf())),
+    let relative = match canonical_project.strip_prefix(&canonical_toplevel) {
+        Ok(relative) if relative.as_os_str().is_empty() => None,
+        Ok(relative) => Some(relative.to_path_buf()),
         // Not a prefix at all. Nothing sane produces this — `--show-toplevel` answered for this
         // very directory — so treat the pair as unusable rather than guessing a layout.
-        Err(_) => Err(WorktreeError::Git(format!(
-            "{} is not inside its own repository root {}",
-            canonical_project.display(),
-            canonical_toplevel.display()
-        ))),
+        Err(_) => {
+            return Err(WorktreeError::Git(format!(
+                "{} is not inside its own repository root {}",
+                canonical_project.display(),
+                canonical_toplevel.display()
+            )));
+        }
+    };
+    Ok((canonical_toplevel, relative))
+}
+
+/// Copy the files the repository's [`WORKTREE_INCLUDE_FILE`] names from the project's checkout into
+/// a new worktree, returning how many were copied.
+///
+/// A file is copied when it matches the include file **and** is ignored — Claude Code's rule. An
+/// untracked file that is not ignored is work in progress rather than local configuration: it
+/// belongs in a commit, or in `.gitignore`, and is left where it is. Tracked files are never
+/// touched; the checkout already has them as committed.
+///
+/// Copied once, now, and never synced: an isolated thread's build may depend on what the project
+/// lists here, but not on whatever else the checkout happens to hold. Without the file nothing is
+/// copied at all.
+///
+/// Both lists come from Git rather than from matching patterns here, so the include file means
+/// exactly what the same patterns would mean in a `.gitignore` — negation, anchoring, `**` and
+/// directory patterns included.
+async fn seed_included_files(toplevel: &Path, worktree: &Path) -> Result<usize, WorktreeError> {
+    let include = toplevel.join(WORKTREE_INCLUDE_FILE);
+    if !include.is_file() {
+        return Ok(0);
     }
+    // Untracked files the include file matches, ignored or not. `--exclude-from` stands in for the
+    // repository's own ignore rules here, so `--ignored` selects by the include patterns alone.
+    // Run from the top level: `ls-files` lists only beneath its working directory, and the include
+    // file's patterns are relative to it.
+    let exclude_from = format!("--exclude-from={}", include.to_string_lossy());
+    let listed = run_git(
+        toplevel,
+        &["ls-files", "-z", "--others", "--ignored", &exclude_from],
+        GIT_SEED_TIMEOUT,
+    )
+    .await?;
+    if !listed.status.success() {
+        return Err(WorktreeError::Git(stderr_or(
+            &listed,
+            "git ls-files --exclude-from failed",
+        )));
+    }
+    let listed = giskard_git_parser::parse_git_path_list(&listed.stdout);
+    if listed.undecodable > 0 {
+        warn!(
+            repo = %toplevel.display(),
+            count = listed.undecodable,
+            "{WORKTREE_INCLUDE_FILE} matched paths this platform cannot represent; they were not \
+             copied"
+        );
+    }
+    if listed.paths.is_empty() {
+        return Ok(0);
+    }
+
+    // A trailing `/` is how `ls-files` reports a nested repository: someone else's checkout, which
+    // is not a file to copy.
+    let (nested, listed_files): (Vec<_>, Vec<_>) =
+        listed.paths.iter().partition(|path| ends_with_slash(path));
+    for path in nested {
+        warn!(path = %path.display(), "not copying a nested repository {WORKTREE_INCLUDE_FILE} matches");
+    }
+
+    // Of those, the ones the repository itself ignores, and which of their parent directories it
+    // ignores too. `check-ignore` is Git's own answer to both questions, which no amount of comparing
+    // listings would match in every case, and it answers them in one process however many paths
+    // there are. The paths go back to it as the bytes it printed them as. A trailing `/` is what
+    // makes a directory-only pattern such as `target/` apply to a directory, as it does when Git
+    // walks the tree, and it also tells the two kinds of answer apart.
+    let mut dirs = std::collections::BTreeSet::new();
+    for file in listed_files.iter().filter(|file| is_plain_relative(file)) {
+        for dir in file.ancestors().skip(1) {
+            if !dir.as_os_str().is_empty() {
+                dirs.insert(dir);
+            }
+        }
+    }
+    let mut input = Vec::new();
+    for path in &listed_files {
+        input.extend_from_slice(path.as_os_str().as_encoded_bytes());
+        input.push(0);
+    }
+    for dir in &dirs {
+        input.extend_from_slice(dir.as_os_str().as_encoded_bytes());
+        input.extend_from_slice(b"/\0");
+    }
+    let checked = run_git_with_input(
+        toplevel,
+        &["check-ignore", "-z", "--stdin"],
+        input,
+        GIT_SEED_TIMEOUT,
+    )
+    .await?;
+    // Exit 1 is not a failure: it is `check-ignore` reporting that none of the paths is ignored.
+    if !checked.status.success() && checked.status.code() != Some(1) {
+        return Err(WorktreeError::Git(stderr_or(
+            &checked,
+            "git check-ignore failed",
+        )));
+    }
+    let (ignored_dirs, ignored): (Vec<_>, Vec<_>) =
+        giskard_git_parser::parse_git_path_list(&checked.stdout)
+            .paths
+            .into_iter()
+            .partition(|path| ends_with_slash(path));
+    // Normalized through its components, since a set of paths is looked up by the ancestors of a
+    // file. `check-ignore` reports a directory inside an ignored one as ignored too, so the
+    // shallowest ignored ancestor of a file is the directory that is ignored as a whole.
+    let ignored_dirs: std::collections::HashSet<PathBuf> = ignored_dirs
+        .iter()
+        .map(|dir| dir.components().collect())
+        .collect();
+    let ignored = drop_files_no_pattern_reaches(toplevel, &include, ignored, &ignored_dirs).await?;
+
+    // Plain filesystem work from here on, much of it with no async form (`set_times`, `lchown`), so
+    // it runs as one blocking task rather than as a call per file.
+    let (from_root, to_root) = (toplevel.to_path_buf(), worktree.to_path_buf());
+    let copied =
+        tokio::task::spawn_blocking(move || copy_included_files(&from_root, &to_root, &ignored))
+            .await
+            .map_err(|error| {
+                WorktreeError::Unavailable(format!(
+                    "copying the files {WORKTREE_INCLUDE_FILE} names did not finish: {error}"
+                ))
+            })??;
+    info!(
+        repo = %toplevel.display(),
+        worktree = %worktree.display(),
+        copied,
+        matched = listed.paths.len(),
+        "seeded worktree from {WORKTREE_INCLUDE_FILE}"
+    );
+    Ok(copied)
+}
+
+/// Drop the files inside a directory the repository ignores *as a whole* — `target/`,
+/// `node_modules/` — unless some include pattern opens that directory, by Claude Code's rule.
+///
+/// Plain `.gitignore` matching would copy `target/debug/.env` for a bare `.env`, and a `**/*.json`
+/// would empty a dependency tree into the worktree. Claude Code does not descend into such a
+/// directory unless the include file asks for it, and neither does this, so one include file gives
+/// the same worktree under both. A directory is opened by any line of the include file that
+///
+/// - matches the directory itself, or a directory above it (`target/`), or
+/// - starts with `**/`, and the first name after it is one of the names in the directory's path
+///   (`**/target/notes.md`); a bare name such as `.env` counts as `**/.env`, or
+/// - is a path that leads into the directory (`vendor/**/config.json`): writing the directory out
+///   is how a pattern says it means to go there.
+///
+/// The decision is per directory, not per file: once a directory is opened, every pattern applies
+/// inside it as it does anywhere else. That is what Claude Code 2.1.316 does — `**/target/notes.md`
+/// makes a bare `.env` copy `target/.env` too — and the `**/` case is the one it documents.
+///
+/// Git decides which directories are ignored as a whole, as it decides everything else about the
+/// repository. The `ignore` crate only matches a single include line against a directory's path,
+/// with the same `.gitignore` rules the line has everywhere else.
+async fn drop_files_no_pattern_reaches(
+    toplevel: &Path,
+    include: &Path,
+    files: Vec<PathBuf>,
+    ignored_dirs: &std::collections::HashSet<PathBuf>,
+) -> Result<Vec<PathBuf>, WorktreeError> {
+    if ignored_dirs.is_empty() {
+        return Ok(files);
+    }
+    let text = tokio::fs::read(include).await.map_err(|error| {
+        WorktreeError::Unavailable(format!("could not read {}: {error}", include.display()))
+    })?;
+    let lines: Vec<IncludeLine> = String::from_utf8_lossy(&text)
+        .lines()
+        .filter_map(|line| IncludeLine::compile(toplevel, line))
+        .collect();
+
+    let mut opened = std::collections::HashMap::<&Path, bool>::new();
+    let mut kept = Vec::with_capacity(files.len());
+    for file in &files {
+        let wholly_ignored = is_plain_relative(file)
+            .then(|| {
+                file.ancestors()
+                    .skip(1)
+                    .filter(|dir| ignored_dirs.contains(*dir))
+                    .last()
+            })
+            .flatten();
+        let keep = match wholly_ignored {
+            // A path that is not plain is refused later, where the copy is.
+            None => true,
+            Some(dir) => *opened.entry(dir).or_insert_with(|| {
+                let open = lines.iter().any(|line| line.opens(dir));
+                debug!(
+                    dir = %dir.display(),
+                    open,
+                    "decided whether {WORKTREE_INCLUDE_FILE} reaches into a directory ignored as \
+                     a whole"
+                );
+                open
+            }),
+        };
+        if keep {
+            kept.push(file.clone());
+        }
+    }
+    Ok(kept)
+}
+
+fn ends_with_slash(path: &Path) -> bool {
+    path.as_os_str().as_encoded_bytes().ends_with(b"/")
+}
+
+/// A path made only of plain names — what Git lists, and the only kind the matcher accepts.
+fn is_plain_relative(path: &Path) -> bool {
+    path.components()
+        .all(|component| matches!(component, Component::Normal(_)))
+}
+
+/// One selecting line of the include file, compiled once, ready to ask whether it opens a directory
+/// the repository ignores as a whole. See [`drop_files_no_pattern_reaches`] for the rule.
+struct IncludeLine {
+    /// The line alone, by `.gitignore` rules.
+    pattern: ignore::gitignore::Gitignore,
+    reach: IncludeLineReach,
+}
+
+/// How a line that does not match a directory can still lead into it.
+enum IncludeLineReach {
+    /// A bare name or a `**/` line: the first name it requires, which may be anywhere in the path.
+    FirstName(String),
+    /// A line with a directory in it: the names it requires at each depth, without its final one,
+    /// since a line that ends at or above a directory could only match it.
+    Path(Vec<IncludePathPart>),
+}
+
+enum IncludePathPart {
+    /// A `**`, which reaches anywhere below the names matched so far.
+    AnyDepth,
+    Name(ignore::gitignore::Gitignore),
+}
+
+impl IncludeLine {
+    /// `None` for a line that selects nothing — a comment, a blank line, a negation — and so opens
+    /// nothing. A line the matcher cannot read is treated the same: the conservative answer, which
+    /// leaves a directory ignored as a whole uncopied.
+    fn compile(toplevel: &Path, line: &str) -> Option<Self> {
+        if line.trim().is_empty() || line.starts_with('#') || line.starts_with('!') {
+            return None;
+        }
+        // Only the slashes are read from the text. An escape (`\#`, `\!`, `\ `) is never one, and
+        // trailing spaces are not part of a pattern unless escaped.
+        let text = line.strip_prefix('\\').unwrap_or(line).trim_end();
+        let text = text.trim_end_matches('/');
+        let reach = if let Some(rest) = text.strip_prefix("**/") {
+            let first = rest.split('/').next().unwrap_or(rest);
+            IncludeLineReach::FirstName(first.to_string())
+        } else if !text.contains('/') {
+            IncludeLineReach::FirstName(text.to_string())
+        } else {
+            let mut parts: Vec<&str> = text.trim_start_matches('/').split('/').collect();
+            if parts.last() != Some(&"**") {
+                parts.pop();
+            }
+            let parts = parts
+                .into_iter()
+                .map(|part| match part {
+                    "**" => Some(IncludePathPart::AnyDepth),
+                    name => {
+                        compile_pattern(toplevel, &format!("/{name}")).map(IncludePathPart::Name)
+                    }
+                })
+                .collect::<Option<Vec<_>>>()?;
+            IncludeLineReach::Path(parts)
+        };
+        Some(Self {
+            pattern: compile_pattern(toplevel, line)?,
+            reach,
+        })
+    }
+
+    fn opens(&self, dir: &Path) -> bool {
+        if self
+            .pattern
+            .matched_path_or_any_parents(dir, true)
+            .is_ignore()
+        {
+            return true;
+        }
+        match &self.reach {
+            IncludeLineReach::FirstName(first) => dir
+                .components()
+                .any(|name| name.as_os_str() == first.as_str()),
+            IncludeLineReach::Path(parts) => {
+                for (depth, name) in dir.components().enumerate() {
+                    match parts.get(depth) {
+                        Some(IncludePathPart::AnyDepth) => return true,
+                        Some(IncludePathPart::Name(part))
+                            if part.matched(Path::new(name.as_os_str()), true).is_ignore() => {}
+                        _ => return false,
+                    }
+                }
+                true
+            }
+        }
+    }
+}
+
+fn compile_pattern(toplevel: &Path, line: &str) -> Option<ignore::gitignore::Gitignore> {
+    let mut builder = ignore::gitignore::GitignoreBuilder::new(toplevel);
+    let built = builder
+        .add_line(None, line)
+        .and_then(|builder| builder.build());
+    match built {
+        Ok(pattern) => Some(pattern),
+        Err(error) => {
+            warn!(line, %error, "{WORKTREE_INCLUDE_FILE} line is not a pattern the matcher reads");
+            None
+        }
+    }
+}
+
+/// Copy each listed file into the worktree, then give every directory this created its source's
+/// metadata. Answers how many files were copied.
+///
+/// A directory's metadata is applied after everything beneath it is written, deepest first. Its
+/// modification time would otherwise move again with each file added to it, and its mode could
+/// forbid adding them at all — a `0500` directory in the checkout is one nothing can be copied into.
+fn copy_included_files(
+    from_root: &Path,
+    to_root: &Path,
+    paths: &[PathBuf],
+) -> Result<usize, WorktreeError> {
+    let mut created_dirs = Vec::new();
+    let mut copied = 0;
+    for relative in paths {
+        if copy_included_file(from_root, to_root, relative, &mut created_dirs)? {
+            copied += 1;
+        }
+    }
+    created_dirs.sort_by_key(|dir: &PathBuf| std::cmp::Reverse(dir.components().count()));
+    for dir in &created_dirs {
+        let failed = |error: std::io::Error| {
+            WorktreeError::Unavailable(format!(
+                "could not give {} its checkout's permissions in the worktree: {error}",
+                dir.display()
+            ))
+        };
+        let source = std::fs::symlink_metadata(from_root.join(dir)).map_err(failed)?;
+        copy_metadata(&source, &to_root.join(dir), dir).map_err(failed)?;
+    }
+    Ok(copied)
+}
+
+/// Copy one file Git listed, keeping its relative path and its metadata. Answers whether anything
+/// was copied. The parent directories it has to create are recorded in `created_dirs`, relative to
+/// the worktree, for [`copy_included_files`] to finish.
+///
+/// Something already at the destination is left alone — the checkout's own content is never
+/// overwritten by a local file — and nothing is written through a symlink the worktree already has
+/// where the checkout has a directory.
+fn copy_included_file(
+    from_root: &Path,
+    to_root: &Path,
+    relative: &Path,
+    created_dirs: &mut Vec<PathBuf>,
+) -> Result<bool, WorktreeError> {
+    // Git lists paths beneath its working directory and nothing else; a path that climbs out of it
+    // or is absolute did not come from that listing, and is refused rather than resolved.
+    if !is_plain_relative(relative) {
+        warn!(path = %relative.display(), "not copying {WORKTREE_INCLUDE_FILE} entry");
+        return Ok(false);
+    }
+    let copy_failed = |error: std::io::Error| {
+        WorktreeError::Unavailable(format!(
+            "could not copy {}, listed by {WORKTREE_INCLUDE_FILE}, into the worktree: {error}",
+            relative.display()
+        ))
+    };
+    let source = from_root.join(relative);
+    let destination = to_root.join(relative);
+    if std::fs::symlink_metadata(&destination).is_ok() {
+        debug!(path = %relative.display(), "already in the worktree; not overwriting");
+        return Ok(false);
+    }
+    let metadata = match std::fs::symlink_metadata(&source) {
+        Ok(metadata) => metadata,
+        // Removed between the listing and now: there is nothing to copy, and that is not an error.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(copy_failed(error)),
+    };
+
+    // One directory at a time rather than `create_dir_all`, so the ones created here are known and
+    // can be given their checkout's metadata once everything beneath them exists.
+    let mut dir = PathBuf::new();
+    for component in relative.parent().into_iter().flat_map(Path::components) {
+        dir.push(component);
+        let target = to_root.join(&dir);
+        match std::fs::symlink_metadata(&target) {
+            Ok(existing) if existing.is_dir() => {}
+            // The commit has something else here — a symlink, most likely, where the checkout has
+            // since put a real directory. Writing through it could land anywhere on disk.
+            Ok(_) => {
+                warn!(
+                    path = %relative.display(),
+                    blocked_by = %dir.display(),
+                    "not copying {WORKTREE_INCLUDE_FILE} entry: the worktree has no directory there"
+                );
+                return Ok(false);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                std::fs::create_dir(&target).map_err(copy_failed)?;
+                created_dirs.push(dir.clone());
+            }
+            Err(error) => return Err(copy_failed(error)),
+        }
+    }
+
+    if metadata.file_type().is_symlink() {
+        let target = std::fs::read_link(&source).map_err(copy_failed)?;
+        let target = worktree_link_target(from_root, relative, target);
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&target, &destination).map_err(copy_failed)?;
+            copy_ownership(&metadata, &destination, relative);
+        }
+        #[cfg(not(unix))]
+        {
+            warn!(
+                path = %relative.display(),
+                target = %target.display(),
+                "not copying a symlink on this platform"
+            );
+            return Ok(false);
+        }
+    } else if metadata.is_file() {
+        std::fs::copy(&source, &destination).map_err(copy_failed)?;
+        copy_metadata(&metadata, &destination, relative).map_err(copy_failed)?;
+    } else {
+        warn!(
+            path = %relative.display(),
+            "not copying {WORKTREE_INCLUDE_FILE} entry that is not a file"
+        );
+        return Ok(false);
+    }
+    debug!(path = %relative.display(), "copied into the worktree");
+    Ok(true)
+}
+
+/// Give a copied file or created directory its source's timestamps, owner and mode, as far as an
+/// unprivileged process can.
+///
+/// Order matters. Timestamps first, while the destination still has the permissions it was created
+/// with — a mode the source has, such as `0200`, could forbid opening it afterwards. Ownership
+/// before the mode, because changing an owner clears the setuid and setgid bits. Extended
+/// attributes and ACLs are not copied.
+fn copy_metadata(
+    source: &std::fs::Metadata,
+    destination: &Path,
+    relative: &Path,
+) -> std::io::Result<()> {
+    let mut times = std::fs::FileTimes::new();
+    if let Ok(modified) = source.modified() {
+        times = times.set_modified(modified);
+    }
+    if let Ok(accessed) = source.accessed() {
+        times = times.set_accessed(accessed);
+    }
+    // Setting times needs an open handle but not a writable one, so a read-only file still gets
+    // them. A directory opens the same way on Unix.
+    match std::fs::File::open(destination) {
+        Ok(file) => file.set_times(times)?,
+        Err(error) => debug!(
+            path = %relative.display(),
+            %error,
+            "could not open the copy to set its timestamps"
+        ),
+    }
+    #[cfg(unix)]
+    copy_ownership(source, destination, relative);
+    std::fs::set_permissions(destination, source.permissions())
+}
+
+/// Give the copy its source's owner and group where that is allowed, and say so where it is not.
+///
+/// Only root can give a file away, so a source owned by someone else keeps the server's user as its
+/// owner — but the server's user may still be a member of the source's group, and the group is
+/// often what carries the access (`www-data`, `docker`).
+#[cfg(unix)]
+fn copy_ownership(source: &std::fs::Metadata, destination: &Path, relative: &Path) {
+    use std::os::unix::fs::MetadataExt;
+
+    let Ok(current) = std::fs::symlink_metadata(destination) else {
+        return;
+    };
+    if current.uid() == source.uid() && current.gid() == source.gid() {
+        return;
+    }
+    let result = std::os::unix::fs::lchown(destination, Some(source.uid()), Some(source.gid()))
+        .or_else(|_| std::os::unix::fs::lchown(destination, None, Some(source.gid())));
+    if let Err(error) = result {
+        debug!(
+            path = %relative.display(),
+            uid = source.uid(),
+            gid = source.gid(),
+            %error,
+            "could not give the copy its source's owner or group"
+        );
+    }
+}
+
+/// The target a copied symlink should have in the worktree.
+///
+/// A link is copied as a link, never followed: following it would copy whatever it points at,
+/// which may be anywhere on disk. An absolute target and a relative one that stays inside the
+/// repository mean the same in the worktree as in the checkout. A relative target that climbs out
+/// of the repository does not — the worktree lives somewhere else entirely, so the same `../..`
+/// lands elsewhere — and is rewritten to the absolute path it reaches from the checkout.
+fn worktree_link_target(from_root: &Path, relative: &Path, target: PathBuf) -> PathBuf {
+    if target.is_absolute() {
+        return target;
+    }
+    let link_dir = relative.parent().unwrap_or(Path::new(""));
+    let mut depth = link_dir.components().count();
+    let mut escapes = false;
+    for component in target.components() {
+        match component {
+            Component::ParentDir if depth == 0 => {
+                escapes = true;
+                break;
+            }
+            Component::ParentDir => depth -= 1,
+            Component::Normal(_) => depth += 1,
+            _ => {}
+        }
+    }
+    if !escapes {
+        return target;
+    }
+    let mut resolved = from_root.join(link_dir);
+    for component in target.components() {
+        match component {
+            Component::ParentDir => {
+                resolved.pop();
+            }
+            Component::Normal(name) => resolved.push(name),
+            _ => {}
+        }
+    }
+    resolved
 }
 
 /// Take a half-created worktree back down, so a failed creation leaves nothing behind.
@@ -530,11 +1103,7 @@ async fn rev_parse(dir: &Path, what: &str) -> Result<String, WorktreeError> {
     Ok(value)
 }
 
-async fn run_git(
-    dir: &Path,
-    args: &[&str],
-    timeout: Duration,
-) -> Result<std::process::Output, WorktreeError> {
+fn git_command(dir: &Path, args: &[&str]) -> TokioCommand {
     let mut cmd = TokioCommand::new("git");
     cmd.current_dir(dir)
         .args(args)
@@ -543,16 +1112,67 @@ async fn run_git(
         .kill_on_drop(true)
         // Git's `fatal:` messages are translated; the callers below match on them.
         .env("LC_ALL", "C");
-    tokio::time::timeout(timeout, cmd.output())
+    cmd
+}
+
+fn git_timed_out(dir: &Path, args: &[&str]) -> WorktreeError {
+    WorktreeError::Unavailable(format!(
+        "git {} timed out in {}",
+        args.first().copied().unwrap_or("command"),
+        dir.display()
+    ))
+}
+
+async fn run_git(
+    dir: &Path,
+    args: &[&str],
+    timeout: Duration,
+) -> Result<std::process::Output, WorktreeError> {
+    tokio::time::timeout(timeout, git_command(dir, args).output())
         .await
-        .map_err(|_| {
-            WorktreeError::Unavailable(format!(
-                "git {} timed out in {}",
-                args.first().copied().unwrap_or("command"),
-                dir.display()
-            ))
-        })?
+        .map_err(|_| git_timed_out(dir, args))?
         .map_err(|error| WorktreeError::Unavailable(format!("failed to run git: {error}")))
+}
+
+/// [`run_git`] for a command that reads its input from stdin, such as `check-ignore --stdin`.
+async fn run_git_with_input(
+    dir: &Path,
+    args: &[&str],
+    input: Vec<u8>,
+    timeout: Duration,
+) -> Result<std::process::Output, WorktreeError> {
+    let unavailable =
+        |error: std::io::Error| WorktreeError::Unavailable(format!("failed to run git: {error}"));
+    let mut cmd = git_command(dir, args);
+    cmd.stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let run = async {
+        let mut child = cmd.spawn().map_err(unavailable)?;
+        let mut stdin = child.stdin.take().ok_or_else(|| {
+            WorktreeError::Unavailable("git was started without a stdin to write to".into())
+        })?;
+        // Written alongside the wait rather than before it: Git answers as it reads, so an input
+        // longer than the pipe buffer would leave both sides blocked on each other.
+        let write = async move {
+            let written = stdin.write_all(&input).await;
+            // Dropping stdin closes it, which is what tells Git the list is complete.
+            drop(stdin);
+            written
+        };
+        let (written, output) = tokio::join!(write, child.wait_with_output());
+        let output = output.map_err(unavailable)?;
+        // A Git that refused early stops reading, and the write fails with a broken pipe; its own
+        // status and message are the answer worth reporting then. A Git that succeeded without
+        // reading everything would have answered for part of the input, which is no answer.
+        if output.status.success() {
+            written.map_err(unavailable)?;
+        }
+        Ok(output)
+    };
+    tokio::time::timeout(timeout, run)
+        .await
+        .map_err(|_| git_timed_out(dir, args))?
 }
 
 fn stderr_or(output: &std::process::Output, fallback: &str) -> String {

@@ -6,14 +6,16 @@
 //! bytes captured from real `git` output.
 //!
 //! The formats parsed here are `git status --porcelain=v2 -z`, `git diff --numstat -z`,
-//! `git log --numstat -z` with an explicit `--format`, `git show --name-status -z`, and
-//! `git for-each-ref` with an explicit `--format`. Each is a documented stability contract, and
+//! `git log --numstat -z` with an explicit `--format`, `git show --name-status -z`,
+//! `git for-each-ref` with an explicit `--format`, and the bare path lists of `git ls-files -z` and
+//! `git check-ignore -z`. Each is a documented stability contract, and
 //! every one of them is read with NUL separators — `-z`, or `%00` in a format string — because that
 //! is what makes them unambiguous: records are NUL-terminated and names are emitted verbatim, so a
 //! path or a ref containing a space, quote, pipe or newline survives round-tripping intact. Git
 //! permits all of those in a ref name; NUL is the one byte it does not.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 
 use giskard_proto::{GitFileStatus, GitStatusResponse};
 
@@ -540,6 +542,52 @@ pub fn apply_numstat_counts(
     }
     status.added_total = added_total;
     status.deleted_total = deleted_total;
+}
+
+/// A list of paths, as Git prints one when asked for bare paths with `-z`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct GitPathList {
+    /// The paths, relative to the directory Git ran in, in the order Git printed them, byte for
+    /// byte. A trailing `/` is kept: it is how `ls-files` marks a directory entry.
+    pub paths: Vec<PathBuf>,
+    /// How many records could not be represented as a path on this platform, and so are not in
+    /// `paths`. Always zero on Unix, where a path *is* bytes.
+    pub undecodable: usize,
+}
+
+/// Parse a NUL-terminated path list: `git ls-files -z` and `git check-ignore -z --stdin`.
+///
+/// Both print one path per record and nothing else, verbatim — with `-z` Git neither quotes nor
+/// escapes a name, so a path containing a space, quote, tab or newline comes back exactly as it is
+/// on disk.
+///
+/// Paths, not strings: these are acted on — opened, copied, fed back to Git — not merely shown, and
+/// a name that is not UTF-8 is still a file. On Unix each record becomes a path from its exact
+/// bytes. Elsewhere Git writes UTF-8, and a record that is not is counted rather than decoded
+/// lossily, which would name a different file, or none.
+pub fn parse_git_path_list(output: &[u8]) -> GitPathList {
+    let mut list = GitPathList::default();
+    for record in output.split(|byte| *byte == 0) {
+        if record.is_empty() {
+            continue;
+        }
+        match path_from_git_bytes(record) {
+            Some(path) => list.paths.push(path),
+            None => list.undecodable += 1,
+        }
+    }
+    list
+}
+
+#[cfg(unix)]
+fn path_from_git_bytes(bytes: &[u8]) -> Option<PathBuf> {
+    use std::os::unix::ffi::OsStrExt;
+    Some(PathBuf::from(std::ffi::OsStr::from_bytes(bytes)))
+}
+
+#[cfg(not(unix))]
+fn path_from_git_bytes(bytes: &[u8]) -> Option<PathBuf> {
+    std::str::from_utf8(bytes).ok().map(PathBuf::from)
 }
 
 /// Read the commit a deleted branch pointed at out of `git branch -d`/`-D`'s own report.
@@ -1233,5 +1281,49 @@ mod tests {
             parse_deleted_branch_sha("Deleted branch x (was abcd)."),
             Some("abcd".to_string())
         );
+    }
+
+    fn paths(names: &[&str]) -> Vec<PathBuf> {
+        names.iter().map(PathBuf::from).collect()
+    }
+
+    /// With `-z` a name is printed verbatim, so the separators that would break a line-based
+    /// reading — a newline, a tab, a quote — are just bytes of the path. The trailing `/` that
+    /// marks a directory entry survives too.
+    #[test]
+    fn reads_nul_terminated_paths_verbatim() {
+        let list = parse_git_path_list(
+            b".env\0config/local dev.toml\0odd\nname\0\"quoted\"\0vendor/nested/\0",
+        );
+        assert_eq!(
+            list.paths,
+            paths(&[
+                ".env",
+                "config/local dev.toml",
+                "odd\nname",
+                "\"quoted\"",
+                "vendor/nested/"
+            ])
+        );
+        assert!(list.paths[4].as_os_str().as_encoded_bytes().ends_with(b"/"));
+        assert_eq!(list.undecodable, 0);
+    }
+
+    #[test]
+    fn an_empty_path_list_is_empty() {
+        assert_eq!(parse_git_path_list(b""), GitPathList::default());
+    }
+
+    /// A Unix file name is bytes, and one that is not UTF-8 is still a file to copy: it comes back
+    /// as exactly those bytes rather than with its invalid ones replaced.
+    #[cfg(unix)]
+    #[test]
+    fn keeps_a_path_that_is_not_utf8_byte_for_byte() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let list = parse_git_path_list(b"good\0bad\xff\0also good\0");
+        assert_eq!(list.paths.len(), 3);
+        assert_eq!(list.paths[1].as_os_str().as_bytes(), b"bad\xff");
+        assert_eq!(list.undecodable, 0);
     }
 }

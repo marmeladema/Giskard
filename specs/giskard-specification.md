@@ -3140,7 +3140,18 @@ project's harness is not running yet, so there is no catalog to choose from (§8
   out only a whole repository — the worktree is then the repository root and the workspace is the
   same subdirectory beneath it, so a path names the same file with isolation as without. A project
   directory absent from the repository's committed content has no counterpart in a fresh checkout,
-  and isolation fails rather than inventing one.
+  and isolation fails rather than inventing one. After checkout the server copies, from the
+  project's checkout, every file that the repository's top-level `.worktreeinclude` matches *and*
+  that the repository ignores — Claude Code's convention, applied for every harness. Both lists are
+  Git's answers (`ls-files -z --others --ignored --exclude-from`, then `check-ignore -z --stdin`,
+  parsed in `giskard-git-parser`), so the file has `.gitignore` semantics — except that, as in
+  Claude Code, a directory the repository ignores as a whole stays closed unless a line matches it,
+  is a `**/` line whose next name is in its path, or is a path leading into it; once open, every
+  line applies inside it. A copy never replaces
+  checked-out content, keeps symlinks as symlinks (rewriting a relative one that leaves the
+  repository to the absolute path it reaches), keeps modes, times and — where permitted — group on
+  files and on the directories it creates, handles paths as bytes, and is made once; a copy that
+  fails fails the start and rolls the worktree back.
   Isolation decides *where* a thread works and nothing else — the permission preset still decides
   what it may do there, and an isolated thread's sandbox is exactly an ordinary thread's, so Git
   commands that write the repository escalate for approval under Auto Approve just as they do
