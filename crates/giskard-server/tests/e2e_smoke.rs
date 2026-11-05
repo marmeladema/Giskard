@@ -19,12 +19,14 @@ use giskard_core::user_input::UserInput;
 use giskard_harness::{AgentHarness, HarnessCapabilities, OpenThreadOptions, ThreadHandle};
 use giskard_harness_replay::ReplayFixture;
 use giskard_proto::{
-    ClientMessage, ErrorSeverity, RequestKind, RuntimeTurnState, ServerMessage, WireAgentEvent,
+    ClientMessage, ErrorSeverity, RequestKind, RuntimeTurnState, ServerMessage,
+    ThreadDeletionProgress, ThreadDeletionState, WireAgentEvent,
 };
 use giskard_server::AppState;
 use giskard_server::hub::Outbound;
 use giskard_testenv::driver::{self, DriverProbe};
 use giskard_testenv::fake::{self, Call, FakeCore, FakeHarness, Gate, Script, TurnCall, caps};
+use giskard_testenv::server::wait_for_thread_deletion;
 use giskard_testenv::{TestServer, auth, factory, fixtures, ws};
 use tracing::Subscriber;
 use tracing_subscriber::Layer;
@@ -2087,6 +2089,7 @@ async fn wait_for_thread_activity(
                     ServerMessage::ThreadState(_)
                     | ServerMessage::ThreadMetadataResult { .. }
                     | ServerMessage::ThreadCatalogChanged
+                    | ServerMessage::ThreadDeletionProgress(_)
                     | ServerMessage::Error { .. }
                     | ServerMessage::Pong => {}
                 }
@@ -2973,6 +2976,7 @@ async fn inactive_thread_progress_sends_activity_without_full_event_subscription
                         }
                     }
                     ServerMessage::ThreadCatalogChanged
+                    | ServerMessage::ThreadDeletionProgress(_)
                     | ServerMessage::ThreadMetadataResult { .. }
                     | ServerMessage::Error { .. }
                     | ServerMessage::Pong => {}
@@ -5449,7 +5453,14 @@ async fn parent_deletion_cascades_to_all_descendants_leaf_first() {
         .send()
         .await
         .unwrap();
-    assert_eq!(deletion.status(), 204);
+    assert_eq!(deletion.status(), 202);
+    let accepted: serde_json::Value = deletion.json().await.unwrap();
+    assert_eq!(accepted["total"], 3);
+    assert_eq!(
+        wait_for_thread_deletion(&client, &base, &cookie, project_id, parent_id).await,
+        None,
+        "the cascade must finish cleanly"
+    );
     assert!(
         state
             .store
@@ -5664,7 +5675,11 @@ async fn thread_delete_removes_native_and_persisted_thread() {
         .send()
         .await
         .unwrap();
-    assert_eq!(resp.status(), 204);
+    assert_eq!(resp.status(), 202);
+    assert_eq!(
+        wait_for_thread_deletion(&client, &base, &cookie, project_id, thread_id).await,
+        None
+    );
     assert!(
         state
             .store
@@ -8028,4 +8043,481 @@ async fn browse_mkdir_creates_directory_and_rejects_escapes() {
         assert_eq!(resp.status(), 400, "name {bad:?} should be rejected");
     }
     assert!(!parent.path().parent().unwrap().join("evil").exists());
+}
+
+// ---- Background thread deletion ----
+
+/// A harness whose thread delete waits at a gate, so a test can hold a cascade mid-way.
+struct GatedDeleteScript {
+    gate: Gate,
+}
+
+#[async_trait::async_trait]
+impl Script for GatedDeleteScript {
+    async fn delete_thread(
+        &self,
+        core: &FakeCore,
+        thread: &ThreadHandle,
+    ) -> Result<(), HarnessError> {
+        self.gate.pass().await;
+        core.remove_log(thread.thread);
+        Ok(())
+    }
+}
+
+async fn start_gated_delete_server() -> (
+    TestServer,
+    Arc<FakeHarness<GatedDeleteScript>>,
+    reqwest::Client,
+    String,
+) {
+    let harness = FakeHarness::new(GatedDeleteScript { gate: Gate::held() });
+    let server = start_custom_server_on_available_port(fake::factory(harness.clone())).await;
+    let client = reqwest::Client::new();
+    let cookie = auth::login(&client, &server.base).await;
+    (server, harness, client, cookie)
+}
+
+async fn deletion_progress(
+    client: &reqwest::Client,
+    base: &str,
+    cookie: &str,
+    project_id: ProjectId,
+    thread_id: ThreadId,
+) -> reqwest::Response {
+    client
+        .get(format!(
+            "{base}/api/projects/{project_id}/threads/{thread_id}/deletion"
+        ))
+        .header("cookie", cookie)
+        .send()
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn thread_delete_runs_in_the_background_and_fences_the_subtree_meanwhile() {
+    let (server, harness, client, cookie) = start_gated_delete_server().await;
+    let state = &server.state;
+    let base = server.base.clone();
+    let (project_id, thread_id) = create_project_and_thread(state, &client, &base, &cookie).await;
+    let child = fixtures::persist_subagent_thread(
+        &state.store,
+        project_id,
+        thread_id,
+        ThreadId::new(),
+        "native-child",
+    )
+    .await;
+    let mut ws = ws::connect(server.addr, &cookie).await;
+
+    let accepted = client
+        .delete(format!(
+            "{base}/api/projects/{project_id}/threads/{thread_id}"
+        ))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(accepted.status(), 202);
+    let body: serde_json::Value = accepted.json().await.unwrap();
+    assert_eq!(body["thread_id"], serde_json::json!(thread_id));
+    assert_eq!(body["total"], 2);
+    // The cascade is parked on the first (leaf) native delete.
+    harness.script.gate.wait_blocked().await;
+
+    let running: ThreadDeletionProgress =
+        deletion_progress(&client, &base, &cookie, project_id, thread_id)
+            .await
+            .json()
+            .await
+            .unwrap();
+    assert_eq!(running.state, ThreadDeletionState::Running);
+    assert_eq!((running.deleted, running.total), (0, 2));
+    assert!(
+        state
+            .registry
+            .loaded_thread_binding(thread_id)
+            .await
+            .is_none(),
+        "the preflight retires the subtree before the cascade starts"
+    );
+
+    // The catalog carries the same record, so a tab that missed the messages shows the same bar.
+    let listed: serde_json::Value = client
+        .get(format!("{base}/api/projects/{project_id}/threads"))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let root_row = listed["threads"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["id"] == serde_json::json!(thread_id))
+        .expect("the root stays listed until the cascade reaches it");
+    assert_eq!(root_row["deletion"]["state"], "running");
+    assert_eq!(root_row["deletion"]["total"], 2);
+
+    // Nothing may touch the subtree while it is being torn down.
+    let reopen = client
+        .post(format!("{base}/api/projects/{project_id}/threads"))
+        .header("cookie", &cookie)
+        .json(&serde_json::json!({"thread_id": thread_id}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(reopen.status(), 409);
+    let rename = client
+        .patch(format!(
+            "{base}/api/projects/{project_id}/threads/{thread_id}/title"
+        ))
+        .header("cookie", &cookie)
+        .json(&serde_json::json!({"title": "too late"}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(rename.status(), 409);
+    let archive = client
+        .post(format!(
+            "{base}/api/projects/{project_id}/threads/{thread_id}/archive"
+        ))
+        .header("cookie", &cookie)
+        .json(&serde_json::json!({"archived": true}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(archive.status(), 409);
+    let again = client
+        .delete(format!(
+            "{base}/api/projects/{project_id}/threads/{thread_id}"
+        ))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(again.status(), 409);
+    let remove_project = client
+        .delete(format!("{base}/api/projects/{project_id}"))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(remove_project.status(), 409);
+    let dismiss_running = client
+        .delete(format!(
+            "{base}/api/projects/{project_id}/threads/{thread_id}/deletion"
+        ))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        dismiss_running.status(),
+        409,
+        "a running deletion is cancelled, not dismissed"
+    );
+    ws::send(
+        &mut ws,
+        &ClientMessage::Subscribe {
+            thread_id: child,
+            since: None,
+        },
+    )
+    .await;
+    let refused = ws::expect_error_for(&mut ws, "subscribe", "thread_deleting").await;
+    assert_eq!(refused.thread_id, Some(child));
+
+    harness.script.gate.release();
+    let done = ws::recv_until(&mut ws, |message| match message {
+        ServerMessage::ThreadDeletionProgress(progress)
+            if progress.thread_id == thread_id && progress.state == ThreadDeletionState::Done =>
+        {
+            Some(progress)
+        }
+        _ => None,
+    })
+    .await
+    .expect("the cascade reports its completion over the WebSocket");
+    assert_eq!((done.deleted, done.total), (2, 2));
+    assert_eq!(
+        deletion_progress(&client, &base, &cookie, project_id, thread_id)
+            .await
+            .status(),
+        404,
+        "a finished deletion leaves no record: the thread is gone"
+    );
+    assert!(
+        state
+            .store
+            .list_threads(project_id)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        deleted_harness_thread_ids(&harness.core),
+        vec!["native-child".to_string(), "th_test".to_string()],
+        "leaf first"
+    );
+}
+
+#[tokio::test]
+async fn thread_delete_cancel_stops_between_threads_and_a_retry_finishes_the_job() {
+    let (server, harness, client, cookie) = start_gated_delete_server().await;
+    let state = &server.state;
+    let base = server.base.clone();
+    let (project_id, thread_id) = create_project_and_thread(state, &client, &base, &cookie).await;
+    for native in ["native-child-a", "native-child-b"] {
+        fixtures::persist_subagent_thread(
+            &state.store,
+            project_id,
+            thread_id,
+            ThreadId::new(),
+            native,
+        )
+        .await;
+    }
+
+    let accepted = client
+        .delete(format!(
+            "{base}/api/projects/{project_id}/threads/{thread_id}"
+        ))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(accepted.status(), 202);
+    harness.script.gate.wait_blocked().await;
+
+    let cancel = client
+        .post(format!(
+            "{base}/api/projects/{project_id}/threads/{thread_id}/deletion/cancel"
+        ))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(cancel.status(), 204);
+    harness.script.gate.release();
+
+    let cancelled = wait_for_thread_deletion(&client, &base, &cookie, project_id, thread_id)
+        .await
+        .expect("a cancelled deletion keeps its record");
+    assert_eq!(cancelled.state, ThreadDeletionState::Cancelled);
+    assert_eq!(
+        (cancelled.deleted, cancelled.total),
+        (1, 3),
+        "the thread in flight finishes; the cascade stops before the next one"
+    );
+    let remaining = state.store.list_threads(project_id).await.unwrap();
+    assert_eq!(remaining.len(), 2);
+    assert!(
+        remaining.contains(&thread_id),
+        "the root is never deleted before its children"
+    );
+    // The record stays for the list to show, until it is dismissed.
+    let listed: serde_json::Value = client
+        .get(format!("{base}/api/projects/{project_id}/threads"))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let root_row = listed["threads"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|row| row["id"] == serde_json::json!(thread_id))
+        .unwrap();
+    assert_eq!(root_row["deletion"]["state"], "cancelled");
+    // A cancel landing after the cascade stopped must not erase why it stopped.
+    let late_cancel = client
+        .post(format!(
+            "{base}/api/projects/{project_id}/threads/{thread_id}/deletion/cancel"
+        ))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(late_cancel.status(), 409);
+    assert_eq!(
+        deletion_progress(&client, &base, &cookie, project_id, thread_id)
+            .await
+            .status(),
+        200,
+        "the record survives a late cancel"
+    );
+    let dismiss = client
+        .delete(format!(
+            "{base}/api/projects/{project_id}/threads/{thread_id}/deletion"
+        ))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(dismiss.status(), 204);
+    assert_eq!(
+        deletion_progress(&client, &base, &cookie, project_id, thread_id)
+            .await
+            .status(),
+        404
+    );
+
+    // Retrying deletes what is left.
+    assert_eq!(
+        server.delete_thread_and_wait(project_id, thread_id).await,
+        None
+    );
+    assert!(
+        state
+            .store
+            .list_threads(project_id)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn thread_delete_step_timeout_fails_the_cascade_and_releases_the_project() {
+    let (server, harness, client, cookie) = start_gated_delete_server().await;
+    let state = &server.state;
+    let base = server.base.clone();
+    state
+        .thread_deletions
+        .set_step_timeout(std::time::Duration::from_millis(100));
+    let (project_id, thread_id) = create_project_and_thread(state, &client, &base, &cookie).await;
+
+    let accepted = client
+        .delete(format!(
+            "{base}/api/projects/{project_id}/threads/{thread_id}"
+        ))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(accepted.status(), 202);
+
+    let failed = wait_for_thread_deletion(&client, &base, &cookie, project_id, thread_id)
+        .await
+        .expect("a stuck step must fail the deletion rather than hold it open");
+    assert_eq!(failed.state, ThreadDeletionState::Failed);
+    assert_eq!((failed.deleted, failed.total), (0, 1));
+    let message = failed.error.clone().unwrap_or_default();
+    assert!(
+        message.contains("stuck on thread") && message.contains(&thread_id.to_string()),
+        "the failure names the thread it stuck on: {message}"
+    );
+    assert!(
+        state
+            .store
+            .load_thread(project_id, thread_id)
+            .await
+            .unwrap()
+            .is_some(),
+        "the thread is kept so the deletion can be retried"
+    );
+
+    // The lifecycle lock went with the failed cascade: a retry is accepted immediately rather
+    // than timing out behind it, and with the harness unblocked it finishes.
+    harness.script.gate.release();
+    assert_eq!(
+        server.delete_thread_and_wait(project_id, thread_id).await,
+        None
+    );
+    assert!(
+        state
+            .store
+            .load_thread(project_id, thread_id)
+            .await
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn thread_delete_batches_catalog_invalidations_across_the_cascade() {
+    let (server, harness, client, cookie) = start_gated_delete_server().await;
+    harness.script.gate.release();
+    let state = &server.state;
+    let base = server.base.clone();
+    let (project_id, thread_id) = create_project_and_thread(state, &client, &base, &cookie).await;
+    let children = 10;
+    for n in 0..children {
+        fixtures::persist_subagent_thread(
+            &state.store,
+            project_id,
+            thread_id,
+            ThreadId::new(),
+            format!("native-child-{n}"),
+        )
+        .await;
+    }
+    let mut ws = ws::connect(server.addr, &cookie).await;
+
+    let accepted = client
+        .delete(format!(
+            "{base}/api/projects/{project_id}/threads/{thread_id}"
+        ))
+        .header("cookie", &cookie)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(accepted.status(), 202);
+
+    // Count catalog invalidations until the cascade reports done, then for a short grace period
+    // so the final one after `finish` is counted too.
+    let mut invalidations = 0usize;
+    let done = ws::recv_until(&mut ws, |message| match message {
+        ServerMessage::ThreadCatalogChanged => {
+            invalidations += 1;
+            None
+        }
+        ServerMessage::ThreadDeletionProgress(progress)
+            if progress.thread_id == thread_id && progress.state == ThreadDeletionState::Done =>
+        {
+            Some(progress)
+        }
+        _ => None,
+    })
+    .await
+    .expect("the cascade reports completion");
+    assert_eq!(done.total, children + 1);
+    let grace = tokio::time::Instant::now() + tokio::time::Duration::from_millis(300);
+    while tokio::time::Instant::now() < grace {
+        let remaining = grace - tokio::time::Instant::now();
+        match tokio::time::timeout(remaining, ws.next()).await {
+            Ok(Some(Ok(tokio_tungstenite::tungstenite::Message::Text(text)))) => {
+                if let Ok(ServerMessage::ThreadCatalogChanged) =
+                    serde_json::from_str::<ServerMessage>(&text)
+                {
+                    invalidations += 1;
+                }
+            }
+            Ok(Some(Ok(_))) => {}
+            _ => break,
+        }
+    }
+    // The invariant is "not one per thread": the cascade invalidates on a count or time
+    // threshold plus once when it stops, so however long the fake harness takes, the count stays
+    // below the number of threads deleted.
+    assert!(
+        invalidations < children + 1,
+        "a {}-thread cascade must not invalidate the catalog per thread; saw {invalidations}",
+        children + 1
+    );
+    assert!(
+        state
+            .store
+            .list_threads(project_id)
+            .await
+            .unwrap()
+            .is_empty()
+    );
 }

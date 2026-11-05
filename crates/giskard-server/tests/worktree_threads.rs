@@ -17,6 +17,7 @@ use giskard_core::turn::{TurnStatus, TurnStatusKind};
 use giskard_persist::store::ThreadGitWorkspace;
 use giskard_testenv::driver::DriverProbe;
 use giskard_testenv::fake::{self, Call, FakeCore, FakeHarness, Script, TurnCall, caps};
+use giskard_testenv::server::wait_for_thread_deletion;
 use giskard_testenv::{TestProject, TestServer, git, ws};
 use tokio::sync::Mutex;
 
@@ -534,6 +535,25 @@ impl Harnessed {
             .expect("the thread records its worktree")
     }
 
+    /// `DELETE` and wait for the background cascade: `None` once the thread is gone, `Some` with
+    /// the record a failed or cancelled deletion left behind.
+    async fn delete_thread_and_wait(
+        &self,
+        thread_id: ThreadId,
+        force: bool,
+    ) -> Option<giskard_proto::ThreadDeletionProgress> {
+        let response = self.delete_thread(thread_id, force).await;
+        assert_eq!(response.status(), 202);
+        wait_for_thread_deletion(
+            &self.server.client,
+            &self.server.base,
+            &self.server.cookie,
+            self.project_id,
+            thread_id,
+        )
+        .await
+    }
+
     async fn delete_thread(&self, thread_id: ThreadId, force: bool) -> reqwest::Response {
         let query = if force { "?force=true" } else { "" };
         self.server
@@ -947,9 +967,13 @@ async fn deleting_a_thread_removes_its_worktree_and_branch() {
     let worktree = server.worktree_of(thread_id).await;
     server.wait_until_idle(thread_id).await;
 
-    let response = server.delete_thread(thread_id, /*force*/ false).await;
+    assert_eq!(
+        server
+            .delete_thread_and_wait(thread_id, /*force*/ false)
+            .await,
+        None
+    );
 
-    assert_eq!(response.status(), 204);
     assert!(!Path::new(&worktree.path).exists());
     assert!(
         !branch_exists(server.project.dir.path(), &worktree.branch),
@@ -970,9 +994,13 @@ async fn deleting_a_thread_whose_worktree_vanished_still_clears_its_branch() {
     server.wait_until_idle(thread_id).await;
     std::fs::remove_dir_all(&worktree.path).unwrap();
 
-    let response = server.delete_thread(thread_id, /*force*/ false).await;
+    assert_eq!(
+        server
+            .delete_thread_and_wait(thread_id, /*force*/ false)
+            .await,
+        None
+    );
 
-    assert_eq!(response.status(), 204);
     assert!(
         !branch_exists(server.project.dir.path(), &worktree.branch),
         "the branch survived a worktree that was already gone"
@@ -1030,8 +1058,12 @@ async fn deleting_a_thread_refuses_to_discard_work_without_confirmation() {
             .contains("uncommitted change")
     );
 
-    let forced = server.delete_thread(thread_id, /*force*/ true).await;
-    assert_eq!(forced.status(), 204);
+    assert_eq!(
+        server
+            .delete_thread_and_wait(thread_id, /*force*/ true)
+            .await,
+        None
+    );
     assert!(!Path::new(&worktree.path).exists());
 }
 
@@ -1062,8 +1094,12 @@ async fn deleting_a_thread_refuses_to_discard_commits_on_no_other_branch() {
     // Parked on a branch of the agent's own, the same commit is no longer at risk — and that branch
     // survives the deletion, because it is the user's now.
     git::run(path, &["branch", "agent/keep-this"]);
-    let response = server.delete_thread(thread_id, /*force*/ false).await;
-    assert_eq!(response.status(), 204);
+    assert_eq!(
+        server
+            .delete_thread_and_wait(thread_id, /*force*/ false)
+            .await,
+        None
+    );
     assert!(branch_exists(server.project.dir.path(), "agent/keep-this"));
     assert!(!branch_exists(server.project.dir.path(), &worktree.branch));
 }
@@ -1401,9 +1437,11 @@ async fn deleting_a_thread_refuses_when_git_cannot_report_what_would_be_lost() {
 
         // The user can still say "delete it anyway", which is the whole point of keeping this a
         // refusal rather than a hard error.
-        let forced = server.delete_thread(thread_id, /*force*/ true).await;
-        assert!(
-            forced.status().is_success(),
+        assert_eq!(
+            server
+                .delete_thread_and_wait(thread_id, /*force*/ true)
+                .await,
+            None,
             "forced delete, broken {break_the}"
         );
     }
@@ -1428,9 +1466,15 @@ async fn a_thread_whose_worktree_cannot_be_removed_is_kept_so_the_delete_can_be_
         .repoint_worktree(thread_id, &project_root, &worktree.repo_root)
         .await;
 
-    let refused = server.delete_thread(thread_id, /*force*/ false).await;
-    assert_eq!(refused.status(), 409);
-    let message = refused.text().await.unwrap();
+    // The preflight passes (the probes can read the checkout), so the request is accepted and
+    // the failure arrives as the cascade's record rather than as the response.
+    let failed = server
+        .delete_thread_and_wait(thread_id, /*force*/ false)
+        .await
+        .expect("a worktree that will not come down must fail the deletion, not finish it");
+    assert_eq!(failed.state, giskard_proto::ThreadDeletionState::Failed);
+    assert_eq!(failed.deleted, 0);
+    let message = failed.error.clone().unwrap_or_default();
     assert!(
         message.contains(&worktree.branch),
         "the refusal must name what was left behind: {message}"
@@ -1451,9 +1495,11 @@ async fn a_thread_whose_worktree_cannot_be_removed_is_kept_so_the_delete_can_be_
         "the refusal must not have removed anything"
     );
 
-    let forced = server.delete_thread(thread_id, /*force*/ true).await;
-    assert!(
-        forced.status().is_success(),
+    assert_eq!(
+        server
+            .delete_thread_and_wait(thread_id, /*force*/ true)
+            .await,
+        None,
         "force must still get rid of a thread whose worktree will not come down"
     );
     assert!(

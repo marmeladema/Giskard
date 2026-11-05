@@ -535,15 +535,30 @@ async fn index_page_is_served_and_public() {
            && body.contains("linked sub-agent thread")
            && body.contains("all corresponding harness threads")
            && body.contains("This cannot be undone")
-           // Deleting the active thread now drops into a fresh draft in the same project instead
-           // of leaving an empty view titled with the deleted thread's name.
-           && remove_thread_confirm.contains("const threadsRefreshed = await loadThreads(pid)")
-           && remove_thread_confirm.contains(
-               "threadsRefreshed && !knownThreadForId(pid, activeThread)"
-           )
+           // The DELETE is accepted (202) once the preflight passed; the cascade runs on the
+           // server and the row reports it, so the card closes and the deleted active view drops
+           // into a fresh draft in the same project right away.
+           && remove_thread_confirm.contains("rememberThreadDeletion(pid, {")
+           && remove_thread_confirm.contains("void loadThreads(pid)")
+           && remove_thread_confirm.contains("deletedIds.has(activeThread)")
            && remove_thread_confirm.contains("openDraftThread(pid)")
            && !remove_thread_confirm.contains("clearThreadView("),
         "thread deletion warns about and lands on a draft in the same project"
+    );
+    assert!(
+        body.contains("function handleThreadDeletionProgress(msg)")
+            && body.contains("msg.type === \"thread_deletion_progress\"")
+            && body.contains("function deletingThreadRow(pid, t, deletion)")
+            && body.contains("role\", \"progressbar\"")
+            && body.contains("/deletion/cancel`")
+            && body.contains("api(\"DELETE\", `/api/projects/${pid}/threads/${t.id}/deletion`)")
+            && body.contains("function applyThreadDeletionToRow(row, deletion)")
+            && body.contains("function threadDeletionWatchdogTick()")
+            && body.contains("function threadDeletionPollTick()")
+            && body.contains(".thread-row.deleting { flex-wrap:wrap; }")
+            && body.contains(".thread-deletion-fill"),
+        "a background thread deletion shows a progress bar in its sidebar row, can be cancelled, \
+         and is resynced rather than declared dead when its messages stop"
     );
     assert!(
         body.contains("overflow:visible")
@@ -656,11 +671,13 @@ async fn index_page_is_served_and_public() {
          dropping them"
     );
     assert!(
-        remove_thread_confirm.contains("deletedIds.has(activeThread) ||")
-            && remove_thread_confirm
-                .contains("threadsRefreshed && !knownThreadForId(pid, activeThread)")
-            && body.contains("String(state.projectId || \"\") === String(pid)"),
-        "cascade delete clears the active view from the refreshed thread list, scoped to the \
+        remove_thread_confirm.contains("activeThread && sameProject && deletedIds.has(activeThread)")
+            && body.contains("String(state.projectId || \"\") === String(pid)")
+            // Descendants the client never listed are reconciled by the catalog: a thread that
+            // vanishes from the authoritative list retires its view, locally-started deletions
+            // silently.
+            && body.contains("removedActiveThreadWasLocal = !!locallyDeletingThreadIds?.has(removedThreadId)"),
+        "cascade delete clears the active view as soon as the deletion is accepted, scoped to the \
          deleted thread's project so unrelated views survive"
     );
     assert!(

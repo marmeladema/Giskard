@@ -158,7 +158,7 @@ struct RegistryTaskTracker {
     completion: Notify,
 }
 
-struct RegistryTaskPermit {
+pub(crate) struct RegistryTaskPermit {
     tracker: Arc<RegistryTaskTracker>,
 }
 
@@ -1496,6 +1496,23 @@ impl HarnessRegistry {
         harness: &str,
         harness_thread_id: String,
     ) -> Result<(), HarnessError> {
+        self.delete_thread_quietly(config, thread_id, harness, harness_thread_id)
+            .await?;
+        self.shared.services.publish_runtime_overview().await;
+        Ok(())
+    }
+
+    /// [`Self::delete_thread`] without the runtime overview broadcast. A cascade deleting a large
+    /// subtree calls this per thread and [`Self::publish_runtime_overview`] once when it stops;
+    /// one broadcast per deleted thread would have every connected tab repaint its badges
+    /// hundreds of times for a single user action.
+    pub async fn delete_thread_quietly(
+        &self,
+        config: &ProjectConfig,
+        thread_id: ThreadId,
+        harness: &str,
+        harness_thread_id: String,
+    ) -> Result<(), HarnessError> {
         let harness = self
             .get_or_create_harness(config.id, config, harness)
             .await?;
@@ -1505,8 +1522,27 @@ impl HarnessRegistry {
             .map(|binding| binding.handle)
             .unwrap_or_else(|| ThreadHandle::detached(thread_id, harness_thread_id));
         harness.delete_thread(&handle).await?;
-        self.retire_thread(thread_id).await;
+        self.retire_thread_quietly(thread_id).await;
         Ok(())
+    }
+
+    pub async fn publish_runtime_overview(&self) {
+        self.shared.services.publish_runtime_overview().await;
+    }
+
+    /// A permit that makes [`Self::shutdown`] wait (bounded) for a background task the registry
+    /// does not otherwise know about. `None` once shutdown has begun.
+    pub(crate) fn register_background_task(&self) -> Option<RegistryTaskPermit> {
+        self.shared.background_tasks.register()
+    }
+
+    /// Whether [`Self::shutdown`] has begun; long-running tasks stop at their next safe point.
+    pub(crate) async fn is_shutting_down(&self) -> bool {
+        self.shared
+            .harness_transitions
+            .lock()
+            .await
+            .is_shutting_down()
     }
 
     pub async fn thread_has_active_turn(&self, thread_id: ThreadId) -> bool {
@@ -1537,12 +1573,24 @@ impl HarnessRegistry {
     }
 
     pub async fn retire_thread(&self, thread_id: ThreadId) {
+        self.retire_thread_quietly(thread_id).await;
+        self.shared.services.publish_runtime_overview().await;
+    }
+
+    /// Retire a whole subtree with one runtime overview broadcast at the end.
+    pub async fn retire_threads(&self, thread_ids: &[ThreadId]) {
+        for thread_id in thread_ids {
+            self.retire_thread_quietly(*thread_id).await;
+        }
+        self.shared.services.publish_runtime_overview().await;
+    }
+
+    async fn retire_thread_quietly(&self, thread_id: ThreadId) {
         let authority = self.shared.thread_authority(thread_id).await;
         self.forget_thread(thread_id).await;
         if let Some(authority) = authority {
             self.shared.services.runtime.forget_threads(&[authority]);
         }
-        self.shared.services.publish_runtime_overview().await;
     }
 
     /// Stop every project harness after HTTP traffic has drained.

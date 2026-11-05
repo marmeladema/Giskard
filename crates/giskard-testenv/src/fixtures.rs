@@ -92,6 +92,47 @@ pub async fn persist_primary_thread_on(
     thread_id
 }
 
+/// A persisted sub-agent of `parent`, as a harness discovery would have left it.
+pub async fn persist_subagent_thread(
+    store: &PersistStore,
+    project_id: ProjectId,
+    parent: ThreadId,
+    thread_id: ThreadId,
+    harness_thread_id: impl Into<String>,
+) -> ThreadId {
+    let now = Utc::now();
+    store
+        .create_thread(
+            project_id,
+            ThreadFile {
+                version: THREAD_METADATA_VERSION,
+                id: thread_id,
+                project_id,
+                revision: 0,
+                title: "Sub-agent".into(),
+                harness_thread_id: harness_thread_id.into(),
+                harness: "codex".into(),
+                parent_thread_id: Some(parent),
+                spawned_by_turn_id: Some(TurnId::new()),
+                kind: ThreadKind::Subagent,
+                mode: TurnMode::Known(Mode::Build),
+                current_model: TurnModel::Known(fake_native_model()),
+                context_window: 0,
+                model_context_windows: HashMap::new(),
+                permission_preset: PermissionPreset::AskFirst,
+                model_efforts: HashMap::new(),
+                tokens: TokenLedger::default(),
+                created_at: now,
+                updated_at: now,
+                archived: false,
+                git_workspace: None,
+            },
+        )
+        .await
+        .expect("persist sub-agent thread fixture");
+    thread_id
+}
+
 pub fn completed_turn_fixture() -> ReplayFixture {
     let thread = ThreadId::new();
     let turn = TurnId::new();

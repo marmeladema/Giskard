@@ -400,6 +400,12 @@ Confirming then deletes anyway; that is where the decision is made. The server k
 for the case where the card could not ask — it refuses with *"deleting this thread would destroy …"*
 and the card asks you to confirm once more.
 
+The deletion itself runs in the background once that check passes: the row stays in the sidebar
+with a progress bar until the thread and every sub-agent under it are gone. A worktree that will
+not come down (Git refuses to remove it, say) stops the deletion at that thread and the row says
+so — the thread is kept, with its checkout and branch, so you can fix the cause and retry, or
+retry with *delete anyway* to leave whatever remains of the checkout behind.
+
 "Commits on no other ref" is the question the confirmation asks, and it is not Git's `branch -d`
 verdict. Those measure different things: `branch -d` decides whether a *branch* may be deleted, by
 comparing against `HEAD` and its upstream only, while the confirmation asks whether any *commit*

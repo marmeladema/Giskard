@@ -8,6 +8,8 @@ use giskard_core::ids::{ProjectId, ThreadId};
 use giskard_core::model::ModelRef;
 use giskard_core::turn::{Mode, PermissionPreset};
 use giskard_persist::store::ThreadFile;
+use giskard_proto::ThreadDeletionState;
+use giskard_testenv::server::wait_for_thread_deletion;
 use giskard_testenv::{TestProject, TestServer, factory, fixtures};
 
 struct Fixture {
@@ -116,13 +118,27 @@ async fn thread_lifecycle_native_failure_preserves_local_thread() {
     let saved = state.store.load_thread(pid, tid).await.unwrap().unwrap();
     assert!(!saved.archived);
 
+    // The preflight has nothing to refuse, so the deletion is accepted; the native failure then
+    // stops the background cascade, which keeps the local thread and says why.
     let delete = client
         .delete(format!("{base}/api/projects/{pid}/threads/{tid}"))
         .header("cookie", &cookie)
         .send()
         .await
         .unwrap();
-    assert_eq!(delete.status(), 500);
+    assert_eq!(delete.status(), 202);
+    let failed = wait_for_thread_deletion(&client, &base, &cookie, pid, tid)
+        .await
+        .expect("a native delete failure must fail the cascade, not finish it");
+    assert_eq!(failed.state, ThreadDeletionState::Failed);
+    assert_eq!((failed.deleted, failed.total), (0, 1));
+    assert!(
+        failed
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("failed to delete thread subtree")),
+        "{failed:?}"
+    );
     assert!(state.store.load_thread(pid, tid).await.unwrap().is_some());
 }
 

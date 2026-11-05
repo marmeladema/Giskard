@@ -9,8 +9,28 @@
 
 **Document status:** Implementation-ready specification.
 **Audience:** An AI coding agent (and its human reviewer) implementing the system.
-**Version:** 1.105
+**Version:** 1.106
 
+> **Amendment — background thread deletion (1.106).** `DELETE` on a thread runs its subtree
+> preflight (liveness, worktree impact, retirement, graph reload, final leaf-first order) in the
+> request and answers `202 Accepted` with the subtree size; the cascade itself runs in a
+> server-owned task that holds the project lifecycle lock until it stops and publishes
+> `ThreadDeletionProgress` (latest-wins per root) to every client. The browser no longer bounds
+> the deletion with a request timeout: aborting the request used to abort the handler mid-cascade.
+> Each step is bounded instead — Git and Codex by their own timeouts, the harness stop and the
+> store removal by a 30-second step timeout — so a hung disk fails the deletion, names the thread it
+> stuck on, and releases the lock. A timed-out harness stop keeps its thread; a timed-out store
+> removal is never cancelled (the rename out of enumeration has already happened), runs to
+> completion on its own task, and counts as deleted. The subtree is fenced before retirement, under
+> the lifecycle lock, so no open or subscribe can land between retirement and the cascade. The
+> cascade stops at the first failure and keeps that thread,
+> preserving the invariant that the root and every ancestor of an undeleted thread exist; the user
+> may cancel between threads, which is always a safe point. While a deletion runs, every thread in
+> its subtree refuses open, subscribe, rename, archive, a second delete, and project deletion with
+> `409`. Catalog invalidations and runtime-overview broadcasts are batched across the cascade
+> rather than issued per thread. `<id>.deleting/` directories left by an interrupted removal are
+> swept at startup, since the thread they belonged to can no longer be deleted again.
+>
 > **Amendment — disk usage warnings and the status route (1.105).** A process-wide disk usage
 > monitor (`[disk_usage]`) samples the data-directory filesystem at startup and every 60 seconds
 > by default, warning below 10 GiB available to an ordinary user. Existing configurations enable
@@ -960,6 +980,10 @@ runtime overview; the hoisting and notification behavior remains current.
   harness and local persistence in leaf-first order. The server preflights the entire subtree, and
   an active turn or running task anywhere returns `409 Conflict` before deletion begins. The browser
   confirms descendant count, native scope, and irreversibility, then clears any deleted active view.
+  The cascade runs in the background after a `202 Accepted` (amendment 1.106): the root's sidebar
+  row shows a determinate progress bar fed by `ThreadDeletionProgress`, offers cancellation, and
+  on failure shows the error with retry and dismiss actions; the thread list carries the same
+  record so a reconnecting tab agrees.
   Discoveries, sub-agent links, and explicit link opens are serialized as admissions by the
   project's event driver. The harness's idempotent native-identity claim prevents duplicate local
   identities, and relationship validation reads the thread graph only when needed. Project

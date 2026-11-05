@@ -240,7 +240,11 @@ the item endpoint above returns its full text. A missing thread or turn is a 404
 the newest page — since a cursor only ever comes from this turn's snapshot or an earlier page.
 
 Process-local thread state is published separately: `ThreadRuntimeOverview { revision, threads }`
-is a global replacement snapshot (including an empty `threads` list), `RequestState` carries a
+is a global replacement snapshot (including an empty `threads` list),
+`ThreadDeletionProgress { project_id, thread_id, state, deleted, total, error? }` is the latest
+count of a background thread deletion, sent to every client and coalesced per root thread so a
+slow socket sees only the newest value (a `done` message is the last one; the catalog invalidation
+that follows removes the row), `RequestState` carries a
 per-request revision and the authoritative pending/responding/resolved status for each approval or
 server request, and
 `RunningTasks { thread_id, revision, tasks }` owns only the Tasks menu and its controls. Tasks carry
@@ -301,15 +305,47 @@ not recoverable through
 a provider switch. Matched approval/server-request responses, interrupting active work, command
 termination, transcript/history reads, and navigation remain supported.
 
-`DELETE /api/projects/{id}/threads/{thread_id}` refuses with `409` when the thread — or any linked
-child it cascades to — has a Git worktree holding work that exists nowhere else: uncommitted
-changes, or commits on its branch that no other ref reaches. The message names what would be
-destroyed. `?force=true` deletes anyway, which is what the browser sends once its confirmation
-card has shown the same facts. Deleting a thread takes its worktree and the branch it started on;
-branches the agent created during the thread are left alone, since they live in the shared
-repository and are the user's now. Deleting a *project* sweeps its worktrees unconditionally —
-that confirmation is project-scoped and one thread's unfinished work must not strand the rest
-half-deleted.
+`DELETE /api/projects/{id}/threads/{thread_id}` runs the preflight in the request and the
+deletion itself in the background. The preflight refuses with `409` when any thread in the subtree
+has an active turn or running command, when another deletion is still running in the project, or
+when the thread — or any linked child it cascades to — has a Git worktree holding work that exists
+nowhere else: uncommitted changes, or commits on its branch that no other ref reaches. The message
+names what would be destroyed. `?force=true` deletes anyway, which is what the browser sends once
+its confirmation card has shown the same facts. Once the preflight passes the response is
+`202 Accepted` with `{ thread_id, total }`, `total` counting the root and every descendant the
+cascade will delete, leaf-first. A thread with more than a thousand sub-agents takes a while, and
+nothing about the request has to wait for it: the cascade is owned by the server process, holds
+the project's lifecycle lock until it stops, and reports over the WebSocket (below).
+
+While it runs, every thread in the subtree is fenced: open, subscribe (`thread_deleting`), rename,
+archive, a second delete, and project deletion all answer `409`. The cascade stops at the first
+thread it cannot delete and keeps that thread, so a failed deletion leaves the root and every
+ancestor of an undeleted thread in place — the same request retried deletes what is left. Each
+step is bounded (Git and Codex calls by their own timeouts, the harness stop and the file removal
+by a 30-second one), so a hung disk fails the deletion rather than holding the project. A harness
+stop that times out leaves the thread intact for the retry. A file removal that times out is past
+the point of no return — the directory is already renamed out of enumeration — so it keeps running
+on its own, that thread counts as deleted, and the cascade stops there with a message saying the
+removal is still finishing.
+
+`GET /api/projects/{id}/threads/{thread_id}/deletion` returns the cascade's record —
+`{ project_id, thread_id, state, deleted, total, error? }` with `state` one of `running`, `failed`,
+`cancelled` — and `404` once it finished (the thread is gone) or when none was started. The same
+record rides on the thread list as each root's optional `deletion` field, so a tab that missed the
+messages shows the same bar. `POST /api/projects/{id}/threads/{thread_id}/deletion/cancel` asks a
+running cascade to stop after the thread it is on (`204`; the record then reads `cancelled`). On a
+record that already stopped it answers `409` rather than discarding the reason it stopped: that is
+`DELETE /api/projects/{id}/threads/{thread_id}/deletion`, which dismisses a failed or cancelled
+record so the row returns to normal (`409` while the cascade still runs). A failed or cancelled
+record otherwise stays until the next delete of the same root replaces it or the project is
+deleted. A server shutting down stops a cascade between threads and records it as `cancelled`.
+
+Deleting a thread takes its worktree and the branch it started on; branches the agent created
+during the thread are left alone, since they live in the shared repository and are the user's now.
+A worktree that will not come down fails the cascade at that thread with the same message the
+refusal used to carry, and `?force=true` on the retry accepts whatever is left behind. Deleting a
+*project* sweeps its worktrees unconditionally — that confirmation is project-scoped and one
+thread's unfinished work must not strand the rest half-deleted.
 
 The requested deletion root must be a primary thread. Requesting deletion of an individual
 sub-agent returns `409 thread_read_only`; deleting a primary recursively removes its linked child
