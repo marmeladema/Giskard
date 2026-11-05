@@ -116,6 +116,14 @@ pub fn protected_routes(state: AppState) -> Router<AppState> {
             get(thread_deletion_impact),
         )
         .route(
+            "/api/projects/{id}/threads/{thread_id}/deletion",
+            get(thread_deletion_progress).delete(dismiss_thread_deletion),
+        )
+        .route(
+            "/api/projects/{id}/threads/{thread_id}/deletion/cancel",
+            post(cancel_thread_deletion),
+        )
+        .route(
             "/api/projects/{id}/threads/{thread_id}/history",
             get(thread_history),
         )
@@ -512,6 +520,10 @@ async fn delete_project(
     State(state): State<AppState>,
     AxumPath(id): AxumPath<ProjectId>,
 ) -> Result<axum::http::StatusCode, ApiError> {
+    // The cascade holds the lifecycle lock below; waiting on it would only time out.
+    if state.thread_deletions.project_has_running(id) {
+        return Err(deletion_running_conflict());
+    }
     let _lifecycle_guard = state
         .registry
         .lock_project_lifecycle_with_timeout(id, PROJECT_LIFECYCLE_LOCK_TIMEOUT)
@@ -583,10 +595,33 @@ async fn delete_project(
         .await;
     }
     state.store.delete_project(id).await?;
+    state.thread_deletions.forget_project(id);
     Ok(axum::http::StatusCode::NO_CONTENT)
 }
 
+/// A thread inside a running deletion is retired and about to lose its files; nothing may
+/// change it, open it, or delete it a second time until the cascade stops.
+async fn reject_thread_mutation_if_deleting(
+    state: &AppState,
+    thread_id: ThreadId,
+) -> Result<(), ApiError> {
+    if state.thread_deletions.deleting_root(thread_id).is_some() {
+        return Err(ApiError::Conflict("thread is being deleted".into()));
+    }
+    Ok(())
+}
+
 async fn reject_thread_mutation_if_live(
+    state: &AppState,
+    thread_id: ThreadId,
+) -> Result<(), ApiError> {
+    reject_thread_mutation_if_deleting(state, thread_id).await?;
+    reject_thread_mutation_if_live_ignoring_fence(state, thread_id).await
+}
+
+/// The liveness half of [`reject_thread_mutation_if_live`], for the deletion handler re-checking
+/// a subtree it has already fenced itself.
+async fn reject_thread_mutation_if_live_ignoring_fence(
     state: &AppState,
     thread_id: ThreadId,
 ) -> Result<(), ApiError> {
@@ -656,13 +691,16 @@ async fn list_threads(
         .load_project(project_id)
         .await?
         .ok_or(ApiError::NotFound)?;
+    let mut deletions = state.thread_deletions.project_progress(project_id);
     let mut threads = Vec::with_capacity(loaded.len());
     for thread in &loaded {
         if thread.kind == ThreadKind::Orphan {
             continue;
         }
         let workspace_root = effective_workspace_root(&state.store, &project, thread).await?;
-        threads.push(thread_summary(thread, workspace_root));
+        let mut summary = thread_summary(thread, workspace_root);
+        summary.deletion = deletions.remove(&thread.id);
+        threads.push(summary);
     }
     threads.sort_by_key(|t| std::cmp::Reverse(t.updated_at));
     Ok(Json(ListThreadsResponse { threads }))
@@ -687,6 +725,7 @@ async fn open_thread(
     );
 
     let thread_id = req.thread_id;
+    reject_thread_mutation_if_deleting(&state, thread_id).await?;
     let Some(persisted) = state.store.load_thread(project_id, thread_id).await? else {
         return Err(ApiError::NotFound);
     };
@@ -1582,7 +1621,7 @@ async fn worktree_deletion_impact(
 /// Returns the failure rather than only logging it. The thread file is the only record of where this
 /// checkout and branch are, so a caller that deleted it first and then discovered the cleanup had
 /// failed would have stranded both with nothing left to find them by.
-async fn remove_worktree_for_deleted_thread(
+pub(crate) async fn remove_worktree_for_deleted_thread(
     worktree: &ThreadWorktree,
     thread_id: ThreadId,
     action: &str,
@@ -1782,6 +1821,7 @@ fn thread_summary(tf: &ThreadFile, workspace_root: String) -> ThreadSummary {
         archived: tf.archived,
         created_at: tf.created_at,
         updated_at: tf.updated_at,
+        deletion: None,
     }
 }
 
@@ -1865,6 +1905,7 @@ async fn rename_thread(
         .ensure_thread_writable(project_id, thread_id)
         .await
         .map_err(harness_api_error)?;
+    reject_thread_mutation_if_deleting(&state, thread_id).await?;
     let title = normalize_thread_title(&req.title)?;
     if thread_file.title == title {
         let workspace_root =
@@ -1960,8 +2001,13 @@ async fn delete_thread(
     State(state): State<AppState>,
     AxumPath((project_id, thread_id)): AxumPath<(ProjectId, ThreadId)>,
     Query(q): Query<DeleteThreadQuery>,
-) -> Result<axum::http::StatusCode, ApiError> {
-    let _lifecycle_guard = state
+) -> Result<(axum::http::StatusCode, Json<DeleteThreadResponse>), ApiError> {
+    // Fast path for the common refusal; the authoritative check is the reservation below, taken
+    // under the lifecycle lock the running cascade holds.
+    if state.thread_deletions.project_has_running(project_id) {
+        return Err(deletion_running_conflict());
+    }
+    let lifecycle_guard = state
         .registry
         .lock_project_lifecycle_with_timeout(project_id, PROJECT_LIFECYCLE_LOCK_TIMEOUT)
         .await
@@ -2012,123 +2058,120 @@ async fn delete_thread(
             }
         }
     }
-    for candidate in &initial_deletion_order {
-        state.registry.retire_thread(*candidate).await;
-    }
-    let graph = load_thread_graph(&state.store, project_id).await?;
+    // Fence the subtree before retiring it: from here until the cascade stops, nothing may open
+    // or change a thread in it, or a retired thread could be re-opened under a new owner just
+    // before its files go.
+    // The reservation is a guard: every early return below, `?` included, releases the fence.
+    let Ok(reservation) =
+        state
+            .thread_deletions
+            .reserve(project_id, thread_id, &initial_deletion_order)
+    else {
+        return Err(deletion_running_conflict());
+    };
+    state.registry.retire_threads(&initial_deletion_order).await;
+    let mut graph = load_thread_graph(&state.store, project_id).await?;
     let deletion_order = descendant_deletion_order(&graph, thread_id);
     if deletion_order.is_empty() {
         return Err(ApiError::NotFound);
     }
     // Preflight the complete subtree before deleting any native or local record. A busy descendant
-    // must reject the entire request instead of leaving a partially deleted ownership tree.
+    // must reject the entire request instead of leaving a partially deleted ownership tree. The
+    // fence is ours, so only liveness can still refuse here.
     for candidate in &deletion_order {
-        reject_thread_mutation_if_live(&state, *candidate).await?;
+        reject_thread_mutation_if_live_ignoring_fence(&state, *candidate).await?;
     }
     let project_config = state
         .store
         .load_project(project_id)
         .await?
         .ok_or(ApiError::NotFound)?;
-    let descendant_count = deletion_order.len().saturating_sub(1);
-    info!(
-        %project_id,
-        %thread_id,
-        descendant_count,
-        action = "delete_thread",
-        "deleting thread subtree in leaf-first order"
-    );
-    for (deleted_count, candidate) in deletion_order.iter().enumerate() {
-        let Some(thread_file) = graph.get(candidate) else {
-            error!(
-                %project_id,
-                root_thread_id = %thread_id,
-                thread_id = %candidate,
-                deleted_count,
-                action = "delete_thread",
-                "thread disappeared from the loaded deletion graph"
-            );
-            return Err(ApiError::Internal(
-                "thread deletion graph changed unexpectedly".into(),
-            ));
-        };
-        // Before the thread file goes: it is the only record of this checkout's path, branch and
-        // repository, so cleaning up afterwards means cleaning up blind if anything fails. Keeping
-        // the thread on failure is what makes a retry possible, and a retry converges — the probes
-        // read a missing checkout as no work, removal de-registers a vanished one, and deleting an
-        // already-gone branch is not an error. `force` accepts whatever is left behind instead,
-        // which is the only way to delete a thread whose repository has gone missing entirely.
-        //
-        // The message deliberately does not promise nothing was touched: cleanup is two Git
-        // commands, and the second can fail after the first has already removed the checkout.
-        if let Some(worktree) = thread_file
-            .git_workspace
-            .as_ref()
-            .and_then(ThreadGitWorkspace::as_worktree)
-            && let Err(error) =
-                remove_worktree_for_deleted_thread(worktree, *candidate, "delete_thread", q.force)
-                    .await
-            && !q.force
-        {
-            return Err(ApiError::Conflict(format!(
-                "could not finish removing worktree {} at {}: {error}. The thread was kept so this \
-                 can be retried — some of the cleanup may already have run. Deleting it anyway \
-                 leaves whatever remains of the checkout and branch behind.",
-                worktree.branch, worktree.path
-            )));
-        }
-        if let Err(error) = state
-            .registry
-            .delete_thread(
-                &project_config,
-                *candidate,
-                &thread_file.harness,
-                thread_file.harness_thread_id.clone(),
-            )
-            .await
-        {
-            error!(
-                %project_id,
-                root_thread_id = %thread_id,
-                thread_id = %candidate,
-                harness_thread_id = %thread_file.harness_thread_id,
-                deleted_count,
-                total_count = deletion_order.len(),
-                action = "delete_thread",
-                %error,
-                "failed to delete native thread while cascading thread deletion"
-            );
-            return Err(ApiError::Internal(format!(
-                "failed to delete thread subtree after deleting {deleted_count} thread(s): {error}"
-            )));
-        }
-        if let Err(error) = state.thread_metadata.delete(project_id, *candidate).await {
-            error!(
-                %project_id,
-                root_thread_id = %thread_id,
-                thread_id = %candidate,
-                harness_thread_id = %thread_file.harness_thread_id,
-                deleted_count,
-                total_count = deletion_order.len(),
-                action = "delete_thread",
-                %error,
-                "native thread was deleted but local thread removal failed"
-            );
-            return Err(error.into());
-        }
+    let files = deletion_order
+        .iter()
+        .filter_map(|id| graph.remove(id))
+        .collect::<Vec<_>>();
+    // From here the request cannot fail: the cascade runs in the background, holding the
+    // lifecycle guard, and reports over the WebSocket. See `thread_deletion` for why.
+    let progress = state
+        .thread_deletions
+        .start(
+            reservation,
+            crate::thread_deletion::DeletionPlan {
+                project: project_config,
+                root: thread_id,
+                files,
+                force: q.force,
+                lifecycle_guard,
+            },
+            state.store.clone(),
+            state.hub.clone(),
+            state.registry.clone(),
+        )
+        .await;
+    Ok((
+        axum::http::StatusCode::ACCEPTED,
+        Json(DeleteThreadResponse {
+            thread_id,
+            total: progress.total,
+        }),
+    ))
+}
 
-        info!(
-            %project_id,
-            root_thread_id = %thread_id,
-            thread_id = %candidate,
-            harness_thread_id = %thread_file.harness_thread_id,
-            deleted_count = deleted_count + 1,
-            total_count = deletion_order.len(),
-            action = "delete_thread",
-            "deleted thread from cascading subtree"
-        );
+fn deletion_running_conflict() -> ApiError {
+    ApiError::Conflict(
+        "a thread deletion is still running in this project; wait for it or cancel it first".into(),
+    )
+}
+
+/// Where a deletion rooted at this thread stands: running, or the last one that failed or was
+/// cancelled. `404` once it finished (the thread is gone) or when none was ever started.
+async fn thread_deletion_progress(
+    State(state): State<AppState>,
+    AxumPath((project_id, thread_id)): AxumPath<(ProjectId, ThreadId)>,
+) -> Result<Json<ThreadDeletionProgress>, ApiError> {
+    match state.thread_deletions.progress(thread_id) {
+        Some(progress) if progress.project_id == project_id => Ok(Json(progress)),
+        _ => Err(ApiError::NotFound),
     }
-    Ok(axum::http::StatusCode::NO_CONTENT)
+}
+
+/// Stop a running deletion at its next safe point. A record that already stopped is left as it
+/// is (`409`): cancelling it would only hide why it stopped, and dismissing is its own route.
+async fn cancel_thread_deletion(
+    State(state): State<AppState>,
+    AxumPath((project_id, thread_id)): AxumPath<(ProjectId, ThreadId)>,
+) -> Result<axum::http::StatusCode, ApiError> {
+    match state.thread_deletions.progress(thread_id) {
+        Some(progress) if progress.project_id == project_id => {}
+        _ => return Err(ApiError::NotFound),
+    }
+    use crate::thread_deletion::CancelOutcome;
+    match state.thread_deletions.cancel(thread_id) {
+        CancelOutcome::Requested => Ok(axum::http::StatusCode::NO_CONTENT),
+        CancelOutcome::NotRunning => Err(ApiError::Conflict(
+            "this deletion has already stopped; dismiss its record instead".into(),
+        )),
+        CancelOutcome::NotFound => Err(ApiError::NotFound),
+    }
+}
+
+/// Forget the record of a failed or cancelled deletion, so the thread reads as ordinary again.
+async fn dismiss_thread_deletion(
+    State(state): State<AppState>,
+    AxumPath((project_id, thread_id)): AxumPath<(ProjectId, ThreadId)>,
+) -> Result<axum::http::StatusCode, ApiError> {
+    match state.thread_deletions.progress(thread_id) {
+        Some(progress) if progress.project_id == project_id => {}
+        _ => return Err(ApiError::NotFound),
+    }
+    use crate::thread_deletion::DismissOutcome;
+    match state.thread_deletions.dismiss(thread_id) {
+        DismissOutcome::Dismissed => Ok(axum::http::StatusCode::NO_CONTENT),
+        DismissOutcome::StillRunning => Err(ApiError::Conflict(
+            "this deletion is still running; cancel it first".into(),
+        )),
+        DismissOutcome::NotFound => Err(ApiError::NotFound),
+    }
 }
 
 #[derive(Deserialize)]

@@ -159,17 +159,6 @@ impl ThreadMetadataService {
             .await;
     }
 
-    pub(crate) async fn delete(
-        &self,
-        project_id: ProjectId,
-        thread_id: ThreadId,
-    ) -> Result<(), PersistError> {
-        self.store.delete_thread(project_id, thread_id).await?;
-        self.invalidate_thread_catalog(project_id, thread_id, 0)
-            .await;
-        Ok(())
-    }
-
     pub(crate) fn thread_state(thread: &ThreadFile, active_turn: Option<bool>) -> ThreadState {
         ThreadState {
             metadata: Self::metadata(thread),

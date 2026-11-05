@@ -187,7 +187,8 @@ impl<'a> HarnessTransitionGuard<'a> {
         self.state.shutting_down = true;
     }
 
-    #[cfg(test)]
+    /// Whether the shutdown fence is up: harness creation is refused and long-running registry
+    /// work should stop at its next safe point.
     pub(super) fn is_shutting_down(&self) -> bool {
         self.state.shutting_down
     }

@@ -5,7 +5,7 @@ use tokio::sync::{Notify, mpsc};
 use tracing::{debug, error};
 
 use giskard_core::ids::ThreadId;
-use giskard_proto::{ServerMessage, ThreadRuntimeOverview, ThreadState};
+use giskard_proto::{ServerMessage, ThreadDeletionProgress, ThreadRuntimeOverview, ThreadState};
 
 use crate::hub::ClientId;
 
@@ -76,6 +76,17 @@ impl ClientDelivery {
         self.replacements.insert_runtime_overview(overview);
         true
     }
+
+    pub(crate) fn publish_thread_deletion_progress(
+        &self,
+        progress: ThreadDeletionProgress,
+    ) -> bool {
+        if self.ordered.is_closed() {
+            return false;
+        }
+        self.replacements.insert_thread_deletion_progress(progress);
+        true
+    }
 }
 
 impl ReplacementReceiver {
@@ -95,6 +106,9 @@ enum ReplacementKey {
     Thread(ThreadId),
     ThreadCatalog,
     RuntimeOverview,
+    /// Keyed by the deletion's root thread: a cascade publishes one count per deleted thread, and
+    /// only the latest matters to a progress bar.
+    ThreadDeletion(ThreadId),
 }
 
 #[derive(Default)]
@@ -229,6 +243,32 @@ impl ReplacementMailbox {
         self.changed.notify_one();
     }
 
+    fn insert_thread_deletion_progress(&self, progress: ThreadDeletionProgress) {
+        let key = ReplacementKey::ThreadDeletion(progress.thread_id);
+        let mut pending = self.lock_pending();
+        if let Some(ServerMessage::ThreadDeletionProgress(current)) = pending.messages.get(&key) {
+            // Counts only grow within one deletion, and a terminal state is its last message. A
+            // smaller count or a non-terminal state behind a terminal one is a retry's first
+            // message racing the previous run's last, and the newer run's view wins regardless.
+            debug!(
+                client_id = self.client_id,
+                thread_id = %progress.thread_id,
+                replaced_deleted = current.deleted,
+                retained_deleted = progress.deleted,
+                action = "coalesce_thread_deletion_progress",
+                "coalescing pending thread deletion progress"
+            );
+        }
+        if !pending.messages.contains_key(&key) {
+            pending.order.push_back(key);
+        }
+        pending
+            .messages
+            .insert(key, ServerMessage::ThreadDeletionProgress(progress));
+        drop(pending);
+        self.changed.notify_one();
+    }
+
     fn pop_front(&self) -> Option<ServerMessage> {
         let mut pending = self.lock_pending();
         while let Some(key) = pending.order.pop_front() {
@@ -318,6 +358,60 @@ mod tests {
             other => panic!("expected thread state, got {other:?}"),
         }
         assert!(matches!(rx.recv().await, Some(ServerMessage::Pong)));
+    }
+
+    #[tokio::test]
+    async fn thread_deletion_progress_coalesces_to_the_latest_count_per_root() {
+        use giskard_core::ids::ProjectId;
+        use giskard_proto::{ThreadDeletionProgress, ThreadDeletionState};
+        let (tx, _rx) = mpsc::channel(1);
+        tx.send(ServerMessage::Pong).await.unwrap();
+        let (delivery, replacements) = ClientDelivery::new(9, tx);
+        let project_id = ProjectId::new();
+        let root = ThreadId::new();
+        let other_root = ThreadId::new();
+        let progress = |thread_id, deleted, state| ThreadDeletionProgress {
+            project_id,
+            thread_id,
+            state,
+            deleted,
+            total: 10,
+            error: None,
+        };
+
+        assert!(delivery.publish_thread_deletion_progress(progress(
+            root,
+            1,
+            ThreadDeletionState::Running
+        )));
+        assert!(delivery.publish_thread_deletion_progress(progress(
+            other_root,
+            4,
+            ThreadDeletionState::Running
+        )));
+        assert!(delivery.publish_thread_deletion_progress(progress(
+            root,
+            10,
+            ThreadDeletionState::Done
+        )));
+
+        // One message per root, in first-seen order, each carrying its latest value.
+        match replacements.try_recv() {
+            Some(ServerMessage::ThreadDeletionProgress(p)) => {
+                assert_eq!(p.thread_id, root);
+                assert_eq!(p.deleted, 10);
+                assert_eq!(p.state, ThreadDeletionState::Done);
+            }
+            other => panic!("expected the root's latest progress, got {other:?}"),
+        }
+        match replacements.try_recv() {
+            Some(ServerMessage::ThreadDeletionProgress(p)) => {
+                assert_eq!(p.thread_id, other_root);
+                assert_eq!(p.deleted, 4);
+            }
+            other => panic!("expected the other root's progress, got {other:?}"),
+        }
+        assert!(replacements.try_recv().is_none());
     }
 
     #[tokio::test]

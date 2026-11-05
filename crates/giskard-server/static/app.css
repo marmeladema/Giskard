@@ -125,6 +125,19 @@
   .project-threads[hidden] { display:none; }
   .thread-row { position:relative; display:flex; align-items:center; gap:4px; margin:3px 0 3px 8px; border-radius:6px; }
   .thread-row.subagent-thread-row { margin-left:24px; }
+  /* A thread being deleted in the background: the row stays, inert, with a determinate bar under
+     the title until the cascade reaches the root. Wrapping puts the bar on its own line. */
+  .thread-row.deleting { flex-wrap:wrap; }
+  .thread-row.deleting .thread { cursor:default; opacity:.7; }
+  .thread-row.deleting .thread-title { text-decoration:line-through; text-decoration-color:var(--muted); }
+  .thread-deletion { flex:1 0 100%; min-width:0; margin:0 8px 4px 8px; }
+  .thread-deletion-bar { height:3px; border-radius:2px; background:var(--panel2); overflow:hidden; }
+  .thread-deletion-fill { height:100%; width:0; border-radius:2px; background:var(--accent); transition:width .2s ease-out; }
+  .thread-row.deletion-stopped .thread-deletion-fill { background:#f85149; }
+  .thread-row.deletion-stopped[data-deletion-state="cancelled"] .thread-deletion-fill { background:#d29922; }
+  .thread-deletion-text { margin-top:3px; color:var(--muted); font-size:11px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+  .thread-row.deletion-stopped .thread-deletion-text { white-space:normal; }
+  .thread-deletion-cancel { flex:none; height:24px; padding:0 8px; font-size:12px; color:var(--muted); }
   .thread { flex:1; min-width:0; padding:5px 8px; border-radius:6px; cursor:pointer; color:var(--muted); font-size:13px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; display:flex; align-items:center; gap:6px; }
   .thread.subagent-thread { font-size:12px; }
   .thread.subagent-thread::before { content:"sub"; flex:none; color:var(--muted); font-size:10px; }

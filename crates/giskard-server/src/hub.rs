@@ -9,8 +9,8 @@ use giskard_core::event::AgentEvent;
 use giskard_core::ids::{ProjectId, ThreadId};
 use giskard_core::user_input::UserInput;
 use giskard_proto::{
-    ErrorInfo, RunningTask, ServerMessage, ThreadRuntimeOverview, ThreadState, WireAgentEvent,
-    WireCommandOutput, WireItem,
+    ErrorInfo, RunningTask, ServerMessage, ThreadDeletionProgress, ThreadRuntimeOverview,
+    ThreadState, WireAgentEvent, WireCommandOutput, WireItem,
 };
 
 use crate::delivery::{ClientDelivery, DeliverySendError, ReplacementReceiver};
@@ -225,6 +225,23 @@ impl Hub {
         });
     }
 
+    /// Publish a thread deletion's latest count to every connected client, latest-wins per root.
+    pub async fn publish_thread_deletion_progress(&self, progress: ThreadDeletionProgress) {
+        let mut clients = self.clients.lock().await;
+        clients.retain(|client_id, delivery| {
+            let retained = delivery.publish_thread_deletion_progress(progress.clone());
+            if !retained {
+                warn!(
+                    %client_id,
+                    thread_id = %progress.thread_id,
+                    action = "publish_thread_deletion_progress",
+                    "client outbound queue closed; removing global client"
+                );
+            }
+            retained
+        });
+    }
+
     /// Publish the complete process-local runtime projection as latest-wins replacement state.
     pub async fn publish_runtime_overview(&self, overview: ThreadRuntimeOverview) {
         let mut clients = self.clients.lock().await;
@@ -362,6 +379,7 @@ fn server_message_kind(msg: &ServerMessage) -> &'static str {
         ServerMessage::ThreadState(_) => "thread_state",
         ServerMessage::ThreadMetadataResult { .. } => "thread_metadata_result",
         ServerMessage::ThreadCatalogChanged => "thread_catalog_changed",
+        ServerMessage::ThreadDeletionProgress(_) => "thread_deletion_progress",
         ServerMessage::HistoryDelta { .. } => "history_delta",
         ServerMessage::LiveTurnSnapshot(_) => "live_turn_snapshot",
         ServerMessage::RunningTasks { .. } => "running_tasks",

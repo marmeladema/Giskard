@@ -15,6 +15,7 @@ pub mod plan;
 pub mod registry;
 pub mod routes;
 mod services;
+pub mod thread_deletion;
 mod thread_graph;
 mod thread_metadata;
 pub mod thread_runtime;

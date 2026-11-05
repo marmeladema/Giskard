@@ -58,6 +58,8 @@ pub struct AppState {
     pub shutdown: AppShutdown,
     /// Global filesystem-capacity projection; no project or thread identities are owned here.
     pub disk_usage: crate::disk_usage::DiskUsageMonitor,
+    /// Background thread deletions in flight, and the last failed one per root thread.
+    pub thread_deletions: Arc<crate::thread_deletion::ThreadDeletionService>,
 }
 
 impl AppState {
@@ -117,6 +119,7 @@ impl AppState {
             login_throttle: Arc::new(LoginThrottle::new()),
             shutdown: AppShutdown::default(),
             disk_usage: crate::disk_usage::DiskUsageMonitor::default(),
+            thread_deletions: Arc::new(crate::thread_deletion::ThreadDeletionService::new()),
         }
     }
 }

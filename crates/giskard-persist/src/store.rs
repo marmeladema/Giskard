@@ -2118,6 +2118,45 @@ impl PersistStore {
         Ok(())
     }
 
+    /// Remove every `<thread_id>.deleting/` directory in the project, returning the ids swept.
+    ///
+    /// `delete_thread` renames a thread out of enumeration before removing it. A crash or an
+    /// abandoned removal between the two leaves a directory that nothing lists and that no later
+    /// `delete_thread` will reach, since the thread is no longer there to delete. Meant for
+    /// startup, when no deletion is in flight; running it beside one would race the rename.
+    pub async fn sweep_abandoned_thread_deletions(
+        &self,
+        project: ProjectId,
+    ) -> Result<Vec<ThreadId>, PersistError> {
+        let dir = self.threads_dir(project);
+        let mut entries = match tokio::fs::read_dir(&dir).await {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(vec![]),
+            Err(e) => return Err(PersistError::Io(e.to_string())),
+        };
+        let mut swept = vec![];
+        while let Some(entry) = entries
+            .next_entry()
+            .await
+            .map_err(|e| PersistError::Io(e.to_string()))?
+        {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            let Some(stem) = name.strip_suffix(crate::layout::DELETING_SUFFIX) else {
+                continue;
+            };
+            let Ok(thread) = stem.parse::<ThreadId>() else {
+                continue;
+            };
+            if !matches!(entry.file_type().await, Ok(kind) if kind.is_dir()) {
+                continue;
+            }
+            remove_dir_all_if_present(&entry.path()).await?;
+            swept.push(thread);
+        }
+        Ok(swept)
+    }
+
     // ---- Storage-layout maintenance (`giskard-admin`, spec §5.5) ----
 
     /// Whether this thread still holds pre-migration originals under `legacy/`.
@@ -2670,6 +2709,43 @@ mod tests {
                 .unwrap()
                 .is_some(),
             "a partial delete must leave the catalog record visible for retry"
+        );
+    }
+
+    /// The startup sweep removes only what an interrupted delete leaves behind — a ULID-named
+    /// `.deleting` directory — and never a live thread or a stranger with the same suffix.
+    #[tokio::test]
+    async fn sweeping_abandoned_deletions_removes_only_deleting_directories() {
+        let (_tmp, store) = make_store();
+        let project_id = ProjectId::new();
+        let thread_id = ThreadId::new();
+        store
+            .create_thread(project_id, test_thread(project_id, thread_id))
+            .await
+            .unwrap();
+        let paths = store.current_thread_paths(project_id, thread_id);
+        let abandoned = ThreadId::new();
+        let abandoned_dir = store
+            .current_thread_paths(project_id, abandoned)
+            .deleting_dir();
+        tokio::fs::create_dir_all(abandoned_dir.join("turns"))
+            .await
+            .unwrap();
+        let unrelated = store.threads_dir(project_id).join("notes.deleting");
+        tokio::fs::write(&unrelated, b"not a thread").await.unwrap();
+
+        let swept = store
+            .sweep_abandoned_thread_deletions(project_id)
+            .await
+            .unwrap();
+
+        assert_eq!(swept, vec![abandoned]);
+        assert!(!abandoned_dir.exists());
+        assert!(paths.dir().exists(), "a live thread is never touched");
+        assert!(unrelated.exists(), "only ULID-named directories are swept");
+        assert_eq!(
+            store.list_threads(project_id).await.unwrap(),
+            vec![thread_id]
         );
     }
 

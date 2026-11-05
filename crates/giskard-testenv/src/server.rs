@@ -11,6 +11,42 @@ use tempfile::TempDir;
 
 use crate::{TestWs, auth, fixtures, ws};
 
+/// Poll a background thread deletion until it stops. `None` means it finished and the thread is
+/// gone (the server answers `404` once the record is dropped); `Some` carries the failed or
+/// cancelled record it left behind.
+pub async fn wait_for_thread_deletion(
+    client: &reqwest::Client,
+    base: &str,
+    cookie: &str,
+    project_id: ProjectId,
+    thread_id: ThreadId,
+) -> Option<giskard_proto::ThreadDeletionProgress> {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let response = client
+            .get(format!(
+                "{base}/api/projects/{project_id}/threads/{thread_id}/deletion"
+            ))
+            .header("cookie", cookie)
+            .send()
+            .await
+            .unwrap();
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            return None;
+        }
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        let progress: giskard_proto::ThreadDeletionProgress = response.json().await.unwrap();
+        if progress.state != giskard_proto::ThreadDeletionState::Running {
+            return Some(progress);
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "thread deletion did not finish: {progress:?}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+}
+
 type SeedFuture = Pin<Box<dyn Future<Output = ()> + Send>>;
 type Seed = Box<dyn FnOnce(Arc<PersistStore>) -> SeedFuture + Send>;
 
@@ -125,6 +161,24 @@ impl TestServer {
         let opened: serde_json::Value = response.json().await.unwrap();
         assert_eq!(opened["thread_id"], serde_json::json!(thread_id));
         thread_id
+    }
+
+    /// `DELETE` the thread and wait for the background cascade to stop. See
+    /// [`wait_for_thread_deletion`] for the return value.
+    pub async fn delete_thread_and_wait(
+        &self,
+        project: ProjectId,
+        thread_id: ThreadId,
+    ) -> Option<giskard_proto::ThreadDeletionProgress> {
+        let response = self
+            .client
+            .delete(self.url(&format!("/api/projects/{project}/threads/{thread_id}")))
+            .header("cookie", &self.cookie)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::ACCEPTED);
+        wait_for_thread_deletion(&self.client, &self.base, &self.cookie, project, thread_id).await
     }
 
     pub async fn ws(&self) -> TestWs {

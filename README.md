@@ -172,7 +172,9 @@ Then open **http://127.0.0.1:8787**, log in, and:
 4. Linked child threads appear in the **Sub-agents** monitor and can be opened from their activity
    rows; their header **Parent** button returns to the owning thread. See
    [Sub-agent threads](docs/subagents.md) for spawning protocols, read-only event ownership,
-   prompts, approvals, and deletion behavior.
+   prompts, approvals, and deletion behavior. Deleting a thread deletes its sub-agents with it, in
+   the background: the row stays in the sidebar with a progress bar until they are all gone, and
+   can be cancelled or, if it stops early, retried.
 
 The header context value is a context-window indicator, not a billing total. It updates during a
 turn from Codex's latest reported input tokens, which are the best available proxy for "how full is

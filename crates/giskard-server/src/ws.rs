@@ -1332,6 +1332,11 @@ async fn run_subscribe_bootstrap(
     // thread remains a hard error.
     let (project_id, notice) = match ensure_thread_open(state, thread_id, "subscribe").await {
         Ok(access) => (access.project_id, access.warning),
+        // Not an orphan to read: its files are going as this runs, and a read-only view of them
+        // would fail half way through for a less honest reason.
+        Err(attach_error) if attach_error.info.code == "thread_deleting" => {
+            return Err(attach_error);
+        }
         Err(attach_error) => {
             let project_id = project_for_readonly(state, thread_id, "subscribe").await?;
             warn!(
@@ -1527,6 +1532,23 @@ async fn ensure_thread_open(
     thread_id: ThreadId,
     action: &str,
 ) -> Result<ThreadAccess, WsError> {
+    // A deletion retired this thread's owner before it started; opening it now would install a
+    // new one under a thread whose files are about to go.
+    if let Some(root) = state.thread_deletions.deleting_root(thread_id) {
+        debug!(
+            %thread_id,
+            root_thread_id = %root,
+            action,
+            "refusing to open a thread while its deletion runs"
+        );
+        return Err(WsError::new(
+            "thread_deleting",
+            ErrorSeverity::Error,
+            "This thread is being deleted.",
+        )
+        .thread(thread_id)
+        .action(action));
+    }
     if let Some(binding) = state.registry.loaded_thread_binding(thread_id).await {
         return Ok(ThreadAccess {
             project_id: binding.project_id(),

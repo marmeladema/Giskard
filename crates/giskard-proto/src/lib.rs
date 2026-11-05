@@ -364,6 +364,9 @@ pub enum ServerMessage {
     /// A committed thread-catalog projection changed. The browser refetches the authoritative
     /// project list; repeated invalidations coalesce client-side.
     ThreadCatalogChanged,
+    /// Latest-wins progress of a background thread deletion, keyed by its root thread. Sent to
+    /// every connected client; a slow socket sees only the most recent count.
+    ThreadDeletionProgress(ThreadDeletionProgress),
     /// Bootstrap-only reconnect history, oldest-first. Normally contains turns after `since`;
     /// `reset` marks the bounded replacement returned for a stale cursor.
     HistoryDelta {
@@ -648,6 +651,11 @@ pub struct ThreadSummary {
     pub archived: bool,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    /// Present while a background deletion rooted at this thread runs, or after one failed or was
+    /// cancelled and nothing has retried it yet. Lets a tab that missed the progress messages
+    /// show the same state as one that watched them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deletion: Option<ThreadDeletionProgress>,
 }
 
 fn is_primary_thread(value: &ThreadKind) -> bool {
@@ -657,6 +665,45 @@ fn is_primary_thread(value: &ThreadKind) -> bool {
 #[derive(Debug, Clone, Serialize)]
 pub struct ListThreadsResponse {
     pub threads: Vec<ThreadSummary>,
+}
+
+/// Where a background thread deletion stands. `Running` is the only non-terminal state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ThreadDeletionState {
+    Running,
+    /// Every thread in the subtree is gone; the root no longer appears in the catalog.
+    Done,
+    /// The cascade stopped at a thread it could not delete. `deleted` threads are gone for good;
+    /// the root and every thread it still reaches remain, so the same request can be retried.
+    Failed,
+    /// Stopped between two threads at the user's request. Same partial state as `Failed`.
+    Cancelled,
+}
+
+/// Progress of one thread deletion. The subtree is deleted leaf-first, so at any point the root
+/// and every ancestor of an undeleted thread still exist: `deleted` of `total` is a prefix of the
+/// cascade, never a scattering.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ThreadDeletionProgress {
+    pub project_id: ProjectId,
+    /// The thread whose deletion was requested; descendants are counted in `total`.
+    pub thread_id: ThreadId,
+    pub state: ThreadDeletionState,
+    pub deleted: usize,
+    pub total: usize,
+    /// Why a `Failed` deletion stopped, worded for the browser.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+/// `DELETE /api/projects/{id}/threads/{thread_id}` answers `202 Accepted` with this once the
+/// preflight passed and the cascade is running in the background.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DeleteThreadResponse {
+    pub thread_id: ThreadId,
+    /// Threads the cascade will delete, the root included.
+    pub total: usize,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1233,6 +1280,33 @@ mod tests {
     fn server_message_pong() {
         let json = serde_json::to_string(&ServerMessage::Pong).unwrap();
         assert_eq!(json, "{\"type\":\"pong\"}");
+    }
+
+    #[test]
+    fn thread_deletion_progress_is_tagged_and_omits_an_absent_error() {
+        let progress = ThreadDeletionProgress {
+            project_id: ProjectId::new(),
+            thread_id: ThreadId::new(),
+            state: ThreadDeletionState::Running,
+            deleted: 3,
+            total: 10,
+            error: None,
+        };
+        let json =
+            serde_json::to_value(ServerMessage::ThreadDeletionProgress(progress.clone())).unwrap();
+        assert_eq!(json["type"], "thread_deletion_progress");
+        assert_eq!(json["state"], "running");
+        assert_eq!(json["deleted"], 3);
+        assert_eq!(json["total"], 10);
+        assert!(json.get("error").is_none());
+        let failed = ThreadDeletionProgress {
+            state: ThreadDeletionState::Failed,
+            error: Some("stuck".into()),
+            ..progress
+        };
+        let json = serde_json::to_value(&failed).unwrap();
+        assert_eq!(json["state"], "failed");
+        assert_eq!(json["error"], "stuck");
     }
 
     #[test]

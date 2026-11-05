@@ -441,6 +441,8 @@ async fn run(
     let catalog = harness_catalog(&startup.config)?;
     let factory = Arc::new(production_factory(catalog)?);
 
+    // Before any request can start a deletion: the sweep assumes none is in flight.
+    giskard_server::thread_deletion::sweep_abandoned_deletions(&startup.store).await;
     let mut state = AppState::new_with_config(
         startup.store,
         factory,

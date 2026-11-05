@@ -257,6 +257,17 @@ the event driver, then takes the authoritative owner set before shutting down th
 removing files. Subtree deletion retires every candidate before reloading
 the graph and computing its final deletion order.
 
+The cascade itself runs in the background: the `DELETE` answers `202 Accepted` once the subtree
+preflight has passed, and the server deletes the subtree leaf-first in a task of its own, holding
+the project lifecycle lock and publishing `ThreadDeletionProgress` as it goes. The root's sidebar
+row shows the count as a progress bar and offers cancellation, which takes effect between threads;
+a thread with a thousand sub-agents therefore never has to fit inside a request timeout. While the
+cascade runs, every thread in the subtree refuses open, subscribe, rename, archive, and a second
+delete. It stops at the first thread it cannot delete — a native failure, a worktree that will not
+come down, or a step that outran its 30-second bound — and keeps that thread, so the root and every
+ancestor of an undeleted thread survive and a retry deletes what is left. See
+[`docs/api-endpoints.md`](api-endpoints.md) for the progress and cancel routes.
+
 Codex may report that a native rollout is already absent. Only the exact matching missing-rollout
 response is treated as idempotent success, allowing stale local metadata to be removed. Other native
 deletion failures remain fatal and preserve the corresponding local record.

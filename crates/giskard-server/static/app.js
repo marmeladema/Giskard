@@ -146,7 +146,19 @@ const MAX_ATTACHMENT_BYTES = 25 * 1024 * 1024;
 const MAX_TOTAL_ATTACHMENT_BYTES = 25 * 1024 * 1024;
 const MAX_ATTACHMENT_NAME_BYTES = 255;
 const MAX_ATTACHMENT_MIME_BYTES = 127;
+// Bounds only the request that runs the preflight; the cascade itself runs on the server and
+// reports over the WebSocket (see `handleThreadDeletionProgress`).
 const THREAD_DELETE_TIMEOUT_MS = 30000;
+// A running deletion that has reported nothing for this long is resynced from the thread list
+// rather than declared dead: the server bounds each of its steps, so silence means a lost
+// message, not a stuck job.
+const THREAD_DELETION_STALE_MS = 60000;
+const THREAD_DELETION_WATCHDOG_INTERVAL_MS = 15000;
+// Progress arrives over the WebSocket, and a draft has none open (deleting the open thread lands
+// on a draft). While a deletion runs without a socket, its record is polled instead.
+const THREAD_DELETION_POLL_INTERVAL_MS = 1000;
+const THREAD_DELETION_DONE_TTL_MS = 30000;
+let threadDeletionPollTimer = null;
 const THREAD_LIST_RETRY_BASE_MS = 500;
 const THREAD_LIST_RETRY_MAX_MS = 10000;
 let state = {
@@ -209,7 +221,16 @@ let state = {
   attachmentGeneration:0, pendingAttachmentOperations:new Map(),
   collapsedProjects:new Set(loadCollapsedProjects()), pendingRemoveProject:null,
   expandedArchivedProjects:new Set(loadExpandedArchivedProjects()),
-  pendingRemoveThread:null, removeThreadRequestSeq:0, projectDirs:{}
+  pendingRemoveThread:null, removeThreadRequestSeq:0, projectDirs:{},
+  // Root thread id → the server's latest word on a background deletion rooted there (`running`,
+  // `failed`, `cancelled`), plus when it was heard. Seeded from the thread list and updated by
+  // `thread_deletion_progress`; a `done` deletion removes its entry along with the thread.
+  threadDeletions:new Map(),
+  // Root id → when its deletion reported `done`. Consulted by this tab's own DELETE response, so a
+  // `done` that beat the response does not seed a bar for a thread that is already gone. Entries
+  // expire after THREAD_DELETION_DONE_TTL_MS; nothing else prunes them, so a refetch racing the
+  // response cannot drop one early.
+  threadDeletionsDone:new Map()
 };
 const RELOAD_DRAFT_KEY = "giskard.reloadDraft";
 try {
@@ -243,6 +264,7 @@ const EFFORT_OPTIONS = [
   { value:"xhigh", label:"Extra High" }
 ];
 setInterval(updateRunningCommandDurations, 1000);
+setInterval(threadDeletionWatchdogTick, THREAD_DELETION_WATCHDOG_INTERVAL_MS);
 
 async function api(method, path, body, options) {
   const opts = { method, headers:{} };
@@ -1462,6 +1484,7 @@ function rememberProjectThreads(pid, threads, conflictThreadIds, locallyDeleting
   if (summaries.some(summary => !validThreadProjection("summary", summary))) {
     return { stale:false, malformed:true, conflicts:new Set() };
   }
+  rememberProjectThreadDeletions(projectId, summaries);
   const previousThreadIds = new Set(knownProjectThreads(projectId).map(t => String(t.id)));
   let stale = false;
   let activeCommonChanged = false;
@@ -1672,6 +1695,8 @@ function setProjectCollapsed(pid, collapsed) {
 }
 
 function threadRow(pid, t) {
+  const deletion = state.threadDeletions.get(String(t.id));
+  if (deletion) return deletingThreadRow(pid, t, deletion);
   const row = document.createElement("div"); row.className="thread-row";
   const title = t.title || t.id.slice(0,8);
   const el = document.createElement("div"); el.className="thread mono";
@@ -1715,6 +1740,292 @@ function threadRow(pid, t) {
     menu.hidden = !wasHidden;
   };
   row.append(el, menuBtn, menu);
+  return row;
+}
+
+/* ---- Background thread deletion ----
+   Deleting a thread cascades to every sub-agent under it, and that can be more than a thousand
+   threads. The server answers the DELETE as soon as its preflight passes and runs the cascade
+   itself, so the row stays in the sidebar with a determinate bar until it is gone, and the user
+   is free to work elsewhere meanwhile. The bar is driven by `thread_deletion_progress` messages
+   (latest wins) and by the `deletion` field the thread list carries for a tab that missed them. */
+
+// `fromList` marks a thread-list snapshot, which may predate the latest progress message: it
+// never moves a running bar backwards, and when it reports nothing new it does not count as
+// having heard from the server either, so the watchdog's "still working" label is not reset by
+// its own resync.
+function rememberThreadDeletion(pid, progress, fromList) {
+  if (!progress || !progress.thread_id) return null;
+  const tid = String(progress.thread_id);
+  const current = state.threadDeletions.get(tid);
+  const entry = {
+    pid:String(pid),
+    state:String(progress.state || "running"),
+    deleted:Number(progress.deleted) || 0,
+    total:Number(progress.total) || 0,
+    error:progress.error ? String(progress.error) : "",
+    heardAt:Date.now(),
+    stale:false
+  };
+  if (fromList && current && current.state === "running" && entry.state === "running") {
+    if (entry.deleted < current.deleted) return current;
+    if (entry.deleted === current.deleted) {
+      entry.heardAt = current.heardAt;
+      entry.stale = current.stale;
+    }
+  }
+  state.threadDeletions.set(tid, entry);
+  if (entry.state === "running") ensureThreadDeletionPoll();
+  return entry;
+}
+
+function ensureThreadDeletionPoll() {
+  if (threadDeletionPollTimer) return;
+  threadDeletionPollTimer = setInterval(threadDeletionPollTick, THREAD_DELETION_POLL_INTERVAL_MS);
+}
+
+function wsIsOpen() {
+  return !!state.ws && state.ws.readyState === WebSocket.OPEN;
+}
+
+// Polls only what the socket would otherwise deliver, and stops itself once nothing is running.
+// A 404 means the record is gone with the thread, which is the `done` the socket would have sent.
+async function threadDeletionPollTick() {
+  const running = Array.from(state.threadDeletions.entries())
+    .filter(([, entry]) => entry.state === "running");
+  if (!running.length) {
+    clearInterval(threadDeletionPollTimer);
+    threadDeletionPollTimer = null;
+    return;
+  }
+  if (wsIsOpen()) return;
+  for (const [tid, entry] of running) {
+    if (entry.polling) continue;
+    entry.polling = true;
+    try {
+      const progress = await api("GET", `/api/projects/${entry.pid}/threads/${tid}/deletion`);
+      handleThreadDeletionProgress(Object.assign({ project_id:entry.pid }, progress));
+    } catch (err) {
+      if (err && err.status === 404) {
+        handleThreadDeletionProgress({
+          project_id:entry.pid, thread_id:tid, state:"done",
+          deleted:entry.total, total:entry.total
+        });
+      } else {
+        console.warn("Could not poll thread deletion progress", { thread_id:tid, error:err });
+      }
+    } finally {
+      const current = state.threadDeletions.get(tid);
+      if (current) current.polling = false;
+    }
+  }
+}
+
+// The thread list is authoritative: a row without a record means the server has none (the
+// deletion finished, was dismissed, or predates a restart), and a thread missing from the list is
+// gone along with any record of deleting it.
+function rememberProjectThreadDeletions(pid, summaries) {
+  const projectId = String(pid);
+  const listed = new Set();
+  for (const summary of summaries) {
+    if (!summary || !summary.id) continue;
+    listed.add(summary.id);
+    if (summary.deletion) {
+      rememberThreadDeletion(
+        projectId, Object.assign({}, summary.deletion, { thread_id:summary.id }), /*fromList*/ true
+      );
+    } else {
+      state.threadDeletions.delete(summary.id);
+    }
+  }
+  for (const [tid, entry] of state.threadDeletions) {
+    if (entry.pid === projectId && !listed.has(tid)) state.threadDeletions.delete(tid);
+  }
+}
+
+function expireThreadDeletionTombstones() {
+  const cutoff = Date.now() - THREAD_DELETION_DONE_TTL_MS;
+  for (const [tid, doneAt] of state.threadDeletionsDone) {
+    if (doneAt < cutoff) state.threadDeletionsDone.delete(tid);
+  }
+}
+
+function threadDeletionText(deletion) {
+  if (deletion.state === "running") {
+    return deletion.stale
+      ? `Deleting ${deletion.deleted} of ${deletion.total}… still working, waiting for the server`
+      : `Deleting ${deletion.deleted} of ${deletion.total}…`;
+  }
+  if (deletion.state === "cancelled") {
+    return `Deletion cancelled after ${deletion.deleted} of ${deletion.total}.`;
+  }
+  return `Deletion failed after ${deletion.deleted} of ${deletion.total}: ${deletion.error}`;
+}
+
+// Progress arrives once per deleted thread. Rebuilding the whole sidebar for each would cost a
+// thousand-row project a thousand repaints, so a running row is updated in place; only a change
+// of state, or a row that is not there, falls back to a full render.
+function applyThreadDeletionToRow(row, deletion) {
+  const fill = row.querySelector(".thread-deletion-fill");
+  const text = row.querySelector(".thread-deletion-text");
+  const progress = row.querySelector(".thread-deletion");
+  if (!fill || !text || !progress) return false;
+  const pct = deletion.total > 0 ? Math.round(100 * deletion.deleted / deletion.total) : 0;
+  fill.style.width = `${Math.max(0, Math.min(100, pct))}%`;
+  text.textContent = threadDeletionText(deletion);
+  progress.setAttribute("aria-valuemax", String(deletion.total));
+  progress.setAttribute("aria-valuenow", String(deletion.deleted));
+  progress.setAttribute("aria-label", text.textContent);
+  return true;
+}
+
+function renderThreadDeletion(pid, tid, deletion) {
+  const row = threadRowForId(tid)?.closest(".thread-row");
+  if (row && row.dataset.deletionState === deletion.state &&
+      applyThreadDeletionToRow(row, deletion)) return;
+  renderProjectThreads(pid);
+}
+
+function handleThreadDeletionProgress(msg) {
+  const pid = String(msg.project_id || "");
+  const tid = String(msg.thread_id || "");
+  if (!pid || !tid) return;
+  const entry = rememberThreadDeletion(pid, msg);
+  if (entry.state === "done") {
+    // The thread is gone; the catalog refresh that follows removes the row for good, and this
+    // tab started the deletion or watched it, so the removal is not news.
+    state.threadDeletions.delete(tid);
+    expireThreadDeletionTombstones();
+    state.threadDeletionsDone.set(tid, Date.now());
+    projectThreadRefresh(pid).locallyDeletingThreadIds.add(tid);
+    void loadThreads(pid);
+    return;
+  }
+  if (entry.state === "failed" || entry.state === "cancelled") {
+    // The survivors are not being deleted by this tab any more. Their markers would otherwise
+    // make a later removal from another session look local and go unannounced. One deletion
+    // runs per project at a time, so clearing the project's set cannot touch another cascade.
+    projectThreadRefresh(pid).locallyDeletingThreadIds.clear();
+    const meta = knownThreadForId(pid, tid);
+    const title = meta && meta.title ? meta.title : tid.slice(0,8);
+    notice(
+      entry.state === "failed"
+        ? `Deleting "${title}" failed after ${entry.deleted} of ${entry.total}: ${entry.error}`
+        : `Deleting "${title}" was cancelled after ${entry.deleted} of ${entry.total}.`,
+      entry.state === "failed" ? "error" : "warning"
+    );
+    void loadThreads(pid);
+  }
+  renderThreadDeletion(pid, tid, entry);
+}
+
+// Silence from the server is resynced, never judged: each step of the cascade is bounded on the
+// server, so a bar that stopped moving means this tab missed a message, and the list says where
+// things really stand.
+function threadDeletionWatchdogTick() {
+  const now = Date.now();
+  const resync = new Set();
+  for (const [tid, entry] of state.threadDeletions) {
+    if (entry.state !== "running") continue;
+    if (now - entry.heardAt < THREAD_DELETION_STALE_MS) continue;
+    if (!entry.stale) {
+      entry.stale = true;
+      renderProjectThreads(entry.pid);
+    }
+    console.warn("Thread deletion has reported no progress; resyncing the thread list", {
+      project_id:entry.pid, thread_id:tid, deleted:entry.deleted, total:entry.total
+    });
+    resync.add(entry.pid);
+  }
+  for (const pid of resync) void loadThreads(pid);
+}
+
+function deletingThreadRow(pid, t, deletion) {
+  const row = document.createElement("div");
+  row.className = "thread-row deleting" + (deletion.state === "running" ? "" : " deletion-stopped");
+  row.dataset.deletionState = deletion.state;
+  const title = t.title || t.id.slice(0,8);
+  const el = document.createElement("div"); el.className = "thread mono";
+  el.dataset.pid = pid; el.dataset.tid = t.id; el.dataset.title = title; el.title = title;
+  el.setAttribute("aria-disabled", "true");
+  const status = document.createElement("span");
+  status.className = "thread-status"; status.setAttribute("aria-hidden", "true");
+  const label = document.createElement("span");
+  label.className = "thread-title"; label.textContent = title;
+  el.append(status, label);
+
+  const progress = document.createElement("div");
+  progress.className = "thread-deletion";
+  progress.setAttribute("role", "progressbar");
+  progress.setAttribute("aria-valuemin", "0");
+  progress.setAttribute("aria-valuemax", String(deletion.total));
+  progress.setAttribute("aria-valuenow", String(deletion.deleted));
+  const bar = document.createElement("div"); bar.className = "thread-deletion-bar";
+  const fill = document.createElement("div"); fill.className = "thread-deletion-fill";
+  const pct = deletion.total > 0 ? Math.round(100 * deletion.deleted / deletion.total) : 0;
+  fill.style.width = `${Math.max(0, Math.min(100, pct))}%`;
+  bar.append(fill);
+  const text = document.createElement("div"); text.className = "thread-deletion-text";
+  text.textContent = threadDeletionText(deletion);
+  progress.setAttribute("aria-label", text.textContent);
+  progress.append(bar, text);
+
+  if (deletion.state === "running") {
+    const cancel = document.createElement("button");
+    cancel.type = "button"; cancel.className = "thread-deletion-cancel";
+    cancel.textContent = "Cancel"; cancel.title = "Stop deleting after the current thread";
+    cancel.onclick = async (e) => {
+      e.stopPropagation();
+      cancel.disabled = true;
+      try {
+        await api("POST", `/api/projects/${pid}/threads/${t.id}/deletion/cancel`);
+      } catch (err) {
+        cancel.disabled = false;
+        notice("Could not cancel the deletion: " + apiFailureMessage(err), "error");
+      }
+    };
+    row.append(el, cancel, progress);
+    return row;
+  }
+
+  const menuBtn = document.createElement("button");
+  menuBtn.type = "button"; menuBtn.className = "thread-menu-btn";
+  menuBtn.textContent = "..."; menuBtn.title = "Thread actions";
+  menuBtn.setAttribute("aria-label", "Thread actions");
+  const menu = document.createElement("div"); menu.className = "thread-menu"; menu.hidden = true;
+  const retry = document.createElement("button");
+  retry.type = "button"; retry.textContent = "Retry delete"; retry.className = "danger";
+  retry.onclick = async (e) => {
+    e.stopPropagation();
+    closeThreadMenus();
+    await deleteThread(pid, t.id, title);
+  };
+  const dismiss = document.createElement("button");
+  dismiss.type = "button"; dismiss.textContent = "Keep thread";
+  dismiss.title = "Forget the failed deletion and keep what is left of the thread";
+  dismiss.onclick = async (e) => {
+    e.stopPropagation();
+    closeThreadMenus();
+    try {
+      await api("DELETE", `/api/projects/${pid}/threads/${t.id}/deletion`);
+    } catch (err) {
+      // 404: the record is already gone, which is what was asked for.
+      if (!(err && err.status === 404)) {
+        notice("Could not dismiss the failed deletion: " + apiFailureMessage(err), "error");
+        return;
+      }
+    }
+    state.threadDeletions.delete(String(t.id));
+    renderProjectThreads(pid);
+  };
+  menu.append(retry, dismiss);
+  menuBtn.onclick = (e) => {
+    e.stopPropagation();
+    const wasHidden = menu.hidden;
+    closeThreadMenus();
+    menu.hidden = !wasHidden;
+  };
+  row.append(el, menuBtn, menu, progress);
   return row;
 }
 
@@ -2180,6 +2491,11 @@ function threadDescendantIds(pid, tid) {
 }
 
 async function deleteThread(pid, tid, title) {
+  const running = state.threadDeletions.get(String(tid));
+  if (running && running.state === "running") {
+    notice("This thread is already being deleted.", "warning");
+    return;
+  }
   const descendants = threadDescendantIds(pid, tid);
   const cascade = descendants.length
     ? `, its ${descendants.length} linked sub-agent thread${descendants.length === 1 ? "" : "s"}, and all corresponding harness threads`
@@ -2298,26 +2614,40 @@ $("removeThreadConfirm").onclick = async () => {
     // make the server's guard unreachable from the UI, and a worktree that became dirty between
     // opening the card and confirming it would be discarded without anyone having said so.
     const force = pending.worktreeAtRisk ? "?force=true" : "";
-    await api("DELETE", `/api/projects/${pid}/threads/${tid}${force}`, undefined, {
+    // 202: the preflight passed and the cascade now runs on the server. Everything that could be
+    // refused (a live turn, work at risk in a worktree, a deletion already running) was refused
+    // before this returns, so from here the row reports progress rather than the card.
+    const accepted = await api("DELETE", `/api/projects/${pid}/threads/${tid}${force}`, undefined, {
       timeoutMs: THREAD_DELETE_TIMEOUT_MS,
     });
-    // The server cascades to descendants it discovered itself, which can include children this
-    // client never listed. Decide from the refreshed authoritative list whether the active view
-    // was deleted; keep the pre-request set as a fallback in case the sidebar reload fails
-    // (loadThreads swallows its own errors and leaves the cached list stale).
-    const threadsRefreshed = await loadThreads(pid);
-    // Read the live view only after the awaits: the user may have navigated to another thread
-    // or another project meanwhile, and an unrelated active view must never be cleared.
+    // A one-thread cascade can report `done` over the socket before this response lands; seeding
+    // a bar then would strike through a thread that is already gone until the next refetch.
+    expireThreadDeletionTombstones();
+    if (state.threadDeletionsDone.has(String(tid))) {
+      state.threadDeletionsDone.delete(String(tid));
+    } else {
+      rememberThreadDeletion(pid, {
+        thread_id: tid,
+        state: "running",
+        deleted: 0,
+        total: accepted && Number(accepted.total) > 0 ? Number(accepted.total) : deletedIds.size
+      });
+      renderProjectThreads(pid);
+    }
+    // Refetch so a cascade that already finished (one thread, fast disk) is reconciled now rather
+    // than on the next invalidation; the response also carries any descendants this client never
+    // listed. A deletion that outlives the request keeps the row, with its bar, until it is done.
+    void loadThreads(pid);
+    // Read the live view only after the await: the user may have navigated to another thread or
+    // another project meanwhile, and an unrelated active view must never be cleared.
     const activeThread = state.threadId ? String(state.threadId) : null;
     const sameProject = String(state.projectId || "") === String(pid);
     // Catalog reconciliation owns the active-thread removal transition. It may already have
-    // opened this draft while `loadThreads` was applying the response.
+    // opened this draft while a refresh was applying its response.
     let openedDraft = sameProject && isDraftThread();
-    if (
-      activeThread && sameProject &&
-      (deletedIds.has(activeThread) ||
-        (threadsRefreshed && !knownThreadForId(pid, activeThread)))
-    ) {
+    // The server retired the subtree before answering: the open view can no longer run a turn,
+    // so leave it now rather than when its row disappears.
+    if (activeThread && sameProject && deletedIds.has(activeThread)) {
       // The active thread was just deleted (or cascaded away). Rather than leave the user staring
       // at an empty view still titled with the deleted thread's name, drop into a fresh draft in
       // the same project so the composer is ready for the next conversation. `openDraftThread`
@@ -3546,6 +3876,10 @@ function handleServer(msg, ws) {
   }
   if (msg && msg.type === "thread_catalog_changed") {
     refreshKnownThreadLists();
+    return;
+  }
+  if (msg && msg.type === "thread_deletion_progress") {
+    handleThreadDeletionProgress(msg);
     return;
   }
   if (!isCurrentThreadServerMessage(msg)) return;
