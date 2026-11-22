@@ -187,15 +187,29 @@ Rules:
   process is common to every kind, so these are parsed by `giskard-persist` and apply to every
   process an instance spawns: Codex's one app-server and Claude Code's per-thread processes alike.
 - **`env` is an overlay on Giskard's inherited environment.** Each entry is set on top of what
-  Giskard itself was started with; nothing is removed or replaced wholesale. Values are literal:
-  no tilde expansion and no `${VAR}` interpolation, so a path is written absolute. Expanding `~`
-  would be right for `CODEX_HOME` and wrong for almost any other variable, and Codex already
-  offers `env_key` indirection where a secret should stay out of a file. Names must be non-empty
-  and contain neither `=` nor NUL, values no NUL; that is checked at boot with the rest. Values
-  may be credentials, so they follow the `ProviderHttpHeaders` convention: a `Debug` that prints
-  names only, and log lines that name variables and never their values. This is the neutral knob
-  that replaces any kind-specific path key: `CODEX_HOME` for Codex, and for Claude Code whatever
-  that CLI reads from its environment for its API key, config directory, or routing.
+  Giskard itself was started with; nothing is removed or replaced wholesale. Values are templates
+  (`giskard-persist`'s `env_template`): `{project_id}`, `{project_name}`, `{project_dir}`,
+  `{harness_name}`, `{data_dir}` and `{env:NAME}`, with `{{`/`}}` as literal braces. Values render
+  in table order (the TOML table is an `IndexMap`, parsed with `preserve_order`), and `{env:NAME}`
+  reads `NAME` as it stands at that line, shell-style: a variable rendered earlier in the table,
+  else Giskard's environment. A later definition does not exist yet, which keeps
+  `ORIG_HOME = "{env:HOME}"` followed by `HOME = ...` expressible. They are rendered by
+  `HarnessKindFactory` once per instance, which is per project, so a placeholder can only name a
+  fact about the project, never about a thread. No tilde expansion: a path is written absolute or
+  built from `{env:HOME}`. A variable whose template names an unset (or non-UTF-8) `{env:NAME}` is
+  skipped (the declaration does not set it), logged at `warn`, and reported to the user: the factory
+  returns it in `CreatedHarness::warnings`, the registry keeps it in the instance's slot, and
+  `HarnessRegistry::open_thread` folds it into the open warning (`ThreadHandle::warning`, code
+  `harness_env_unset`) that every open path already shows as a toast. The adapters never see it.
+  Values are parsed into `EnvTemplate`s by `HarnessEnv`'s `Deserialize`, so a value with NUL or a
+  malformed or unknown placeholder fails the config load (the error points at the table header, not
+  the value's line), and the declaration holds only parsed templates; `Serialize` writes each back
+  as its source. Names must be non-empty and contain neither `=` nor NUL, checked at boot by
+  `HarnessCatalog::resolve` with the rest. Values may be credentials, so they follow the
+  `ProviderHttpHeaders` convention: a `Debug` that prints names only, and log lines that name
+  variables and never their values. This is the neutral knob that replaces any kind-specific path
+  key: `CODEX_HOME` for Codex, and for Claude Code whatever that CLI reads from its environment for
+  its API key, config directory, or routing.
 - **Kind-specific keys stay out of `giskard-persist`.** AGENTS.md confines Codex types to the
   adapter, and persist cannot depend on it. Persist parses the neutral keys above and an opaque
   TOML table of everything else. The binary's factory deserializes that table into the adapter's

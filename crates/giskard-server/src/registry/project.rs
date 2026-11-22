@@ -114,8 +114,16 @@ impl ProjectAuthority {
 
 /// Whether the installed harness accepts normal use or is being deleted.
 enum ProjectHarnessState {
-    Active(Arc<dyn AgentHarness>, DriverHandle),
-    Deleting(Arc<dyn AgentHarness>, DriverHandle),
+    Active(InstalledHarness),
+    Deleting(InstalledHarness),
+}
+
+/// A published harness, its event driver, and the user-facing warnings its factory reported at
+/// creation ([`super::CreatedHarness::warnings`]), kept for as long as the instance lives.
+struct InstalledHarness {
+    harness: Arc<dyn AgentHarness>,
+    driver: DriverHandle,
+    warnings: Arc<[String]>,
 }
 
 type HarnessAndDriver = (Arc<dyn AgentHarness>, DriverHandle);
@@ -210,8 +218,16 @@ impl ProjectHarnessGuard<'_, '_, '_> {
     /// Clones an active harness; empty and deleting slots are not reachable.
     pub(super) fn active(&self) -> Option<Arc<dyn AgentHarness>> {
         match self.slot() {
-            Some(ProjectHarnessState::Active(harness, _)) => Some(harness.clone()),
-            Some(ProjectHarnessState::Deleting(_, _)) | None => None,
+            Some(ProjectHarnessState::Active(installed)) => Some(installed.harness.clone()),
+            Some(ProjectHarnessState::Deleting(_)) | None => None,
+        }
+    }
+
+    /// The active harness's creation warnings; none for an empty or deleting slot.
+    pub(super) fn warnings(&self) -> Arc<[String]> {
+        match self.slot() {
+            Some(ProjectHarnessState::Active(installed)) => installed.warnings.clone(),
+            Some(ProjectHarnessState::Deleting(_)) | None => Arc::from([]),
         }
     }
 
@@ -225,8 +241,8 @@ impl ProjectHarnessGuard<'_, '_, '_> {
             ));
         }
         match self.slot() {
-            Some(ProjectHarnessState::Active(harness, _)) => Ok(Some(harness.clone())),
-            Some(ProjectHarnessState::Deleting(_, _)) => Err(HarnessError::Protocol(format!(
+            Some(ProjectHarnessState::Active(installed)) => Ok(Some(installed.harness.clone())),
+            Some(ProjectHarnessState::Deleting(_)) => Err(HarnessError::Protocol(format!(
                 "project {} harness {} is being deleted",
                 self.project_id, self.name
             ))),
@@ -235,17 +251,26 @@ impl ProjectHarnessGuard<'_, '_, '_> {
     }
 
     /// Publishes a newly created harness into the same slot checked for creation.
-    pub(super) fn publish_active(&mut self, harness: Arc<dyn AgentHarness>, driver: DriverHandle) {
+    pub(super) fn publish_active(
+        &mut self,
+        harness: Arc<dyn AgentHarness>,
+        driver: DriverHandle,
+        warnings: Vec<String>,
+    ) {
         self.slots.insert(
             self.name.clone(),
-            ProjectHarnessState::Active(harness, driver),
+            ProjectHarnessState::Active(InstalledHarness {
+                harness,
+                driver,
+                warnings: warnings.into(),
+            }),
         );
     }
 
     pub(super) fn driver(&self) -> Option<DriverHandle> {
         match self.slot() {
-            Some(ProjectHarnessState::Active(_, driver))
-            | Some(ProjectHarnessState::Deleting(_, driver)) => Some(driver.clone()),
+            Some(ProjectHarnessState::Active(installed))
+            | Some(ProjectHarnessState::Deleting(installed)) => Some(installed.driver.clone()),
             None => None,
         }
     }
@@ -258,11 +283,15 @@ impl ProjectHarnessGuard<'_, '_, '_> {
         let Some(state) = self.slots.get_mut(&self.name) else {
             return;
         };
-        if let ProjectHarnessState::Deleting(current, driver) = state
-            && Arc::ptr_eq(current, &harness)
+        if let ProjectHarnessState::Deleting(installed) = state
+            && Arc::ptr_eq(&installed.harness, &harness)
         {
-            let driver = driver.clone();
-            *state = ProjectHarnessState::Active(harness, driver);
+            let installed = InstalledHarness {
+                harness,
+                driver: installed.driver.clone(),
+                warnings: installed.warnings.clone(),
+            };
+            *state = ProjectHarnessState::Active(installed);
         }
     }
 
@@ -270,7 +299,7 @@ impl ProjectHarnessGuard<'_, '_, '_> {
     pub(super) fn finish_delete(&mut self, harness: &Arc<dyn AgentHarness>) {
         if matches!(
             self.slot(),
-            Some(ProjectHarnessState::Deleting(current, _)) if Arc::ptr_eq(current, harness)
+            Some(ProjectHarnessState::Deleting(installed)) if Arc::ptr_eq(&installed.harness, harness)
         ) {
             self.slots.shift_remove(&self.name);
         }
@@ -290,7 +319,7 @@ impl ProjectHarnessesGuard<'_, '_, '_> {
     /// already being deleted, so a second deletion never interleaves with the first.
     pub(super) fn begin_delete_all(&mut self) -> Result<Vec<NamedHarness>, HarnessError> {
         if let Some(name) = self.slots.iter().find_map(|(name, state)| {
-            matches!(state, ProjectHarnessState::Deleting(_, _)).then_some(name)
+            matches!(state, ProjectHarnessState::Deleting(_)).then_some(name)
         }) {
             return Err(HarnessError::Protocol(format!(
                 "project {} harness {name} deletion is already in progress",
@@ -299,10 +328,15 @@ impl ProjectHarnessesGuard<'_, '_, '_> {
         }
         let mut deleting = Vec::with_capacity(self.slots.len());
         for (name, state) in self.slots.iter_mut() {
-            if let ProjectHarnessState::Active(harness, driver) = state {
-                let harness = harness.clone();
-                let driver = driver.clone();
-                *state = ProjectHarnessState::Deleting(harness.clone(), driver.clone());
+            if let ProjectHarnessState::Active(installed) = state {
+                let harness = installed.harness.clone();
+                let driver = installed.driver.clone();
+                let installed = InstalledHarness {
+                    harness: harness.clone(),
+                    driver: driver.clone(),
+                    warnings: installed.warnings.clone(),
+                };
+                *state = ProjectHarnessState::Deleting(installed);
                 deleting.push((name.clone(), (harness, driver)));
             }
         }
@@ -314,8 +348,10 @@ impl ProjectHarnessesGuard<'_, '_, '_> {
         self.slots
             .drain(..)
             .map(|(name, state)| match state {
-                ProjectHarnessState::Active(harness, driver)
-                | ProjectHarnessState::Deleting(harness, driver) => (name, (harness, driver)),
+                ProjectHarnessState::Active(installed)
+                | ProjectHarnessState::Deleting(installed) => {
+                    (name, (installed.harness, installed.driver))
+                }
             })
             .collect()
     }

@@ -28,8 +28,8 @@ use giskard_core::turn::{
 };
 use giskard_core::user_input::UserInput;
 use giskard_harness::{
-    AgentHarness, EventStreamError, HarnessBootstrap, KnownThreadBinding, OpenThreadOptions,
-    ThreadHandle, ThreadUpdate, thread_update_channel,
+    AgentHarness, EventStreamError, HarnessBootstrap, HarnessNotice, KnownThreadBinding,
+    OpenThreadOptions, ThreadHandle, ThreadUpdate, thread_update_channel,
 };
 use giskard_persist::store::{
     AmendOutcome, ProjectConfig, ThreadFile, ThreadMutation, TurnCommitOutcome,
@@ -74,6 +74,31 @@ use thread::{
     TurnIntent, WeakOwnerLock, external_turn_input_label,
 };
 
+/// What a [`HarnessFactory`] built: the instance, and the warnings to show the user about how it
+/// was built.
+pub struct CreatedHarness {
+    pub harness: Arc<dyn AgentHarness>,
+    /// One sentence each, never a secret (today: skipped `[harnesses.<name>.env]` variables).
+    /// The registry keeps them with the instance and adds them to the open warning
+    /// (`ThreadHandle::warning`) of every thread opened on it, which the browser shows as a toast.
+    pub warnings: Vec<String>,
+}
+
+impl From<Arc<dyn AgentHarness>> for CreatedHarness {
+    fn from(harness: Arc<dyn AgentHarness>) -> Self {
+        Self {
+            harness,
+            warnings: Vec::new(),
+        }
+    }
+}
+
+impl<H: AgentHarness + 'static> From<Arc<H>> for CreatedHarness {
+    fn from(harness: Arc<H>) -> Self {
+        Self::from(harness as Arc<dyn AgentHarness>)
+    }
+}
+
 #[async_trait]
 pub trait HarnessFactory: Send + Sync {
     /// Construct the project's instance of the `harness` declaration with its complete durable
@@ -85,7 +110,7 @@ pub trait HarnessFactory: Send + Sync {
         config: &ProjectConfig,
         harness: &str,
         bootstrap: HarnessBootstrap,
-    ) -> Result<Arc<dyn AgentHarness>, HarnessError>;
+    ) -> Result<CreatedHarness, HarnessError>;
 
     /// The declarations this factory can construct. The default is the synthesized single `codex`,
     /// which is what every test factory constructs.
@@ -360,6 +385,15 @@ impl RegistryShared {
         let authority = self.project_authority(project_id).await?;
         let mut transitions = self.harness_transitions.lock().await;
         transitions.project(&authority, harness).await.active()
+    }
+
+    /// The creation warnings of the project's instance of `harness`; none when it is not active.
+    async fn harness_warnings(&self, project_id: ProjectId, harness: &str) -> Arc<[String]> {
+        let Some(authority) = self.project_authority(project_id).await else {
+            return Arc::from([]);
+        };
+        let mut transitions = self.harness_transitions.lock().await;
+        transitions.project(&authority, harness).await.warnings()
     }
 
     async fn event_driver(&self, project_id: ProjectId, harness: &str) -> Option<DriverHandle> {
@@ -783,7 +817,10 @@ impl HarnessRegistry {
             return Ok(harness);
         }
         let binding_count = bootstrap.known_threads.len();
-        let h = self.factory.create(config, harness, bootstrap).await?;
+        let CreatedHarness {
+            harness: h,
+            warnings,
+        } = self.factory.create(config, harness, bootstrap).await?;
         debug!(project_id = %project, harness, bindings = binding_count,
             "created harness with durable thread bindings installed");
 
@@ -801,7 +838,7 @@ impl HarnessRegistry {
             h.discoveries(),
             driver_permit,
         );
-        slot.publish_active(h.clone(), driver);
+        slot.publish_active(h.clone(), driver, warnings);
         Ok(h)
     }
 
@@ -871,14 +908,21 @@ impl HarnessRegistry {
         let harness = self
             .get_or_create_harness(config.id, config, &thread.harness)
             .await?;
-        ensure_subagent_thread_open(
+        let mut binding = ensure_subagent_thread_open(
             config,
             thread,
             &self.shared,
             &harness,
             ClassificationPhase::from(thread.kind),
         )
-        .await
+        .await?;
+        // Same toast as a primary open: the sub-agent runs on the same instance.
+        let warnings = self
+            .shared
+            .harness_warnings(config.id, &thread.harness)
+            .await;
+        binding.handle.warning = with_harness_warnings(binding.handle.warning.take(), &warnings);
+        Ok(binding)
     }
 
     pub async fn open_thread(
@@ -923,7 +967,7 @@ impl HarnessRegistry {
             .map_err(|error| HarnessError::Protocol(error.to_string()))?;
         let restore_permit = self.shared.services.runtime.restoration_permit(&authority);
 
-        let handle = harness
+        let mut handle = harness
             .open_thread(OpenThreadOptions {
                 project: config.id,
                 thread,
@@ -939,6 +983,8 @@ impl HarnessRegistry {
                 handle.thread
             )));
         }
+        let warnings = self.shared.harness_warnings(config.id, harness_name).await;
+        handle.warning = with_harness_warnings(handle.warning.take(), &warnings);
 
         // Bind the model the harness reports as effective when it says so — Codex can ignore
         // resume overrides for a loaded thread, and the binding must reflect reality, not the
@@ -2156,6 +2202,30 @@ impl HarnessThreadId {
     }
 }
 
+/// Fold the instance's [`CreatedHarness::warnings`] into the warning an open returns, so every
+/// path that opens a thread (create, open, subscribe, model switch) shows them without a turn.
+/// An open warning of the harness's own keeps its code and leads the message.
+fn with_harness_warnings(
+    warning: Option<HarnessNotice>,
+    warnings: &[String],
+) -> Option<HarnessNotice> {
+    if warnings.is_empty() {
+        return warning;
+    }
+    let launch = warnings.join(" ");
+    Some(match warning {
+        None => HarnessNotice {
+            code: "harness_env_unset".into(),
+            message: launch,
+            detail: None,
+        },
+        Some(mut warning) => {
+            warning.message = format!("{} {launch}", warning.message);
+            warning
+        }
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
@@ -2178,7 +2248,7 @@ mod tests {
     use giskard_core::user_input::UserInput;
     use giskard_harness::{
         AgentEventStream, AgentHarness, DiscoveryStream, EventLog, HarnessBootstrap,
-        HarnessCapabilities, OpenThreadOptions, ThreadDiscovered, ThreadHandle,
+        HarnessCapabilities, HarnessNotice, OpenThreadOptions, ThreadDiscovered, ThreadHandle,
     };
     use giskard_persist::PersistStore;
     use giskard_persist::store::{ProjectConfig, ThreadFile};
@@ -2428,6 +2498,8 @@ mod tests {
         harness: StdMutex<Option<Arc<DiscoveryHarness>>>,
         /// Every harness constructed, in construction order.
         created: StdMutex<Vec<Arc<DiscoveryHarness>>>,
+        /// Reported as the next harness's creation warnings.
+        warnings: StdMutex<Vec<String>>,
     }
 
     #[async_trait::async_trait]
@@ -2437,11 +2509,14 @@ mod tests {
             _config: &ProjectConfig,
             _harness: &str,
             bootstrap: HarnessBootstrap,
-        ) -> Result<Arc<dyn AgentHarness>, HarnessError> {
+        ) -> Result<super::CreatedHarness, HarnessError> {
             let harness = Arc::new(DiscoveryHarness::new(bootstrap));
             *self.harness.lock().unwrap() = Some(harness.clone());
             self.created.lock().unwrap().push(harness.clone());
-            Ok(harness)
+            Ok(super::CreatedHarness {
+                harness,
+                warnings: self.warnings.lock().unwrap().clone(),
+            })
         }
     }
 
@@ -2517,7 +2592,7 @@ mod tests {
             _config: &ProjectConfig,
             _harness: &str,
             _bootstrap: giskard_harness::HarnessBootstrap,
-        ) -> Result<Arc<dyn giskard_harness::AgentHarness>, HarnessError> {
+        ) -> Result<super::CreatedHarness, HarnessError> {
             Err(HarnessError::Protocol(
                 "unused test harness factory was called".into(),
             ))
@@ -2612,7 +2687,7 @@ mod tests {
             _config: &ProjectConfig,
             _harness: &str,
             bootstrap: giskard_harness::HarnessBootstrap,
-        ) -> Result<Arc<dyn AgentHarness>, HarnessError> {
+        ) -> Result<super::CreatedHarness, HarnessError> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             // Held open so a second caller is certainly inside construction. The harness must not
             // become reachable until its complete bootstrap has been installed.
@@ -2620,7 +2695,7 @@ mod tests {
             self.harness
                 .bound
                 .store(bootstrap.known_threads.len().max(1), Ordering::SeqCst);
-            Ok(self.harness.clone())
+            Ok(self.harness.clone().into())
         }
     }
 
@@ -2637,7 +2712,7 @@ mod tests {
             _config: &ProjectConfig,
             _harness: &str,
             _bootstrap: giskard_harness::HarnessBootstrap,
-        ) -> Result<Arc<dyn AgentHarness>, HarnessError> {
+        ) -> Result<super::CreatedHarness, HarnessError> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
             self.max_active.fetch_max(active, Ordering::SeqCst);
@@ -2646,7 +2721,8 @@ mod tests {
             Ok(Arc::new(ShutdownHarness {
                 calls: Arc::new(AtomicUsize::new(0)),
                 fail: false,
-            }))
+            })
+            .into())
         }
     }
 
@@ -2663,10 +2739,10 @@ mod tests {
             _config: &ProjectConfig,
             _harness: &str,
             _bootstrap: giskard_harness::HarnessBootstrap,
-        ) -> Result<Arc<dyn AgentHarness>, HarnessError> {
+        ) -> Result<super::CreatedHarness, HarnessError> {
             self.started.notify_one();
             self.release.notified().await;
-            Ok(self.harness.clone())
+            Ok(self.harness.clone().into())
         }
     }
 
@@ -2730,6 +2806,7 @@ mod tests {
         let factory = Arc::new(DiscoveryFactory {
             harness: StdMutex::new(None),
             created: StdMutex::new(Vec::new()),
+            warnings: StdMutex::new(Vec::new()),
         });
         let sink = Arc::new(super::driver::probe::ProbeSink::default());
         let registry = Arc::new(super::HarnessRegistry::new_with_driver_events(
@@ -2966,6 +3043,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn creation_warnings_become_the_open_warning_of_every_thread() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(PersistStore::new(tmp.path().to_path_buf()));
+        let (_project, config) = create_test_project(&store, "creation-warnings").await;
+        let (registry, factory, _sink) = discovery_registry(store).await;
+        *factory.warnings.lock().unwrap() = vec!["FOO is unset.".into(), "BAR too.".into()];
+
+        // The first open creates the instance; the second reuses it and still reports them.
+        for _ in 0..2 {
+            let binding = registry
+                .open_thread(
+                    &config,
+                    "codex",
+                    "/tmp/test",
+                    ThreadId::new(),
+                    None,
+                    test_model(),
+                )
+                .await
+                .unwrap();
+            let warning = binding
+                .handle
+                .warning
+                .expect("the creation warnings are the open warning");
+            assert_eq!(warning.code, "harness_env_unset");
+            assert_eq!(warning.message, "FOO is unset. BAR too.");
+        }
+        assert_eq!(factory.created.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn creation_warnings_follow_the_harness_own_open_warning() {
+        let own = || HarnessNotice {
+            code: "codex_resume_failed".into(),
+            message: "Context was lost.".into(),
+            detail: Some("d".into()),
+        };
+        let merged = super::with_harness_warnings(Some(own()), &["FOO is unset.".into()])
+            .expect("a warning");
+        assert_eq!(merged.code, "codex_resume_failed");
+        assert_eq!(merged.message, "Context was lost. FOO is unset.");
+        assert_eq!(merged.detail.as_deref(), Some("d"));
+        let untouched = super::with_harness_warnings(Some(own()), &[]).expect("a warning");
+        assert_eq!(untouched.message, "Context was lost.");
+        assert!(super::with_harness_warnings(None, &[]).is_none());
+    }
+
+    #[tokio::test]
     async fn an_explicit_open_after_a_failed_deletion_resumes_succeeds() {
         let tmp = tempfile::tempdir().unwrap();
         let store = Arc::new(PersistStore::new(tmp.path().to_path_buf()));
@@ -3099,6 +3224,48 @@ mod tests {
             .iter()
             .map(|(native, handle)| (native.clone(), handle.thread))
             .collect()
+    }
+
+    #[tokio::test]
+    async fn creation_warnings_also_reach_subagent_opens() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = Arc::new(PersistStore::new(tmp.path().to_path_buf()));
+        let (project, config) = create_test_project(&store, "subagent-warnings").await;
+        let parent = ThreadId::new();
+        store
+            .save_thread(
+                project,
+                &test_thread_file(
+                    project,
+                    parent,
+                    "native-parent",
+                    giskard_core::ThreadKind::Primary,
+                ),
+            )
+            .await
+            .unwrap();
+        let mut child = test_thread_file(
+            project,
+            ThreadId::new(),
+            "native-child",
+            giskard_core::ThreadKind::Subagent,
+        );
+        child.parent_thread_id = Some(parent);
+        store.save_thread(project, &child).await.unwrap();
+        let (registry, factory, _sink) = discovery_registry(store).await;
+        *factory.warnings.lock().unwrap() = vec!["FOO is unset.".into()];
+
+        let binding = registry
+            .attach_subagent_thread(&config, &child)
+            .await
+            .unwrap();
+
+        let warning = binding
+            .handle
+            .warning
+            .expect("the creation warnings are the open warning");
+        assert_eq!(warning.code, "harness_env_unset");
+        assert_eq!(warning.message, "FOO is unset.");
     }
 
     #[tokio::test]
@@ -4154,6 +4321,7 @@ mod tests {
                         fail: false,
                     }),
                     super::DriverHandle::disconnected(),
+                    Vec::new(),
                 );
         }
         let failing = registry
@@ -4168,6 +4336,7 @@ mod tests {
                     fail: true,
                 }),
                 super::DriverHandle::disconnected(),
+                Vec::new(),
             );
         }
 
@@ -4230,7 +4399,7 @@ mod tests {
             transitions
                 .project(&authority, "codex")
                 .await
-                .publish_active(harness, super::DriverHandle::disconnected());
+                .publish_active(harness, super::DriverHandle::disconnected(), Vec::new());
             transitions
                 .project_all(&authority)
                 .await
@@ -4278,7 +4447,11 @@ mod tests {
             transitions
                 .project(&authority, "codex")
                 .await
-                .publish_active(harness.clone(), super::DriverHandle::responsive_for_test());
+                .publish_active(
+                    harness.clone(),
+                    super::DriverHandle::responsive_for_test(),
+                    Vec::new(),
+                );
         }
 
         let error = registry.delete_project(project_id).await.unwrap_err();
@@ -4314,7 +4487,11 @@ mod tests {
             transitions
                 .project(&authority, "codex")
                 .await
-                .publish_active(harness.clone(), super::DriverHandle::disconnected());
+                .publish_active(
+                    harness.clone(),
+                    super::DriverHandle::disconnected(),
+                    Vec::new(),
+                );
         }
 
         let error = registry.delete_project(project_id).await.unwrap_err();

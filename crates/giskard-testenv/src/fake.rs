@@ -730,9 +730,9 @@ impl<S: Script> HarnessFactory for FakeFactory<S> {
         _config: &ProjectConfig,
         _harness: &str,
         bootstrap: HarnessBootstrap,
-    ) -> Result<Arc<dyn AgentHarness>, HarnessError> {
+    ) -> Result<giskard_server::CreatedHarness, HarnessError> {
         self.0.core.seed_routes(&bootstrap);
-        Ok(self.0.clone())
+        Ok(self.0.clone().into())
     }
 }
 

@@ -3,6 +3,8 @@
 use indexmap::IndexMap;
 use serde::{Deserialize, Serialize};
 
+use crate::env_template::{EnvTemplate, EnvTemplateContext, ResolvedEnv, UnsetVariable};
+
 /// Global application configuration (spec Appendix C).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
@@ -63,33 +65,96 @@ impl HarnessDeclaration {
     }
 }
 
-/// A declaration's environment overlay (`[harnesses.<name>.env]`).
+/// A declaration's environment overlay (`[harnesses.<name>.env]`), parsed.
 ///
-/// Values are literal and may be credentials, so the custom `Debug` implementation prints the
-/// variable names only, on the `ProviderHttpHeaders` pattern.
-#[derive(Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(transparent)]
-pub struct HarnessEnv(IndexMap<String, String>);
+/// Each value is an [`EnvTemplate`], parsed while `config.toml` is loaded: a value that is not a
+/// valid template, or that contains NUL, fails the load like any other bad value, and `toml`
+/// reports it with its line. Serializing writes each template back as its source string. Values
+/// may be credentials, so the custom `Debug` implementation prints the variable names only, on the
+/// `ProviderHttpHeaders` pattern.
+#[derive(Clone, Default, PartialEq, Eq)]
+pub struct HarnessEnv(IndexMap<String, EnvTemplate>);
 
 impl HarnessEnv {
     pub fn is_empty(&self) -> bool {
         self.0.is_empty()
     }
 
-    pub fn iter(&self) -> impl Iterator<Item = (&str, &str)> {
-        self.0
-            .iter()
-            .map(|(name, value)| (name.as_str(), value.as_str()))
+    pub fn names(&self) -> impl Iterator<Item = &str> {
+        self.0.keys().map(String::as_str)
     }
 
-    pub fn get(&self, name: &str) -> Option<&str> {
-        self.0.get(name).map(String::as_str)
+    pub fn get(&self, name: &str) -> Option<&EnvTemplate> {
+        self.0.get(name)
+    }
+
+    /// Render every value against one instance's facts, in table order. A value naming a
+    /// placeholder with no usable value is skipped: left out of `entries` (never set to an empty
+    /// string) and reported in `unset`.
+    ///
+    /// `{env:NAME}` reads `NAME` as it stands at that line, as a shell would: the value of a
+    /// variable rendered earlier in this table, else `lookup_env` (Giskard's environment). A
+    /// variable defined *later* is not yet set, so `ORIG_HOME = "{env:HOME}"` above
+    /// `HOME = "/sandbox"` keeps Giskard's `HOME`, and a variable's own name reads Giskard's value,
+    /// so `PATH = "/x:{env:PATH}"` extends Giskard's `PATH`. A skipped variable does not count as
+    /// defined: a later `{env:NAME}` reads it as if its line were not there.
+    pub fn resolve(
+        &self,
+        context: &EnvTemplateContext<'_>,
+        lookup_env: &dyn Fn(&str) -> Result<String, std::env::VarError>,
+    ) -> ResolvedEnv {
+        let mut resolved = ResolvedEnv::default();
+        for (name, template) in &self.0 {
+            let earlier = &resolved.entries;
+            let lookup = |variable: &str| {
+                earlier
+                    .iter()
+                    .find(|(defined, _)| defined == variable)
+                    .map(|(_, value)| Ok(value.clone()))
+                    .unwrap_or_else(|| lookup_env(variable))
+            };
+            match template.render(context, &lookup) {
+                Ok(value) => resolved.entries.push((name.clone(), value)),
+                Err(placeholder) => resolved.unset.push(UnsetVariable {
+                    name: name.clone(),
+                    placeholder,
+                }),
+            }
+        }
+        resolved
     }
 }
 
-impl FromIterator<(String, String)> for HarnessEnv {
-    fn from_iter<I: IntoIterator<Item = (String, String)>>(iter: I) -> Self {
-        Self(iter.into_iter().collect())
+impl Serialize for HarnessEnv {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        let mut map = serializer.serialize_map(Some(self.0.len()))?;
+        for (name, template) in &self.0 {
+            map.serialize_entry(name, &template.source())?;
+        }
+        map.end()
+    }
+}
+
+impl<'de> Deserialize<'de> for HarnessEnv {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        use serde::de::Error;
+        let raw = IndexMap::<String, String>::deserialize(deserializer)?;
+        let mut parsed = IndexMap::with_capacity(raw.len());
+        for (name, value) in raw {
+            if value.contains('\0') {
+                return Err(D::Error::custom(format!(
+                    "variable {name:?} has a value containing NUL"
+                )));
+            }
+            let template = EnvTemplate::parse(&value).map_err(|error| {
+                D::Error::custom(format!(
+                    "variable {name:?} is not a valid template: {error}"
+                ))
+            })?;
+            parsed.insert(name, template);
+        }
+        Ok(Self(parsed))
     }
 }
 
@@ -123,8 +188,6 @@ pub enum HarnessConfigError {
          non-empty and contain neither `=` nor NUL"
     )]
     InvalidEnvName { declaration: String, name: String },
-    #[error("[harnesses.{declaration}.env] variable {name:?} has a value containing NUL")]
-    InvalidEnvValue { declaration: String, name: String },
 }
 
 /// The declarations after the rules are applied: every name is declared, exactly one is the
@@ -158,15 +221,11 @@ impl HarnessCatalog {
             {
                 return Err(HarnessConfigError::BlankCommand(name.clone()));
             }
-            for (variable, value) in declaration.env.iter() {
+            // Values were parsed and checked when the config was loaded (`HarnessEnv`'s
+            // `Deserialize`); names are checked here, where the message can name the declaration.
+            for variable in declaration.env.names() {
                 if variable.is_empty() || variable.contains('=') || variable.contains('\0') {
                     return Err(HarnessConfigError::InvalidEnvName {
-                        declaration: name.clone(),
-                        name: variable.to_string(),
-                    });
-                }
-                if value.contains('\0') {
-                    return Err(HarnessConfigError::InvalidEnvValue {
                         declaration: name.clone(),
                         name: variable.to_string(),
                     });
@@ -568,6 +627,7 @@ pub struct ModelConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::EnvTemplateContext;
 
     #[test]
     fn file_logging_defaults_disabled_and_validates_path() {
@@ -954,20 +1014,164 @@ roots = []
             assert!(message.contains(&format!("{expected:?}")), "{message}");
             assert!(!message.contains("secret-value"), "{message}");
         }
+    }
 
+    #[test]
+    fn env_values_are_parsed_when_the_config_loads() {
+        for (value, reason) in [
+            ("secret\\u0000value", "has a value containing NUL"),
+            (
+                "s3cr3t-{projet_dir}",
+                "is not a valid template: unknown placeholder `{projet_dir}`",
+            ),
+        ] {
+            let src = format!(
+                "[harnesses.x]\nkind = \"codex\"\n[harnesses.x.env]\nTOKEN = \"{value}\"\n"
+            );
+            let message = toml::from_str::<Config>(&src).unwrap_err().to_string();
+            // The whole table is read before any value is checked, so `toml` points at the
+            // table's header, and the quoted source line is not the one holding the value.
+            assert!(message.contains("[harnesses.x.env]"), "{message}");
+            assert!(
+                !message.contains("secret") && !message.contains("s3cr3t"),
+                "{message}"
+            );
+            assert!(
+                message.contains(&format!("variable \"TOKEN\" {reason}")),
+                "{message}"
+            );
+        }
+    }
+
+    #[test]
+    fn env_serializes_back_to_its_source() {
+        let src = "[harnesses.x]\nkind = \"codex\"\n[harnesses.x.env]\n\
+                   B = \"{{lit}}{project_dir}\"\nA = \"{env:HOME}/x\"\n";
+        let config: Config = toml::from_str(src).unwrap();
+        let written = toml::to_string(&config.harnesses["x"]).unwrap();
+        let reread: HarnessDeclaration = toml::from_str(&written).unwrap();
+        assert_eq!(reread.env, config.harnesses["x"].env);
+        assert!(written.contains("{{lit}}{project_dir}"), "{written}");
+        assert_eq!(reread.env.names().collect::<Vec<_>>(), ["B", "A"]);
+    }
+
+    #[test]
+    fn env_resolves_per_instance_and_leaves_unresolvable_values_unset() {
         let config: Config = toml::from_str(
-            "[harnesses.x]\nkind = \"codex\"\n[harnesses.x.env]\nTOKEN = \"secret\\u0000value\"\n",
+            "[harnesses.x]\nkind = \"claude-code\"\n[harnesses.x.env]\n\
+             CACHE = \"{project_dir}/.cache/{harness_name}\"\n\
+             LITERAL = \"{{x}}\"\n\
+             MISSING = \"{env:GISKARD_TEST_SURELY_UNSET}\"\n\
+             NO_DATA = \"{data_dir}/x\"\n\
+             HOME_BIN = \"{env:HOME}/bin\"\n",
         )
         .unwrap();
-        let err = HarnessCatalog::resolve(&config).unwrap_err();
+        HarnessCatalog::resolve(&config).unwrap();
+        let context = EnvTemplateContext {
+            project_dir: Some("/src/demo"),
+            harness_name: Some("x"),
+            ..EnvTemplateContext::default()
+        };
+        let lookup = |name: &str| {
+            (name == "HOME")
+                .then(|| "/home/me".to_owned())
+                .ok_or(std::env::VarError::NotPresent)
+        };
+        let resolved = config.harnesses["x"].env.resolve(&context, &lookup);
         assert_eq!(
-            err,
-            HarnessConfigError::InvalidEnvValue {
-                declaration: "x".into(),
-                name: "TOKEN".into(),
-            }
+            resolved.entries,
+            [
+                ("CACHE".to_owned(), "/src/demo/.cache/x".to_owned()),
+                ("LITERAL".to_owned(), "{x}".to_owned()),
+                ("HOME_BIN".to_owned(), "/home/me/bin".to_owned()),
+            ]
         );
-        assert!(!err.to_string().contains("secret"));
+        let unset: Vec<String> = resolved.unset.iter().map(ToString::to_string).collect();
+        assert_eq!(
+            unset,
+            [
+                "MISSING is skipped: {env:GISKARD_TEST_SURELY_UNSET} has no value",
+                "NO_DATA is skipped: {data_dir} has no value",
+            ]
+        );
+        let debug = format!("{resolved:?}");
+        assert!(!debug.contains("/src/demo"), "{debug}");
+    }
+
+    #[test]
+    fn env_values_read_earlier_variables_and_giskard_environment() {
+        let config: Config = toml::from_str(
+            "[harnesses.x]\nkind = \"codex\"\n[harnesses.x.env]\n\
+             ROOT = \"{project_dir}/.tools\"\n\
+             PATH = \"{env:ROOT}/bin:{env:PATH}\"\n\
+             CACHE = \"{env:ROOT}/cache\"\n\
+             GONE = \"{env:GISKARD_TEST_SURELY_UNSET}\"\n\
+             HOME_DIR = \"{env:GONE}{env:HOME}\"\n",
+        )
+        .unwrap();
+        HarnessCatalog::resolve(&config).unwrap();
+        let context = EnvTemplateContext {
+            project_dir: Some("/src/demo"),
+            ..EnvTemplateContext::default()
+        };
+        let lookup = |name: &str| {
+            match name {
+                "PATH" => Some("/usr/bin".to_owned()),
+                "HOME" => Some("/home/me".to_owned()),
+                // Giskard's own ROOT is shadowed by the table's.
+                "ROOT" => Some("/giskard-root".to_owned()),
+                _ => None,
+            }
+            .ok_or(std::env::VarError::NotPresent)
+        };
+        let resolved = config.harnesses["x"].env.resolve(&context, &lookup);
+        assert_eq!(
+            resolved.entries,
+            [
+                ("ROOT".to_owned(), "/src/demo/.tools".to_owned()),
+                (
+                    "PATH".to_owned(),
+                    "/src/demo/.tools/bin:/usr/bin".to_owned()
+                ),
+                ("CACHE".to_owned(), "/src/demo/.tools/cache".to_owned()),
+            ]
+        );
+        // GONE is unset, so HOME_DIR, reading it, is unset too.
+        let unset: Vec<&str> = resolved
+            .unset
+            .iter()
+            .map(|unset| unset.name.as_str())
+            .collect();
+        assert_eq!(unset, ["GONE", "HOME_DIR"]);
+    }
+
+    #[test]
+    fn env_values_read_names_as_they_stand_at_their_line() {
+        let config: Config = toml::from_str(
+            "[harnesses.x]\nkind = \"codex\"\n[harnesses.x.env]\n\
+             ORIG_HOME = \"{env:HOME}\"\n\
+             HOME = \"/sandbox/home\"\n\
+             CONFIG = \"{env:HOME}/.config\"\n",
+        )
+        .unwrap();
+        HarnessCatalog::resolve(&config).unwrap();
+        let lookup = |name: &str| {
+            (name == "HOME")
+                .then(|| "/home/me".to_owned())
+                .ok_or(std::env::VarError::NotPresent)
+        };
+        let resolved = config.harnesses["x"]
+            .env
+            .resolve(&EnvTemplateContext::default(), &lookup);
+        assert_eq!(
+            resolved.entries,
+            [
+                ("ORIG_HOME".to_owned(), "/home/me".to_owned()),
+                ("HOME".to_owned(), "/sandbox/home".to_owned()),
+                ("CONFIG".to_owned(), "/sandbox/home/.config".to_owned()),
+            ]
+        );
+        assert!(resolved.unset.is_empty());
     }
 
     #[test]
@@ -977,7 +1181,10 @@ roots = []
         )
         .unwrap();
         let env = &config.harnesses["x"].env;
-        assert_eq!(env.get("CODEX_HOME"), Some("/very/secret/home"));
+        assert_eq!(
+            env.get("CODEX_HOME").map(EnvTemplate::source).as_deref(),
+            Some("/very/secret/home")
+        );
         let debug = format!("{env:?}");
         assert!(debug.contains("CODEX_HOME"), "{debug}");
         assert!(!debug.contains("/very/secret/home"), "{debug}");

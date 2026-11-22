@@ -3,7 +3,6 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use giskard_core::error::{HarnessError, PersistError};
-use giskard_harness::EnvOverlay;
 use giskard_harness_claude::{ClaudeHarness, ClaudeLaunchOptions, DEFAULT_IDLE_TIMEOUT};
 use giskard_harness_codex::{CodexDeclarationOptions, CodexHarness, CodexLaunchOptions};
 use giskard_persist::{Config, HarnessCatalog, HarnessDeclaration};
@@ -51,12 +50,7 @@ impl HarnessKind for CodexKind {
         let launch = CodexLaunchOptions {
             command: declaration.command.as_ref().map(std::path::PathBuf::from),
             args: declaration.args.clone(),
-            env: EnvOverlay::new(
-                declaration
-                    .env
-                    .iter()
-                    .map(|(name, value)| (name.to_owned(), value.to_owned())),
-            ),
+            env: spec.env,
             profile: options.profile,
             project_id: Some(spec.project_id),
             declaration: Some(spec.name.to_owned()),
@@ -121,12 +115,7 @@ impl HarnessKind for ClaudeCodeKind {
         let launch = ClaudeLaunchOptions {
             command: declaration.command.as_ref().map(std::path::PathBuf::from),
             args: declaration.args.clone(),
-            env: EnvOverlay::new(
-                declaration
-                    .env
-                    .iter()
-                    .map(|(name, value)| (name.to_owned(), value.to_owned())),
-            ),
+            env: spec.env,
             project_id: Some(spec.project_id),
             declaration: Some(spec.name.to_owned()),
             idle_timeout,
@@ -407,7 +396,7 @@ fn production_factory(catalog: HarnessCatalog) -> Result<HarnessKindFactory, Str
             harness = name,
             kind = %declaration.kind,
             default = declaration.default,
-            env_names = ?declaration.env.iter().map(|(name, _)| name).collect::<Vec<_>>(),
+            env_names = ?declaration.env.names().collect::<Vec<_>>(),
             "declared harness"
         );
     }
@@ -431,7 +420,7 @@ async fn run(
     // Declarations are read once, from the startup config, and every one is checked before the
     // listener binds, so a typo refuses startup instead of surfacing on the first project open.
     let catalog = harness_catalog(&startup.config)?;
-    let factory = Arc::new(production_factory(catalog)?);
+    let factory = Arc::new(production_factory(catalog)?.with_data_dir(&startup.data_dir));
 
     // Before any request can start a deletion: the sweep assumes none is in flight.
     giskard_server::thread_deletion::sweep_abandoned_deletions(&startup.store).await;

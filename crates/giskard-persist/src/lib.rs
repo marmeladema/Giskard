@@ -4,6 +4,7 @@ pub mod atomic;
 pub mod command_output;
 pub mod config;
 pub mod data_dir;
+pub mod env_template;
 pub mod history;
 pub mod layout;
 pub mod lock;
@@ -17,6 +18,10 @@ pub use config::{
     ModelConfig, ModelRate, ProviderConfig, RetentionConfig,
 };
 pub use data_dir::{DATA_DIR_ENV, default_data_dir};
+pub use env_template::{
+    EnvTemplate, EnvTemplateContext, ResolvedEnv, TemplateError, TemplateVar, Unresolvable,
+    UnsetVariable,
+};
 pub use giskard_core::PersistError;
 pub use layout::ThreadLayout;
 pub use lock::{DataDirLock, LOCK_FILE_NAME};
