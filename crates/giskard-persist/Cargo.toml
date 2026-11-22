@@ -28,9 +28,6 @@ version = "0.10"
 [dependencies.rpassword]
 version = "7"
 
-[dependencies.dirs-next]
-version = "2"
-
 [[bin]]
 name = "giskard-admin"
 path = "src/bin/giskard_admin.rs"

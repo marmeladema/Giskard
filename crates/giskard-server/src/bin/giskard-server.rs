@@ -145,14 +145,6 @@ impl HarnessKind for ClaudeCodeKind {
     }
 }
 
-fn default_data_dir() -> std::path::PathBuf {
-    if let Ok(dir) = std::env::var("GISKARD_DATA_DIR") {
-        return std::path::PathBuf::from(dir);
-    }
-    let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-    std::path::PathBuf::from(format!("{home}/.local/share/giskard"))
-}
-
 async fn load_required_config(
     store: &giskard_persist::PersistStore,
     data_dir: &std::path::Path,
@@ -330,7 +322,7 @@ struct Startup {
 }
 
 async fn prepare_startup() -> Result<Startup, String> {
-    let data_dir = default_data_dir();
+    let data_dir = giskard_persist::default_data_dir();
     std::fs::create_dir_all(&data_dir)
         .map_err(|e| format!("cannot create data dir {}: {e}", data_dir.display()))?;
 

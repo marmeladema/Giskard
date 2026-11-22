@@ -46,7 +46,6 @@ toml = { version = "1.1", features = ["preserve_order"] }
 futures = "0.3"
 axum = { version = "0.8", features = ["ws"] }
 tower = "0.5"
-tower-cookies = "0.11"
 tower-http = { version = "0.7", features = ["fs", "cors"] }
 argon2 = "0.6"
 hmac = "0.13"
