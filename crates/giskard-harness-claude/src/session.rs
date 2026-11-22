@@ -11,6 +11,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
+use claude_codes::{ApplyFlagSettingsRequest, ControlRequestPayload, EffortLevel};
 use giskard_core::approval::ApprovalDecision;
 use giskard_core::error::HarnessError;
 use giskard_core::event::AgentEvent;
@@ -660,7 +661,7 @@ struct TurnSetup {
     deadline: Instant,
     /// Decided when the mode is in: the `set_model` to send, and the effort to send.
     model_change: Option<String>,
-    effort_change: Option<String>,
+    effort_change: Option<EffortLevel>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1635,7 +1636,11 @@ impl Supervisor {
             }
             SetupStage::Model => json!({"subtype": "set_model", "model": setup.model_change}),
             SetupStage::Effort => {
-                json!({"subtype": "apply_flag_settings", "settings": {"effortLevel": setup.effort_change}})
+                let settings = match setup.effort_change.clone() {
+                    Some(level) => ApplyFlagSettingsRequest::new().effort_level(level),
+                    None => ApplyFlagSettingsRequest::new(),
+                };
+                json!(ControlRequestPayload::ApplyFlagSettings(settings))
             }
             SetupStage::ReadBack => json!({"subtype": "get_settings"}),
         };
@@ -1723,9 +1728,14 @@ impl Supervisor {
                 // reports none), so a requested level is sent and checked again whenever the
                 // model changes.
                 let model_changes = setup.model_change.is_some();
-                setup.effort_change = setup.settings.effort.clone().filter(|requested| {
-                    model_changes || Some(requested.as_str()) != self.current_effort.as_deref()
-                });
+                setup.effort_change = setup
+                    .settings
+                    .effort
+                    .as_deref()
+                    .filter(|requested| {
+                        model_changes || Some(*requested) != self.current_effort.as_deref()
+                    })
+                    .map(EffortLevel::from);
                 if !model_changes && setup.effort_change.is_none() {
                     self.log_turn_settings(turn, false);
                     return Ok(None);
@@ -1795,8 +1805,8 @@ impl Supervisor {
         self.current_model.reasoning_effort =
             applied_effort.clone().map(giskard_core::model::Effort);
         self.sync_entry_model();
-        if let Some(level) = setup.effort_change.as_deref()
-            && applied_effort.as_deref() != Some(level)
+        if let Some(level) = &setup.effort_change
+            && applied_effort.as_deref() != Some(level.as_str())
         {
             warn!(
                 thread_id = %self.thread,
@@ -1861,7 +1871,7 @@ impl Supervisor {
                     thread_id = %self.thread,
                     turn_id = %turn,
                     action = "apply_flag_settings",
-                    effort = display_opt(setup.effort_change.as_deref()),
+                    effort = display_opt(setup.effort_change.as_ref()),
                     error_code = display_opt(failure.code()),
                     error = %failure,
                     "Claude Code did not take the effort level"
