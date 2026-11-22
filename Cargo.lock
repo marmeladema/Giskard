@@ -27,12 +27,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "anyhow"
-version = "1.0.104"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
-
-[[package]]
 name = "argon2"
 version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -293,11 +287,10 @@ dependencies = [
 
 [[package]]
 name = "claude-codes"
-version = "2.1.316"
+version = "2.1.331"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9d29a4c6468db1b33addb0286c7dcad00365ff5244d857082502c54bae8e8e6d"
+checksum = "bc3f5363df74a6023c2349cf2bebc5e4c8e50274c18a6482396ca1cd17fa9b88"
 dependencies = [
- "anyhow",
  "chrono",
  "log",
  "serde",
