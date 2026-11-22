@@ -3,19 +3,20 @@
 //! a kind.
 
 use std::collections::HashSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use giskard_core::error::HarnessError;
 use giskard_core::ids::ProjectId;
-use giskard_harness::{AgentHarness, HarnessBootstrap};
+use giskard_harness::{AgentHarness, EnvOverlay, HarnessBootstrap};
 use giskard_persist::store::ProjectConfig;
-use giskard_persist::{HarnessCatalog, HarnessDeclaration};
+use giskard_persist::{EnvTemplateContext, HarnessCatalog, HarnessDeclaration};
 use indexmap::IndexMap;
 use tracing::warn;
 
 use crate::HarnessFactory;
+use crate::registry::CreatedHarness;
 
 /// What a kind needs to construct one instance.
 pub struct HarnessInstanceSpec<'a> {
@@ -24,6 +25,9 @@ pub struct HarnessInstanceSpec<'a> {
     /// The declaration's `[harnesses.<name>]` key.
     pub name: &'a str,
     pub declaration: &'a HarnessDeclaration,
+    /// The declaration's `env`, resolved for this project. Use this, never `declaration.env`,
+    /// whose values are unrendered templates.
+    pub env: EnvOverlay,
 }
 
 #[async_trait]
@@ -51,6 +55,8 @@ pub struct HarnessKindFactory {
     /// retrying an attach does not repeat the same operator message. Keyed by declaration name,
     /// which is configuration, not entity identity; it lives as long as the factory.
     reported_undeclared: Mutex<HashSet<String>>,
+    /// What `{data_dir}` renders to in a declaration's `env`. `None` leaves it without a value.
+    data_dir: Option<PathBuf>,
 }
 
 impl Default for HarnessKindFactory {
@@ -59,6 +65,7 @@ impl Default for HarnessKindFactory {
             kinds: IndexMap::new(),
             catalog: HarnessCatalog::synthesized(),
             reported_undeclared: Mutex::new(HashSet::new()),
+            data_dir: None,
         }
     }
 }
@@ -104,6 +111,12 @@ impl HarnessKindFactory {
     /// Replace the catalog projects resolve against.
     pub fn with_catalog(mut self, catalog: HarnessCatalog) -> Self {
         self.catalog = catalog;
+        self
+    }
+
+    /// The data directory `{data_dir}` renders to.
+    pub fn with_data_dir(mut self, data_dir: impl Into<PathBuf>) -> Self {
+        self.data_dir = Some(data_dir.into());
         self
     }
 
@@ -153,7 +166,7 @@ impl HarnessFactory for HarnessKindFactory {
         config: &ProjectConfig,
         harness: &str,
         bootstrap: HarnessBootstrap,
-    ) -> Result<Arc<dyn AgentHarness>, HarnessError> {
+    ) -> Result<CreatedHarness, HarnessError> {
         let Some(declaration) = self.catalog.get(harness) else {
             let declared = self.catalog.names().collect::<Vec<_>>().join(", ");
             if self.first_report_of(harness) {
@@ -189,18 +202,77 @@ impl HarnessFactory for HarnessKindFactory {
                 config.id, harness, declaration.kind, supported
             )));
         };
+        let workspace_root = config.workspace_root.as_deref().unwrap_or(&config.dir);
+        let (env, warnings) = resolve_env(config, harness, declaration, self.data_dir.as_deref());
         let spec = HarnessInstanceSpec {
             project_id: config.id,
-            workspace_root: PathBuf::from(config.workspace_root.as_deref().unwrap_or(&config.dir)),
+            workspace_root: PathBuf::from(workspace_root),
             name: harness,
             declaration,
+            env,
         };
-        kind.create(spec, bootstrap).await
+        let harness = kind.create(spec, bootstrap).await?;
+        Ok(CreatedHarness { harness, warnings })
     }
 
     fn catalog(&self) -> HarnessCatalog {
         self.catalog.clone()
     }
+}
+
+/// Render a declaration's `env` for one project, warning once per instance about every variable
+/// skipped. Names and placeholders are logged; values never are.
+fn resolve_env(
+    config: &ProjectConfig,
+    harness: &str,
+    declaration: &HarnessDeclaration,
+    data_dir: Option<&Path>,
+) -> (EnvOverlay, Vec<String>) {
+    let project_id = config.id.to_string();
+    let data_dir = data_dir.map(|path| path.to_string_lossy());
+    let context = EnvTemplateContext {
+        project_id: Some(&project_id),
+        project_name: Some(&config.name),
+        project_dir: Some(&config.dir),
+        harness_name: Some(harness),
+        data_dir: data_dir.as_deref(),
+    };
+    let resolved = declaration
+        .env
+        .resolve(&context, &|name| std::env::var(name));
+    if !resolved.unset.is_empty() {
+        warn!(
+            project_id = %config.id,
+            harness = %harness,
+            action = "resolve_harness_env",
+            unset = ?resolved
+                .unset
+                .iter()
+                .map(|unset| format!(
+                    "{}={} ({})",
+                    unset.name,
+                    unset.placeholder,
+                    unset.placeholder.reason()
+                ))
+                .collect::<Vec<_>>(),
+            "harness environment variables skipped: their templates name a placeholder with no \
+             usable value"
+        );
+    }
+    let notices = resolved
+        .unset
+        .iter()
+        .map(|unset| {
+            format!(
+                "Environment variable {} from [harnesses.{harness}.env] in config.toml is \
+                 skipped: {} {}.",
+                unset.name,
+                unset.placeholder,
+                unset.placeholder.reason()
+            )
+        })
+        .collect();
+    (EnvOverlay::new(resolved.entries), notices)
 }
 
 #[cfg(test)]
@@ -362,6 +434,86 @@ command = "/opt/nightly/bin/codex"
             matches!(&error, HarnessError::Protocol(message) if message.starts_with("stub reached: other as nightly")),
             "{error:?}"
         );
+    }
+
+    /// A kind that records the resolved environment it was given, values included, since a test
+    /// needs to see them, and builds a do-nothing harness.
+    #[derive(Default)]
+    struct EnvProbe {
+        env: Mutex<Vec<(String, String)>>,
+    }
+
+    #[async_trait]
+    impl HarnessKind for EnvProbe {
+        fn name(&self) -> &str {
+            "probe"
+        }
+        fn validate(&self, _declaration: &HarnessDeclaration) -> Result<(), String> {
+            Ok(())
+        }
+        async fn create(
+            &self,
+            spec: HarnessInstanceSpec<'_>,
+            _bootstrap: HarnessBootstrap,
+        ) -> Result<Arc<dyn AgentHarness>, HarnessError> {
+            *self.env.lock().unwrap() = spec.env.entries().to_vec();
+            Ok(Arc::new(giskard_harness_replay::ReplayHarness::new()))
+        }
+    }
+
+    #[tokio::test]
+    #[traced_test]
+    async fn env_templates_resolve_against_the_project_and_unset_ones_are_reported() {
+        let probe = Arc::new(EnvProbe::default());
+        let factory = HarnessKindFactory::new()
+            .register(probe.clone())
+            .expect("kind registers")
+            .with_data_dir("/data")
+            .with_catalog(catalog(
+                r#"
+[harnesses.p]
+kind = "probe"
+[harnesses.p.env]
+CACHE = "{project_dir}/.cache/{harness_name}"
+ID = "{project_name}:{project_id}:{data_dir}"
+GONE = "s3cr3t-{env:GISKARD_TEST_SURELY_UNSET}"
+"#,
+            ));
+        let config = project("p");
+        let created = match factory
+            .create(&config, "p", HarnessBootstrap::default())
+            .await
+        {
+            Ok(created) => created,
+            Err(error) => panic!("the probe builds a harness: {error:?}"),
+        };
+        assert_eq!(
+            *probe.env.lock().unwrap(),
+            [
+                (
+                    "CACHE".to_owned(),
+                    "/tmp/giskard-harness-kinds-test/.cache/p".to_owned()
+                ),
+                ("ID".to_owned(), format!("proj:{}:/data", config.id)),
+            ]
+        );
+        assert_eq!(
+            created.warnings,
+            [
+                "Environment variable GONE from [harnesses.p.env] in config.toml is skipped: \
+              {env:GISKARD_TEST_SURELY_UNSET} has no value."
+            ]
+        );
+        logs_assert(lines_with(
+            1,
+            &[
+                " WARN ",
+                "action=\"resolve_harness_env\"",
+                "harness=p",
+                "GONE={env:GISKARD_TEST_SURELY_UNSET}",
+            ],
+        ));
+        assert!(!logs_contain("s3cr3t"));
     }
 
     #[test]

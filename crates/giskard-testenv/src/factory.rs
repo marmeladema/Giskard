@@ -6,7 +6,7 @@ use giskard_harness::{AgentHarness, HarnessBootstrap};
 use giskard_harness_replay::{ReplayFixture, ReplayHarness};
 use giskard_persist::HarnessCatalog;
 use giskard_persist::store::ProjectConfig;
-use giskard_server::HarnessFactory;
+use giskard_server::{CreatedHarness, HarnessFactory};
 
 /// A factory over a closure that also receives the requested `[harnesses.<name>]` declaration.
 struct FnFactory<F>(F);
@@ -24,8 +24,8 @@ where
         config: &ProjectConfig,
         harness: &str,
         bootstrap: HarnessBootstrap,
-    ) -> Result<Arc<dyn AgentHarness>, HarnessError> {
-        (self.0)(config, harness, bootstrap)
+    ) -> Result<CreatedHarness, HarnessError> {
+        (self.0)(config, harness, bootstrap).map(CreatedHarness::from)
     }
 }
 
@@ -67,7 +67,7 @@ impl HarnessFactory for CatalogFactory {
         config: &ProjectConfig,
         harness: &str,
         bootstrap: HarnessBootstrap,
-    ) -> Result<Arc<dyn AgentHarness>, HarnessError> {
+    ) -> Result<CreatedHarness, HarnessError> {
         self.inner.create(config, harness, bootstrap).await
     }
 
@@ -145,11 +145,13 @@ mod tests {
         let first = factory
             .create(&config, "codex", HarnessBootstrap::default())
             .await
-            .unwrap();
+            .unwrap()
+            .harness;
         let second = factory
             .create(&config, "codex", HarnessBootstrap::default())
             .await
-            .unwrap();
+            .unwrap()
+            .harness;
         assert!(Arc::ptr_eq(&harness, &first));
         assert!(Arc::ptr_eq(&first, &second));
     }

@@ -120,8 +120,31 @@ max_command_output_bytes = 134217728   # 128 MiB
 #     one on Giskard's PATH runs instead, with no error.
 #   * `[harnesses.<name>.env]` is applied over Giskard's own environment for every process that
 #     instance spawns, and for Giskard's own model discovery on its behalf (env-backed keys,
-#     headers, and auth commands resolve through it first). Values are literal and are never
-#     logged; only the variable names are.
+#     headers, and auth commands resolve through it first). Values are never logged; only the
+#     variable names are.
+#   * `env` values are templates, rendered once per project when the project's instance of the
+#     declaration starts (on the first thread opened after a server start):
+#       {project_id}     the project's id
+#       {project_name}   the project's display name
+#       {project_dir}    the project's directory
+#       {harness_name}   this declaration's name (the table key)
+#       {data_dir}       Giskard's data directory (GISKARD_DATA_DIR)
+#       {env:NAME}       NAME as it stands at that line, as in a shell: a variable defined above
+#                        it in this table, else Giskard's own environment. A variable's own name
+#                        (or one defined below) still has Giskard's value there, so
+#                        PATH = "{env:HOME}/bin:{env:PATH}" extends Giskard's PATH.
+#     Write `{{` and `}}` for literal braces. Anything else in braces is a startup error. A variable
+#     whose template names an unset {env:NAME} (or one whose value is not valid UTF-8) is skipped:
+#     the declaration does not set it (it is never set to ""). The server logs a warning, and
+#     opening or resuming a thread on that instance shows it as a warning toast. Templates are per
+#     project, not per thread: every thread of a project sees the same values.
+#   * Who sees `env`. Claude Code: each thread's `claude` process, and the commands it runs (Bash
+#     tool, hooks). Codex: the project's one app-server process. The commands the agent runs
+#     inherit it filtered by `shell_environment_policy` in Codex's config.toml: `inherit = "core"`
+#     or `"none"`, `exclude`, and `include_only` can drop these variables, so keep them out of
+#     those filters if commands need them. Codex starts a stdio MCP server with a small fixed set
+#     of variables plus the ones its `[mcp_servers.<id>]` entry names in `env_vars` or `env`, so
+#     name a variable there for an MCP server to see it.
 #   * The only Codex-specific key is `profile`, passed as `-c profile=<name>`; the only
 #     `claude-code` one is `idle_shutdown_secs`. Any other key is a startup error, as are a blank
 #     declaration name, an unknown `kind`, two defaults, a blank command or profile, and an
@@ -150,6 +173,10 @@ max_command_output_bytes = 134217728   # 128 MiB
 # idle_shutdown_secs = 600
 # [harnesses.claude.env]
 # CLAUDE_CONFIG_DIR = "/home/you/.claude"
+# # Templates: a per-project cache, and a PATH that puts the project's tools first.
+# TOOLS = "{project_dir}/.tools"
+# PATH = "{env:TOOLS}/bin:{project_dir}/node_modules/.bin:{env:PATH}"
+# PROJECT_CACHE = "{data_dir}/cache/{project_id}"
 
 # ---- Providers ----
 # This whole section is OPTIONAL, and most setups need none of it.

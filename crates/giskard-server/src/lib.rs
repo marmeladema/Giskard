@@ -33,6 +33,6 @@ pub use harness_kinds::{
     HarnessValidationError,
 };
 pub use registry::{
-    DeferReason, DriverEvent, DriverEventSink, ForwarderExitReason, HarnessFactory,
+    CreatedHarness, DeferReason, DriverEvent, DriverEventSink, ForwarderExitReason, HarnessFactory,
     HarnessRegistry, LogDriverEventSink, OwnerExitDisposition, RefusedSubject,
 };

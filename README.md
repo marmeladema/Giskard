@@ -294,7 +294,7 @@ service does not silently run with an empty provider list.
 | | `default` | first declared | At most one declaration may be `true`; new projects use it when no harness is chosen, and a project's declaration is what a new thread preselects. |
 | | `command` | `codex` or `claude` on `PATH`, by kind | Program to spawn. A bare name is resolved on Giskard's own `PATH`, not a `PATH` set in `env`, so use an absolute path for a binary that is not on Giskard's `PATH`; otherwise the one on Giskard's `PATH` runs instead, silently. |
 | | `args` | `[]` | Extra arguments, appended after `app-server --listen stdio://` (Codex) or after the stream-json protocol flags (Claude Code). |
-| | `env` | `{}` | `[harnesses.<name>.env]`: variables applied over Giskard's environment for the instance's processes and for discovery on its behalf. Values are never logged. |
+| | `env` | `{}` | `[harnesses.<name>.env]`: variables applied over Giskard's environment for the instance's processes and for discovery on its behalf. Values are templates rendered per project (see [Harness environment templates](#harness-environment-templates)). Values are never logged. |
 | | `profile` | Codex's own | **Codex only.** Passed as `-c profile=<name>`. Any other Codex key is a startup error. |
 | | `idle_shutdown_secs` | `600` | **Claude Code only.** Seconds a thread's `claude` process may sit idle (no turn, no pending approval or question, no running sub-agent or background command) before it is stopped; the thread stays open and its next message resumes the session. `0` keeps every process until its thread is archived, deleted or the server stops. Any other kind-specific key is a startup error. |
 | `[providers.<id>]` | `model_listing`, `[[providers.<id>.models]]` | — | **Optional.** Models are found without it: every provider Codex has a `base_url` for is discovered from `GET {base_url}/models` with the key Codex holds for it, and the provider Codex routes to also contributes its `model/list` catalog. A built-in Codex has no endpoint for and does not route to — `ollama` or `lmstudio` when you use neither — has nothing to contribute and is not offered; declare models for it if you want it in the picker. Declare a provider only to turn discovery off (`model_listing = false`), to add models by hand for an endpoint with no `/models` route, to override metadata, or to pin picker order — declared providers come first in the order written, the rest by id. Keyed by routing id, the same way Codex keys `[model_providers.<id>]`; the id must name a provider Codex knows (see below). |
@@ -325,16 +325,74 @@ harness, discover project or harness paths, block work, or delete files. Configu
 explicitly; filesystem capacity does not fully represent per-user/directory quotas or independently
 limited subvolumes. Set `[disk_usage].enabled = false` to disable it.
 
-Harness declarations are read once at startup and validated before the server listens: a blank
-name (`[harnesses.""]`), an unknown `kind`, two `default = true` entries, a blank `command` or
-`profile`, an invalid `env` variable name, or an unrecognised Codex key refuses startup with a
+Harness declarations are read once at startup and validated before the server listens: a blank name
+(`[harnesses.""]`), an unknown `kind`, two `default = true` entries, a blank `command` or `profile`,
+an invalid `env` variable name or template, or an unrecognised Codex key refuses startup with a
 message naming the `[harnesses.<name>]` key. A declaration's name is durable — each project stores
 the name it was created on as its default, and each thread stores the name it runs on — so the
 new-project dialog offers a choice only when more than one is declared, and renaming or removing a
 declaration leaves the threads on it read-only (with the missing name and `[harnesses]` in the
-warning) until it is declared again, while threads on other declarations keep working. Declaring
-the table switches off the synthesized `codex`; projects and threads created before you declared it
-are stamped `codex`, so keep a declaration named `codex` for them.
+warning) until it is declared again, while threads on other declarations keep working. Declaring the
+table switches off the synthesized `codex`; projects and threads created before you declared it are
+stamped `codex`, so keep a declaration named `codex` for them.
+
+### Harness environment templates
+
+`[harnesses.<name>.env]` values are templates. Each project gets its own instance of a declaration,
+and the templates are rendered once for it when it starts (on the first thread opened after a
+server start), so every thread of one project sees the same values:
+
+| Placeholder | Value |
+|---|---|
+| `{project_id}` | The project's id |
+| `{project_name}` | The project's display name |
+| `{project_dir}` | The project's directory |
+| `{harness_name}` | The declaration's name |
+| `{data_dir}` | Giskard's data directory (`GISKARD_DATA_DIR`) |
+| `{env:NAME}` | `NAME` as the harness will see it: a variable defined above it in the same table, else Giskard's own environment |
+
+```toml
+[harnesses.claude.env]
+TOOLS = "{project_dir}/.tools"
+PATH = "{env:TOOLS}/bin:{env:PATH}"
+PROJECT_CACHE = "{data_dir}/cache/{project_id}"
+```
+
+Variables are rendered top to bottom, as a shell would run `export` lines: `{env:NAME}` is
+`NAME` as it stands at that line. `PATH` above reads `TOOLS` from the line before. A variable's
+own name, or one defined further down, still has Giskard's value at that point. That is how
+`PATH` extends Giskard's `PATH`, and how a value can be saved before it is replaced:
+
+```toml
+ORIG_HOME = "{env:HOME}"     # Giskard's HOME
+HOME = "/sandbox/home"
+CONFIG = "{env:HOME}/.config" # /sandbox/home/.config
+```
+
+A skipped variable (see below) does not count as defined: a later `{env:NAME}` reads it as if its
+line were not there.
+
+`{{` and `}}` are literal braces; any other brace pair that is not a placeholder refuses startup.
+Templates are parsed as `config.toml` loads, so the error is a config error that points at the
+`[harnesses.<name>.env]` table and names the variable and, when it looks like a placeholder, the
+placeholder, but not the value. A variable whose template names an unset `{env:NAME}`, or one whose
+value is not valid UTF-8, is skipped: the declaration does not set it (it is never set to an empty
+string). The server logs a warning naming the variable and placeholder, and creating, opening or
+resuming a thread on that instance shows the same warning as a toast, with no turn needed, e.g.
+"Environment variable HOME from [harnesses.claude.env] in config.toml is skipped: {env:MISSING} has
+no value."
+
+Where the variables reach depends on the kind:
+
+- **Claude Code** sets them on each thread's `claude` process; the commands it runs (the Bash tool,
+  hooks) inherit them.
+- **Codex** sets them on the project's single app-server process. The commands the agent runs
+  inherit them through Codex's `shell_environment_policy`: `inherit = "core"` or `"none"`, an
+  `exclude` pattern, or an `include_only` list that does not name a variable drops it from the
+  command's environment, so keep the ones commands need out of those filters in Codex's own
+  config.toml. Codex starts a stdio MCP server with a small fixed set of variables plus those its
+  `[mcp_servers.<id>]` entry names in `env_vars` or `env`; name a variable there for an MCP server
+  to see it.
 
 **Claude Code.** A `claude-code` declaration takes the neutral keys above and
 `idle_shutdown_secs`:

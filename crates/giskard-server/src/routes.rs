@@ -2245,7 +2245,6 @@ mod tests {
 
     use giskard_core::event::AgentEvent;
     use giskard_core::item::{Item, ItemPayload};
-    use giskard_harness::AgentHarness;
     use giskard_persist::store::ProjectConfig;
 
     use super::*;
@@ -2260,7 +2259,7 @@ mod tests {
             _config: &ProjectConfig,
             _harness: &str,
             _bootstrap: giskard_harness::HarnessBootstrap,
-        ) -> Result<Arc<dyn AgentHarness>, giskard_core::HarnessError> {
+        ) -> Result<crate::CreatedHarness, giskard_core::HarnessError> {
             Err(giskard_core::HarnessError::Spawn("unused in test".into()))
         }
     }
