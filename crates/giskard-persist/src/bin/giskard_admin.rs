@@ -17,8 +17,6 @@
 //! (`<data_dir>/.giskard.lock`) and refuses while `giskard-server` — or another `giskard-admin`
 //! run — holds it. `--dry-run` and read-only inspection take no lock and warn instead.
 
-use std::path::PathBuf;
-
 use argon2::PasswordHasher;
 
 #[tokio::main]
@@ -36,13 +34,7 @@ async fn run() -> Result<(), String> {
         std::process::exit(1);
     }
 
-    let data_dir = std::env::var("GISKARD_DATA_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| {
-            dirs_next::data_dir()
-                .unwrap_or_else(|| PathBuf::from("."))
-                .join("giskard")
-        });
+    let data_dir = giskard_persist::default_data_dir();
 
     let cmd = &args[1];
     match cmd.as_str() {

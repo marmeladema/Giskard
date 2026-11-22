@@ -6,7 +6,13 @@
 [advisories]
 # RustSec advisory database. Security vulnerabilities fail the check. Add specific advisory IDs to
 # `ignore` (each with a `reason`) only after assessing that they don't apply to how we use the crate.
-ignore = []
+ignore = [
+    # chrono is unmaintained (all versions; no fixed release). Not a vulnerability: no flaw is
+    # reported. It is a direct dependency of most crates here (timestamps and their serde format)
+    # and of claude-codes, so it stays in the tree either way; a move to jiff is its own change,
+    # which must keep the persisted timestamp format byte for byte.
+    { id = "RUSTSEC-2026-0543", reason = "unmaintained, no known flaw; also required by claude-codes" },
+]
 # Vulnerabilities are always reported. For lower-severity "unmaintained" advisories, only flag crates
 # this workspace depends on directly — a newly-unmaintained *transitive* crate we can't act on should
 # not block unrelated PRs.
