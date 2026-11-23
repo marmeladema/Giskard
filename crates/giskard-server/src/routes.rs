@@ -495,7 +495,7 @@ async fn list_harnesses(State(state): State<AppState>) -> Json<ListHarnessesResp
             .iter()
             .map(|(name, declaration)| HarnessDeclarationSummary {
                 name: name.to_owned(),
-                kind: declaration.kind.clone(),
+                kind: declaration.kind().to_string(),
                 default: declaration.default,
             })
             .collect(),
@@ -4061,7 +4061,7 @@ async fn project_list_models(
         harnesses.push(HarnessModelGroup {
             kind: catalog
                 .get(&name)
-                .map(|declaration| declaration.kind.clone())
+                .map(|declaration| declaration.kind().to_string())
                 .unwrap_or_default(),
             default: name == catalog.default_name(),
             capabilities: capabilities.map(capabilities_info),

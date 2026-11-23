@@ -394,7 +394,7 @@ fn production_factory(catalog: HarnessCatalog) -> Result<HarnessKindFactory, Str
     for (name, declaration) in factory.catalog().iter() {
         info!(
             harness = name,
-            kind = %declaration.kind,
+            kind = %declaration.kind(),
             default = declaration.default,
             env_names = ?declaration.env.names().collect::<Vec<_>>(),
             "declared harness"
@@ -519,6 +519,21 @@ mod tests {
     }
 
     #[test]
+    fn every_kind_implied_by_name_is_one_this_server_builds() {
+        for kind in HarnessCatalog::KINDS_IMPLIED_BY_NAME {
+            let factory = startup_factory(&format!("[harnesses.{kind}]\n"))
+                .unwrap_or_else(|error| panic!("[harnesses.{kind}] without `kind`: {error}"));
+            assert_eq!(
+                factory
+                    .catalog()
+                    .get(kind)
+                    .map(|declaration| declaration.kind()),
+                Some(*kind)
+            );
+        }
+    }
+
+    #[test]
     fn startup_accepts_no_harnesses_table_and_two_codex_declarations() {
         let factory = startup_factory("").expect("the synthesized codex is valid");
         assert_eq!(factory.catalog().default_name(), "codex");
@@ -559,7 +574,7 @@ CLAUDE_CONFIG_DIR = "/home/you/.claude"
             factory
                 .catalog()
                 .get("claude")
-                .map(|declaration| declaration.kind.as_str()),
+                .map(|declaration| declaration.kind()),
             Some("claude-code")
         );
     }

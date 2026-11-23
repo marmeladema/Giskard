@@ -35,7 +35,12 @@ pub struct Config {
 /// stay in the adapter crate.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HarnessDeclaration {
-    pub kind: String,
+    /// The adapter. Optional on a declaration named after a kind in
+    /// [`HarnessCatalog::KINDS_IMPLIED_BY_NAME`], where it is that name;
+    /// `HarnessCatalog::resolve` fills it in or refuses the entry, so read it through
+    /// [`HarnessDeclaration::kind`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
     #[serde(default)]
     pub default: bool,
     /// Program to spawn. `None` leaves it to the adapter (Codex: `codex` on `PATH`).
@@ -53,9 +58,15 @@ pub struct HarnessDeclaration {
 }
 
 impl HarnessDeclaration {
+    /// The declaration's kind. Always set on a declaration from a [`HarnessCatalog`]; empty on a
+    /// raw one that omits it.
+    pub fn kind(&self) -> &str {
+        self.kind.as_deref().unwrap_or_default()
+    }
+
     fn synthesized_codex() -> Self {
         Self {
-            kind: HarnessCatalog::SYNTHESIZED_NAME.to_string(),
+            kind: Some(HarnessCatalog::SYNTHESIZED_NAME.to_string()),
             default: true,
             command: None,
             args: Vec::new(),
@@ -179,6 +190,16 @@ pub enum HarnessConfigError {
     /// The name is quoted in the message, since `[harnesses.]` would not say which key it was.
     #[error("[harnesses.{0:?}] has a blank name; a declaration needs a non-blank table key")]
     BlankName(String),
+    #[error(
+        "[harnesses.{0}] has no `kind`; only a declaration named after its kind ({names}) may \
+         omit it",
+        names = HarnessCatalog::KINDS_IMPLIED_BY_NAME
+            .iter()
+            .map(|kind| format!("`{kind}`"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    )]
+    MissingKind(String),
     #[error("[harnesses.{0}] has a blank `kind`")]
     BlankKind(String),
     #[error("[harnesses.{0}] has a blank `command`; omit the key to use the adapter's default")]
@@ -200,6 +221,9 @@ pub struct HarnessCatalog {
 
 impl HarnessCatalog {
     pub const SYNTHESIZED_NAME: &str = "codex";
+    /// Kinds a declaration may leave out when its name is the kind (`[harnesses.codex]`).
+    /// Unrelated to what is synthesized when nothing is declared.
+    pub const KINDS_IMPLIED_BY_NAME: &[&str] = &["codex", "claude-code"];
 
     /// Apply the declaration rules to `config.harnesses`.
     pub fn resolve(config: &Config) -> Result<Self, HarnessConfigError> {
@@ -211,8 +235,14 @@ impl HarnessCatalog {
             if name.trim().is_empty() {
                 return Err(HarnessConfigError::BlankName(name.clone()));
             }
-            if declaration.kind.trim().is_empty() {
-                return Err(HarnessConfigError::BlankKind(name.clone()));
+            match declaration.kind.as_deref() {
+                None if !Self::KINDS_IMPLIED_BY_NAME.contains(&name.as_str()) => {
+                    return Err(HarnessConfigError::MissingKind(name.clone()));
+                }
+                Some(kind) if kind.trim().is_empty() => {
+                    return Err(HarnessConfigError::BlankKind(name.clone()));
+                }
+                _ => {}
             }
             if declaration
                 .command
@@ -255,6 +285,8 @@ impl HarnessCatalog {
             .map(|(name, declaration)| {
                 let mut declaration = declaration.clone();
                 declaration.default = *name == default;
+                // Only a name in `KINDS_IMPLIED_BY_NAME` gets past the check above without one.
+                declaration.kind.get_or_insert_with(|| name.clone());
                 (name.clone(), declaration)
             })
             .collect();
@@ -907,7 +939,7 @@ roots = []
         let entries: Vec<_> = catalog.iter().collect();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].0, "codex");
-        assert_eq!(entries[0].1.kind, "codex");
+        assert_eq!(entries[0].1.kind(), "codex");
         assert!(entries[0].1.default);
         assert_eq!(catalog.default_name(), "codex");
     }
@@ -985,11 +1017,63 @@ roots = []
     }
 
     #[test]
+    fn a_declaration_named_after_its_kind_may_omit_it() {
+        let config: Config = toml::from_str(
+            "[harnesses.claude-code]\n[harnesses.codex.env]\nA = \"1\"\n\
+             [harnesses.claude]\nkind = \"claude-code\"\n",
+        )
+        .unwrap();
+        let catalog = HarnessCatalog::resolve(&config).unwrap();
+        let kinds: Vec<_> = catalog
+            .iter()
+            .map(|(name, declaration)| (name, declaration.kind()))
+            .collect();
+        assert_eq!(
+            kinds,
+            [
+                ("claude-code", "claude-code"),
+                ("codex", "codex"),
+                ("claude", "claude-code")
+            ]
+        );
+        assert!(
+            catalog
+                .get("codex")
+                .is_some_and(|d| d.env.get("A").is_some())
+        );
+
+        // An explicit kind is taken as written, even on a kind's name.
+        let config: Config = toml::from_str("[harnesses.codex]\nkind = \"claude-code\"\n").unwrap();
+        let catalog = HarnessCatalog::resolve(&config).unwrap();
+        assert_eq!(
+            catalog.get("codex").map(HarnessDeclaration::kind),
+            Some("claude-code")
+        );
+    }
+
+    #[test]
+    fn other_declarations_need_a_kind() {
+        let config: Config = toml::from_str("[harnesses.stable.env]\nA = \"1\"\n").unwrap();
+        let err = HarnessCatalog::resolve(&config).unwrap_err();
+        assert_eq!(err, HarnessConfigError::MissingKind("stable".into()));
+        assert_eq!(
+            err.to_string(),
+            "[harnesses.stable] has no `kind`; only a declaration named after its kind \
+             (`codex`, `claude-code`) may omit it"
+        );
+
+        // A blank kind is not an omitted one, even on a kind's name.
+        let config: Config = toml::from_str("[harnesses.codex]\nkind = \"\"\n").unwrap();
+        let err = HarnessCatalog::resolve(&config).unwrap_err();
+        assert_eq!(err, HarnessConfigError::BlankKind("codex".into()));
+    }
+
+    #[test]
     fn kind_specific_keys_are_kept_opaque() {
         let config: Config =
             toml::from_str("[harnesses.x]\nkind = \"codex\"\nprofile = \"p\"\n").unwrap();
         let declaration = &config.harnesses["x"];
-        assert_eq!(declaration.kind, "codex");
+        assert_eq!(declaration.kind(), "codex");
         assert_eq!(declaration.options["profile"].as_str(), Some("p"));
         assert!(!declaration.options.contains_key("kind"));
     }

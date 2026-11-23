@@ -290,7 +290,7 @@ service does not silently run with an empty provider list.
 | `[history]` | `initial` / `page` | `5` / `5` | Turns fetched on open (topped up client-side to ~2 screens) / per scroll-up page. |
 | | `turn_items` | `100` | Newest items of a running turn sent when a browser (re)connects; older settled items load on scroll-up or from the "Load earlier items" row, this many per page. Items still running or waiting on you are always sent. |
 | `[retention]` | `max_command_output_bytes` | `134217728` (128 MiB) | Maximum durable completed-command output. Must be at least `32768` (32 KiB); larger output retains a UTF-8-safe head and tail. |
-| `[harnesses.<name>]` | `kind` | — | **Optional.** A named harness declaration; the whole table defaults to one harness named `codex` of kind `codex`. `kind` is the adapter: `codex` or `claude-code`. |
+| `[harnesses.<name>]` | `kind` | — | **Optional.** A named harness declaration; the whole table defaults to one harness named `codex` of kind `codex`. `kind` is the adapter: `codex` or `claude-code`. Required, except on a declaration named after its kind (`[harnesses.codex]`, `[harnesses.claude-code]`), where it defaults to that name. |
 | | `default` | first declared | At most one declaration may be `true`; new projects use it when no harness is chosen, and a project's declaration is what a new thread preselects. |
 | | `command` | `codex` or `claude` on `PATH`, by kind | Program to spawn. A bare name is resolved on Giskard's own `PATH`, not a `PATH` set in `env`, so use an absolute path for a binary that is not on Giskard's `PATH`; otherwise the one on Giskard's `PATH` runs instead, silently. |
 | | `args` | `[]` | Extra arguments, appended after `app-server --listen stdio://` (Codex) or after the stream-json protocol flags (Claude Code). |
@@ -334,7 +334,18 @@ new-project dialog offers a choice only when more than one is declared, and rena
 declaration leaves the threads on it read-only (with the missing name and `[harnesses]` in the
 warning) until it is declared again, while threads on other declarations keep working. Declaring the
 table switches off the synthesized `codex`; projects and threads created before you declared it are
-stamped `codex`, so keep a declaration named `codex` for them.
+stamped `codex`, so keep a declaration named `codex` for them. A declaration named after its kind
+(`codex` or `claude-code`) may omit `kind`, so changing only the built-in Codex's environment takes
+nothing more than its `env` table:
+
+```toml
+[harnesses.codex.env]
+CODEX_HOME = "{project_dir}/.codex"
+```
+
+Any other declaration without a `kind` refuses startup. Leaving out `kind` does not bring back the
+synthesized `codex`: `[harnesses.claude-code]` alone is a Claude Code only setup, with no Codex
+harness.
 
 ### Harness environment templates
 
@@ -399,7 +410,6 @@ Where the variables reach depends on the kind:
 
 ```toml
 [harnesses.codex]
-kind = "codex"
 default = true
 
 [harnesses.claude]
