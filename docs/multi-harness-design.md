@@ -231,6 +231,12 @@ Rules:
   with default options, and it is the default because it is the only entry. Every existing
   `project.json` already says `harness = "codex"`, which reinterprets as that name unchanged, and
   a thread file without a `harness` field belongs to it (see *Persistence*).
+- **A kind's name implies the kind.** A declaration named after a kind (`codex` or
+  `claude-code`) may omit `kind`, which then defaults to that name, so changing the built-in
+  harness's environment takes only `[harnesses.codex.env]`. Every other declaration must name its
+  kind: nothing is inferred from any other name. This is unrelated to synthesis: naming a kind
+  does not make it the default, and declaring any entry still switches off the synthesized
+  `codex`.
 - **Declaring the table is the off switch.** As soon as any `[harnesses.<name>]` entry exists,
   the config is exactly what it declares and nothing is synthesized. A Claude Code only setup
   declares `[harnesses.claude]` and never has a Codex harness. Pre-declaration projects and

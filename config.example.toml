@@ -104,7 +104,9 @@ max_command_output_bytes = 134217728   # 128 MiB
 # Declare harnesses to run Claude Code, or more than one Codex side by side (a stable and a nightly
 # build, or two CODEX_HOMEs). A project picks its default in the new-project dialog; each new thread
 # picks its harness from the model picker, which groups models by harness. The rules:
-#   * `kind` is `codex` or `claude-code`.
+#   * `kind` is `codex` or `claude-code`. It is required, except on a declaration named after its
+#     kind (`[harnesses.codex]` or `[harnesses.claude-code]`), where it defaults to that name:
+#     `[harnesses.codex.env]` alone keeps the built-in Codex and only sets its environment.
 #   * The table key (`codex-stable` below) is the harness's name. It is durable: each project
 #     stores its default in project.json and each thread the name it runs on in its thread.json,
 #     so renaming or removing a declaration leaves the threads on it read-only until a declaration

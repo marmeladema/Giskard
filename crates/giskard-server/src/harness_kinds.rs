@@ -132,10 +132,10 @@ impl HarnessKindFactory {
     /// that kind must accept its options.
     pub fn validate(&self) -> Result<(), HarnessValidationError> {
         for (name, declaration) in self.catalog.iter() {
-            let Some(kind) = self.kinds.get(&declaration.kind) else {
+            let Some(kind) = self.kinds.get(declaration.kind()) else {
                 return Err(HarnessValidationError::UnknownKind {
                     declaration: name.to_owned(),
-                    kind: declaration.kind.clone(),
+                    kind: declaration.kind().to_string(),
                     supported: self.kinds().collect::<Vec<_>>().join(", "),
                 });
             };
@@ -186,12 +186,12 @@ impl HarnessFactory for HarnessKindFactory {
         };
         // `validate` refuses boot for an unregistered kind, so this is unreachable in a server
         // that started; it still degrades to `Unsupported` rather than panicking.
-        let Some(kind) = self.kinds.get(&declaration.kind) else {
+        let Some(kind) = self.kinds.get(declaration.kind()) else {
             let supported = self.kinds().collect::<Vec<_>>().join(", ");
             warn!(
                 project_id = %config.id,
                 harness = %harness,
-                kind = %declaration.kind,
+                kind = %declaration.kind(),
                 action = "create_harness",
                 supported = %supported,
                 "project's harness declaration names a kind this server cannot construct"
@@ -199,7 +199,10 @@ impl HarnessFactory for HarnessKindFactory {
             return Err(HarnessError::Unsupported(format!(
                 "project {} names harness {:?} of kind {:?}, which this server cannot construct; \
                  supported kinds: {}",
-                config.id, harness, declaration.kind, supported
+                config.id,
+                harness,
+                declaration.kind(),
+                supported
             )));
         };
         let workspace_root = config.workspace_root.as_deref().unwrap_or(&config.dir);
