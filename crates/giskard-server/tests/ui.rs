@@ -3079,7 +3079,7 @@ fn browser_loads_completed_command_output_only_in_the_overlay() {
     let download = between(
         body,
         "function downloadOutputOverlay() {",
-        "$(\"codeOverlay\").addEventListener",
+        "/* ---------- composer + controls ---------- */",
     );
     assert!(download.contains("outputOverlayModel(ov.itemId, ov.kind)"));
     assert!(download.contains("model.blocks[0].text"));
@@ -3489,8 +3489,10 @@ fn sidebar_activity_notifications_target_approval_rows() {
     ));
     assert!(body.contains("const focused = document.hasFocus ? document.hasFocus() : true;"));
     assert!(body.contains(
-        "if (document.visibilityState === \"visible\" && focused && String(tid) === String(state.threadId))"
+        "if (document.visibilityState === \"visible\" && focused && String(tid) === String(state.threadId) && !viewerOpen)"
     ));
+    // The viewer covers the transcript, so a request in the current thread isn't seen while it is open.
+    assert!(body.contains("const viewerOpen = $(\"codeOverlay\").classList.contains(\"open\");"));
     // Desktop notifications wire their click; service-worker clicks arrive via the worker postMessage.
     assert!(body.contains(
         "result.notification.onclick = () => handleNotificationClick({ threadId: tid, requestId: waitingRequestId(activity) });"
