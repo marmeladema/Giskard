@@ -1,41 +1,22 @@
 # syntax=docker/dockerfile:1.7
 
-# End-to-end test image for Giskard's web UI.
+# End-to-end test image for Giskard's web UI: the official Playwright image (Node + browsers
+# preinstalled) plus the suite's npm dependencies, and nothing else.
 #
-# The optional builder produces the deterministic, Codex-free `giskard-server-replay`. The runtime
-# is the official Playwright image (Node + browsers preinstalled). Local scripts bind-mount a host
-# binary or export the builder's result; the default target remains self-contained for CI.
+# `run.sh` and `screenshots.sh` — locally and in CI — build the deterministic, Codex-free
+# `giskard-server-replay` on the host and bind-mount it into the container together with the suite
+# (tests/e2e), so neither a code change nor a test edit produces a new image. Docker's layer cache
+# rebuilds it only when the base image, the CA certificates or package.json/package-lock.json change.
 #
-# Build context is the repository root:
-#   docker build -f tests/e2e/Dockerfile -t giskard-e2e .
+# Build context is this directory:
+#   docker build -t giskard-e2e tests/e2e
 
-# ---- Stage 1: build the replay server ----
-FROM rust:1-slim-bookworm AS builder
-WORKDIR /src
-
-# ring (via rustls) needs a C toolchain and perl to build.
-COPY tests/e2e/.host-ca-certificates/ /usr/local/share/ca-certificates/giskard-host/
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends build-essential ca-certificates pkg-config perl \
-    && update-ca-certificates \
-    && rm -rf /var/lib/apt/lists/*
-
-COPY . .
-ENV SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
-ENV CARGO_HTTP_CAINFO=/etc/ssl/certs/ca-certificates.crt
-RUN --mount=type=cache,id=giskard-e2e-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
-    --mount=type=cache,id=giskard-e2e-cargo-git,target=/usr/local/cargo/git,sharing=locked \
-    --mount=type=cache,id=giskard-e2e-target,target=/src/target,sharing=locked \
-    cargo build --release -p giskard-server --bin giskard-server-replay \
-    && install -Dm755 target/release/giskard-server-replay /out/giskard-server-replay
-
-# ---- Stage 2: run Playwright ----
-# The tag MUST match the @playwright/test version in tests/e2e/package.json so the bundled browsers
-# line up. Bump both together.
-FROM mcr.microsoft.com/playwright:v1.62.1-noble AS runtime
+# The tag MUST match the @playwright/test version in package.json so the bundled browsers line up,
+# and its Ubuntu release (`resolute`) must be the one CI builds the replay server on. See README.md.
+FROM mcr.microsoft.com/playwright:v1.65.1-resolute
 WORKDIR /e2e
 
-COPY tests/e2e/.host-ca-certificates/ /usr/local/share/ca-certificates/giskard-host/
+COPY .host-ca-certificates/ /usr/local/share/ca-certificates/giskard-host/
 RUN apt-get update \
     && apt-get install -y --no-install-recommends git \
     && update-ca-certificates \
@@ -43,25 +24,15 @@ RUN apt-get update \
 ENV SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
 ENV NODE_EXTRA_CA_CERTS=/etc/ssl/certs/ca-certificates.crt
 
-# Install JS deps first (better layer caching), then copy the tests.
-COPY tests/e2e/package.json tests/e2e/package-lock.json ./
+# Only the dependencies live in the image, in /e2e/node_modules. The suite itself sits below, in
+# /e2e/suite, where the scripts mount it, and Node resolves `@playwright/test` by walking up to them.
+COPY package.json package-lock.json ./
 RUN npm ci
-COPY tests/e2e/ ./
+ENV PATH=/e2e/node_modules/.bin:$PATH
+WORKDIR /e2e/suite
 
-# Playwright's webServer launches `giskard-server-replay` (resolved on PATH). CI mode disables
-# reuse-existing-server and enables one retry.
+# Playwright's webServer launches `giskard-server-replay` (resolved on PATH, where the scripts mount
+# it). CI mode disables reuse-existing-server and enables one retry.
 ENV CI=1
-ENTRYPOINT ["npx", "playwright", "test"]
+ENTRYPOINT ["playwright", "test"]
 CMD []
-
-# Local runs use this image and bind-mount the replay binary, keeping it out of image layers.
-FROM runtime AS e2e-runtime
-
-# The local fallback exports only this artifact to a temporary host directory. Cargo's mutable
-# registry, Git, and target data remain BuildKit cache mounts rather than image layers.
-FROM scratch AS replay-binary
-COPY --from=builder /out/giskard-server-replay /giskard-server-replay
-
-# Preserve a self-contained default image for CI and direct Dockerfile callers.
-FROM runtime AS e2e
-COPY --from=builder /out/giskard-server-replay /usr/local/bin/giskard-server-replay

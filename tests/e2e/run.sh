@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Build the e2e image and run the Playwright suite in a container. No Node/npm/Rust needed on the
-# host — only Docker.
+# Build the replay server and the e2e image, then run the Playwright suite in a container. The host
+# needs Docker and a Rust toolchain; Node, npm and the browsers stay inside the image.
 #
 # Usage:
 #   tests/e2e/run.sh                       # run the whole suite
@@ -20,12 +20,12 @@ trap 'rm -rf "$binary_dir"' EXIT
 binary_path="$(<"$binary_dir/resolved-path")"
 
 echo "==> Running Playwright tests"
-# --ipc=host avoids Chromium crashing on small /dev/shm. The report volume surfaces results on the
-# host even when tests fail.
-mkdir -p "$repo_root/tests/e2e/playwright-report"
+# --ipc=host avoids Chromium crashing on small /dev/shm. The suite is mounted rather than baked into
+# the image, so edits to it need no rebuild; the HTML report lands in it, on the host, even when
+# tests fail.
 docker run --rm --ipc=host \
   --user "$(id -u):$(id -g)" \
   -e GISKARD_PLAYWRIGHT_OUTPUT_DIR=/tmp/giskard-playwright-test-results \
   -v "$binary_path:/usr/local/bin/giskard-server-replay:ro" \
-  -v "$repo_root/tests/e2e/playwright-report:/e2e/playwright-report" \
+  -v "$repo_root/tests/e2e:/e2e/suite" \
   "$image" "$@"

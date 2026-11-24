@@ -1,6 +1,5 @@
-# This file is only consulted when the build context is tests/e2e/. The real build uses the repo
-# root as context (see Dockerfile header), so the root .dockerignore governs there. Kept in sync as
-# a courtesy for anyone building from this directory.
+# The image is built with this directory as its context and copies only package.json,
+# package-lock.json and .host-ca-certificates/; the suite is mounted at run time instead.
 node_modules
 test-results
 playwright-report
