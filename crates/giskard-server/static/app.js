@@ -167,7 +167,7 @@ let state = {
   updateRequired:false, uiVersionCheckPending:false,
   wsLastProblem:"", wsLastProblemNotice:"", wsLastProblemNoticeAt:0,
   wsProbeTimer:null, wsProbeToken:0, wsProbeSocket:null,
-  draftThread:null, reloadDraftProjectId:null, firstTurnStartingThreadId:null, inputDrafts:new Map(),
+  draftThread:null, firstTurnStartingThreadId:null, inputDrafts:new Map(),
   // Per-turn DOM identity (foundation for incremental reconnect): `currentRenderTurnId` is the turn
   // whose rows are being stamped right now (a persisted turn being rendered, or the live turn being
   // streamed); `newestPersistedTurnId` is the id of the newest turn known to have completed — the
@@ -232,19 +232,65 @@ let state = {
   // response cannot drop one early.
   threadDeletionsDone:new Map()
 };
-const RELOAD_DRAFT_KEY = "giskard.reloadDraft";
-try {
-  const saved = JSON.parse(sessionStorage.getItem(RELOAD_DRAFT_KEY) || "null");
-  sessionStorage.removeItem(RELOAD_DRAFT_KEY);
-  if (saved && typeof saved.key === "string" && typeof saved.value === "string" && saved.value) {
-    state.inputDrafts.set(saved.key, saved.value);
-    if (typeof saved.draftProjectId === "string" && saved.draftProjectId) {
-      state.reloadDraftProjectId = saved.draftProjectId;
-    }
-  }
-} catch {
-  try { sessionStorage.removeItem(RELOAD_DRAFT_KEY); } catch {}
+// Unsent composer text — and, for a draft, the settings picked for it — outlives a reload. Each
+// composer has its own localStorage entry rather than one shared map: two tabs typing into different
+// threads would otherwise each write back a map without the other's text. `state.inputDrafts` holds
+// only the records storage refused (unavailable, or full), so switching threads still keeps those.
+// It holds nothing storage has, so an entry another tab removed — by sending that draft — stays gone.
+const COMPOSER_DRAFT_PREFIX = "giskard.composerDraft.";
+// A composer left untouched this long is not coming back, and nothing else knows when a thread or
+// project an entry belongs to has gone away.
+const COMPOSER_DRAFT_MAX_AGE_MS = 30 * 24 * 60 * 60 * 1000;
+function validComposerDraft(record) {
+  if (!record || typeof record !== "object" || typeof record.text !== "string") return null;
+  const settings = record.settings && typeof record.settings === "object" ? record.settings : null;
+  if (!record.text && !settings) return null;
+  return { text:record.text, ...(settings ? { settings } : {}),
+    savedAt:Number(record.savedAt) || 0 };
 }
+function readComposerDraft(key) {
+  if (!key) return null;
+  try {
+    const raw = localStorage.getItem(COMPOSER_DRAFT_PREFIX + key);
+    if (raw !== null) return validComposerDraft(JSON.parse(raw));
+  } catch {}
+  return state.inputDrafts.get(key) || null;
+}
+// `record` null (or holding nothing) forgets the composer's entry.
+// The open composer as this tab last saved or restored it: key, and the record without its
+// timestamp. Only the open composer's own saves and restores move it — writes for other keys (a
+// deleted thread's cleanup, say) do not.
+let composerDraftBaseline = { key:"", content:"null" };
+function composerDraftContent(record) {
+  const valid = validComposerDraft(record);
+  return valid ? JSON.stringify({ text:valid.text, settings:valid.settings || null }) : "null";
+}
+function writeComposerDraft(key, record) {
+  if (!key) return;
+  const valid = validComposerDraft(record && { ...record, savedAt:Date.now() });
+  state.inputDrafts.delete(key);
+  try {
+    if (valid) localStorage.setItem(COMPOSER_DRAFT_PREFIX + key, JSON.stringify(valid));
+    else localStorage.removeItem(COMPOSER_DRAFT_PREFIX + key);
+  } catch {
+    if (valid) state.inputDrafts.set(key, valid);
+    // Full: an older copy left behind would be read back over the newer one held in memory.
+    try { localStorage.removeItem(COMPOSER_DRAFT_PREFIX + key); } catch {}
+  }
+}
+function pruneComposerDrafts() {
+  try {
+    const cutoff = Date.now() - COMPOSER_DRAFT_MAX_AGE_MS;
+    for (let i = localStorage.length - 1; i >= 0; i--) {
+      const name = localStorage.key(i);
+      if (!name || !name.startsWith(COMPOSER_DRAFT_PREFIX)) continue;
+      let record = null;
+      try { record = validComposerDraft(JSON.parse(localStorage.getItem(name))); } catch {}
+      if (!record || record.savedAt < cutoff) localStorage.removeItem(name);
+    }
+  } catch {}
+}
+pruneComposerDrafts();
 let attachmentIngestQueue = Promise.resolve();
 const activeAttachmentReaders = new Set();
 // The inline transcript row shows only a compact preview of a command's/tool's output — the most
@@ -1045,6 +1091,9 @@ async function loadProjects() {
   for (const projectId of Array.from(state.projectThreads.keys())) {
     if (listedProjectIds.has(projectId)) continue;
     if (String(state.projectId || "") === projectId) clearProjectView(projectId);
+    // After the view has left it: leaving saves the composer it leaves. Projects removed while not
+    // open, here or in another browser, go the same way.
+    writeComposerDraft(`draft:${projectId}`, null);
     const refresh = state.threadListRefreshes.get(projectId);
     if (refresh) {
       refresh.retired = true;
@@ -1055,6 +1104,7 @@ async function loadProjects() {
     state.projectThreads.delete(projectId);
     for (const thread of removed) {
       const tid = String(thread.id);
+      writeComposerDraft(`thread:${tid}`, null);
       state.threadIndex.delete(tid);
       state.threadAuthorities.delete(tid);
       state.pendingDetailConflictResyncs.delete(tid);
@@ -1117,21 +1167,22 @@ async function loadProjects() {
     pending.push(loadThreads(p.id));
   }
   await Promise.all(pending);
-  const reloadDraftProjectId = state.reloadDraftProjectId;
-  state.reloadDraftProjectId = null;
-  if (reloadDraftProjectId && listedProjectIds.has(reloadDraftProjectId)) {
-    openDraftThread(reloadDraftProjectId);
-    return;
-  }
-  restoreLastThread();
+  restoreLastThread(listedProjectIds);
 }
 
-// Reopen the thread that was last active in this browser (H: persisted client-side, not on the
-// server). Silently ignored if it no longer exists (e.g. deleted since).
-function restoreLastThread() {
-  if (state.threadId) return;   // already viewing a thread
+// Reopen the thread — or the project's draft — that was last active in this browser (H: persisted
+// client-side, not on the server). Silently ignored if it no longer exists (e.g. deleted since).
+function restoreLastThread(listedProjectIds) {
+  // Already viewing something. A draft counts: the project list reloads under an open one when a
+  // project is added or removed, and that must not swap the draft for the last thread.
+  if (state.threadId || isDraftThread()) return;
   let last;
   try { last = JSON.parse(localStorage.getItem("giskard.lastThread") || "null"); } catch { last = null; }
+  if (last && last.draft && last.pid) {
+    if (listedProjectIds.has(String(last.pid))) openDraftThread(String(last.pid));
+    else localStorage.removeItem("giskard.lastThread");
+    return;
+  }
   if (!last || !last.pid || !last.tid) return;
   const el = document.querySelector(`.thread[data-tid="${last.tid}"]`);
   const meta = knownProjectThreads(last.pid).find(t => String(t.id) === String(last.tid));
@@ -1532,13 +1583,15 @@ function rememberProjectThreads(pid, threads, conflictThreadIds, locallyDeleting
     // Membership is authoritative. Retire the vanished thread's detail authority and transition
     // the active surface in the same reconciliation step, so no caller can observe a selected
     // thread that the catalog no longer contains. A draft keeps the user in the same project and
-    // is also the normal destination after deleting the open thread locally.
-    try { localStorage.removeItem("giskard.lastThread"); } catch {}
+    // is also the normal destination after deleting the open thread locally. Opening it also
+    // replaces the vanished thread as the view a reload returns to.
     openDraftThread(projectId);
     if (!removedActiveThreadWasLocal) {
       notice("The open thread was removed in another browser session.", "warning");
     }
   }
+  // After the view has left them: leaving saves the composer it leaves.
+  for (const removedThreadId of previousThreadIds) writeComposerDraft(`thread:${removedThreadId}`, null);
 
   // Link results are browser-local accelerators only. Discard them when the authoritative thread
   // list reloads; a later click resolves the trusted item coordinates idempotently on the server.
@@ -2668,11 +2721,8 @@ $("removeThreadConfirm").onclick = async () => {
       // at an empty view still titled with the deleted thread's name, drop into a fresh draft in
       // the same project so the composer is ready for the next conversation. `openDraftThread`
       // tears down the WebSocket, clears `state.threadId`, and resets the title to "New thread".
-      // The explicit `giskard.lastThread` removal above prevents a reload from resurrecting the
-      // deleted thread (`openDraftThread` itself never touches that key; without this, reload
-      // would self-heal via `restoreLastThread` failing to find the thread, but clearing it now
-      // avoids the transient stale entry).
-      try { localStorage.removeItem("giskard.lastThread"); } catch {}
+      // It also points `giskard.lastThread` at the draft, so a reload cannot resurrect the deleted
+      // thread.
       openDraftThread(pid);
       openedDraft = true;
     }
@@ -3011,27 +3061,59 @@ function settleDraftModel(failure) {
   // The project's default harness first: its default model, else its first. Only a project whose
   // default declaration offers nothing starts from another harness's first model.
   const group = state.models.filter(m => m.harness === state.projectHarness);
+  // A model saved with the draft is the user's earlier choice, but only while the catalog still
+  // offers it — and its effort only while that model still offers the effort.
+  const saved = draft.savedModel;
+  const restored = failure || !saved ? null : state.models.find(m =>
+    (m.harness || null) === saved.harness && m.provider === saved.provider && m.model === saved.model) || null;
   const chosen = failure ? null :
-    (group.find(m => m.is_default) || group[0] || state.models[0] || null);
+    (restored || group.find(m => m.is_default) || group[0] || state.models[0] || null);
   if (!failure && !chosen) failure = "this project has no models to choose from";
   draft.modelLoading = false;
   draft.modelError = failure || null;
   if (chosen) {
-    state.currentModel = normalizeDraftModel(chosen);
+    const effort = restored && saved.reasoning_effort &&
+      effortOptionsForModel(restored).some(o => o.value === saved.reasoning_effort)
+      ? saved.reasoning_effort : null;
+    state.currentModel = normalizeDraftModel({ ...chosen, reasoning_effort:effort });
     draft.harness = chosen.harness || null;
+    draft.modelPinned = !!restored;
   }
+  // Settled one way or the other: from here the draft saves what it shows. A failed catalog keeps
+  // the saved model for the next visit, when the catalog may load.
+  if (!failure) draft.savedModel = null;
+  if (chosen) applySavedDraftMode(draft);
   syncModelControls();
   updateComposerControls();
   if (failure) notice("Cannot start a thread here — " + failure + ".", "error");
+  else if (saved && !restored) {
+    notice(`${saved.model}, the model this draft was saved with, is no longer offered here; ` +
+      `it now uses ${chosen.model}.`, "warning");
+    saveComposerDraft();
+  } else if (restored && saved.reasoning_effort && !state.currentModel.reasoning_effort) {
+    notice(`${saved.model} no longer offers the ${saved.reasoning_effort} reasoning effort this ` +
+      "draft was saved with; it now uses the default.", "warning");
+    saveComposerDraft();
+  }
+}
+
+// The draft's harness is known now, so its saved mode can be applied; `updateComposerControls`
+// still falls back to Build if this harness has no Plan mode.
+function applySavedDraftMode(draft) {
+  if (!draft.savedMode) return;
+  setMode(draft.savedMode);
+  draft.savedMode = null;
 }
 
 // Remember that the user chose this draft's model, so a late project default cannot replace it —
 // and that the draft now has an authoritative model, so it can be sent.
 function pinDraftModel() {
   if (!state.draftThread) return;
+  applySavedDraftMode(state.draftThread);
   state.draftThread.modelPinned = true;
   state.draftThread.modelLoading = false;
   state.draftThread.modelError = null;
+  saveComposerDraft();
   // Picking a model is what resolves a draft that was waiting on — or failed to get — its default,
   // so the Send control has to be re-evaluated here; nothing else on this path does it.
   updateComposerControls();
@@ -3121,16 +3203,57 @@ function saveComposerDraft() {
   if (!input) return;
   const key = composerDraftKey();
   if (!key) return;
-  const value = input.value || "";
-  if (value) state.inputDrafts.set(key, value);
-  else state.inputDrafts.delete(key);
+  const settings = isDraftThread() ? draftSettings(state.draftThread) : null;
+  const record = { text:input.value || "", ...(settings ? { settings } : {}) };
+  // Unchanged since this tab last wrote or restored it, yet gone from storage: another tab removed
+  // it — by sending that draft, say. Writing it back would offer the sent message again. An edit
+  // made since is new work, and is saved.
+  if (composerDraftBaseline.key === key && composerDraftBaseline.content === composerDraftContent(record) &&
+      !readComposerDraft(key)) return;
+  writeComposerDraft(key, record);
+  composerDraftBaseline = { key, content:composerDraftContent(record) };
+}
+
+// What a draft would start its thread with, where it differs from what a fresh draft offers — null
+// when nothing does. The model is saved once the draft has one of its own: picked by the user, or
+// restored from an earlier save. A project default is not saved, so a later visit takes the default
+// as it is then.
+function draftSettings(draft) {
+  const settings = {};
+  const model = draft.modelPinned && state.currentModel
+    ? { harness:draft.harness || null, ...state.currentModel }
+    : draft.savedModel;
+  if (model) settings.model = model;
+  if ((draft.savedMode || state.mode) === "plan") settings.mode = "plan";
+  if (state.permissionPreset && state.permissionPreset !== "ask_first") {
+    settings.permissionPreset = state.permissionPreset;
+  }
+  if (state.draftGitStrategy && state.draftGitStrategy !== GIT_STRATEGY_SHARED) {
+    settings.gitStrategy = state.draftGitStrategy;
+  }
+  return Object.keys(settings).length ? settings : null;
+}
+
+// A saved model in the shape `settleDraftModel` matches against the catalog; anything else is null.
+function savedDraftModel(model) {
+  if (!model || typeof model !== "object" || typeof model.provider !== "string" ||
+      typeof model.model !== "string" || !model.provider || !model.model) return null;
+  return {
+    harness:typeof model.harness === "string" && model.harness ? model.harness : null,
+    provider:model.provider,
+    model:model.model,
+    reasoning_effort:typeof model.reasoning_effort === "string" && model.reasoning_effort
+      ? model.reasoning_effort : null
+  };
 }
 
 function restoreComposerDraft() {
   const input = $("input");
   if (!input) return;
   const key = composerDraftKey();
-  input.value = key ? (state.inputDrafts.get(key) || "") : "";
+  const saved = readComposerDraft(key);
+  input.value = saved ? saved.text : "";
+  composerDraftBaseline = { key, content:composerDraftContent(saved) };
   // The restored draft is as tall as whatever was typed into it before the switch away, so the box
   // has to be re-measured for it: a thread whose draft is ten lines opens with a ten-line composer.
   autosizeComposer();
@@ -3142,7 +3265,8 @@ function restoreComposerDraft() {
 }
 
 function clearComposerDraft(key) {
-  if (key) state.inputDrafts.delete(key);
+  writeComposerDraft(key, null);
+  if (composerDraftBaseline.key === key) composerDraftBaseline = { key, content:"null" };
   const input = $("input");
   if (input && composerDraftKey() === key) { input.value = ""; autosizeComposer(); }
 }
@@ -3182,11 +3306,18 @@ function openDraftThread(pid) {
   }
 
   setActiveViewIdentity(pid, null);
+  // A reload comes back to this draft rather than to whichever thread was open before it.
+  try { localStorage.setItem("giskard.lastThread", JSON.stringify({ pid, draft:true })); } catch {}
   renderParentThreadButton();
-  // `modelLoading` until the project's default arrives; `currentModel` stays null until then so a
-  // placeholder can never reach `threads/start` (LT7).
-  state.draftThread = { projectId:pid, title:"New thread", modelLoading:true, modelError:null, harness:null };
-  setDraftGitStrategy(GIT_STRATEGY_SHARED);   // chosen per draft: never carried over from the last one
+  // The project's draft comes back as it was left — text and settings alike — until it is sent.
+  const saved = (readComposerDraft(`draft:${pid}`) || {}).settings || {};
+  // `modelLoading` until the project's catalog arrives; `currentModel` stays null until then so a
+  // placeholder can never reach `threads/start` (LT7). `savedModel` is checked against that catalog.
+  // `savedMode` likewise waits for the harness: until the model settles, the capabilities in force
+  // are the project default's, which may lack the Plan mode the saved model's harness offers.
+  state.draftThread = { projectId:pid, title:"New thread", modelLoading:true, modelError:null, harness:null,
+    savedModel:savedDraftModel(saved.model), savedMode:saved.mode === "plan" ? "plan" : null };
+  setDraftGitStrategy(saved.gitStrategy || GIT_STRATEGY_SHARED);
   state.firstTurnStartingThreadId = null;
   state.pendingUserEl = null;
   state.pendingUserText = null;
@@ -3207,12 +3338,8 @@ function openDraftThread(pid) {
   renderMcpButton();
   renderSubagentsButton();
   loadProjectModels(pid);   // load this project's model list (config + discovery + Codex names)
-  // A no-op while the list is still loading; `loadProjectModels` settles it on arrival. This call
-  // covers reopening a draft in a project whose catalog is already loaded, where that fetch is
-  // skipped entirely and nothing else would resolve the draft's model.
-  settleDraftModel();
-  setMode("build");
-  setPermissionPreset("ask_first");
+  setMode(saved.mode || "build");
+  setPermissionPreset(saved.permissionPreset || "ask_first");
   setTurnActive(false);
   state.historyLoaded = false; state.oldestTurnId = null; state.hasMoreHistory = false;
   state.loadingHistory = false; state.pendingOlder = false; state.autoFilledTurns = 0;
@@ -3238,6 +3365,12 @@ function openDraftThread(pid) {
   syncModelControls();
   closeDrawers();
   restoreComposerDraft();
+  // A no-op while the list is still loading; `loadProjectModels` settles it on arrival. This call
+  // covers reopening a draft in a project whose catalog is already loaded, where that fetch is
+  // skipped entirely and nothing else would resolve the draft's model. It comes last: it may add a
+  // notice, which clearing the notices above would remove, and save the draft, which has to see the
+  // draft's own text in the composer rather than the text of the view just left.
+  settleDraftModel();
   $("input").focus();
 }
 
@@ -3609,16 +3742,9 @@ function requireUiReload(browserVersion, serverVersion) {
   });
 }
 function reloadUpdatedUi() {
+  // Already saved on every edit; this covers anything that has not reached storage yet. The view
+  // itself comes back through `giskard.lastThread`, a draft included.
   saveComposerDraft();
-  const key = composerDraftKey();
-  const value = $("input") ? $("input").value || "" : "";
-  try {
-    if (key && value) {
-      const draftProjectId = isDraftThread() ? state.draftThread.projectId : null;
-      sessionStorage.setItem(RELOAD_DRAFT_KEY, JSON.stringify({ key, value, draftProjectId }));
-    }
-    else sessionStorage.removeItem(RELOAD_DRAFT_KEY);
-  } catch {}
   location.reload();
 }
 function setWsStatus(status, detail) {
@@ -11198,7 +11324,10 @@ $("input").addEventListener("input", () => {
 // area changes. Without it the shell falls back to the 100vh/100dvh CSS and nothing else notices a
 // resize, so the window event is the signal there.
 if (!window.visualViewport) window.addEventListener("resize", autosizeComposer);
-$("gitStrategySel").onchange = (e) => setDraftGitStrategy(e.target.value);
+$("gitStrategySel").onchange = (e) => {
+  setDraftGitStrategy(e.target.value);
+  saveComposerDraft();
+};
 $("attachBtn").onclick = () => $("attachmentInput").click();
 $("attachmentInput").addEventListener("change", attachSelectedFiles);
 initComposerFileTransfers();
@@ -11281,6 +11410,11 @@ async function startDraftThread(text, attachments) {
     const tid = res && res.thread_id;
     if (!tid) throw new Error("new thread response did not include thread_id");
     if (staleDraftContinuation(draft, draftKey, pid)) {
+      // The thread exists, but leaving the draft saved it again, message and settings included.
+      // Left there, reopening the draft would offer to send the same message a second time. Text
+      // typed since — into a newer draft of the same project — is a different message, and stays.
+      const left = readComposerDraft(draftKey);
+      if (left && left.text.trim() === text) clearComposerDraft(draftKey);
       await loadThreads(pid);
       return;
     }
@@ -11634,7 +11768,9 @@ function compactContext() {
 $("modeSel").onchange = () => {
   const mode = $("modeSel").value === "plan" ? "plan" : "build";
   if (isDraftThread()) {
+    state.draftThread.savedMode = null;   // the user's pick replaces the one waiting on the harness
     setMode(mode);
+    saveComposerDraft();
     return;
   }
   if (!state.threadId) {
@@ -11652,6 +11788,7 @@ $("permissionPresetSel").onchange = () => {
   const preset = $("permissionPresetSel").value || "ask_first";
   if (isDraftThread()) {
     setPermissionPreset(preset);
+    saveComposerDraft();
     return;
   }
   if (!state.threadId) {

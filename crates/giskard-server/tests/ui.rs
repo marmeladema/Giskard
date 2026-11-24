@@ -71,7 +71,8 @@ async fn index_page_is_served_and_public() {
     assert!(
         body.contains("if (state.updateRequired) return;")
             && body.contains("id=\"updateBanner\"")
-            && body.contains("sessionStorage.setItem(RELOAD_DRAFT_KEY"),
+            && body.contains("function reloadUpdatedUi() {")
+            && body.contains("localStorage.setItem(COMPOSER_DRAFT_PREFIX + key"),
         "an update mismatch stops reconnecting and offers a draft-preserving reload"
     );
     assert!(
@@ -1145,7 +1146,7 @@ async fn index_page_is_served_and_public() {
             && body.contains("function restoreComposerDraft()")
             && body.contains("$(\"input\").addEventListener(\"input\", () => {")
             && body.contains("  saveComposerDraft();"),
-        "pending composer text is cached per existing thread and per project draft"
+        "pending composer text is kept per existing thread and per project draft"
     );
     assert!(
         body.contains(
@@ -1779,12 +1780,22 @@ fn browser_has_no_model_list_outside_a_project() {
     assert!(
         settle.contains(
             "const group = state.models.filter(m => m.harness === state.projectHarness);"
-        ) && settle
-            .contains("(group.find(m => m.is_default) || group[0] || state.models[0] || null)")
-            && settle.contains("draft.harness = chosen.harness || null;")
+        ) && settle.contains(
+            "(restored || group.find(m => m.is_default) || group[0] || state.models[0] || null)"
+        ) && settle.contains("draft.harness = chosen.harness || null;")
             && settle.contains("draft.modelPinned")
             && !settle.contains("default_model"),
         "the draft model is derived from the live catalog, and a user's own pick still wins"
+    );
+    // A saved Plan mode waits for the harness: before the model settles, the capabilities in force
+    // are the project default's, which may coerce it to Build.
+    assert!(
+        settle.contains("if (chosen) applySavedDraftMode(draft);")
+            && body.contains("applySavedDraftMode(state.draftThread);")
+            && body.contains(
+                "if ((draft.savedMode || state.mode) === \"plan\") settings.mode = \"plan\";"
+            ),
+        "a draft's saved mode is applied once its harness is known, and kept until then"
     );
     assert!(
         !body.contains("applyProjectDefaultModel") && !body.contains("project.default_model"),
@@ -2288,7 +2299,7 @@ fn browser_scopes_unsent_composer_text_to_thread() {
     );
     assert_order(
         restore_draft,
-        "input.value = key ? (state.inputDrafts.get(key) || \"\") : \"\";",
+        "input.value = saved ? saved.text : \"\";",
         "clearPendingAttachments();",
     );
 
@@ -3663,8 +3674,9 @@ fn browser_offers_the_git_strategy_choice_on_drafts_only() {
          so a request can never ask for a strategy the control no longer shows as chosen"
     );
     assert!(
-        source.contains("setDraftGitStrategy(GIT_STRATEGY_SHARED);"),
-        "each draft chooses for itself rather than inheriting the last draft's choice"
+        source.contains("setDraftGitStrategy(saved.gitStrategy || GIT_STRATEGY_SHARED);"),
+        "a draft keeps its own choice until it is sent, and a fresh draft starts from the shared \
+         checkout rather than inheriting the last thread's choice"
     );
     assert!(
         source.contains("GIT_STRATEGIES.has(strategy) ? strategy : GIT_STRATEGY_SHARED"),
@@ -3793,7 +3805,7 @@ fn browser_projection_conflict_and_malformed_catalog_recovery_is_bounded() {
     let projects = between(
         source,
         "async function loadProjects() {",
-        "function restoreLastThread() {",
+        "function restoreLastThread(listedProjectIds) {",
     );
     assert!(
         projects.contains(

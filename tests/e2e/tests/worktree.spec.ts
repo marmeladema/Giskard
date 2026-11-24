@@ -96,11 +96,21 @@ test.describe("git checkout choice on a draft", () => {
     await expect(page.locator("#turnPickerBtn .mp-label")).toHaveText("Build · Ask first");
   });
 
-  test("does not carry the choice into the next draft", async ({ page }) => {
+  // The choice belongs to the draft, which lasts until it is sent: reopening it brings the choice
+  // back, and only the draft after a send starts from the shared checkout again.
+  test("keeps the choice until the draft is sent", async ({ page }) => {
     await newDraft(page);
     await page.locator("#gitStrategySel").selectOption("worktree");
     await expect(page.locator("#gitStrategySel")).toHaveValue("worktree");
 
+    await newDraft(page);
+    await expect(page.locator("#gitStrategySel")).toHaveValue("worktree");
+
+    await page.locator("#input").fill("Isolated, then the next draft starts over");
+    await page.locator("#sendBtn").click();
+    await expect(
+      page.locator("#transcript .msg.agent", { hasText: SCRIPTED_REPLY }),
+    ).toBeVisible();
     await newDraft(page);
 
     await expect(page.locator("#gitStrategySel")).toHaveValue("shared");
