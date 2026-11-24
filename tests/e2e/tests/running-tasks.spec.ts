@@ -1052,7 +1052,9 @@ test("late clipboard completion does not relabel a different overlay", async ({ 
     app.finishCopy?.(true);
   });
 
-  await expect(page.locator("#codeCopyDiff")).toHaveText("Copy diff");
+  await expect(page.locator("#codeCopyDiff")).toHaveText("Copy");
+  // Nor its result: on a phone the button is an icon, and the result is what it shows.
+  await expect(page.locator("#codeCopyDiff")).not.toHaveAttribute("data-result", /./);
 });
 
 test("stale command output linkification falls back to plain text without retrying", async ({ page }) => {

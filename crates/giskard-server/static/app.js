@@ -2198,6 +2198,7 @@ function activeParentThread() {
    once there, "← Parent" takes its place again. */
 function setViewerOpen(open) {
   $("codeOverlay").classList.toggle("open", open);
+  setViewerTitleExpanded(false);
   $("codeClose").hidden = !open;
   renderParentThreadButton();
   // Opened from a transcript link, focus would be left on an element the viewer now hides; move it
@@ -7930,7 +7931,7 @@ async function openGitDiff(path, side) {
       notice(`No ${side === "staged" ? "staged " : ""}diff available for ${path}.`, "warning");
       return;
     }
-    openDiffOverlay(side === "staged" ? `${path} (staged)` : path, res.diff);
+    openDiffOverlay(path, res.diff, { label: side === "staged" ? "Staged diff" : "Diff" });
   } catch (e) {
     if (state.projectId !== pid) return;
     notice("Could not load git diff: " + apiFailureMessage(e), "error");
@@ -7940,8 +7941,8 @@ async function openGitDiff(path, side) {
 }
 
 /* One commit's diff, whole or for a single file within it. History, not the working tree: the
-   overlay title carries the sha, which is the only thing separating this from the working-tree diff
-   of the same path. */
+   viewer's details line carries the sha ("Diff at <sha>", "Commit <sha>"), which is the only thing
+   separating this from the working-tree diff of the same path. */
 async function openGitCommitDiff(sha, path) {
   if (!state.projectId || !sha || state.gitDiffPending) return;
   // Captured whole, because a diff is read through one thread's workspace: a project-only guard
@@ -7957,7 +7958,8 @@ async function openGitCommitDiff(sha, path) {
       notice(path ? `No diff for ${path} in ${sha}.` : `No diff in ${sha}.`, "warning");
       return;
     }
-    openDiffOverlay(path ? `${path} at ${sha}` : `${sha} ${gitCommitTitle(sha)}`.trim(), res.diff);
+    if (path) openDiffOverlay(path, res.diff, { label: `Diff at ${sha}` });
+    else openDiffOverlay(gitCommitTitle(sha) || sha, res.diff, { label: `Commit ${sha}`, isPath: false });
   } catch (e) {
     if (!activeViewIdentityIsCurrent(view)) return;
     notice("Could not load git diff: " + apiFailureMessage(e), "error");
@@ -7984,7 +7986,7 @@ async function openGitBranchDiff() {
       return;
     }
     const base = status && status.base ? status.base : "base";
-    openDiffOverlay(`${base}…HEAD (${count} commit${count === 1 ? "" : "s"})`, res.diff);
+    openDiffOverlay(`${base}…HEAD`, res.diff, { label: `${count} commit${count === 1 ? "" : "s"}`, isPath: false });
   } catch (e) {
     if (!activeViewIdentityIsCurrent(view)) return;
     notice("Could not load git diff: " + apiFailureMessage(e), "error");
@@ -8014,7 +8016,7 @@ async function openGitWorkingDiff() {
       notice("No tracked changes to review.", "warning");
       return;
     }
-    openDiffOverlay("Working tree", res.diff);
+    openDiffOverlay("Working tree", res.diff, { isPath: false });
   } catch (e) {
     if (state.projectId !== pid) return;
     notice("Could not load git diff: " + apiFailureMessage(e), "error");
@@ -10113,11 +10115,37 @@ function isMarkdownSourcePath(path, language) {
   const lower = String(path || "").toLowerCase();
   return lower.endsWith(".md") || lower.endsWith(".markdown") || String(language || "").toLowerCase() === "markdown";
 }
+/* The viewer's title is one line on a phone. A path is cut at the start when it doesn't fit, since
+   the file name at its end is what identifies it; anything else (a command line) at the end. */
+function setViewerTitle(text, isPath) {
+  const el = $("codePath");
+  el.textContent = text;
+  el.title = text;
+  el.classList.toggle("path-title", !!isPath);
+}
+/* On a phone there is no hover for the title's tooltip, so a tap (or Enter/Space) on a cut title
+   shows it in full. The state survives a view repainting its title (a running command's output does
+   every second) and is reset when a view opens (setViewerOpen). */
+function setViewerTitleExpanded(expanded) {
+  const el = $("codePath");
+  el.classList.toggle("expanded", expanded);
+  el.setAttribute("aria-expanded", String(expanded));
+}
+$("codePath").addEventListener("click", () => setViewerTitleExpanded(!$("codePath").classList.contains("expanded")));
+$("codePath").addEventListener("keydown", (e) => {
+  if (e.key !== "Enter" && e.key !== " ") return;
+  e.preventDefault();
+  setViewerTitleExpanded(!$("codePath").classList.contains("expanded"));
+});
 function setCodeSourceToggle(visible, label) {
   const btn = $("codeSourceToggle");
   btn.hidden = !visible;
   btn.disabled = !visible;
-  if (visible) btn.textContent = label || "Source";
+  if (visible) {
+    btn.textContent = label || "Source";
+    // On a phone the button is an icon, so it carries which view it switches to.
+    btn.dataset.icon = btn.textContent === "Rendered" ? "rendered" : "source";
+  }
 }
 function codeOverlayRequestMatches(path, projectId, requestId) {
   return state.codePath === path &&
@@ -10154,7 +10182,7 @@ async function openCodeOverlay(path, line) {
   // workspace-relative form, the same truncation the transcript diff row uses, so the leading
   // checkout/worktree prefix is not carried in the overlay header.
   const displayPath = displayPathForWorkspace(path);
-  $("codePath").textContent = state.codeLine ? `${displayPath}#${state.codeLine}` : displayPath;
+  setViewerTitle(state.codeLine ? `${displayPath}#${state.codeLine}` : displayPath, true);
   $("codeMeta").textContent = "Loading…";
   $("codeView").innerHTML = `<div class="code-empty">Loading source…</div>`;
   $("codeDownload").disabled = false;
@@ -10257,7 +10285,7 @@ function showSourceCodeOverlay() {
  * one; leading `+`/`-` still classifies them correctly, which is enough to read them by. */
 /* Beyond this many lines the diff stops being something anyone scrolls, and building three DOM
    nodes per line starts to block the tab — a regenerated lockfile can run to six figures. The rows
-   are capped and the shortfall is stated; Copy diff still hands back the whole thing. */
+   are capped and the shortfall is stated; Copy still hands back the whole thing. */
 const DIFF_MAX_ROWS = 20000;
 
 function parseUnifiedDiff(diff) {
@@ -10273,7 +10301,7 @@ function parseUnifiedDiff(diff) {
   let markers = 1;
   for (const text of lines) {
     if (rows.length >= DIFF_MAX_ROWS) {
-      rows.push({ kind:"meta", text:`… ${(lines.length - rows.length).toLocaleString()} more lines not shown. Use Copy diff for the whole patch.` });
+      rows.push({ kind:"meta", text:`… ${(lines.length - rows.length).toLocaleString()} more lines not shown. Use Copy for the whole patch.` });
       break;
     }
     // `@@ -old +new @@`, or `@@@ -p1 -p2 +result @@@` with one range per parent plus the result.
@@ -10357,7 +10385,11 @@ function renderDiffRows(rows) {
 /* The diff is rendered directly, like source: line numbers down the side and one row per line,
    rather than a markdown code block nested in the overlay. That also drops a server round trip —
    the colouring is by line kind, which is all the previous markdown rendering gave it. */
-function openDiffOverlay(path, diff) {
+/* `title` names what the diff is of: a path (cut at the start on a phone, to keep the file name) or
+   other text (`isPath:false`, cut at the end). Which diff it is (staged, at a commit) goes in the
+   details line through `label`, so a cut title never loses it. */
+function openDiffOverlay(path, diff, opts) {
+  opts = opts || {};
   diff = String(diff || "");
   if (!state.projectId || !diff.trim()) return;
   state.diffSelectionToken++;
@@ -10373,10 +10405,12 @@ function openDiffOverlay(path, diff) {
   setCodeCopyDiff(true);
   // Truncate the workspace prefix from the title the same way the transcript diff row does, so
   // the overlay header does not carry the checkout/worktree path.
-  const titlePath = displayPathForWorkspace(path) || "File change";
-  $("codePath").textContent = `Diff: ${titlePath}`;
+  const isPath = opts.isPath !== false;
+  const titlePath = isPath ? displayPathForWorkspace(path) || "File change" : path;
+  setViewerTitle(titlePath, isPath);
   const stats = diffStats(diff);
-  $("codeMeta").textContent = `+${stats.added} −${stats.removed} · ${stats.lines.toLocaleString()} lines`;
+  $("codeMeta").textContent =
+    `${opts.label || "Diff"} · +${stats.added} −${stats.removed} · ${stats.lines.toLocaleString()} lines`;
   $("codeDownload").disabled = true;
   $("codeView").replaceChildren(renderDiffRows(parseUnifiedDiff(diff)));
   $("codeView").scrollTop = 0;
@@ -10387,7 +10421,10 @@ function setCodeCopyDiff(visible) {
   const btn = $("codeCopyDiff");
   btn.hidden = !visible;
   btn.disabled = !visible;
-  if (!visible) btn.textContent = "Copy diff";
+  // Whether shown or hidden, the button starts from no copy result: a ✓/✕ icon from an earlier
+  // copy must not outlive the view it was for.
+  delete btn.dataset.result;
+  if (!visible) btn.textContent = "Copy";
 }
 function closeCodeOverlay() {
   state.diffSelectionToken++;
@@ -10436,11 +10473,16 @@ $("codeCopyDiff").onclick = async () => {
     : state.outputOverlay == null && state.diffOverlayText === diffText;
   if (!stillCurrent) return;
   btn.textContent = ok ? "Copied" : "Copy failed";
+  // On a phone the button is an icon and its word is hidden, so the result shows as the icon.
+  btn.dataset.result = ok ? "ok" : "err";
   setTimeout(() => {
     const sameView = outputText != null
       ? state.outputOverlay === ov
       : state.outputOverlay == null && state.diffOverlayText === diffText;
-    if (sameView && !btn.hidden) btn.textContent = outputText != null ? "Copy output" : "Copy diff";
+    if (sameView && !btn.hidden) {
+      btn.textContent = "Copy";
+      delete btn.dataset.result;
+    }
   }, 1500);
 };
 
@@ -10657,7 +10699,7 @@ async function loadCommandOutputOverlay(overlay) {
     overlay.loadingPayload = null;
     overlay.controller = null;
     setCodeCopyDiff(true);
-    $("codeCopyDiff").textContent = "Copy output";
+    $("codeCopyDiff").textContent = "Copy";
     renderOutputOverlay();
   } catch (e) {
     if (controller && controller.signal.aborted) return;
@@ -10716,7 +10758,7 @@ async function loadToolOutputOverlay(overlay) {
         overlay.loadingVersion = "";
         overlay.controller = null;
         setCodeCopyDiff(true);
-        $("codeCopyDiff").textContent = "Copy output";
+        $("codeCopyDiff").textContent = "Copy";
         renderOutputOverlay();
         return;
       }
@@ -10767,7 +10809,7 @@ function openOutputOverlay(itemId, kind) {
     loadToolOutputOverlay(state.outputOverlay);
   } else if (kind === "command" && model && !model.running && model.blocks.length) {
     setCodeCopyDiff(true);
-    $("codeCopyDiff").textContent = "Copy output";
+    $("codeCopyDiff").textContent = "Copy";
   }
 }
 function renderOutputOverlay() {
@@ -10775,13 +10817,13 @@ function renderOutputOverlay() {
   if (!ov) return;
   const model = outputOverlayModel(ov.itemId, ov.kind);
   if (!model) {
-    $("codePath").textContent = ov.kind === "tool" ? "Tool" : "Command";
+    setViewerTitle(ov.kind === "tool" ? "Tool" : "Command", false);
     $("codeMeta").textContent = "No data available.";
     $("codeView").innerHTML = `<div class="code-empty">No output to show.</div>`;
     $("codeDownload").disabled = true;
     return;
   }
-  $("codePath").textContent = model.title;
+  setViewerTitle(model.title, false);
   const statLabel = model.statsLabel;
   const spinner = model.running ? "⟳ " : "";
   const truncSuffix = model.truncated ? " · retained output truncated" : "";
