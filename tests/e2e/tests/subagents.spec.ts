@@ -466,12 +466,12 @@ test.describe("active-thread deletion lands on a draft", () => {
       await expect(page.locator("#transcript .draft-empty")).toBeVisible();
       await expect(page.locator("#transcript")).not.toContainText("No thread selected");
 
-      // The deleted thread is no longer the persisted last-thread, so a reload does not
-      // resurrect it; the draft view is what reload would land on (no lastThread entry).
+      // The deleted thread is no longer the persisted last view, so a reload does not resurrect
+      // it; it lands on the draft that replaced it.
       const lastAfter = await page.evaluate(() =>
         JSON.parse(localStorage.getItem("giskard.lastThread") || "null"),
       );
-      expect(lastAfter).toBeNull();
+      expect(lastAfter).toEqual({ pid: projectId, draft: true });
     } finally {
       await deleteProject(page, projectId);
     }
