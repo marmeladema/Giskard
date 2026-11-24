@@ -13,21 +13,22 @@ concurrency:
 jobs:
   playwright:
     name: playwright
-    runs-on: ubuntu-latest
+    # Must be the Ubuntu release of the Playwright image (`-resolute` in tests/e2e/Dockerfile): the replay
+    # server is built here and run in that image, so it must not need a newer glibc than the image's.
+    # build-image.sh checks this before any test runs. Bump the two together.
+    runs-on: ubuntu-26.04
     steps:
       - uses: actions/checkout@v4
 
-      - name: Build e2e image
-        run: docker build -f tests/e2e/Dockerfile -t giskard-e2e .
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
 
+      # The same command as a local run: builds the replay server here (release, through the cargo
+      # cache above) and the dependencies-only image, then mounts the binary and the suite into it.
       - name: Run Playwright tests
-        run: |
-          mkdir -p "${{ github.workspace }}/tests/e2e/playwright-report"
-          docker run --rm --ipc=host \
-            --user "$(id -u):$(id -g)" \
-            -e GISKARD_PLAYWRIGHT_OUTPUT_DIR=/tmp/giskard-playwright-test-results \
-            -v "${{ github.workspace }}/tests/e2e/playwright-report:/e2e/playwright-report" \
-            giskard-e2e
+        run: tests/e2e/run.sh
 
       - name: Upload Playwright report
         if: ${{ !cancelled() }}

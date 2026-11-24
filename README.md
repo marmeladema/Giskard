@@ -725,26 +725,26 @@ every pull request: `rustfmt` (`cargo fmt --all --check`), `clippy` (`cargo clip
 ### Browser (Playwright) end-to-end tests
 
 [`tests/e2e/`](tests/e2e/) holds Playwright tests that drive the real web UI in a headless browser —
-login, projects/threads, live message streaming, and settings. They run entirely inside Docker, so
-no Node/npm or browsers are needed on your host:
+login, projects/threads, live message streaming, and settings. The browser runs inside Docker, so no
+Node/npm or browsers are needed on your host; the replay server is built on the host with cargo and
+mounted into the container:
 
 ```bash
-# Preferred locally when compatible host builds are supported:
-cargo build -p giskard-server --bin giskard-server-replay
-GISKARD_E2E_PREBUILT_BIN=target/debug/giskard-server-replay tests/e2e/run.sh
-
-tests/e2e/run.sh                      # build the image and run the whole suite
+tests/e2e/run.sh                      # build the server and the image, run the whole suite
 tests/e2e/run.sh tests/login.spec.ts  # a single spec; extra args pass through to `playwright test`
+
+# Use another build of the replay server instead of the release build run.sh makes:
+GISKARD_E2E_PREBUILT_BIN=target/debug/giskard-server-replay tests/e2e/run.sh
 ```
 
-If the supplied path does not exist, the script builds the replay server in Docker. An existing
-binary that cannot run in the Playwright image fails validation rather than silently rebuilding.
+Before any test, the script checks that the binary runs in the Playwright image, whose Ubuntu release
+may ship an older glibc than your host.
 
 The tests run against `giskard-server-replay` (a bin in `giskard-server`): a deterministic,
 Codex-free build that serves the same UI/API, boots with a known password and a pre-seeded project,
 and streams a fixed agent reply per turn via an in-process scripted harness. See
 [`tests/e2e/README.md`](tests/e2e/README.md) for details and the without-Docker workflow. The
-[E2E workflow](.github/workflows/e2e.yml) runs the same container in CI.
+[E2E workflow](.github/workflows/e2e.yml) runs the same command in CI.
 
 The README screenshots are produced by the same infrastructure — regenerate them after a UI change
 with:
