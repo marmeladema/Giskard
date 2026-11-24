@@ -1007,19 +1007,21 @@
   /* Pinned to the left edge of the scroll box so line numbers stay visible while a long line is
      scrolled sideways; the opaque background hides the text passing underneath. */
   .code-line-nos, .diff-gutters { position:sticky; left:0; z-index:1; }
+  /* Kept narrow so a phone has room for the code: a column of numbers needs little air around it,
+     and a faded hairline after each column does the separating that padding used to. */
   .code-line-nos {
-    padding:16px 10px 16px 14px; border-right:1px solid var(--border); background:#0d1117;
+    padding:16px 4px; border-right:1px solid rgba(255,255,255,.07); background:#0d1117;
     color:var(--muted); font-family:var(--mono); font-size:12.5px; line-height:1.45; text-align:right;
     user-select:none;
   }
-  .code-line-no { height:1.45em; min-width:3ch; }
+  .code-line-no { height:1.45em; min-width:2ch; }
   .code-line-no.focused { color:#fff; background:rgba(79,140,255,.28); border-radius:4px; }
   .code-source { min-width:0; }
   /* The <pre> carries the syntax theme's background inline. Size its box to the widest line
      (width:max-content) instead of letting the text overflow a viewport-width box, so that grey
      background follows the line when scrolling horizontally; min-width:100% still fills short files.
      This sizes the visible element directly rather than relying on grid track sizing to grow it. */
-  .code-source pre { margin:0; padding:16px; min-height:100%; width:max-content; min-width:100%; font-family:var(--mono); font-size:12.5px; line-height:1.45; white-space:pre; }
+  .code-source pre { margin:0; padding:16px 16px 16px 6px; min-height:100%; width:max-content; min-width:100%; font-family:var(--mono); font-size:12.5px; line-height:1.45; white-space:pre; }
   .code-markdown { max-width:900px; padding:20px 24px 40px; color:var(--fg); }
   .code-markdown pre { background:#0b0e13; }
   .code-overlay-warning {
@@ -1032,13 +1034,13 @@
   /* Both gutters sit in one sticky wrapper so they pin together, side by side. */
   .diff-gutters { display:flex; background:#0d1117; }
   .diff-gutters .code-line-nos { position:static; }
-  .diff-line-nos { padding-left:10px; padding-right:8px; border-right:0; }
-  .diff-line-nos + .diff-line-nos { padding-left:0; padding-right:10px; border-right:1px solid var(--border); }
+  /* Each gutter is a .code-line-nos, so each brings its own padding and hairline: one between the
+     two sides, one before the code. */
   /* max-content so the row backgrounds run the full width of the longest line rather than stopping
      at the viewport edge when the diff is scrolled sideways — the same trick .code-source pre uses. */
   .diff-source { min-width:100%; width:max-content; padding:16px 0; }
   .diff-line {
-    height:1.45em; padding:0 16px; font-family:var(--mono); font-size:12.5px; line-height:1.45;
+    height:1.45em; padding:0 16px 0 6px; font-family:var(--mono); font-size:12.5px; line-height:1.45;
     white-space:pre; color:#c9d1d9;
   }
   .diff-line.diff-add { background:rgba(63,185,80,.15); color:#aff5b4; }
