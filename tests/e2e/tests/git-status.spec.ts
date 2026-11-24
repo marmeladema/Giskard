@@ -424,6 +424,68 @@ test.describe("git status line", () => {
     expect(file.gutters[0].left).toBeCloseTo(0, 0);
   });
 
+  // The gutters are kept narrow so a phone keeps room for the code: 4px either side of each
+  // column of numbers, a faded hairline after each column instead of wider padding, and 6px before
+  // the code. A column is as wide as its widest number, so that is the only width it adds.
+  test("keeps the line-number gutters narrow, separated by hairlines", async ({ page }) => {
+    const layout = () =>
+      page.evaluate(() => {
+        const view = document.getElementById("codeView")!;
+        const gutters = [...view.querySelectorAll<HTMLElement>(".code-line-nos")];
+        const digit = (() => {
+          const probe = document.createElement("span");
+          probe.textContent = "0000000000";
+          gutters[0].append(probe);
+          const w = probe.getBoundingClientRect().width / 10;
+          probe.remove();
+          return w;
+        })();
+        const code = view.querySelector<HTMLElement>(".diff-line, .code-source pre")!;
+        const codeStyle = getComputedStyle(code);
+        return {
+          digit,
+          gutters: gutters.map((g) => {
+            const cs = getComputedStyle(g);
+            return {
+              width: g.getBoundingClientRect().width,
+              padding: [cs.paddingLeft, cs.paddingRight],
+              rule: [cs.borderRightWidth, cs.borderRightColor],
+            };
+          }),
+          codeGap: code.getBoundingClientRect().left + parseFloat(codeStyle.paddingLeft) -
+            gutters[gutters.length - 1].getBoundingClientRect().right,
+        };
+      });
+    const hairline = ["1px", "rgba(255, 255, 255, 0.07)"];
+
+    // Four-digit numbers on one side, three on the other.
+    await page.evaluate(() =>
+      openDiffOverlay("wide.rs", "@@ -998,2 +1000,2 @@\n-old\n+new\n context"));
+    const diff = await layout();
+    expect(diff.gutters).toHaveLength(2);
+    for (const g of diff.gutters) {
+      expect(g.padding).toEqual(["4px", "4px"]);
+      expect(g.rule).toEqual(hairline);
+    }
+    expect(diff.gutters[0].width).toBeCloseTo(3 * diff.digit + 9, 0);
+    expect(diff.gutters[1].width).toBeCloseTo(4 * diff.digit + 9, 0);
+    expect(diff.codeGap).toBeCloseTo(6, 0);
+
+    // A short file: the column is never narrower than two digits, so a one-digit file still has
+    // room around its numbers.
+    await page.evaluate(() => {
+      closeCodeOverlay();
+      document.getElementById("codeOverlay")!.classList.add("open");
+      renderCodeHtml({ total_lines: 3, html: "<pre>a\nb\nc</pre>" }, null);
+    });
+    const file = await layout();
+    expect(file.gutters).toHaveLength(1);
+    expect(file.gutters[0].padding).toEqual(["4px", "4px"]);
+    expect(file.gutters[0].rule).toEqual(hairline);
+    expect(file.gutters[0].width).toBeCloseTo(2 * file.digit + 9, 0);
+    expect(file.codeGap).toBeCloseTo(6, 0);
+  });
+
   // A regenerated lockfile can run to six figures, and three DOM nodes per line would block the
   // tab. The rows are capped and the shortfall stated; the copy still carries the whole patch.
   test("caps a very large diff without losing it", async ({ page }) => {
