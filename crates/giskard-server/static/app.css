@@ -983,12 +983,23 @@
   .remove-project-path { padding:8px 10px; border:1px solid var(--border); border-radius:8px; background:var(--panel2); font-size:12px; word-break:break-all; }
   .remove-thread-dialog { width:min(520px,92vw); }
   .remove-thread-dialog p { margin:0 0 10px; }
-  .code-dialog { width:min(1120px,94vw); height:min(860px,90vh); }
-  .code-head { padding:14px 18px; border-bottom:1px solid var(--border); display:flex; gap:10px; align-items:flex-start; }
+  /* The viewer (files, diffs, command/tool output) opens in the thread column, over the transcript.
+     The two share .thread-stage, which takes the transcript's old place in the column; the viewer is
+     laid on top (absolute, inset 0) and the transcript is only made invisible, never display:none.
+     A display:none transcript would have no height: every row streamed in meanwhile would count as
+     "at the bottom", its scroll position would be lost, and coming back at scrollTop 0 would page in
+     older history. Kept laid out, it goes on following the turn underneath, as if still on screen. */
+  .thread-stage { flex:1; min-height:0; position:relative; display:flex; flex-direction:column; }
+  .content-viewer { display:none; position:absolute; inset:0; z-index:2; flex-direction:column; background:var(--panel); }
+  .content-viewer.open { display:flex; }
+  #codeOverlay.open + #transcript { visibility:hidden; }
+  .code-head { padding:10px 14px; border-bottom:1px solid var(--border); display:flex; gap:10px; align-items:center; flex:none; }
   .code-head-main { flex:1; min-width:0; }
+  .code-actions { display:flex; gap:8px; flex:none; }
   .code-title { font-family:var(--mono); word-break:break-all; font-size:13px; }
   .code-meta { margin-top:4px; color:var(--muted); font-size:12px; }
   .code-view { flex:1; overflow:auto; background:#0b0e13; }
+  .code-view:focus { outline:none; }
   /* The table is as wide as its widest line (width:max-content), not the viewport: the gutter below
      is sticky, and a sticky box can't leave its containing block, so a viewport-wide table would let
      the line numbers scroll away once a long line was scrolled past one screen width. */
@@ -1151,10 +1162,30 @@
     .resizer { display:none; }
     .center { border:0; height:100vh; height:100dvh; height:var(--app-height); }
     #mobileBar { display:flex; }
+    /* On a phone the title gets the first row and the actions a row of their own; on one row the
+       buttons squeezed the path into a column a few letters wide. */
+    .code-head { flex-wrap:wrap; padding:8px 10px; gap:8px; }
+    .code-actions { flex-basis:100%; justify-content:flex-end; }
     /* Tighten the header on phones; with only the status badges left it stays on one line. The
        header stacks directly below the mobile bar as the next flex child — no offset needed. */
     header.thr { gap:7px 6px; padding:7px 10px; }
     header.thr .badge { padding:3px 7px; }
+    /* The status badge is just its coloured dot. There is no hover for the tooltip, so a tap shows
+       the word for a few seconds (app.js) in a bubble below the badge, from its data-label. The
+       bubble floats rather than widening the badge, so nothing in the header moves. The word is
+       hidden visually only, so screen readers still read it. */
+    .ws-badge .ws-label {
+      position:absolute; width:1px; height:1px; overflow:hidden; clip-path:inset(50%); white-space:nowrap;
+    }
+    /* Without its word the badge would only be as tall as the dot; stretching it to the header row
+       makes it the same height as the text badges beside it. */
+    .ws-badge { position:relative; gap:0; padding:3px 6px; align-self:stretch; cursor:pointer; -webkit-tap-highlight-color:transparent; }
+    .ws-badge.show-label::after {
+      content:attr(data-label); position:absolute; top:calc(100% + 6px); left:0; z-index:36;
+      padding:3px 8px; border:1px solid; border-color:inherit; border-radius:8px;
+      background:var(--panel); color:inherit; font-size:11px; white-space:nowrap;
+      box-shadow:0 4px 12px rgba(0,0,0,.4); pointer-events:none;
+    }
     /* The context gauge ("12.3k / 272k") is the widest element in the bar. Hide the inline number
        on phones — the full breakdown is one tap away in the Context card — so the row packs. */
     header.thr #gauge { display:none; }

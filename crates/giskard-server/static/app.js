@@ -2193,11 +2193,26 @@ function activeParentThread() {
   };
 }
 
+/* The viewer's "← Thread" sits in the thread header where a sub-agent thread's "← Parent" does, so
+   there is one back button in one place: while the viewer is open it leads back to the thread, and
+   once there, "← Parent" takes its place again. */
+function setViewerOpen(open) {
+  $("codeOverlay").classList.toggle("open", open);
+  $("codeClose").hidden = !open;
+  renderParentThreadButton();
+  // Opened from a transcript link, focus would be left on an element the viewer now hides; move it
+  // into the viewer so the keyboard (Tab, arrow-key scrolling) carries on from there.
+  const active = document.activeElement;
+  if (open && (!active || active === document.body || $("transcript").contains(active))) {
+    $("codeView").focus({ preventScroll:true });
+  }
+}
+
 function renderParentThreadButton() {
   const btn = $("parentThreadBtn");
   if (!btn) return;
   const parent = activeParentThread();
-  btn.hidden = !parent;
+  btn.hidden = !parent || $("codeOverlay").classList.contains("open");
   btn.disabled = !parent;
   btn.dataset.parentThreadId = parent ? parent.id : "";
   const label = parent ? `Back to parent thread: ${parent.title}` : "Back to parent thread";
@@ -2692,6 +2707,9 @@ $("removeThreadConfirm").onclick = async () => {
 
 function clearThreadView(tid) {
   if (state.threadId !== tid) return;
+  // The viewer shows this thread's files; with the thread gone (archived, deleted, its project
+  // removed) there is nothing behind it. The sidebar stays usable while it is open, so this happens.
+  closeCodeOverlay();
   saveComposerDraft();
   try { localStorage.removeItem("giskard.lastThread"); } catch {}
   clearWsReconnectTimer();
@@ -3226,6 +3244,10 @@ function openDraftThread(pid) {
 async function openThread(pid, tid, title, opts) {
   opts = opts || {};
   saveComposerDraft();
+  // The file view belongs to the thread it was opened from, and navigation is leaving that thread —
+  // a notification click can even land in another project. Close it now, not after the round trip
+  // below, so the column never shows one thread's file while the sidebar shows another selected.
+  closeCodeOverlay();
   if (!opts.firstTurnStarting) state.firstTurnStartingThreadId = null;
   if (opts.focusRequestId) {
     state.pendingWaitingFocus = {
@@ -3248,10 +3270,6 @@ async function openThread(pid, tid, title, opts) {
   try { localStorage.setItem("giskard.lastThread", JSON.stringify({ pid, tid })); } catch {}
 
   clearThreadActivity(tid);
-  // The file view belongs to the thread it was opened from, and navigation is leaving that thread —
-  // a notification click can even land in another project. Close it rather than leave it showing
-  // one workspace's file while the app is somewhere else.
-  closeCodeOverlay();
   setActiveViewIdentity(pid, tid);
   state.pendingUserEl = null; state.pendingUserText = null;
   state.turnSteering = !!res.turn_steering;
@@ -3361,11 +3379,26 @@ function wsStatusLabel(status) {
 function renderWsStatus() {
   const el = $("wsStatusBadge");
   if (!el) return;
+  const label = wsStatusLabel(state.wsStatus);
   el.hidden = !state.threadId && !isDraftThread();
+  const shown = el.classList.contains("show-label");
   el.className = `badge ws-badge state-${state.wsStatus}`;
-  el.textContent = wsStatusLabel(state.wsStatus);
-  el.title = state.wsStatusDetail || wsStatusLabel(state.wsStatus);
+  if (shown) el.classList.add("show-label");
+  el.querySelector(".ws-label").textContent = label;
+  el.title = state.wsStatusDetail || label;
+  // The phone's tap bubble shows this (see app.css); the label itself stays in place for screen readers.
+  el.dataset.label = label;
 }
+/* On a phone the badge shrinks to its dot, and there is no hover to show a tooltip, so a tap shows
+   the state in a bubble below it for a few seconds (the bubble is CSS, from the aria-label). */
+const WS_LABEL_REVEAL_MS = 3000;
+let wsLabelRevealTimer = null;
+$("wsStatusBadge").addEventListener("click", () => {
+  const el = $("wsStatusBadge");
+  el.classList.add("show-label");
+  clearTimeout(wsLabelRevealTimer);
+  wsLabelRevealTimer = setTimeout(() => el.classList.remove("show-label"), WS_LABEL_REVEAL_MS);
+});
 function recordWsProblem(message) {
   state.wsLastProblem = message || "";
   if (message) state.wsStatusDetail = message;
@@ -4052,7 +4085,11 @@ async function maybeNotifyWaitingRequest(tid, activity) {
     summary: activity.summary || ""
   });
   const focused = document.hasFocus ? document.hasFocus() : true;
-  if (document.visibilityState === "visible" && focused && String(tid) === String(state.threadId)) {
+  // With the viewer open the transcript is covered, so a request there would go unseen: notify as
+  // for any other thread (the notification's click goes back to the thread, see
+  // schedulePendingWaitingFocus).
+  const viewerOpen = $("codeOverlay").classList.contains("open");
+  if (document.visibilityState === "visible" && focused && String(tid) === String(state.threadId) && !viewerOpen) {
     recordNotificationDiagnostic("waiting_notify_suppressed_visible_current_thread", {
       tid,
       request_id: waitingRequestId(activity),
@@ -5607,6 +5644,7 @@ function schedulePendingWaitingFocus() {
   const row = waitingRequestRowById(pending.requestId);
   if (row) {
     state.pendingWaitingFocus = null;
+    closeCodeOverlay();
     row.scrollIntoView({ block:"center", behavior:"smooth" });
     row.classList.add("waiting-target");
     row.setAttribute("tabindex", "-1");
@@ -8279,6 +8317,8 @@ function navigateToTask(id) {
   const key = idKey(id);
   const task = key && state.runningTasks.get(key);
   if (!task) return;
+  // The task's row is in the transcript, which the viewer covers.
+  closeCodeOverlay();
   state.pendingTaskOpen = null;
   const intent = ++state.taskIntentSeq;
   if (state.commandMsgElsByItemId.has(key)) {
@@ -10108,7 +10148,7 @@ async function openCodeOverlay(path, line) {
   state.codePath = path;
   state.codeLine = normalizeLine(line, null);
   state.codeOverlaySource = null;
-  $("codeOverlay").classList.add("open");
+  setViewerOpen(true);
   $("codeOverlay").dataset.requestId = requestId;
   // The raw path is kept for `state.codePath` (download/file API) but the title bar shows the
   // workspace-relative form, the same truncation the transcript diff row uses, so the leading
@@ -10327,7 +10367,7 @@ function openDiffOverlay(path, diff) {
   releaseOutputOverlay();
   cancelOutputOverlayRefresh();
   state.diffOverlayText = diff;
-  $("codeOverlay").classList.add("open");
+  setViewerOpen(true);
   delete $("codeOverlay").dataset.requestId;
   setCodeSourceToggle(false);
   setCodeCopyDiff(true);
@@ -10351,7 +10391,7 @@ function setCodeCopyDiff(visible) {
 }
 function closeCodeOverlay() {
   state.diffSelectionToken++;
-  $("codeOverlay").classList.remove("open");
+  setViewerOpen(false);
   delete $("codeOverlay").dataset.requestId;
   delete $("codeOverlay").dataset.projectId;
   delete $("codeOverlay").dataset.threadId;
@@ -10405,10 +10445,10 @@ $("codeCopyDiff").onclick = async () => {
 };
 
 /* ---------- command / tool output overlay ----------
-   Reuses the #codeOverlay modal (same head/close/escape/backdrop plumbing as the source and diff
-   views) to show a command's or tool's full output in a large scrollable card instead of an inline
-   collapsible block. While the underlying command is still running, the card live-updates: every
-   render path that refreshes the inline row also calls refreshOutputOverlay, so the modal tracks the
+   Reuses the #codeOverlay viewer (same head/back/escape plumbing as the source and diff views) to
+   show a command's or tool's full output in the thread column instead of an inline collapsible
+   block. While the underlying command is still running, the view live-updates: every render path
+   that refreshes the inline row also calls refreshOutputOverlay, so the viewer tracks the
    command's state and streaming output in place. */
 // Stable core of the server's live_buffer truncation marker (see live_buffer.rs). When a client
 // reconnects mid-command, the server can only replay a compacted head+tail snapshot with this
@@ -10711,7 +10751,7 @@ function openOutputOverlay(itemId, kind) {
     outputVersion:"", links:null, linksVersion:"", linkResolvedVersion:"", linkController:null
   };
   cancelOutputOverlayRefresh();
-  $("codeOverlay").classList.add("open");
+  setViewerOpen(true);
   $("codeDownload").disabled = false;
   setCodeSourceToggle(false);
   setCodeCopyDiff(false);
@@ -11005,7 +11045,6 @@ function downloadOutputOverlay() {
   a.remove();
   setTimeout(() => URL.revokeObjectURL(url), 0);
 }
-$("codeOverlay").addEventListener("click", (e) => { if (e.target === $("codeOverlay")) closeCodeOverlay(); });
 
 /* ---------- composer + controls ---------- */
 function sendInput() {
@@ -11039,6 +11078,9 @@ function sendInput() {
     return;
   }
   const draftKey = composerDraftKey();
+  // The viewer covers the transcript; sending is asking for a reply, so go back to where it (or a
+  // failure to send) appears.
+  closeCodeOverlay();
   const body = bubble("user pending","you");
   body.textContent = pendingUserDisplayText(text, attachments);
   const msgEl = body.parentElement;
@@ -11077,6 +11119,7 @@ function steerInput(text) {
   }
   const turnId = String(state.currentRenderTurnId);
   const draftKey = composerDraftKey();
+  closeCodeOverlay();
   const body = bubble("user pending", "you");
   body.textContent = text;
   const element = body.parentElement;
@@ -11167,6 +11210,9 @@ async function startDraftThread(text, attachments) {
   // first draft would come back after the user opened a second one and clear its composer, open
   // over it, or mark its rows failed — losing whatever they had typed in the meantime.
   $("transcript").innerHTML = "";   // drop the draft placeholder before the first real row
+  // The viewer covers the transcript; sending is asking for a reply, so go back to where it (or a
+  // failure to send) appears.
+  closeCodeOverlay();
   const body = bubble("user pending","you");
   body.textContent = pendingUserDisplayText(text, attachments);
   const msgEl = body.parentElement;
@@ -11821,6 +11867,15 @@ function setThreadTitle(t) {
     ? `<span class="crumb">${escapeHtml(proj)}</span> / ${escapeHtml(t)}`
     : escapeHtml(t);
 }
+const ESCAPABLE_MENUS = ["settingsMenu", "modelPickerMenu", "turnPickerMenu", "tasksMenu", "subagentsMenu", "mcpMenu", "usageMenu"];
+function escapableMenuOpen() {
+  // The drawer class can outlive a resize from phone to desktop width, where the drawer isn't shown.
+  // #mobileBar, not #btnMenu: the breakpoint hides the bar, and a hidden ancestor doesn't change a
+  // child's own computed display.
+  const drawer = $("app").classList.contains("drawer-left") && getComputedStyle($("mobileBar")).display !== "none";
+  const sidebarMenu = [...document.querySelectorAll(".thread-menu, .project-menu")].some((m) => !m.hidden);
+  return drawer || sidebarMenu || ESCAPABLE_MENUS.some((id) => !$(id).hidden);
+}
 function closeDrawers() { $("app").classList.remove("drawer-left"); }
 function toggleDrawer(side) {
   if (side !== "left") return;
@@ -11829,15 +11884,22 @@ function toggleDrawer(side) {
 $("btnMenu").onclick = () => toggleDrawer("left");
 $("backdrop").onclick = closeDrawers;
 document.addEventListener("keydown", (e) => {
-  if (e.key!=="Escape") return;
+  // An Escape that only dismisses an input method's candidate list belongs to the IME.
+  if (e.key!=="Escape" || e.isComposing) return;
   if ($("removeThreadModal").classList.contains("open")) closeRemoveThreadModal();
-  else if ($("codeOverlay").classList.contains("open")) closeCodeOverlay();
-  else {
+  // The viewer sits in the thread column rather than over the whole app, so a dialog, a menu or the
+  // drawer can be open on top of it, and Escape deals with that first. The project dialogs don't
+  // close on Escape, but the viewer under them mustn't close either.
+  else if ($("projectModal").classList.contains("open") || $("removeProjectModal").classList.contains("open")) return;
+  else if (escapableMenuOpen()) {
     closeSettingsMenu();
     closeModelPicker();
     closeTurnPicker();
+    for (const id of ESCAPABLE_MENUS) $(id).hidden = true;
+    closeThreadMenus();
     closeDrawers();
   }
+  else if ($("codeOverlay").classList.contains("open")) closeCodeOverlay();
 });
 
 function renderTokens(led) {

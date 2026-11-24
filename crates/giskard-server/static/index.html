@@ -104,11 +104,15 @@
         <div class="mbTitle" id="mbTitle">Giskard</div>
       </div>
       <header class="thr" id="thrHeader" style="display:none">
+        <button id="codeClose" class="badge parent-thread-btn" type="button" hidden
+                title="Back to the thread (Esc)" aria-label="Back to the thread">
+          <span aria-hidden="true">←</span><span>Thread</span>
+        </button>
         <button id="parentThreadBtn" class="badge parent-thread-btn" type="button" hidden
                 title="Back to parent thread" aria-label="Back to parent thread">
           <span aria-hidden="true">←</span><span>Parent</span>
         </button>
-        <span id="wsStatusBadge" class="badge ws-badge state-closed" title="WebSocket disconnected">Disconnected</span>
+        <span id="wsStatusBadge" class="badge ws-badge state-closed" title="WebSocket disconnected"><span class="ws-label">Disconnected</span></span>
         <div class="tasks-wrap">
           <button id="tasksBtn" class="badge tasks-btn state-idle" title="Running tasks" aria-label="Running tasks">
             <span>Tasks</span><span id="tasksCount" class="mono">0</span>
@@ -117,7 +121,7 @@
         </div>
         <div class="subagents-wrap">
           <button id="subagentsBtn" class="badge subagents-btn state-idle" title="Sub-agents" aria-label="Sub-agents">
-            <span>Sub-agents</span><span id="subagentsCount" class="mono">0</span>
+            <span>Agents</span><span id="subagentsCount" class="mono">0</span>
           </button>
           <div id="subagentsMenu" class="subagents-popover" hidden></div>
         </div>
@@ -135,7 +139,28 @@
         </div>
       </header>
       <div id="diskUsageBanner" class="disk-usage-banner" role="status" aria-live="polite" hidden></div>
-      <div id="transcript" class="muted" style="padding:24px">Select or create a thread to begin.</div>
+      <!-- The file/diff/output viewer opens in place of the transcript, on top of it rather than
+           instead of it: the transcript stays laid out underneath (only hidden), so its scroll
+           position, stick-to-bottom following and history paging are untouched while it is covered.
+           Highlighting and downloads are served by the backend, so the browser needs no JS
+           highlighter or filesystem access. -->
+      <div class="thread-stage">
+        <section class="content-viewer" id="codeOverlay" aria-label="Viewer">
+          <div class="code-head">
+            <div class="code-head-main">
+              <div class="code-title" id="codePath">—</div>
+              <div class="code-meta" id="codeMeta">Loading…</div>
+            </div>
+            <div class="code-actions">
+              <button id="codeSourceToggle" hidden>Source</button>
+              <button id="codeCopyDiff" hidden title="Copy the diff to the clipboard">Copy diff</button>
+              <button id="codeDownload">Download</button>
+            </div>
+          </div>
+          <div class="code-view" id="codeView" tabindex="-1"><div class="code-empty">Select a linked path.</div></div>
+        </section>
+        <div id="transcript" class="muted" style="padding:24px">Select or create a thread to begin.</div>
+      </div>
       <div class="readonly-banner" id="readOnlyBanner" hidden></div>
       <div class="update-banner" id="updateBanner" role="alert" hidden>
         <span>Giskard was updated. Reload before continuing. Text drafts will be preserved; attachments must be re-added.</span>
@@ -371,24 +396,6 @@
         <button id="removeThreadCancel">Cancel</button>
         <button class="danger" id="removeThreadConfirm">Delete thread</button>
       </div>
-    </div>
-  </div>
-
-  <!-- Source/code overlay opened from linkified transcript paths. Highlighting and downloads are
-       served by the backend so the browser does not need a JS highlighter or filesystem access. -->
-  <div class="overlay" id="codeOverlay">
-    <div class="dialog code-dialog">
-      <div class="code-head">
-        <div class="code-head-main">
-          <div class="code-title" id="codePath">—</div>
-          <div class="code-meta" id="codeMeta">Loading…</div>
-        </div>
-        <button id="codeSourceToggle" hidden>Source</button>
-        <button id="codeCopyDiff" hidden title="Copy the diff to the clipboard">Copy diff</button>
-        <button id="codeDownload">Download</button>
-        <button id="codeClose">Close</button>
-      </div>
-      <div class="code-view" id="codeView"><div class="code-empty">Select a linked path.</div></div>
     </div>
   </div>
 
