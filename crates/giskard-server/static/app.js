@@ -10306,7 +10306,11 @@ function renderDiffRows(rows) {
     source.append(line);
   }
 
-  table.append(oldNos, newNos, source);
+  // One wrapper for both gutters, so they stay pinned side by side when the diff scrolls sideways.
+  const gutters = document.createElement("div");
+  gutters.className = "diff-gutters";
+  gutters.append(oldNos, newNos);
+  table.append(gutters, source);
   return table;
 }
 
@@ -10336,6 +10340,7 @@ function openDiffOverlay(path, diff) {
   $("codeDownload").disabled = true;
   $("codeView").replaceChildren(renderDiffRows(parseUnifiedDiff(diff)));
   $("codeView").scrollTop = 0;
+  $("codeView").scrollLeft = 0;
 }
 
 function setCodeCopyDiff(visible) {
@@ -10366,6 +10371,7 @@ function releaseOutputOverlay() {
   state.outputOverlay = null;
   $("codeView").replaceChildren();
   $("codeView").scrollTop = 0;
+  $("codeView").scrollLeft = 0;
   $("codeDownload").disabled = true;
   setCodeCopyDiff(false);
 }
@@ -10941,6 +10947,9 @@ function renderCodeHtml(res, targetLine) {
 
   table.append(gutter, source);
   $("codeView").replaceChildren(table);
+  // A new file (or the Source toggle) starts at the left edge rather than keeping the sideways
+  // scroll of whatever was shown before, which would open it with only the pinned gutter in view.
+  $("codeView").scrollLeft = 0;
   if (line) requestAnimationFrame(() => requestAnimationFrame(() => scrollToCodeLine(line)));
 }
 function scrollToCodeLine(line) {

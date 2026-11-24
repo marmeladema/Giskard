@@ -989,7 +989,13 @@
   .code-title { font-family:var(--mono); word-break:break-all; font-size:13px; }
   .code-meta { margin-top:4px; color:var(--muted); font-size:12px; }
   .code-view { flex:1; overflow:auto; background:#0b0e13; }
-  .code-table { display:grid; grid-template-columns:auto minmax(0,1fr); min-height:100%; }
+  /* The table is as wide as its widest line (width:max-content), not the viewport: the gutter below
+     is sticky, and a sticky box can't leave its containing block, so a viewport-wide table would let
+     the line numbers scroll away once a long line was scrolled past one screen width. */
+  .code-table { display:grid; grid-template-columns:auto minmax(0,1fr); min-height:100%; width:max-content; min-width:100%; }
+  /* Pinned to the left edge of the scroll box so line numbers stay visible while a long line is
+     scrolled sideways; the opaque background hides the text passing underneath. */
+  .code-line-nos, .diff-gutters { position:sticky; left:0; z-index:1; }
   .code-line-nos {
     padding:16px 10px 16px 14px; border-right:1px solid var(--border); background:#0d1117;
     color:var(--muted); font-family:var(--mono); font-size:12.5px; line-height:1.45; text-align:right;
@@ -1012,7 +1018,9 @@
   /* A diff is laid out like a source file rather than as a code block inside the overlay: two
      gutters (the line's number on each side of the change) and one row per line. Only added,
      removed and context lines carry a number on the side they exist in. */
-  .diff-table { grid-template-columns:auto auto minmax(0,1fr); }
+  /* Both gutters sit in one sticky wrapper so they pin together, side by side. */
+  .diff-gutters { display:flex; background:#0d1117; }
+  .diff-gutters .code-line-nos { position:static; }
   .diff-line-nos { padding-left:10px; padding-right:8px; border-right:0; }
   .diff-line-nos + .diff-line-nos { padding-left:0; padding-right:10px; border-right:1px solid var(--border); }
   /* max-content so the row backgrounds run the full width of the longest line rather than stopping

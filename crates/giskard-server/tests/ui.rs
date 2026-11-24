@@ -1679,6 +1679,12 @@ async fn index_page_is_served_and_public() {
          regardless of how the browser resolves grid track sizing"
     );
     assert!(
+        between(&body, ".code-line-nos, .diff-gutters {", "}").contains("position:sticky")
+            && between(&body, ".code-table {", "}").contains("width:max-content"),
+        "the line-number gutters stay pinned while a long line scrolls sideways, and the table is \
+         as wide as its widest line so the sticky gutters are never carried off with it"
+    );
+    assert!(
         body.contains("scrollToCodeLine"),
         "UI scrolls the code overlay to a requested line"
     );

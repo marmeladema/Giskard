@@ -374,6 +374,50 @@ test.describe("git status line", () => {
     expect(rows.every((r) => r.old === "")).toBe(true);
   });
 
+  // A long line scrolls sideways under the line numbers rather than taking them with it: the
+  // gutters are sticky, and the table is as wide as the widest line so they stay pinned however far
+  // it scrolls — a viewport-wide table would let them go after one screen width.
+  test("keeps the line numbers pinned while a long line scrolls sideways", async ({ page }) => {
+    const long = "x".repeat(4000);
+    const measure = () =>
+      page.evaluate(() => {
+        const view = document.getElementById("codeView")!;
+        view.scrollLeft = view.scrollWidth;
+        const left = view.getBoundingClientRect().left + view.clientLeft;
+        return {
+          scrolled: view.scrollLeft,
+          gutters: [...view.querySelectorAll<HTMLElement>(".code-line-nos")].map((g) => {
+            const r = g.getBoundingClientRect();
+            return { left: r.left - left, right: r.right - left };
+          }),
+        };
+      });
+
+    await page.evaluate((l) => openDiffOverlay("long.rs", `@@ -1 +1 @@\n-${l}\n+${l}`), long);
+    await expect(page.locator("#codeOverlay")).toHaveClass(/\bopen\b/);
+    const diff = await measure();
+    expect(diff.scrolled, "the long line overflows the view").toBeGreaterThan(2000);
+    expect(diff.gutters).toHaveLength(2);
+    expect(diff.gutters[0].left).toBeCloseTo(0, 0);
+    // The new-side gutter stays beside the old-side one, not stacked on top of it.
+    expect(diff.gutters[1].left).toBeCloseTo(diff.gutters[0].right, 0);
+
+    // Another diff opens at the left edge, not at the sideways scroll the last one was left at.
+    await page.evaluate((l) => openDiffOverlay("other.rs", `@@ -1 +1 @@\n-${l}\n+${l}`), long);
+    expect(await page.evaluate(() => document.getElementById("codeView")!.scrollLeft)).toBe(0);
+
+    // The file view, rendered into the overlay as openCodeOverlay leaves it: open, no diff.
+    await page.evaluate((l) => {
+      closeCodeOverlay();
+      document.getElementById("codeOverlay")!.classList.add("open");
+      renderCodeHtml({ total_lines: 2, html: `<pre>short\n${l}</pre>` }, null);
+    }, long);
+    const file = await measure();
+    expect(file.scrolled).toBeGreaterThan(2000);
+    expect(file.gutters).toHaveLength(1);
+    expect(file.gutters[0].left).toBeCloseTo(0, 0);
+  });
+
   // A regenerated lockfile can run to six figures, and three DOM nodes per line would block the
   // tab. The rows are capped and the shortfall stated; the copy still carries the whole patch.
   test("caps a very large diff without losing it", async ({ page }) => {
@@ -648,3 +692,5 @@ declare function gitFileOpenable(path: string, hasThread: boolean): boolean;
 declare const state: { diffOverlayText: string | null };
 declare function openDiffOverlay(path: string, diff: string): void;
 declare function openCodeOverlay(path: string, line?: number): Promise<void>;
+declare function closeCodeOverlay(): void;
+declare function renderCodeHtml(res: { total_lines: number; html: string }, line: number | null): void;
