@@ -41,7 +41,7 @@ test.describe("lazy agent diffs", () => {
     await group.locator(".file-change-entry").first().locator(".diff-open").click();
 
     await expect(page.locator("#codeOverlay")).toHaveClass(/\bopen\b/);
-    await expect(page.locator("#codePath")).toHaveText(`Diff: ${SCRIPTED_DIFF_PATH}`);
+    await expect(page.locator("#codePath")).toHaveText(`${SCRIPTED_DIFF_PATH}`);
     await expect(page.locator("#codeView")).toContainText("first version");
     expect(requests).toBe(1);
   });

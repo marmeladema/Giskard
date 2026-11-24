@@ -1162,10 +1162,36 @@
     .resizer { display:none; }
     .center { border:0; height:100vh; height:100dvh; height:var(--app-height); }
     #mobileBar { display:flex; }
-    /* On a phone the title gets the first row and the actions a row of their own; on one row the
-       buttons squeezed the path into a column a few letters wide. */
-    .code-head { flex-wrap:wrap; padding:8px 10px; gap:8px; }
-    .code-actions { flex-basis:100%; justify-content:flex-end; }
+    /* On a phone the viewer's header is compact: a one-line title with its details below, and the
+       actions as icon buttons beside them rather than a row of labelled buttons of their own. */
+    .code-head { padding:8px 10px; gap:8px; }
+    .code-title { white-space:nowrap; overflow:hidden; text-overflow:ellipsis; word-break:normal; cursor:pointer; }
+    /* A tap shows a cut title in full (app.js), wrapped and in its own order. */
+    .code-title.expanded { white-space:normal; word-break:break-all; direction:ltr; }
+    /* A path is cut at the start, keeping the file name (setViewerTitle). The right-to-left box puts
+       the ellipsis on the left; the LRM marks around the text keep the path's own left-to-right
+       order, so punctuation at either end ("(staged)") stays put. */
+    .code-title.path-title:not(.expanded) { direction:rtl; text-align:left; }
+    .code-title.path-title:not(.expanded)::before, .code-title.path-title:not(.expanded)::after { content:"\200E"; }
+    .code-actions { gap:6px; }
+    /* Icon buttons: the word stays in the button for screen readers, pushed out of the box by
+       text-indent, and the icon is a mask over the text colour. A disabled one dims through the
+       global button:disabled opacity. */
+    .code-actions button {
+      position:relative; width:34px; height:34px; padding:0; overflow:hidden; white-space:nowrap; text-indent:100%;
+    }
+    .code-actions button::before {
+      content:""; position:absolute; inset:0; margin:auto; width:16px; height:16px; background:currentColor;
+      -webkit-mask:var(--icon) center/contain no-repeat; mask:var(--icon) center/contain no-repeat;
+    }
+    #codeDownload { --icon:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none' stroke='black' stroke-width='1.6' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M8 2v8M4.5 6.5 8 10l3.5-3.5M3 13.5h10'/%3E%3C/svg%3E"); }
+    #codeCopyDiff { --icon:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none' stroke='black' stroke-width='1.6' stroke-linecap='round' stroke-linejoin='round'%3E%3Crect x='5' y='5' width='8.5' height='8.5' rx='1.5'/%3E%3Cpath d='M10.5 5V3.5A1.5 1.5 0 0 0 9 2H3.5A1.5 1.5 0 0 0 2 3.5V9a1.5 1.5 0 0 0 1.5 1.5H5'/%3E%3C/svg%3E"); }
+    /* With its word hidden, a copy's result shows as the icon (app.js sets data-result). */
+    #codeCopyDiff[data-result="ok"] { --icon:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none' stroke='black' stroke-width='1.6' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M3 8.5 6.5 12 13 4.5'/%3E%3C/svg%3E"); color:#3fb950; }
+    #codeCopyDiff[data-result="err"] { --icon:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none' stroke='black' stroke-width='1.6' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M4 4l8 8M12 4l-8 8'/%3E%3C/svg%3E"); color:#f85149; }
+    /* The icon shows the view the button switches to: the source, or back to the rendered page. */
+    #codeSourceToggle[data-icon="source"] { --icon:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none' stroke='black' stroke-width='1.6' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M5.5 4 2 8l3.5 4M10.5 4 14 8l-3.5 4'/%3E%3C/svg%3E"); }
+    #codeSourceToggle[data-icon="rendered"] { --icon:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none' stroke='black' stroke-width='1.6' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M4 2h5.5L12.5 5v9h-8.5z'/%3E%3Cpath d='M6.5 8.5h4M6.5 11h4'/%3E%3C/svg%3E"); }
     /* Tighten the header on phones; with only the status badges left it stays on one line. The
        header stacks directly below the mobile bar as the next flex child — no offset needed. */
     header.thr { gap:7px 6px; padding:7px 10px; }

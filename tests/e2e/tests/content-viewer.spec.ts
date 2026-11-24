@@ -23,7 +23,7 @@ async function openWorkingTreeDiff(page: Page) {
   await page.locator('#gitLineToggle').click();
   await page.locator('.git-file[data-git-diff="src/main.rs"]').click();
   await expect(viewer(page)).toHaveClass(/\bopen\b/);
-  await expect(page.locator("#codePath")).toHaveText("Diff: src/main.rs");
+  await expect(page.locator("#codePath")).toHaveText("src/main.rs");
 }
 
 /** A transcript tall enough to scroll, so a scroll position means something. */
@@ -230,29 +230,105 @@ test.describe("content viewer", () => {
   test.describe("on a phone", () => {
     test.use({ viewport: { width: 390, height: 844 }, deviceScaleFactor: 3, isMobile: true, hasTouch: true });
 
-    test("gives the title its own row instead of squeezing it beside the buttons", async ({ page }) => {
+    test("keeps the header compact: a one-line title, its details, and icon buttons beside them", async ({ page }) => {
       await openThreadWithReply(page);
-      await openWorkingTreeDiff(page);
+      const path = "crates/giskard-server/src/registry/event_forwarder.rs";
+      await page.evaluate((p) =>
+        (window as unknown as { openDiffOverlay: (p: string, d: string) => void })
+          .openDiffOverlay(p, "@@ -1 +1 @@\n-old\n+new"), path);
+      await expect(viewer(page)).toHaveClass(/\bopen\b/);
+      await expect(page.locator("#codePath")).toHaveText(path);
 
       const layout = await page.evaluate(() => {
-        const rect = (id: string) => document.getElementById(id)!.getBoundingClientRect();
+        const rect = (el: Element) => el.getBoundingClientRect();
+        const title = document.getElementById("codePath")!;
+        // Where the path's first and last characters land: a long path is cut at the start.
+        const text = title.firstChild as Text;
+        const range = document.createRange();
+        range.setStart(text, 0); range.setEnd(text, 1);
+        const first = range.getBoundingClientRect();
+        range.setStart(text, text.length - 1); range.setEnd(text, text.length);
+        const last = range.getBoundingClientRect();
         const head = document.querySelector("#codeOverlay .code-head")!;
         return {
-          title: rect("codePath").width,
-          back: rect("codeClose"),
-          download: rect("codeDownload"),
-          titleRect: rect("codePath"),
+          head: rect(head), title: rect(title), meta: rect(document.getElementById("codeMeta")!),
+          copy: rect(document.getElementById("codeCopyDiff")!),
+          download: rect(document.getElementById("codeDownload")!),
+          first, last, lineHeight: parseFloat(getComputedStyle(title).lineHeight) || 20,
           headOverflow: head.scrollWidth - head.clientWidth,
-          viewport: window.innerWidth,
         };
       });
-      // The way back is in the thread header, above the viewer…
-      expect(layout.back.bottom).toBeLessThanOrEqual(layout.titleRect.top);
-      // …the title takes the width…
-      expect(layout.title).toBeGreaterThan(layout.viewport * 0.6);
-      // …and the actions sit on a row below it.
-      expect(layout.download.top).toBeGreaterThanOrEqual(layout.titleRect.bottom - 0.5);
+      // Two short lines, not three rows: about half the height the labelled buttons needed.
+      expect(layout.head.height).toBeLessThan(70);
+      expect(layout.title.height).toBeLessThan(layout.lineHeight * 1.5);
+      // The file name at the end of the path stays in view; the start is what gets cut.
+      expect(layout.last.right).toBeLessThanOrEqual(layout.title.right + 0.5);
+      expect(layout.first.left).toBeLessThan(layout.title.left);
+      // The actions sit beside the title and details, as icon buttons.
+      expect(layout.download.left).toBeGreaterThanOrEqual(layout.title.right);
+      expect(layout.download.top).toBeLessThan(layout.meta.bottom);
+      expect(layout.download.width).toBeLessThan(40);
+      expect(layout.copy.width).toBeLessThan(40);
       expect(layout.headOverflow).toBeLessThanOrEqual(0);
+      // Their words stay as their names.
+      await expect(page.getByRole("button", { name: "Copy", exact: true })).toBeVisible();
+      await expect(page.getByRole("button", { name: "Download" })).toBeVisible();
+
+      // There's no hover for the tooltip on a phone: a tap shows the cut title in full.
+      const title = page.locator("#codePath");
+      await expect(title).toHaveAttribute("title", path);
+      await title.click();
+      expect((await title.boundingBox())!.height).toBeGreaterThan(layout.lineHeight * 1.5);
+      expect(await title.evaluate((el) => el.scrollWidth <= el.clientWidth)).toBe(true);
+      await title.click();
+      expect((await title.boundingBox())!.height).toBeLessThan(layout.lineHeight * 1.5);
+      await expect(title).toHaveAttribute("aria-expanded", "false");
+
+      // The keyboard works it too.
+      await title.focus();
+      await page.keyboard.press("Enter");
+      await expect(title).toHaveAttribute("aria-expanded", "true");
+      expect((await title.boundingBox())!.height).toBeGreaterThan(layout.lineHeight * 1.5);
+      // It stays expanded while the view repaints its title (a running command's output does every
+      // second)…
+      await page.evaluate((p) =>
+        (window as unknown as { setViewerTitle: (t: string, isPath: boolean) => void }).setViewerTitle(p, true), path);
+      await expect(title).toHaveAttribute("aria-expanded", "true");
+      await page.keyboard.press(" ");
+      await expect(title).toHaveAttribute("aria-expanded", "false");
+      // …and a newly opened view starts with its title collapsed.
+      await title.click();
+      await expect(title).toHaveAttribute("aria-expanded", "true");
+      await page.evaluate((p) =>
+        (window as unknown as { openDiffOverlay: (p: string, d: string) => void })
+          .openDiffOverlay(p, "@@ -1 +1 @@\n-old\n+new"), path);
+      await expect(title).toHaveAttribute("aria-expanded", "false");
+
+      // Details too long for one line wrap rather than being cut: what ends them can matter.
+      await page.evaluate(() => {
+        document.getElementById("codeMeta")!.textContent =
+          "⟳ Running · 12,345 lines · 1.2 MB · retained output truncated";
+      });
+      const meta = page.locator("#codeMeta");
+      expect(await meta.evaluate((el) => el.scrollWidth <= el.clientWidth)).toBe(true);
+
+      // With the word hidden, a copy's result shows as the icon, then goes back.
+      await page.locator("#codeCopyDiff").click();
+      await expect(page.locator("#codeCopyDiff")).toHaveAttribute("data-result", /^(ok|err)$/);
+      await expect(page.locator("#codeCopyDiff")).not.toHaveAttribute("data-result", /./, { timeout: 4_000 });
+    });
+
+    test("shows the view the Source button switches to as its icon", async ({ page }) => {
+      await openThreadWithReply(page);
+      await page.locator("#gitLineToggle").click();
+      await page.locator('.git-file[data-git-file="NOTES.md"]').click();
+      await expect(page.locator("#codeView .code-markdown")).toHaveCount(1);
+      const toggle = page.locator("#codeSourceToggle");
+      await expect(toggle).toHaveAccessibleName("Source");
+      await expect(toggle).toHaveAttribute("data-icon", "source");
+      await toggle.click();
+      await expect(toggle).toHaveAccessibleName("Rendered");
+      await expect(toggle).toHaveAttribute("data-icon", "rendered");
     });
   });
 });

@@ -38,7 +38,9 @@ test.describe("git status line", () => {
     // The whole row is the button: clicking it opens the existing diff overlay.
     await row.click();
     await expect(page.locator("#codeOverlay")).toHaveClass(/\bopen\b/);
-    await expect(page.locator("#codePath")).toHaveText("Diff: src/main.rs");
+    await expect(page.locator("#codePath")).toHaveText("src/main.rs");
+    // "Diff" leads the details line rather than the title, which a phone cuts at the start.
+    await expect(page.locator("#codeMeta")).toHaveText(/^Diff · \+\d+ −\d+ · \d+ lines$/);
   });
 
   // The row's own figures are the control that reviews them — there is no word to press — so the
@@ -53,7 +55,7 @@ test.describe("git status line", () => {
 
     await review.click();
     await expect(page.locator("#codeOverlay")).toHaveClass(/\bopen\b/);
-    await expect(page.locator("#codePath")).toHaveText("Diff: Working tree");
+    await expect(page.locator("#codePath")).toHaveText("Working tree");
     // Reviewing is not expanding: the figures open a diff, the branch beside them opens the list.
     await expect(page.locator("#gitLineBody")).toBeHidden();
   });
@@ -123,7 +125,7 @@ test.describe("git status line", () => {
     expect(box!.width).toBeGreaterThanOrEqual(34);
 
     await review.click();
-    await expect(page.locator("#codePath")).toHaveText("Diff: Working tree");
+    await expect(page.locator("#codePath")).toHaveText("Working tree");
   });
 
   // The commits the branch holds that its base does not — the seeded workspace has two, on top of
@@ -143,7 +145,8 @@ test.describe("git status line", () => {
     await commits.click();
     await expect(page.locator("#codeOverlay")).toHaveClass(/\bopen\b/);
     // Three dots, not two: the title names the range so it cannot be mistaken for the working tree.
-    await expect(page.locator("#codePath")).toHaveText("Diff: origin/main…HEAD (2 commits)");
+    await expect(page.locator("#codePath")).toHaveText("origin/main…HEAD");
+    await expect(page.locator("#codeMeta")).toHaveText(/^2 commits · /);
   });
 
   // Each commit is a row that opens into its own files, and each of those opens the diff of that
@@ -177,7 +180,9 @@ test.describe("git status line", () => {
 
     await file.click();
     await expect(page.locator("#codeOverlay")).toHaveClass(/\bopen\b/);
-    await expect(page.locator("#codePath")).toHaveText(`Diff: README.md at ${sha}`);
+    // The commit goes in the details line, so a title cut on a phone keeps it.
+    await expect(page.locator("#codePath")).toHaveText("README.md");
+    await expect(page.locator("#codeMeta")).toHaveText(new RegExp(`^Diff at ${sha} · `));
   });
 
   // The figures on a commit row follow the same rule as the figures on the line: they are the
@@ -191,9 +196,10 @@ test.describe("git status line", () => {
 
     await figures.click();
     await expect(page.locator("#codeOverlay")).toHaveClass(/\bopen\b/);
-    await expect(page.locator("#codePath")).toHaveText(
-      `Diff: ${sha} Document how to run the demo`,
-    );
+    await expect(page.locator("#codePath")).toHaveText("Document how to run the demo");
+    await expect(page.locator("#codeMeta")).toHaveText(new RegExp(`^Commit ${sha} · `));
+    // A commit message is cut at its end on a phone, not at its start like a path.
+    await expect(page.locator("#codePath")).not.toHaveClass(/\bpath-title\b/);
   });
 
   // Untracked entries are listed too, and the two kinds are not the same row: a file can be opened,
@@ -507,7 +513,7 @@ test.describe("git status line", () => {
     await expect(page.locator("#codeCopyDiff")).toHaveText("Copy failed");
 
     // The label goes back so the button is usable again rather than stuck on the error.
-    await expect(page.locator("#codeCopyDiff")).toHaveText("Copy diff", { timeout: 5_000 });
+    await expect(page.locator("#codeCopyDiff")).toHaveText("Copy", { timeout: 5_000 });
   });
 
   test("re-rendering an unchanged list keeps its rows", async ({ page }) => {
