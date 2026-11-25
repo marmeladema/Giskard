@@ -8,6 +8,11 @@ const WS_PROBLEM_NOTICE_INTERVAL_MS = 30000;
 const WS_BACKGROUND_CLOSE_GRACE_MS = 10000;
 const WS_FOREGROUND_PROBE_TIMEOUT_MS = 1200;
 const TRANSCRIPT_BOTTOM_STICKY_PX = 96;
+// How close to the end a transcript must be to count as *followed* when its box changes size — the
+// keyboard opening, the Git row arriving. Tighter than the sticky distance above, which decides
+// whether new rows carry the view along: a reader a few lines up is somewhere on purpose, and a
+// resize must not move them. See the transcript's ResizeObserver.
+const TRANSCRIPT_FOLLOWED_PX = 2;
 // Whether the composer is on a touch/coarse-pointer device (mobile keyboard). On touch there's no
 // Shift modifier reachable while typing, so the newline key fires a plain Enter; the composer must
 // let it insert a newline rather than sending the half-typed message. Detected once at load and
@@ -92,7 +97,7 @@ const COMPOSER_HINT = COMPOSER_IS_TOUCH
     // flex layout has reflowed. Leave readers who deliberately scrolled up exactly where they are.
     const followTranscriptBottom = !!(transcript
       && transcript.scrollHeight - transcript.scrollTop - transcript.clientHeight
-        <= TRANSCRIPT_BOTTOM_STICKY_PX);
+        <= TRANSCRIPT_FOLLOWED_PX);
     const scrollIntentAtResize = transcriptScrollIntent;
     // Use px (not vh) so it tracks the live visual viewport, not the layout viewport. Round to
     // avoid sub-pixel jitter from the fractional heights visualViewport reports. offsetTop is
@@ -2792,6 +2797,9 @@ function clearThreadView(tid) {
   state.pendingLiveSnapshotReconcile = false;
   resetGitState();
   resetRenderState();
+  // A view opens at its newest row; the scroll position the last one was left at says nothing
+  // about it, and replacing the content need not fire a scroll event that would say so.
+  transcriptFollowed = true;
   clearReasoningChoices();
   $("thrHeader").style.display="none"; $("composer").style.display="none";
   $("pickerBar").style.display="none"; closeModelPicker(); closeTurnPicker();
@@ -3353,6 +3361,9 @@ function openDraftThread(pid) {
   state.resyncStickBottom = false;
   state.pendingLiveSnapshotReconcile = false;
   resetRenderState();
+  // A view opens at its newest row; the scroll position the last one was left at says nothing
+  // about it, and replacing the content need not fire a scroll event that would say so.
+  transcriptFollowed = true;
   clearReasoningChoices();
   syncActiveThreadHighlight();   // state.threadId is null for a draft, so this clears any selection
   $("thrHeader").style.display="flex"; $("composer").style.display="flex";
@@ -3445,6 +3456,9 @@ async function openThread(pid, tid, title, opts) {
   state.awaitingIncrementalResync = false; state.resyncStickBottom = false;
   state.pendingLiveSnapshotReconcile = false;
   resetRenderState();
+  // A view opens at its newest row; the scroll position the last one was left at says nothing
+  // about it, and replacing the content need not fire a scroll event that would say so.
+  transcriptFollowed = true;
   clearReasoningChoices();
   syncActiveThreadHighlight();
   renderAllThreadActivityIndicators();
@@ -6389,6 +6403,37 @@ function scrollTranscriptToBottom() {
   const t = $("transcript");
   if (t) t.scrollTop = t.scrollHeight;
 }
+// The transcript also changes height while its content stays the same: the Git row arriving after
+// the view opened, a notice, a banner, the composer growing. A scroll box keeps its scrollTop across
+// a resize, not its distance from the bottom, so a followed transcript would let its newest row
+// slide behind whatever took the height. Whether it is followed is read from its own scroll events —
+// a resize fires none, so the flag still holds the state from before it — and kept after each one.
+//
+// "Followed" here means at the very bottom, not the looser "near it" that decides whether new rows
+// carry the view along: a reader a few lines up, or a row the app has just scrolled into view near
+// the end, is somewhere on purpose, and a keyboard opening must not move them.
+//
+// A resize can itself move the view: content sized to the box (a draft's placeholder) shrinks with
+// it, and the browser's scroll anchoring shifts scrollTop to keep what is on screen in place. That
+// scroll is not the reader's, and it reaches the scroll handler before the observer. So a scroll
+// made at a different box height from the last observed one only counts when reader input — the
+// same events syncAppHeight treats as intent — came before it; otherwise the observer settles it.
+let transcriptFollowed = true;
+let transcriptObservedHeight = $("transcript").clientHeight;
+let transcriptReaderInput = false;
+for (const type of ["wheel", "touchmove", "pointerdown", "keydown"]) {
+  $("transcript").addEventListener(type, () => { transcriptReaderInput = true; }, { passive:true });
+}
+$("transcript").addEventListener("scroll", () => {
+  const t = $("transcript");
+  if (t.clientHeight !== transcriptObservedHeight && !transcriptReaderInput) return;
+  transcriptReaderInput = false;
+  transcriptFollowed = t.scrollHeight - t.scrollTop - t.clientHeight <= TRANSCRIPT_FOLLOWED_PX;
+}, { passive:true });
+new ResizeObserver(() => {
+  transcriptObservedHeight = $("transcript").clientHeight;
+  if (transcriptFollowed) scrollTranscriptToBottom();
+}).observe($("transcript"));
 function keepTranscriptAtBottom(shouldStick) {
   if (!shouldStick || state.renderTarget) return;
   scrollTranscriptToBottom();

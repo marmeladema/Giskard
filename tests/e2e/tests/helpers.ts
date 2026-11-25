@@ -236,4 +236,8 @@ export async function login(page: Page, password: string = PASSWORD): Promise<vo
   await page.getByRole("button", { name: "Log in" }).click();
   // The shell only gets the `open` class after `/api/login` succeeds and startApp() runs.
   await expect(page.locator("#app")).toHaveClass(/open/);
+  // …which is before the project list has loaded. A test that counts projects, or plants cached
+  // state that load would then prune, races it unless it waits; the seeded "Demo" row is the sign
+  // it is done. Attached rather than visible: on a phone the list sits in the closed drawer.
+  await expect(page.locator(".proj", { hasText: "Demo" })).toBeAttached();
 }
