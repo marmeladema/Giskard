@@ -32,6 +32,11 @@ async function openDraft(page: Page) {
   if (await menuButton.isVisible()) await menuButton.click();
   await page.locator(".proj", { hasText: "Demo" }).locator(".project-add").click();
   await expect(page.locator("#input")).toBeVisible();
+  // The Git row above the composer arrives with its own request after the draft opens, and takes
+  // its height from the transcript. The app keeps a followed transcript pinned through that, but
+  // only on the next frame, so a measurement taken in between would see the gap. Demo is a
+  // repository, so the row always comes.
+  await expect(page.locator("#gitLine")).toBeVisible();
 }
 
 /** Inject a tall block into the transcript so it overflows and scrolls. */
@@ -224,6 +229,48 @@ test.describe("mobile title + status bars stay pinned at the top", () => {
     const tops = await barTops(page);
     expect(tops.mbTop).toBe(120);
     expect(tops.thTop).toBe(120 + tops.mbHeight);
+  });
+
+  // The keyboard keeps a transcript at its newest row there, but only one actually at it. A reader a
+  // few lines up — still close enough that new rows would carry them along — chose that position,
+  // and the keyboard opening must not take it away.
+  test("the keyboard leaves a reader a few lines from the end where they are (iOS Safari)", async ({ page }) => {
+    await openDraft(page);
+    await fillTallTranscript(page);
+
+    // Where the reader's text sits, measured from the transcript's top edge. scrollTop is not a
+    // fair measure: content sized to the box shrinks with it, and scroll anchoring adjusts scrollTop
+    // to keep what is on screen in place.
+    const readingAt = () => page.evaluate(() => {
+      const el = document.getElementById("transcript")!;
+      const filler = [...el.children].find((c) => c.textContent === "tall filler")!;
+      return Math.round(filler.getBoundingClientRect().top - el.getBoundingClientRect().top);
+    });
+    // Opening the draft queues a bottom pin for the next frame; let it run before placing the reader.
+    await page.evaluate(() => new Promise<void>((resolve) => {
+      requestAnimationFrame(() => requestAnimationFrame(() => resolve()));
+    }));
+    await page.evaluate(() => {
+      const el = document.getElementById("transcript")!;
+      el.scrollTop = el.scrollHeight - el.clientHeight - 50;
+    });
+    // Let the scroll event land before anything resizes.
+    await page.evaluate(() => new Promise(requestAnimationFrame));
+    expect(await transcriptBottomGap(page)).toBe(50);
+    const before = await readingAt();
+
+    await page.locator("#input").focus();
+    await simulateIOSKeyboard(page, 400);
+    await expect.poll(async () => await page.evaluate(() =>
+      Math.round((document.querySelector(".center") as HTMLElement).getBoundingClientRect().height),
+    )).toBeLessThan(500);
+    await page.evaluate(() => new Promise<void>((resolve) => {
+      requestAnimationFrame(() => requestAnimationFrame(() => resolve()));
+    }));
+
+    // Not taken to the end, and the text being read did not move.
+    expect(await transcriptBottomGap(page)).toBeGreaterThan(2);
+    expect(await readingAt()).toBe(before);
   });
 
   test("an intervening reader scroll overrides the queued bottom restoration", async ({ page }) => {

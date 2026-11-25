@@ -11,6 +11,33 @@ async function createThread(page: Page, message: string): Promise<string> {
   return tid as string;
 }
 
+/**
+ * Leave the thread for a draft, then wait for the project's thread list to settle.
+ *
+ * A thread's socket delivers catalog invalidations, and every completed turn sends one — which can
+ * land after the reply is on screen, since the server sends it from its own delivery path. Each one
+ * refetches the list, so a test that counts those requests must not share its window with one. So
+ * does the runtime overview, which names active threads server-wide: one this page has never listed
+ * — left waiting by an earlier test — schedules a refetch of every known list shortly after. A draft
+ * has no socket, so neither arrives once it is open; any refetch already started or scheduled, and
+ * any deletion still running in the project (whose progress refetches the list), is waited out here.
+ */
+async function leaveForDraft(page: Page, projectId: string): Promise<void> {
+  await page.locator(".proj", { hasText: "Demo" }).locator(".project-add").click();
+  await expect(page.locator("#transcript .draft-empty")).toBeVisible();
+  await page.waitForFunction((pid) => {
+    const app = (0, eval);
+    if (app("staleThreadListRefreshTimer") !== null) return false;
+    // A running deletion polls, and its progress refetches the list.
+    for (const entry of app("state").threadDeletions.values()) {
+      if (entry.pid === pid && entry.state === "running") return false;
+    }
+    const refresh = app("state").threadListRefreshes.get(pid);
+    return !refresh || (!refresh.promise && !refresh.retryTimer &&
+      refresh.appliedGeneration >= refresh.wantedGeneration);
+  }, projectId);
+}
+
 function nextRoute(): {
   promise: Promise<Route>;
   resolve: (route: Route) => void;
@@ -111,6 +138,7 @@ test.describe("thread metadata reconciliation", () => {
     const tid = await createThread(page, "Exercise catalog invalidation ordering.");
     const projectId = await page.locator(".thread.active").getAttribute("data-pid");
     expect(projectId).toBeTruthy();
+    await leaveForDraft(page, projectId!);
     const latest = await page.evaluate((threadId) => {
       const app = window as any;
       const current = app.composedThreadSummary(threadId);
@@ -144,6 +172,7 @@ test.describe("thread metadata reconciliation", () => {
     const tid = await createThread(page, "Exercise catalog retry.");
     const projectId = await page.locator(".thread.active").getAttribute("data-pid");
     expect(projectId).toBeTruthy();
+    await leaveForDraft(page, projectId!);
     const latest = await page.evaluate((threadId) => {
       const app = window as any;
       const current = app.composedThreadSummary(threadId);
@@ -171,6 +200,7 @@ test.describe("thread metadata reconciliation", () => {
     const tid = await createThread(page, "Exercise malformed catalog recovery.");
     const projectId = await page.locator(".thread.active").getAttribute("data-pid");
     expect(projectId).toBeTruthy();
+    await leaveForDraft(page, projectId!);
     const current = await page.evaluate((threadId) =>
       (window as any).composedThreadSummary(threadId), tid,
     );

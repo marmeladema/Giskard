@@ -652,6 +652,14 @@ async fn list_threads(
     State(state): State<AppState>,
     AxumPath(project_id): AxumPath<ProjectId>,
 ) -> Result<Json<ListThreadsResponse>, ApiError> {
+    // Deletion records are read on both sides of the thread reads, and a listed thread carries one
+    // if either read found it. A deletion that finishes in between removes the thread first and its
+    // record second, so a read taken only after could list the thread with no deletion running; one
+    // that starts in between registers its record after a read taken only before. Either way the
+    // response would show a state that never existed, and the browser, which takes the list as
+    // authoritative, would drop its own record and stop polling — leaving the row behind in a tab
+    // with no socket open, such as the draft that replaces a deleted open thread.
+    let mut deletions_before = state.thread_deletions.project_progress(project_id);
     let thread_ids = state.store.list_threads(project_id).await?;
     let mut loaded = Vec::new();
     for tid in thread_ids {
@@ -691,7 +699,7 @@ async fn list_threads(
         .load_project(project_id)
         .await?
         .ok_or(ApiError::NotFound)?;
-    let mut deletions = state.thread_deletions.project_progress(project_id);
+    let mut deletions_after = state.thread_deletions.project_progress(project_id);
     let mut threads = Vec::with_capacity(loaded.len());
     for thread in &loaded {
         if thread.kind == ThreadKind::Orphan {
@@ -699,7 +707,10 @@ async fn list_threads(
         }
         let workspace_root = effective_workspace_root(&state.store, &project, thread).await?;
         let mut summary = thread_summary(thread, workspace_root);
-        summary.deletion = deletions.remove(&thread.id);
+        // The later read is the more current one when both have a record.
+        summary.deletion = deletions_after
+            .remove(&thread.id)
+            .or_else(|| deletions_before.remove(&thread.id));
         threads.push(summary);
     }
     threads.sort_by_key(|t| std::cmp::Reverse(t.updated_at));

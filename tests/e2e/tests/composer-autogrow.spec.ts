@@ -27,6 +27,11 @@ async function openDraftComposer(page: Page) {
   await page.locator(".proj", { hasText: "Demo" }).locator(".project-add").click();
   const input = page.locator("#input");
   await expect(input).toBeVisible();
+  // The Git row above the composer arrives with its own request after the draft opens, and takes
+  // its height from the transcript. The app keeps a followed transcript pinned through that, but
+  // only on the next frame, so a measurement taken in between would see the gap. Demo is a
+  // repository, so the row always comes.
+  await expect(page.locator("#gitLine")).toBeVisible();
   return input;
 }
 
@@ -156,6 +161,60 @@ test.describe("composer auto-grow (desktop)", () => {
     // row would slide out of view behind the growing box.
     await input.fill(MANY_LINES);
     await expect.poll(async () => transcriptBottomGap(page)).toBeLessThanOrEqual(1);
+  });
+
+  // Anything that takes height from the transcript does the same, not only the composer. The Git
+  // row is the one that arrives late: it waits on its own request, and lands after the transcript
+  // has been scrolled to its newest row whenever that request is the slower one. It is held here
+  // until then, so the case is exercised every run rather than by chance.
+  test("a transcript following its newest row keeps following it when the Git row arrives", async ({ page }) => {
+    let release!: () => void;
+    const held = new Promise<void>((resolve) => { release = resolve; });
+    let requested = false;
+    await page.route(/\/git\/status/, async (route) => {
+      requested = true;
+      await held;
+      await route.fallback();
+    });
+    try {
+      await page.locator(".proj", { hasText: "Demo" }).locator(".project-add").click();
+      await expect(page.locator("#input")).toBeVisible();
+      await expect.poll(() => requested).toBe(true);
+      await expect(page.locator("#gitLine")).toBeHidden();
+
+      await page.evaluate(() => {
+        const t = document.getElementById("transcript")!;
+        const filler = document.createElement("div");
+        filler.style.height = "4000px";
+        t.appendChild(filler);
+        t.scrollTop = t.scrollHeight;
+      });
+      expect(await transcriptBottomGap(page)).toBeLessThanOrEqual(1);
+    } finally {
+      // Released however the above ends, so a failure cannot leave the request hanging.
+      release();
+    }
+    await expect(page.locator("#gitLine")).toBeVisible();
+    await expect.poll(async () => transcriptBottomGap(page)).toBeLessThanOrEqual(1);
+
+    // A transcript the reader scrolled back through is left where they put it — even a few lines
+    // back, close enough to the end that new rows would still carry it along.
+    const resized = async (hidden: boolean) => {
+      await page.evaluate((h) => { document.getElementById("gitLine")!.hidden = h; }, hidden);
+      await page.evaluate(() => new Promise(requestAnimationFrame));
+      await page.evaluate(() => new Promise(requestAnimationFrame));
+    };
+    for (const back of [4000, 40]) {
+      const top = await page.evaluate((b) => {
+        const t = document.getElementById("transcript")!;
+        t.scrollTop = Math.max(0, t.scrollHeight - t.clientHeight - b);
+        return t.scrollTop;
+      }, back);
+      await page.evaluate(() => new Promise(requestAnimationFrame));
+      await resized(true);
+      await resized(false);
+      expect(await page.evaluate(() => document.getElementById("transcript")!.scrollTop)).toBe(top);
+    }
   });
 
   test("restores the height of a draft when switching back to it", async ({ page }) => {
