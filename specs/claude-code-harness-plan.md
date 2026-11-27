@@ -17,6 +17,12 @@ the control channel, resume scope — so treat these facts as carrying a version
 `system/init.capabilities` to feature-detect rather than comparing version strings, and re-check
 before shipping against a much later CLI (§12).
 
+> **Amendment (turn steering, step 0).** Compatibility with old CLIs is not a goal: the adapter
+> refuses a Claude Code older than a minimum version (2.1.330) at the handshake, reading
+> `claude_code_version` from the `initialize` answer. Feature detection stays the rule for
+> anything above the floor. See
+> [`claude-code-harness-plan/turn-steering-plan.md`](claude-code-harness-plan/turn-steering-plan.md) §1.
+
 Section references written as "spec §X" point at `specs/giskard-specification.md`; bare "§X" refers to
 this document.
 
