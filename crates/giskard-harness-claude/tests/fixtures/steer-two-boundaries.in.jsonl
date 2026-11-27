@@ -1,0 +1,3 @@
+{"type": "user", "uuid": "86d8a1cc-ca63-4b59-a48c-3d2d8de8e9a0", "message": {"role": "user", "content": [{"type": "text", "text": "Run this exact Bash command: `sleep 5 && cat data.txt`. When it has finished, run the Bash command `sleep 5 && echo N`, with N replaced by the number its output gives. Then reply DONE."}]}}
+{"type": "user", "uuid": "18283b22-5122-4fc2-afa9-a84f31dbd372", "message": {"role": "user", "content": [{"type": "text", "text": "Also say APPLE at the end."}]}}
+{"type": "user", "uuid": "3d72ec28-c5bd-4657-b992-af9e954024a4", "message": {"role": "user", "content": [{"type": "text", "text": "Also say BANANA at the end."}]}}

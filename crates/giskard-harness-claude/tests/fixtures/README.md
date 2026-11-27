@@ -5,7 +5,7 @@ Stream-json transcripts recorded against **Claude Code 2.1.286** (the two `subag
 `prompt-not-replayed` and the `mcp-status` scenarios against **2.1.287**, the two `forked-skill*`
 against **2.1.289**, the three `delegation-background*`, the six sub-agent resume scenarios
 `subagent-resume*` and `subagent-message-running` against **2.1.306**, the two `lifecycle-*`
-against **2.1.330**) by driving a real
+and the twelve `steer-*` against **2.1.332**) by driving a real
 `claude -p` child over a stdio pipe, for the mapper tests of
 [`specs/claude-code-harness-plan.md`](../../../../specs/claude-code-harness-plan.md) (§11). They
 live in `crates/giskard-harness-claude/tests/fixtures/`, where the mapper tests read them.
@@ -23,8 +23,12 @@ Every scenario ran with `--model haiku`, `--permission-prompt-tool stdio`, `--se
 (the `forked-skill*` scenarios: `project`, since the CLI loads no project skill without it),
 a fresh `--session-id`, a throwaway working directory holding one file `data.txt` whose content is
 `the magic number is 4271`, and an environment reduced to `PATH`, `HOME` and the variables that
-carry authentication. The recorder answered every `can_use_tool` per the scenario's policy below and
-closed stdin when the scenario's stop condition was met.
+carry authentication. The `lifecycle-*` and `steer-*` scenarios also set
+`ENABLE_CLAUDEAI_MCP_SERVERS=false`, so the recording account's claude.ai connectors appear
+neither in a re-emitted `init` nor in what the model reads (a compaction summary would name
+them), and stamp every stdin `user` line with a `uuid`; the `steer-*` scenarios also pass
+`--forward-subagent-text`, as the adapter does. The recorder answered every `can_use_tool` per
+the scenario's policy below and closed stdin when the scenario's stop condition was met.
 
 | Scenario | Mode | What it exercises | Policy / stop |
 | --- | --- | --- | --- |
@@ -62,6 +66,18 @@ closed stdin when the scenario's stop condition was met.
 | `subagent-resume-respawn-first`, `subagent-resume-respawn` | acceptEdits, `--forward-subagent-text`; two processes on one session | a foreground delegation in a first process (`--session-id`, 1 result, then stdin closed: as a reap), then a second process with `--resume <session>` whose message makes the model call `SendMessage` (line 8): its `task_started` names a task this process never saw (line 10), and the run's frames name the **first process's** `Agent` call (lines 12–13). Each file holds one process's lines; the `-first` meta's argv is the first launch | 1 result; 2 results, then 30 s quiet |
 | `lifecycle-prompt` | manual, `--include-partial-messages`, uuid-stamped `user` lines | a text turn, then `/compact`, each line carrying a top-level `uuid`: its `command_lifecycle` `queued` and `started` (lines 1–2) **before** the turn's `init` (3), `completed` (14) **after** the `result` (13), whose `user_message_uuids` names the prompt; for `/compact`, `queued` and `started` (15–16) seconds before its `init` (19), which comes only once compaction is done, then `compact_boundary`, the `result` (23) and `completed` (24). The `init` advertises `msg_lifecycle_v1` | 2 results |
 | `lifecycle-interrupted` | manual, `--include-partial-messages`, a uuid-stamped `user` line | a looping `Bash` command, its ask answered allow, then `interrupt` 4 s later while it runs: the rejection `tool_result`, the interruption marker, an `aborted_tools` result (29), then the prompt's `command_lifecycle` **`cancelled`** (30), not `completed` | allow; interrupt; 1 result |
+| `steer-folded` | manual, `--include-partial-messages` | a steer written 1 s into a `sleep 6` call: `queued` (19), **`started` right after the call's `tool_result`** (22–23), its `completed` (33) before the turn's single `result` (34), which lists `[P, S]`; the prompt's `completed` after it (35) | auto-allowed; 1 result |
+| `steer-folded-two` | as `steer-folded` | two steers written back to back during the call: both `queued` (19–20), both `started` at the same boundary (24–25), one reply honouring both, one `result` (47) | 1 result |
+| `steer-two-boundaries` | as `steer-folded` | a turn with two sequential calls (the second needs the first's output): one steer during each, each `started` at its own boundary (25, 46), one `result` (73) listing `[P, S1, S2]` | 1 result |
+| `steer-during-ask` | manual, `--include-partial-messages` | a steer written while a `touch` ask (15) waits; the answer, then `started` right after the `tool_result` (20–21); one `result` (31) | allow after 2 s; 1 result |
+| `steer-subagent` | manual, `--include-partial-messages`, `--forward-subagent-text`, `CLAUDE_CODE_DISABLE_BACKGROUND_TASKS=1` (the model may otherwise background the delegation) | a steer written while a foreground `Agent` sub-agent runs its `Bash` call (`task_started` 20, steer `queued` 27): not delivered to the sub-agent; `started` after the parent's `Agent` `tool_result` (33–34); one `result` (51) | 1 result |
+| `steer-next-turn` | manual, `--include-partial-messages` | a steer written while a no-tool answer streams (`queued` 9): the turn ends without it (`result` 100, prompt `completed` 101), then the steer `started` (102), a new `init` (103) and **the next turn** answering it (`result` 120, listing `[S]`) | 2 results |
+| `steer-next-turn-merged` | as `steer-next-turn` | two steers during the answer (9–10): both `started` together after the `result` (96–97), **one** next turn (`result` 108, listing `[S1, S2]`) | 2 results |
+| `steer-slash` | manual, `--include-partial-messages` | `/compact` written as a steer during a `Bash` call (19): **never taken in**; the turn ends (`result` 31), then it starts as the next turn (33) and runs as the command (`init` 36, `compact_boundary` 37, `result` 40) | 2 results |
+| `steer-withdrawn-interrupt` | manual, `--include-partial-messages` | a steer queued during a call (19), then `cancel_async_message` and a plain `interrupt` written back to back: `cancelled` (20), `{"cancelled": true, …}` (21), `{"still_queued": []}` (22), an `aborted_tools` result (25); nothing runs after | withdraw + interrupt; 1 result |
+| `steer-withdrawn-cancel` | manual, `--include-partial-messages` | a steer queued while a `touch` ask (16) waits, then `cancel_async_message` and the ask answered deny with `interrupt: true`: `cancelled` (21), `{"cancelled": true, …}` (22), an `aborted_tools` result (25); nothing runs after | withdraw + deny; 1 result |
+| `steer-folded-interrupted` | manual, `--include-partial-messages` | a steer taken in after a first call (`started` 25), then `interrupt` during a second `sleep 20` call (answer 50): the steer `cancelled` (53) before the `aborted_tools` result (54), which lists `[P, S]` | interrupt; 1 result |
+| `steer-stop-late` | manual, `--include-partial-messages` | a steer queued after a call's `tool_result` (23), then `cancel_async_message` and `interrupt` sent at the final `message_delta`: the turn ends `completed` (54), the steer `started` as the next turn (56), the withdrawal answers `{"cancelled": false}` (59), and the `interrupt` aborts the steer's turn at once (`aborted_streaming` result 62, steer `cancelled` 63) | withdraw + interrupt at `end_turn`; 2 results |
 | `autocompact-state` | — | the two top-level frames `active_goal` and `autocompact_state` a session emits before its first turn in some environments; two frames only, recorded separately with an environment that sets autocompact overrides | — |
 
 ## Sanitization

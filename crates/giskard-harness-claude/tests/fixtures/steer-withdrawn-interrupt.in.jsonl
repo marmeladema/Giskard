@@ -1,0 +1,4 @@
+{"type": "user", "uuid": "3d2b0451-06b7-4321-8ae1-5507339fe7ee", "message": {"role": "user", "content": [{"type": "text", "text": "Run this exact Bash command: `sleep 6 && echo slept`, then reply DONE."}]}}
+{"type": "user", "uuid": "58174dae-cc84-43e6-a5ce-d51eec5fc81f", "message": {"role": "user", "content": [{"type": "text", "text": "Also say the word KIWI."}]}}
+{"type": "control_request", "request_id": "64e5cf43-4cde-4daf-a1f5-91c3cee52b50", "request": {"subtype": "cancel_async_message", "message_uuid": "58174dae-cc84-43e6-a5ce-d51eec5fc81f"}}
+{"type": "control_request", "request_id": "d3c8d17e-d2ad-4015-b5be-8ceca3b2a76d", "request": {"subtype": "interrupt"}}

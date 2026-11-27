@@ -1,0 +1,4 @@
+{"type": "user", "uuid": "f9a506da-6b5e-49a4-8ffc-820873ebfee2", "message": {"role": "user", "content": [{"type": "text", "text": "Run this exact Bash command: `touch probe.txt`, then reply DONE."}]}}
+{"type": "user", "uuid": "f1d55795-4196-437c-9067-39d5f70b0418", "message": {"role": "user", "content": [{"type": "text", "text": "Also say the word KIWI."}]}}
+{"type": "control_request", "request_id": "db76759c-33cd-4eac-903f-546e48951e99", "request": {"subtype": "cancel_async_message", "message_uuid": "f1d55795-4196-437c-9067-39d5f70b0418"}}
+{"type": "control_response", "response": {"subtype": "success", "request_id": "62f6bbf0-1054-48d6-88d5-3bf62e25abf3", "response": {"behavior": "deny", "message": "Cancelled by the user in Giskard", "interrupt": true}}}

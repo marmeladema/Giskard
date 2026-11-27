@@ -1,3 +1,3 @@
-{"type": "user", "uuid": "39bf4b15-e1ff-4fab-b72b-febfea6f8f2b", "message": {"role": "user", "content": [{"type": "text", "text": "Run this exact Bash command: `for i in 1 2 3 4 5 6; do echo line $i; sleep 5; done`, then reply done."}]}}
-{"type": "control_response", "response": {"subtype": "success", "request_id": "f1408177-414a-4d5d-a921-db3a28162453", "response": {"behavior": "allow"}}}
-{"type": "control_request", "request_id": "f7d22947-6840-4fb3-b1a1-81328afd91f2", "request": {"subtype": "interrupt"}}
+{"type": "user", "uuid": "3750206b-85f1-40ba-b803-b9ee2d416cc7", "message": {"role": "user", "content": [{"type": "text", "text": "Run this exact Bash command: `for i in 1 2 3 4 5 6; do echo line $i; sleep 5; done`, then reply done."}]}}
+{"type": "control_response", "response": {"subtype": "success", "request_id": "a7a4b187-135c-4cc2-8aa4-0fdb74f9ba2b", "response": {"behavior": "allow"}}}
+{"type": "control_request", "request_id": "38d5e71f-9134-4190-9623-0eba3a7eeb12", "request": {"subtype": "interrupt"}}

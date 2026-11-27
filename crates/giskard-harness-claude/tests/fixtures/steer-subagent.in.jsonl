@@ -1,0 +1,2 @@
+{"type": "user", "uuid": "b4bf328e-2816-4231-8ff1-8bdceb502825", "message": {"role": "user", "content": [{"type": "text", "text": "Use the Agent tool (subagent_type general-purpose) with this prompt: 'Run this exact Bash command: `sleep 6 && echo ok`, then reply OK.' Then reply DONE."}]}}
+{"type": "user", "uuid": "34bcb485-09d1-4b5f-991a-ca2e398def56", "message": {"role": "user", "content": [{"type": "text", "text": "Also say the word KIWI at the very end of your final reply."}]}}
