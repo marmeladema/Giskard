@@ -1067,6 +1067,10 @@ impl ClaudeHarness {
         )
         .await?;
         let reply = InitializeReply::from_value(&reply);
+        if let Err(error) = check_claude_code_version(reply.claude_code_version.as_deref()) {
+            reap(child.as_mut()).await;
+            return Err(error);
+        }
         let snapshot = self.store_catalog(reply.models.as_deref().unwrap_or_default(), "probe");
         let answer = match follow_up {
             Some(body) => Some(
@@ -1294,12 +1298,62 @@ async fn reap(child: &mut dyn ClaudeChild) -> ChildExit {
     child.wait().await
 }
 
+/// The oldest Claude Code release the adapter runs: the protocol it relies on (per-message
+/// `command_lifecycle`, `cancel_async_message`, the interrupt receipt) was verified on it, and an
+/// older one is refused at the handshake rather than half-supported.
+pub(crate) const MIN_CLAUDE_CODE_VERSION: &str = "2.1.330";
+
 /// The parts of the `initialize` response the adapter reads; unknown keys are ignored.
 #[derive(Debug, Default, Deserialize)]
 struct InitializeReply {
     models: Option<Vec<Value>>,
     current_permission_mode: Option<String>,
     pid: Option<u32>,
+    /// Absent from the 2.1.286 recording; 2.1.330 and later report it.
+    claude_code_version: Option<String>,
+}
+
+/// `major.minor.patch` of a version string; a pre-release or build suffix after the patch
+/// number is ignored (`2.1.332-beta.1` reads as 2.1.332).
+fn parse_version(version: &str) -> Option<(u64, u64, u64)> {
+    let mut parts = version.trim().splitn(3, '.');
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next()?.parse().ok()?;
+    let patch = parts.next()?;
+    let digits = patch
+        .find(|c: char| !c.is_ascii_digit())
+        .map_or(patch, |end| &patch[..end]);
+    Some((major, minor, digits.parse().ok()?))
+}
+
+/// Refuse a CLI older than `MIN_CLAUDE_CODE_VERSION`, or one that does not say its version (only
+/// releases older than the minimum omit it from `initialize`).
+fn check_claude_code_version(reported: Option<&str>) -> Result<(), HarnessError> {
+    let minimum = parse_version(MIN_CLAUDE_CODE_VERSION);
+    let found = reported.and_then(parse_version);
+    match (found, minimum) {
+        (Some(found), Some(minimum)) if found >= minimum => Ok(()),
+        _ => {
+            let message = match reported {
+                Some(version) => format!(
+                    "Claude Code {version} is not supported; Giskard needs Claude Code \
+                     {MIN_CLAUDE_CODE_VERSION} or later (run `claude update`)"
+                ),
+                None => format!(
+                    "Claude Code did not report its version, so it predates \
+                     {MIN_CLAUDE_CODE_VERSION}; Giskard needs Claude Code \
+                     {MIN_CLAUDE_CODE_VERSION} or later (run `claude update`)"
+                ),
+            };
+            warn!(
+                action = "claude_version",
+                claude_code_version = display_opt(reported),
+                minimum = MIN_CLAUDE_CODE_VERSION,
+                "refusing a Claude Code release older than the supported minimum"
+            );
+            Err(HarnessError::Unsupported(message))
+        }
+    }
 }
 
 impl InitializeReply {
@@ -1501,6 +1555,16 @@ async fn handshake(
             ))));
         }
     };
+
+    if let Err(error) = check_claude_code_version(reply.claude_code_version.as_deref()) {
+        reap(child).await;
+        return Err(HandshakeFailure::Error(error));
+    }
+    debug!(
+        action = "handshake",
+        claude_code_version = display_opt(reply.claude_code_version.as_deref()),
+        "Claude Code answered initialize"
+    );
 
     // No turn runs before this: nothing reaches stdout before the first user message, and every
     // turn sets its own mode. A bypass-launched child that cannot leave bypass is never used.
@@ -2164,9 +2228,11 @@ impl AgentHarness for ClaudeHarness {
         overrides: TurnOverrides,
     ) -> Result<TurnId, HarnessError> {
         let UserInput::Text { text, attachments } = input;
+        let command_uuid = uuid::Uuid::new_v4().to_string();
         let line = UserLine {
-            line: user_message_line(&text, &attachments)?,
+            line: user_message_line(&text, &attachments, &command_uuid)?,
             prompt: text,
+            command_uuid,
         };
         let turn = TurnId::new();
         let mode = turn_mode(&overrides);
@@ -2475,6 +2541,9 @@ mod tests {
     }
 
     /// The `initialize` fixture's own response payload (its `models` populate the catalog).
+    /// The version every scripted `initialize` reports (as `tests/fake-claude.sh` does).
+    const TEST_CLAUDE_CODE_VERSION: &str = "2.1.332";
+
     fn initialize_payload() -> Value {
         let path = format!(
             "{}/tests/fixtures/initialize.out.jsonl",
@@ -2482,7 +2551,10 @@ mod tests {
         );
         let text = std::fs::read_to_string(path).unwrap();
         let first: Value = serde_json::from_str(text.lines().next().unwrap()).unwrap();
-        first["response"]["response"].clone()
+        let mut payload = first["response"]["response"].clone();
+        // The recording (2.1.286) predates the field; the adapter refuses a reply without it.
+        payload["claude_code_version"] = json!(TEST_CLAUDE_CODE_VERSION);
+        payload
     }
 
     fn settings(applied: &str) -> Value {
@@ -2516,6 +2588,18 @@ mod tests {
             .iter()
             .map(|line| serde_json::from_str(line).unwrap())
             .collect()
+    }
+
+    /// A written `user` line without its command uuid, which must be a fresh v4 UUID.
+    fn without_command_uuid(mut message: Value) -> Value {
+        let uuid = message
+            .as_object_mut()
+            .and_then(|object| object.remove("uuid"))
+            .and_then(|uuid| uuid.as_str().map(str::to_owned))
+            .expect("a user line carries its command uuid");
+        let parsed = uuid::Uuid::parse_str(&uuid).expect("the command uuid is a UUID");
+        assert_eq!(parsed.get_version_num(), 4, "{uuid}");
+        message
     }
 
     fn missing_transcript_exit() -> Action {
@@ -2647,6 +2731,80 @@ mod tests {
             "requested=sonnet",
             "applied=claude-opus-5-5",
         ]));
+        harness.shutdown().await.unwrap();
+    }
+
+    // ---- the minimum Claude Code version --------------------------------------------------------
+
+    #[test]
+    fn versions_compare_by_number_and_ignore_a_suffix() {
+        assert_eq!(parse_version("2.1.330"), Some((2, 1, 330)));
+        assert_eq!(parse_version(" 2.1.332-beta.1 "), Some((2, 1, 332)));
+        assert_eq!(parse_version("2.1"), None);
+        assert_eq!(parse_version("two.1.3"), None);
+        assert!(check_claude_code_version(Some(MIN_CLAUDE_CODE_VERSION)).is_ok());
+        assert!(check_claude_code_version(Some("2.1.332")).is_ok());
+        // 2.1.1000 is newer than 2.1.330: numbers, not strings.
+        assert!(check_claude_code_version(Some("2.1.1000")).is_ok());
+        assert!(check_claude_code_version(Some("3.0.0")).is_ok());
+        assert!(matches!(
+            check_claude_code_version(Some("2.1.329")),
+            Err(HarnessError::Unsupported(message))
+                if message.contains("2.1.329") && message.contains("2.1.330 or later")
+        ));
+        assert!(matches!(
+            check_claude_code_version(None),
+            Err(HarnessError::Unsupported(message)) if message.contains("did not report")
+        ));
+        assert!(matches!(
+            check_claude_code_version(Some("nightly")),
+            Err(HarnessError::Unsupported(message)) if message.contains("nightly")
+        ));
+    }
+
+    #[tokio::test]
+    #[traced_test]
+    async fn an_older_claude_code_is_refused_at_the_handshake() {
+        let mut payload = initialize_payload();
+        payload["claude_code_version"] = json!("2.1.329");
+        let (child, record) = ScriptedChild::new(vec![Step::OnStdin(
+            control("initialize"),
+            vec![Action::Respond(payload)],
+        )]);
+        let (harness, _) = harness(vec![child]);
+        let (options, _updates) = open_options(ThreadId::new(), None, "sonnet");
+        let error = harness.open_thread(options).await.unwrap_err();
+        assert!(
+            matches!(&error, HarnessError::Unsupported(message)
+                if message.contains("Claude Code 2.1.329 is not supported")),
+            "{error}"
+        );
+        // Nothing after `initialize`: the child is reaped before any mode is set.
+        assert_eq!(written(&record).len(), 1);
+        assert!(lock(&record).stdin_closed);
+        logs_assert(a_line_with(&[
+            r#"action="claude_version""#,
+            "claude_code_version=2.1.329",
+        ]));
+        harness.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn the_model_probe_refuses_an_older_claude_code() {
+        let mut payload = initialize_payload();
+        payload
+            .as_object_mut()
+            .unwrap()
+            .remove("claude_code_version");
+        let (probe, _) = ScriptedChild::new(vec![Step::OnStdin(
+            control("initialize"),
+            vec![Action::Respond(payload)],
+        )]);
+        let (harness, _) = harness(vec![probe]);
+        assert!(matches!(
+            harness.list_models().await,
+            Err(HarnessError::Unsupported(message)) if message.contains("did not report")
+        ));
         harness.shutdown().await.unwrap();
     }
 
@@ -2793,7 +2951,7 @@ mod tests {
         assert!(usage_models.iter().all(|m| *m == Some(model("sonnet"))));
         assert_eq!(completion(&events), (turn, TurnStatusKind::Completed, None));
 
-        let message = written(&record).pop().unwrap();
+        let message = without_command_uuid(written(&record).pop().unwrap());
         assert_eq!(
             message,
             json!({"type": "user", "message": {"role": "user", "content": [
@@ -2838,6 +2996,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[traced_test]
     async fn interrupt_resolves_on_the_control_response_and_the_turn_ends_interrupted() {
         let (child, record) = scripted(
             handshake_steps("sonnet"),
@@ -2846,7 +3005,7 @@ mod tests {
                 Step::OnStdin(
                     control("interrupt"),
                     vec![
-                        Action::Respond(json!({"still_queued": []})),
+                        Action::Respond(json!({"still_queued": ["c-left"], "cancelled": []})),
                         Action::EmitFixture {
                             name: "cancel",
                             skip_types: &["control_request"],
@@ -2874,6 +3033,12 @@ mod tests {
         assert_eq!(last["type"], "control_request");
         assert_eq!(last["request"], json!({"subtype": "interrupt"}));
         assert!(uuid::Uuid::parse_str(last["request_id"].as_str().unwrap()).is_ok());
+        // The receipt's counts, never its uuids.
+        logs_assert(lines_with(
+            1,
+            &["interrupt answered", "still_queued=1", "cancelled=0"],
+        ));
+        logs_assert(no_line_with("c-left"));
         harness.shutdown().await.unwrap();
     }
 
@@ -5057,7 +5222,7 @@ mod tests {
         // No per-turn settings for a compaction turn: only the message.
         assert_eq!(subtypes_written(&record).len(), before);
         assert_eq!(
-            written(&record).pop().unwrap(),
+            without_command_uuid(written(&record).pop().unwrap()),
             json!({"type": "user", "message": {"role": "user", "content": [
                 {"type": "text", "text": "/compact"}
             ]}})
@@ -6137,6 +6302,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[traced_test]
     async fn a_real_child_handshakes_and_completes_a_turn() {
         let (harness, workspace) = real_harness(&[]);
         let (options, _updates) = real_options(&workspace, None);
@@ -6161,10 +6327,35 @@ mod tests {
             })
             .collect();
         assert_eq!(messages, ["pong?"]);
+        // The stamped prompt's lifecycle frames are mapped, not skipped as unknown.
+        logs_assert(lines_with(
+            1,
+            &[r#"action="command_started""#, r#"command_kind="prompt""#],
+        ));
+        logs_assert(no_line_with("does not know"));
         harness.interrupt(&handle).await.unwrap();
         harness.set_thread_name(&handle, "named").await.unwrap();
         harness.shutdown().await.unwrap();
         assert!(matches!(stream.recv().await, Err(EventStreamError::Closed)));
+        // `completed` follows the turn's `result`; the stop read stdout to its end.
+        logs_assert(lines_with(1, &[r#"action="command_completed""#]));
+    }
+
+    #[tokio::test]
+    async fn a_real_child_too_old_or_unversioned_is_refused() {
+        for (version, expected) in [
+            ("2.1.286", "Claude Code 2.1.286 is not supported"),
+            ("none", "did not report its version"),
+        ] {
+            let (harness, workspace) = real_harness(&[("FAKE_CLAUDE_VERSION", version)]);
+            let (options, _updates) = real_options(&workspace, None);
+            let error = harness.open_thread(options).await.unwrap_err();
+            assert!(
+                matches!(&error, HarnessError::Unsupported(message) if message.contains(expected)),
+                "{version}: {error}"
+            );
+            harness.shutdown().await.unwrap();
+        }
     }
 
     #[tokio::test]

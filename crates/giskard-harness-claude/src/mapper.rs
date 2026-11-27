@@ -12,11 +12,11 @@ use std::sync::Arc;
 use chrono::Utc;
 use claude_codes::io::{AssistantMessage, AssistantUsage, ResultMessage, UserMessage};
 use claude_codes::{
-    ApiKeySource, ApiRetryMessage, CompactBoundaryMessage, ContentBlock, InitMessage,
-    PermissionDeniedMessage, RateLimitEvent, RateLimitStatus, StatusMessage,
-    TaskNotificationMessage, TaskStartedMessage, TaskStatus, TaskType, TaskUpdatedMessage,
-    ToolPermissionRequest, ToolResultBlock, ToolResultContent, ToolResultMeta, ToolUseBlock,
-    UsageInfo,
+    ApiKeySource, ApiRetryMessage, CommandLifecycleMessage, CommandLifecycleState,
+    CompactBoundaryMessage, ContentBlock, InitMessage, PermissionDeniedMessage, RateLimitEvent,
+    RateLimitStatus, StatusMessage, TaskNotificationMessage, TaskStartedMessage, TaskStatus,
+    TaskType, TaskUpdatedMessage, ToolPermissionRequest, ToolResultBlock, ToolResultContent,
+    ToolResultMeta, ToolUseBlock, UsageInfo,
 };
 use giskard_core::approval::{ApprovalDecision, ApprovalKind, ApprovalMetadata, ApprovalRequest};
 use giskard_core::event::AgentEvent;
@@ -55,6 +55,12 @@ const INHERIT_MODEL: &str = "inherit";
 const SYNTHETIC_MODEL: &str = "<synthetic>";
 /// `result.origin.kind` of the turn the CLI runs on its own once a background task ended.
 const TASK_NOTIFICATION_ORIGIN: &str = "task-notification";
+/// The `system/init` capability that says the CLI emits `command_lifecycle` frames for a stdin
+/// message carrying a `uuid`.
+const LIFECYCLE_CAPABILITY: &str = "msg_lifecycle_v1";
+/// The terminal `command_lifecycle` state 2.1.330 added after the crate's enum: the session's
+/// receive-side policy declined the message before it entered the queue.
+const REFUSED_STATE: &str = "refused";
 
 /// Where a frame's items belong: the child process's own thread, or a sub-agent route.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -90,6 +96,33 @@ pub enum TurnKind {
     User,
     /// A `/compact` the adapter wrote for `compact_thread`.
     Compaction,
+}
+
+/// What a stdin message the adapter stamped with a `uuid` was.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommandKind {
+    /// A turn's prompt (`start_turn`).
+    Prompt,
+    /// The `/compact` line of a compaction turn.
+    Compact,
+}
+
+impl CommandKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            CommandKind::Prompt => "prompt",
+            CommandKind::Compact => "compact",
+        }
+    }
+}
+
+/// One stdin message the CLI may still report on (`SessionState::commands`).
+struct CommandEntry {
+    /// The turn the adapter opened for it.
+    turn: TurnId,
+    kind: CommandKind,
+    /// Its `started` arrived: the CLI took it into a turn.
+    started: bool,
 }
 
 /// What the adapter must do with one mapped frame.
@@ -256,6 +289,18 @@ struct SessionState {
     ended_routes: HashMap<String, RouteState>,
     /// `(type, subtype)` pairs of unknown frames already logged at `warn`.
     unknown_seen: HashSet<(String, Option<String>)>,
+    // ENTITY-AUTHORITY-EXCEPTION:
+    // Role: Join a `command_lifecycle` frame to the turn of the stdin message it reports on.
+    // Source of truth: The adapter's `note_command`, right after it opened the turn whose line
+    //   carries the uuid.
+    // Structural reason: The frame names only the uuid, and a prompt's `completed` arrives after
+    //   the `result` that dropped its `TurnState`.
+    // Synchronization: The single adapter task that owns the child process owns the mapper.
+    // Invalidation/removal: The command's terminal state (`completed`, `cancelled`, `discarded`,
+    //   `refused`) removes the entry; `child_exited` clears the rest.
+    commands: HashMap<String, CommandEntry>,
+    /// Whether the latest `system/init` advertised `msg_lifecycle_v1`; `None` before any `init`.
+    lifecycle_supported: Option<bool>,
 }
 
 /// A resumed sub-agent run waiting for its first frame (`SessionState::pending_resumes`).
@@ -435,6 +480,9 @@ struct TurnState {
     prompt_acknowledged: bool,
     /// The text the adapter wrote for this turn (`note_prompt`), which the `UserMessage` says.
     prompt: Option<String>,
+    /// The `uuid` of the stdin line that opened this turn (`note_command`); `None` for a turn the
+    /// CLI started on its own.
+    command_uuid: Option<String>,
     items: TurnItems,
 }
 
@@ -518,6 +566,7 @@ impl TurnState {
             denied_tool_use_ids: HashSet::new(),
             prompt_acknowledged: false,
             prompt: None,
+            command_uuid: None,
             items: TurnItems::default(),
         }
     }
@@ -761,6 +810,18 @@ impl ClaudeMapper {
     /// turn there is nothing to complete.
     pub fn child_exited(&mut self, exit: &str) -> Vec<MapperOutput> {
         let mut out = Vec::new();
+        // No lifecycle frame comes from a process that has gone.
+        if !self.session.commands.is_empty() {
+            debug!(
+                thread_id = %self.thread,
+                harness_thread_id = %self.harness_thread_id,
+                commands = self.session.commands.len(),
+                exit,
+                action = "commands_dropped",
+                "Claude Code exited with commands not yet terminated"
+            );
+            self.session.commands.clear();
+        }
         // A background command dies with the child: no notification will come for it.
         let lost: Vec<String> = self
             .session
@@ -1006,6 +1067,7 @@ impl ClaudeMapper {
                 });
             }
             Frame::TaskNotification(task) => self.on_task_notification(task, &mut out),
+            Frame::CommandLifecycle(message) => self.on_command_lifecycle(message),
             frame @ (Frame::SessionTitleChanged(_) | Frame::Ignored { .. }) => {
                 let (frame_type, subtype) = frame.kind();
                 debug!(
@@ -1034,6 +1096,22 @@ impl ClaudeMapper {
             claude_code_version = display_opt(init.claude_code_version.as_deref()),
             "session initialized"
         );
+        let lifecycle_supported = init
+            .capabilities
+            .iter()
+            .any(|capability| capability == LIFECYCLE_CAPABILITY);
+        self.session.lifecycle_supported = Some(lifecycle_supported);
+        if !lifecycle_supported && !self.session.commands.is_empty() {
+            // No frame will ever end these entries: a CLI without the capability sends none.
+            debug!(
+                thread_id = %self.thread,
+                harness_thread_id = %self.harness_thread_id,
+                commands = self.session.commands.len(),
+                action = "commands_dropped",
+                "Claude Code does not report command lifecycle; not tracking commands"
+            );
+            self.session.commands.clear();
+        }
         // The CLI emits `init` at the top of every prompt it takes, before it decides whether a
         // model call is needed: the prompt is in. A re-emitted `init` mid-turn, a compaction
         // turn's and one outside any turn acknowledge nothing (`acknowledge_prompt`'s gate).
@@ -1797,6 +1875,39 @@ impl ClaudeMapper {
                 "the result names an origin"
             ),
             None => {}
+        }
+        // The result lists the client uuids of every message its turn consumed. A turn the
+        // adapter opened for a stamped line must be among them; one the CLI started on its own
+        // consumed none of the adapter's (a continuation lists none, a merged queue may).
+        if !result.user_message_uuids.is_empty() {
+            match turn.command_uuid.as_deref() {
+                Some(command_uuid)
+                    if !result
+                        .user_message_uuids
+                        .iter()
+                        .any(|uuid| uuid == command_uuid) =>
+                {
+                    warn!(
+                        thread_id = %self.thread,
+                        harness_thread_id = %self.harness_thread_id,
+                        turn_id = %turn_id,
+                        command_uuid = %command_uuid,
+                        listed = result.user_message_uuids.len(),
+                        action = "result_uuid_mismatch",
+                        "the result does not list the message that opened its turn"
+                    );
+                }
+                Some(_) => {}
+                None => debug!(
+                    thread_id = %self.thread,
+                    harness_thread_id = %self.harness_thread_id,
+                    turn_id = %turn_id,
+                    listed = result.user_message_uuids.len(),
+                    external = turn.external,
+                    action = "result_foreign_uuids",
+                    "a turn the adapter did not open consumed client messages"
+                ),
+            }
         }
         let status = result_status(&result, turn.interrupt_sent);
         self.emit_usage(&Route::Primary, out);
@@ -3555,6 +3666,156 @@ impl ClaudeMapper {
         }
     }
 
+    /// The `uuid` of the stdin line the adapter is about to write for the active turn, called
+    /// right after `begin_turn`. The CLI reports the line's fate under it (`command_lifecycle`).
+    pub fn note_command(&mut self, command_uuid: String, kind: CommandKind) {
+        let Some(turn) = self.turn.as_mut() else {
+            warn!(
+                thread_id = %self.thread,
+                harness_thread_id = %self.harness_thread_id,
+                command_uuid = %command_uuid,
+                command_kind = kind.as_str(),
+                action = "note_command",
+                "a command was noted with no active turn; its lifecycle is not tracked"
+            );
+            return;
+        };
+        turn.command_uuid = Some(command_uuid.clone());
+        // Before the first `init` the capability is unknown, so the entry is kept until it says.
+        if self.session.lifecycle_supported == Some(false) {
+            return;
+        }
+        let entry = CommandEntry {
+            turn: turn.id,
+            kind,
+            started: false,
+        };
+        self.session.commands.insert(command_uuid, entry);
+    }
+
+    /// `command_lifecycle`: the fate of a line the adapter stamped. Observed and cross-checked
+    /// only; the prompt is still acknowledged at the turn's `system/init`.
+    fn on_command_lifecycle(&mut self, message: CommandLifecycleMessage) {
+        let CommandLifecycleMessage {
+            command_uuid,
+            state,
+            ..
+        } = message;
+        let active_turn = self.turn.as_ref().map(|turn| turn.id);
+        let Some(entry) = self.session.commands.get_mut(&command_uuid) else {
+            debug!(
+                thread_id = %self.thread,
+                harness_thread_id = %self.harness_thread_id,
+                command_uuid = %command_uuid,
+                state = %state,
+                action = "lifecycle_untracked",
+                "lifecycle of a command this mapper does not track"
+            );
+            return;
+        };
+        let turn = entry.turn;
+        let kind = entry.kind.as_str();
+        let terminal = match &state {
+            CommandLifecycleState::Queued => {
+                debug!(
+                    thread_id = %self.thread,
+                    turn_id = %turn,
+                    command_uuid = %command_uuid,
+                    command_kind = kind,
+                    action = "command_queued",
+                    "Claude Code queued the command"
+                );
+                false
+            }
+            CommandLifecycleState::Started => {
+                entry.started = true;
+                if active_turn == Some(turn) {
+                    info!(
+                        thread_id = %self.thread,
+                        harness_thread_id = %self.harness_thread_id,
+                        turn_id = %turn,
+                        command_uuid = %command_uuid,
+                        command_kind = kind,
+                        action = "command_started",
+                        "Claude Code took the command into a turn"
+                    );
+                } else {
+                    warn!(
+                        thread_id = %self.thread,
+                        harness_thread_id = %self.harness_thread_id,
+                        turn_id = %turn,
+                        active_turn_id = display_opt(active_turn),
+                        command_uuid = %command_uuid,
+                        command_kind = kind,
+                        action = "command_started",
+                        "Claude Code took the command into a turn after its own turn was no \
+                         longer active"
+                    );
+                }
+                false
+            }
+            CommandLifecycleState::Completed => {
+                debug!(
+                    thread_id = %self.thread,
+                    turn_id = %turn,
+                    command_uuid = %command_uuid,
+                    command_kind = kind,
+                    action = "command_completed",
+                    "the turn that consumed the command ended"
+                );
+                true
+            }
+            CommandLifecycleState::Cancelled => {
+                info!(
+                    thread_id = %self.thread,
+                    harness_thread_id = %self.harness_thread_id,
+                    turn_id = %turn,
+                    command_uuid = %command_uuid,
+                    command_kind = kind,
+                    started = entry.started,
+                    action = "command_cancelled",
+                    "Claude Code cancelled the command (an interrupt ends its turn so)"
+                );
+                true
+            }
+            CommandLifecycleState::Discarded => {
+                warn!(
+                    thread_id = %self.thread,
+                    harness_thread_id = %self.harness_thread_id,
+                    turn_id = %turn,
+                    command_uuid = %command_uuid,
+                    command_kind = kind,
+                    action = "command_discarded",
+                    "the session ended with the command still queued"
+                );
+                true
+            }
+            CommandLifecycleState::Unknown(other) => {
+                let refused = other == REFUSED_STATE;
+                warn!(
+                    thread_id = %self.thread,
+                    harness_thread_id = %self.harness_thread_id,
+                    turn_id = %turn,
+                    command_uuid = %command_uuid,
+                    command_kind = kind,
+                    state = %other,
+                    action = "command_lifecycle",
+                    "{}",
+                    if refused {
+                        "Claude Code refused the command; it will not run"
+                    } else {
+                        "a command lifecycle state this adapter does not know; still tracked"
+                    }
+                );
+                // An unknown state may be an intermediate one: only `refused` is known terminal.
+                refused
+            }
+        };
+        if terminal {
+            self.session.commands.remove(&command_uuid);
+        }
+    }
+
     /// Acknowledge the active user turn's prompt: its `UserMessage` item, from the text the
     /// adapter wrote. `trigger` is `"init"` for the turn's `system/init`, the CLI's per-prompt
     /// frame; any other trigger is the backstop, the first answer frame of a turn that had no
@@ -3593,8 +3854,37 @@ impl ClaudeMapper {
                 "no system/init preceded the answer; acknowledged from the first answer frame"
             );
         }
+        let command_uuid = state.command_uuid.clone();
         let harness_item_id = format!("user:{turn}:sent");
         self.user_message(&Route::Primary, turn, harness_item_id, text, out);
+        self.check_prompt_started(turn, command_uuid.as_deref(), trigger);
+    }
+
+    /// The CLI reports `started` for a prompt ~0.1 s before that turn's `system/init`, so an
+    /// acknowledged prompt whose `started` has not arrived means the two signals disagree.
+    fn check_prompt_started(&self, turn: TurnId, command_uuid: Option<&str>, trigger: &str) {
+        if self.session.lifecycle_supported != Some(true) {
+            return;
+        }
+        let Some(command_uuid) = command_uuid else {
+            return;
+        };
+        let started = self
+            .session
+            .commands
+            .get(command_uuid)
+            .is_some_and(|entry| entry.started);
+        if !started {
+            warn!(
+                thread_id = %self.thread,
+                harness_thread_id = %self.harness_thread_id,
+                turn_id = %turn,
+                command_uuid = %command_uuid,
+                trigger,
+                action = "prompt_lifecycle_missing",
+                "the prompt was acknowledged before Claude Code reported it started"
+            );
+        }
     }
 
     /// Whether `text` is the route's delegated prompt, and whether it was already delivered.
@@ -8585,5 +8875,297 @@ mod tests {
         let updated = position(&lines, |frame| frame["subtype"] == "task_updated");
         assert!(events(&mapper.map_line(&lines[updated])).is_empty());
         assert!(!mapper.has_tasks());
+    }
+
+    // ---- command lifecycle ---------------------------------------------------------------------
+
+    /// Drive a fixture recorded with uuid-stamped lines: each stdin `user` line opens its turn
+    /// (and is noted with its uuid) when its `queued` frame arrives, as the supervisor opens the
+    /// turn just before writing the line.
+    fn drive_stamped(mapper: &mut ClaudeMapper, name: &str) -> Vec<MapperOutput> {
+        let mut commands: std::collections::VecDeque<(String, String)> = in_frames(name)
+            .iter()
+            .filter(|frame| frame["type"] == "user")
+            .map(|frame| {
+                let uuid = frame["uuid"].as_str().expect("a stamped line").to_owned();
+                let text = frame["message"]["content"][0]["text"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_owned();
+                (uuid, text)
+            })
+            .collect();
+        let interrupt = interrupted(name);
+        let mut outputs = Vec::new();
+        for line in out_lines(name) {
+            let frame: Value = serde_json::from_str(&line).unwrap();
+            let opens = frame["type"] == "command_lifecycle"
+                && frame["state"] == "queued"
+                && commands
+                    .front()
+                    .is_some_and(|(uuid, _)| frame["command_uuid"] == uuid.as_str());
+            if opens {
+                let (uuid, text) = commands.pop_front().unwrap();
+                if text == "/compact" {
+                    outputs.extend(mapper.begin_turn(TurnId::new(), TurnKind::Compaction));
+                    mapper.note_command(uuid, CommandKind::Compact);
+                } else {
+                    outputs.extend(mapper.begin_turn(TurnId::new(), TurnKind::User));
+                    mapper.note_prompt(text);
+                    mapper.note_command(uuid, CommandKind::Prompt);
+                }
+                if interrupt {
+                    mapper.note_interrupt_sent();
+                }
+            }
+            outputs.extend(mapper.map_line(&line));
+        }
+        assert!(commands.is_empty(), "every stamped line was queued");
+        outputs
+    }
+
+    fn lifecycle_line(command_uuid: &str, state: &str) -> String {
+        format!(
+            r#"{{"type":"command_lifecycle","command_uuid":"{command_uuid}","state":"{state}","uuid":"u","session_id":"s"}}"#
+        )
+    }
+
+    fn init_line(capabilities: &[&str]) -> String {
+        json!({
+            "type": "system", "subtype": "init", "session_id": "s", "uuid": "u",
+            "cwd": WORKSPACE, "model": "claude-haiku-5-5", "permissionMode": "default",
+            "apiKeySource": "none", "tools": [], "mcp_servers": [],
+            "capabilities": capabilities,
+        })
+        .to_string()
+    }
+
+    fn result_line(user_message_uuids: &[&str]) -> String {
+        let mut frame: Value = serde_json::from_str(
+            out_lines("text-turn")
+                .iter()
+                .find(|line| line.contains(r#""type": "result""#))
+                .unwrap(),
+        )
+        .unwrap();
+        frame["user_message_uuids"] = json!(user_message_uuids);
+        frame.to_string()
+    }
+
+    #[test]
+    #[traced_test]
+    fn a_prompt_and_a_compaction_report_their_lifecycle_and_agree_with_their_turns() {
+        let mut mapper = new_mapper();
+        let outputs = drive_stamped(&mut mapper, "lifecycle-prompt");
+        let completions: Vec<TurnStatusKind> = events(&outputs)
+            .into_iter()
+            .filter_map(|event| match event {
+                AgentEvent::TurnCompleted { status, .. } => Some(status.kind),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            completions,
+            vec![TurnStatusKind::Completed, TurnStatusKind::Completed]
+        );
+        assert_eq!(mapper.session.lifecycle_supported, Some(true));
+        // The prompt's and the compaction's `completed` came after their results; nothing waits.
+        assert!(mapper.session.commands.is_empty());
+        logs_assert(lines_with(
+            1,
+            &[r#"action="command_started""#, r#"command_kind="prompt""#],
+        ));
+        logs_assert(lines_with(
+            1,
+            &[r#"action="command_started""#, r#"command_kind="compact""#],
+        ));
+        logs_assert(lines_with(2, &[r#"action="command_completed""#]));
+        logs_assert(lines_with(0, &[" WARN "]));
+        logs_assert(lines_with(0, &[" ERROR "]));
+    }
+
+    #[test]
+    #[traced_test]
+    fn an_interrupted_prompt_is_cancelled_after_its_result() {
+        let mut mapper = new_mapper();
+        let outputs = drive_stamped(&mut mapper, "lifecycle-interrupted");
+        assert!(events(&outputs).iter().any(|event| matches!(
+            event,
+            AgentEvent::TurnCompleted { status, .. } if status.kind == TurnStatusKind::Interrupted
+        )));
+        assert!(mapper.session.commands.is_empty());
+        logs_assert(lines_with(
+            1,
+            &[r#"action="command_cancelled""#, "started=true"],
+        ));
+        logs_assert(lines_with(0, &[" WARN "]));
+        logs_assert(lines_with(0, &[" ERROR "]));
+    }
+
+    #[test]
+    #[traced_test]
+    fn a_prompt_acknowledged_before_its_started_frame_is_reported() {
+        let mut mapper = new_mapper();
+        mapper.begin_turn(TurnId::new(), TurnKind::User);
+        mapper.note_prompt("ping".into());
+        mapper.note_command("c-1".into(), CommandKind::Prompt);
+        let outputs = mapper.map_line(&init_line(&["msg_lifecycle_v1"]));
+        // The acknowledgement still happens: the cross-check only reports.
+        assert!(
+            completed_items(&outputs)
+                .iter()
+                .any(|item| matches!(item.payload, ItemPayload::UserMessage { .. }))
+        );
+        logs_assert(lines_with(
+            1,
+            &[
+                " WARN ",
+                r#"action="prompt_lifecycle_missing""#,
+                "command_uuid=c-1",
+            ],
+        ));
+    }
+
+    #[test]
+    #[traced_test]
+    fn without_the_capability_a_missing_started_frame_is_not_reported() {
+        let mut mapper = new_mapper();
+        mapper.begin_turn(TurnId::new(), TurnKind::User);
+        mapper.note_prompt("ping".into());
+        mapper.note_command("c-1".into(), CommandKind::Prompt);
+        mapper.map_line(&init_line(&[]));
+        assert_eq!(mapper.session.lifecycle_supported, Some(false));
+        logs_assert(lines_with(0, &["prompt_lifecycle_missing"]));
+    }
+
+    #[test]
+    #[traced_test]
+    fn a_result_that_does_not_list_the_turns_message_is_reported() {
+        let mut mapper = new_mapper();
+        mapper.begin_turn(TurnId::new(), TurnKind::User);
+        mapper.note_command("c-1".into(), CommandKind::Prompt);
+        mapper.map_line(&result_line(&["c-other"]));
+        logs_assert(lines_with(
+            1,
+            &[
+                " WARN ",
+                r#"action="result_uuid_mismatch""#,
+                "command_uuid=c-1",
+            ],
+        ));
+
+        // Listed, or a result that lists nothing (an older CLI): no report.
+        mapper.begin_turn(TurnId::new(), TurnKind::User);
+        mapper.note_command("c-2".into(), CommandKind::Prompt);
+        mapper.map_line(&result_line(&["c-2"]));
+        mapper.begin_turn(TurnId::new(), TurnKind::User);
+        mapper.note_command("c-3".into(), CommandKind::Prompt);
+        mapper.map_line(&result_line(&[]));
+        logs_assert(lines_with(1, &[r#"action="result_uuid_mismatch""#]));
+    }
+
+    #[test]
+    #[traced_test]
+    fn a_turn_the_cli_started_may_consume_client_messages() {
+        let mut mapper = new_mapper();
+        // No turn open: the result opens an external one, which noted no command.
+        mapper.map_line(&result_line(&["c-1"]));
+        logs_assert(lines_with(
+            1,
+            &[
+                " DEBUG ",
+                r#"action="result_foreign_uuids""#,
+                "external=true",
+            ],
+        ));
+        logs_assert(lines_with(0, &["result_uuid_mismatch"]));
+    }
+
+    #[test]
+    #[traced_test]
+    fn lifecycle_states_keep_or_drop_the_command() {
+        let mut mapper = new_mapper();
+        let turn = TurnId::new();
+        mapper.begin_turn(turn, TurnKind::User);
+        mapper.note_command("c-1".into(), CommandKind::Prompt);
+        // A state the adapter does not know may be an intermediate one: still tracked.
+        assert!(mapper.map_line(&lifecycle_line("c-1", "parked")).is_empty());
+        assert!(mapper.session.commands.contains_key("c-1"));
+        logs_assert(lines_with(1, &[" WARN ", "state=parked", "still tracked"]));
+        // `refused` is terminal.
+        mapper.map_line(&lifecycle_line("c-1", "refused"));
+        assert!(!mapper.session.commands.contains_key("c-1"));
+        logs_assert(lines_with(1, &[" WARN ", "state=refused", "will not run"]));
+
+        mapper.note_command("c-2".into(), CommandKind::Prompt);
+        mapper.map_line(&lifecycle_line("c-2", "discarded"));
+        assert!(mapper.session.commands.is_empty());
+        logs_assert(lines_with(1, &[" WARN ", r#"action="command_discarded""#]));
+
+        // A uuid nobody noted is only logged.
+        assert!(
+            mapper
+                .map_line(&lifecycle_line("c-9", "started"))
+                .is_empty()
+        );
+        logs_assert(lines_with(
+            1,
+            &[" DEBUG ", r#"action="lifecycle_untracked""#],
+        ));
+    }
+
+    #[test]
+    #[traced_test]
+    fn a_command_started_after_its_turn_ended_is_reported() {
+        let mut mapper = new_mapper();
+        mapper.begin_turn(TurnId::new(), TurnKind::User);
+        mapper.note_command("c-1".into(), CommandKind::Prompt);
+        mapper.map_line(&result_line(&[]));
+        mapper.map_line(&lifecycle_line("c-1", "started"));
+        logs_assert(lines_with(
+            1,
+            &[" WARN ", r#"action="command_started""#, "no longer active"],
+        ));
+    }
+
+    #[test]
+    #[traced_test]
+    fn a_command_noted_without_a_turn_is_not_tracked() {
+        let mut mapper = new_mapper();
+        mapper.note_command("c-1".into(), CommandKind::Prompt);
+        assert!(mapper.session.commands.is_empty());
+        logs_assert(lines_with(1, &[" WARN ", r#"action="note_command""#]));
+    }
+
+    #[test]
+    #[traced_test]
+    fn a_cli_without_the_capability_tracks_no_command() {
+        let mut mapper = new_mapper();
+        // The first prompt is noted before any `init` says whether frames will come.
+        mapper.begin_turn(TurnId::new(), TurnKind::User);
+        mapper.note_prompt("ping".into());
+        mapper.note_command("c-1".into(), CommandKind::Prompt);
+        assert!(mapper.session.commands.contains_key("c-1"));
+        mapper.map_line(&init_line(&[]));
+        assert!(mapper.session.commands.is_empty(), "nothing would end it");
+        mapper.map_line(&result_line(&[]));
+        // Later prompts are not tracked at all, so the table never grows.
+        for uuid in ["c-2", "c-3"] {
+            mapper.begin_turn(TurnId::new(), TurnKind::User);
+            mapper.note_command(uuid.into(), CommandKind::Prompt);
+            mapper.map_line(&result_line(&[]));
+        }
+        assert!(mapper.session.commands.is_empty());
+        logs_assert(lines_with(1, &[r#"action="commands_dropped""#]));
+        logs_assert(lines_with(0, &[" WARN "]));
+    }
+
+    #[test]
+    fn the_child_exiting_drops_every_command() {
+        let mut mapper = new_mapper();
+        mapper.begin_turn(TurnId::new(), TurnKind::User);
+        mapper.note_command("c-1".into(), CommandKind::Prompt);
+        mapper.child_exited("exit status: 1");
+        assert!(mapper.session.commands.is_empty());
     }
 }

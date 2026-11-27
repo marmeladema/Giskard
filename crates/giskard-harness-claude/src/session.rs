@@ -26,7 +26,7 @@ use tokio::time::Instant;
 use tracing::{Instrument, debug, error, info, warn};
 
 use crate::log_fields::display_opt;
-use crate::mapper::{ClaudeMapper, MapperOutput, RouteLookup, TurnKind};
+use crate::mapper::{ClaudeMapper, CommandKind, MapperOutput, RouteLookup, TurnKind};
 use crate::process::{ChildExit, ChildLogContext, ClaudeChild, LaunchMode};
 
 /// How long a background command's terminal `task_updated` may wait for the `task_notification`
@@ -70,6 +70,9 @@ pub(crate) struct UserLine {
     /// The text block of `line`: what the turn's `UserMessage` says, emitted at the turn's
     /// `system/init` (`ClaudeMapper::note_prompt`).
     pub prompt: String,
+    /// The line's top-level `uuid`, under which the CLI reports its `command_lifecycle`
+    /// (`ClaudeMapper::note_command`).
+    pub command_uuid: String,
 }
 
 /// What the façade asks a supervisor to do.
@@ -552,6 +555,8 @@ fn ask_user_question_answers(questions: &Value, value: &Value) -> Option<Value> 
 /// Who waits for a control response.
 enum Waiter {
     Unit(oneshot::Sender<Result<(), HarnessError>>),
+    /// The user's `interrupt`: its answer is logged, then replied.
+    Interrupt(oneshot::Sender<Result<(), HarnessError>>),
     Value(oneshot::Sender<Result<Value, HarnessError>>),
     /// A sub-agent's `stop_task`: its answer is logged, then replied.
     StopTask(StopTaskWaiter),
@@ -573,7 +578,7 @@ impl Waiter {
     fn resolve(self, payload: Result<Value, HarnessError>) {
         // A caller that gave up (its timeout fired) has dropped the receiver; nothing to tell.
         match self {
-            Waiter::Unit(reply) => {
+            Waiter::Unit(reply) | Waiter::Interrupt(reply) => {
                 let _ = reply.send(
                     payload
                         .and_then(|payload| control_outcome(&payload))
@@ -1105,8 +1110,12 @@ impl Supervisor {
                             success = outcome.is_ok(),
                             "control response received"
                         );
-                        if let Waiter::StopTask(stop) = &waiter {
-                            self.log_stop_task_answer(stop, &outcome);
+                        match &waiter {
+                            Waiter::StopTask(stop) => self.log_stop_task_answer(stop, &outcome),
+                            Waiter::Interrupt(_) | Waiter::Stop => {
+                                self.log_interrupt_answer(&request_id, &outcome);
+                            }
+                            Waiter::Unit(_) | Waiter::Value(_) => {}
                         }
                         waiter.resolve(Ok(payload));
                     }
@@ -1463,7 +1472,8 @@ impl Supervisor {
                     let _ = reply.send(Err(error.clone()));
                     return Err(error);
                 }
-                self.waiters.insert(request_id.clone(), Waiter::Unit(reply));
+                self.waiters
+                    .insert(request_id.clone(), Waiter::Interrupt(reply));
                 self.interrupt_sent = true;
                 let turn = self.mapper.active_turn();
                 if turn.is_some() {
@@ -1956,10 +1966,15 @@ impl Supervisor {
         self.withdrawn.clear();
         // `TurnStarted` reaches the log before the line is written, so the server sees the turn
         // before its first frame.
-        let UserLine { line, prompt } = line;
+        let UserLine {
+            line,
+            prompt,
+            command_uuid,
+        } = line;
         let outputs = self.mapper.begin_turn(turn, TurnKind::User);
         self.mapper.note_turn_model(model);
         self.mapper.note_prompt(prompt);
+        self.mapper.note_command(command_uuid, CommandKind::Prompt);
         for output in outputs {
             if let MapperOutput::Event(event) = output {
                 self.append(event);
@@ -2331,6 +2346,32 @@ impl Supervisor {
     }
 
     /// The CLI answered a `stop_task`.
+    /// An `interrupt`'s answer (`interrupt_receipt_v1`): `still_queued` lists the stamped
+    /// messages the interrupt left queued (each will run as a turn of its own), `cancelled` those
+    /// it withdrew. Only the counts are logged.
+    fn log_interrupt_answer(&self, request_id: &str, outcome: &Result<Value, HarnessError>) {
+        match outcome {
+            Ok(receipt) => {
+                let count = |key: &str| receipt.get(key).and_then(Value::as_array).map(Vec::len);
+                info!(
+                    thread_id = %self.thread,
+                    request_id = %request_id,
+                    still_queued = display_opt(count("still_queued")),
+                    cancelled = display_opt(count("cancelled")),
+                    action = "interrupt",
+                    "interrupt answered"
+                );
+            }
+            Err(error) => warn!(
+                thread_id = %self.thread,
+                request_id = %request_id,
+                error = %error,
+                action = "interrupt",
+                "Claude Code refused the interrupt"
+            ),
+        }
+    }
+
     fn log_stop_task_answer(&self, stop: &StopTaskWaiter, outcome: &Result<Value, HarnessError>) {
         match outcome {
             Ok(_) => info!(
@@ -2375,11 +2416,14 @@ impl Supervisor {
             return Ok(());
         }
         self.withdrawn.clear();
+        let command_uuid = uuid::Uuid::new_v4().to_string();
         for output in self.mapper.begin_turn(turn, TurnKind::Compaction) {
             if let MapperOutput::Event(event) = output {
                 self.append(event);
             }
         }
+        self.mapper
+            .note_command(command_uuid.clone(), CommandKind::Compact);
         if let Some(message) = notice {
             self.append(AgentEvent::Notice {
                 thread: self.thread,
@@ -2396,7 +2440,7 @@ impl Supervisor {
             action = "compact",
             "writing /compact"
         );
-        let line = json!({"type": "user", "message": {
+        let line = json!({"type": "user", "uuid": command_uuid, "message": {
             "role": "user",
             "content": [{"type": "text", "text": "/compact"}],
         }})

@@ -4,7 +4,8 @@ Stream-json transcripts recorded against **Claude Code 2.1.286** (the two `subag
 `replay-compact`, the five `background-{stop,complete,taskstop,fail,stop-next-turn}`, the
 `prompt-not-replayed` and the `mcp-status` scenarios against **2.1.287**, the two `forked-skill*`
 against **2.1.289**, the three `delegation-background*`, the six sub-agent resume scenarios
-`subagent-resume*` and `subagent-message-running` against **2.1.306**) by driving a real
+`subagent-resume*` and `subagent-message-running` against **2.1.306**, the two `lifecycle-*`
+against **2.1.330**) by driving a real
 `claude -p` child over a stdio pipe, for the mapper tests of
 [`specs/claude-code-harness-plan.md`](../../../../specs/claude-code-harness-plan.md) (§11). They
 live in `crates/giskard-harness-claude/tests/fixtures/`, where the mapper tests read them.
@@ -59,6 +60,8 @@ closed stdin when the scenario's stop condition was met.
 | `subagent-resume-foreground` | acceptEdits, `--forward-subagent-text` | background tasks enabled, the first run in the foreground (lines 3–11, its route dropped with the first turn, line 17); the `SendMessage` run is **backgrounded** (line 26, not awaited) and its frames name the original call (lines 29–32) | 2 results |
 | `subagent-message-running` | acceptEdits, `--forward-subagent-text` | `SendMessage` to a sub-agent **still running** (line 23) is answered "Message queued for delivery" (line 24): no `task_started`, no frame shows the message. The run completes (line 44); later the sub-agent's own background command finishes and **wakes it**: a second run of the task whose `task_started` names the route's own `Agent` call and whose `prompt` is the `<task-notification>` (line 57), after the route was dropped; its frames (lines 64–69) | 4 results, then 60 s quiet |
 | `subagent-resume-respawn-first`, `subagent-resume-respawn` | acceptEdits, `--forward-subagent-text`; two processes on one session | a foreground delegation in a first process (`--session-id`, 1 result, then stdin closed: as a reap), then a second process with `--resume <session>` whose message makes the model call `SendMessage` (line 8): its `task_started` names a task this process never saw (line 10), and the run's frames name the **first process's** `Agent` call (lines 12–13). Each file holds one process's lines; the `-first` meta's argv is the first launch | 1 result; 2 results, then 30 s quiet |
+| `lifecycle-prompt` | manual, `--include-partial-messages`, uuid-stamped `user` lines | a text turn, then `/compact`, each line carrying a top-level `uuid`: its `command_lifecycle` `queued` and `started` (lines 1–2) **before** the turn's `init` (3), `completed` (14) **after** the `result` (13), whose `user_message_uuids` names the prompt; for `/compact`, `queued` and `started` (15–16) seconds before its `init` (19), which comes only once compaction is done, then `compact_boundary`, the `result` (23) and `completed` (24). The `init` advertises `msg_lifecycle_v1` | 2 results |
+| `lifecycle-interrupted` | manual, `--include-partial-messages`, a uuid-stamped `user` line | a looping `Bash` command, its ask answered allow, then `interrupt` 4 s later while it runs: the rejection `tool_result`, the interruption marker, an `aborted_tools` result (29), then the prompt's `command_lifecycle` **`cancelled`** (30), not `completed` | allow; interrupt; 1 result |
 | `autocompact-state` | — | the two top-level frames `active_goal` and `autocompact_state` a session emits before its first turn in some environments; two frames only, recorded separately with an environment that sets autocompact overrides | — |
 
 ## Sanitization
