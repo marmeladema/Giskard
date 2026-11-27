@@ -34,7 +34,7 @@ use crate::catalog::{
 use crate::frame::Frame;
 use crate::ids::is_task_native_id;
 use crate::log_fields::display_opt;
-use crate::mapper::ClaudeMapper;
+use crate::mapper::{ClaudeMapper, SteerOutcome};
 use crate::mcp::mcp_servers;
 use crate::process::{
     ChildExit, ChildLogContext, ClaudeChild, ClaudeLaunchOptions, ExitKind, LaunchMode,
@@ -2195,6 +2195,44 @@ impl AgentHarness for ClaudeHarness {
         Ok(())
     }
 
+    /// Write steering text into the exact active turn (§4 of the turn-steering plan). Resolves
+    /// once the CLI has taken it in, into that turn or as the next one, or once it certainly
+    /// will not be: the wait has no fixed limit, because a steer lands only at the turn's next
+    /// tool boundary, and the supervisor answers every steer, at child exit at the latest.
+    async fn steer_turn(
+        &self,
+        thread: &ThreadHandle,
+        expected_turn: TurnId,
+        text: String,
+    ) -> Result<(), HarnessError> {
+        if is_task_native_id(&thread.harness_thread_id) {
+            return Err(HarnessError::Unsupported(format!(
+                "a sub-agent thread cannot be steered ({})",
+                thread.harness_thread_id
+            )));
+        }
+        let sent = self.enqueue(thread.thread, "steer_turn", |_, _, reply| {
+            Ok(ChildCommand::Steer {
+                turn: expected_turn,
+                text,
+                reply,
+            })
+        })?;
+        match sent {
+            // A reply dropped unanswered (an aborted supervisor never reaches its exit handling)
+            // says nothing about whether the steer was written: its outcome is unknown, never a
+            // failure a caller could take as "not sent" and resend.
+            Enqueued::Sent(answer) => answer
+                .await
+                .unwrap_or_else(|_| SteerOutcome::Unknown.into_result(expected_turn)),
+            Enqueued::NoThread => Err(HarnessError::ThreadNotFound(thread.thread)),
+            // Reaped: an idle child has no active turn to steer.
+            Enqueued::NoChild => Err(HarnessError::Protocol(format!(
+                "cannot steer turn {expected_turn}: no active turn"
+            ))),
+        }
+    }
+
     async fn interrupt(&self, thread: &ThreadHandle) -> Result<(), HarnessError> {
         if is_task_native_id(&thread.harness_thread_id) {
             return self.interrupt_route(thread).await;
@@ -2457,6 +2495,7 @@ mod tests {
     use crate::session::tests::{
         Action, ScriptRecord, ScriptedChild, Step, control, fixture_lines, user,
     };
+    use giskard_core::item::ItemPayload;
 
     const WORKSPACE: &str = "/work/project";
     const RESUME_ID: &str = "d9bfe887-699b-4c3d-9d6f-b7001e75764b";
@@ -8648,5 +8687,693 @@ mod tests {
         logs_assert(a_line_with(&["WARN", "command queue full"]));
         gate.send_replace(true);
         harness.shutdown().await.unwrap();
+    }
+
+    // ---- turn steering (step 3 of the turn-steering plan) ---------------------------------------
+
+    /// The prompt line's answer: its lifecycle, then the turn's `system/init`, which takes it in.
+    fn prompt_taken_in() -> Step {
+        Step::OnStdin(
+            user(),
+            vec![
+                Action::Lifecycle("queued"),
+                Action::Lifecycle("started"),
+                Action::EmitFixturePrefix {
+                    name: "text-turn",
+                    count: 1,
+                },
+            ],
+        )
+    }
+
+    /// The rest of the prompt's turn, after its `init`: the reply and the `result`.
+    fn rest_of_prompt_turn() -> Action {
+        Action::EmitFixtureFrom {
+            name: "text-turn",
+            from: 1,
+        }
+    }
+
+    /// Open a thread on `child`, start a turn, and wait until its prompt is taken in.
+    async fn steerable_turn(
+        child: ScriptedChild,
+        launch: ClaudeLaunchOptions,
+    ) -> (Arc<ClaudeHarness>, ThreadHandle, AgentEventStream, TurnId) {
+        let (harness, _) = harness_with(launch, vec![child]);
+        let (options, _updates) = open_options(ThreadId::new(), None, "sonnet");
+        let handle = harness.open_thread(options).await.unwrap();
+        let mut stream = harness.subscribe(&handle);
+        let turn = harness
+            .start_turn(&handle, text("pong?"), overrides())
+            .await
+            .unwrap();
+        next_matching(&mut stream, |event| match event {
+            AgentEvent::ItemCompleted { item, .. }
+                if matches!(item.payload, ItemPayload::UserMessage { .. }) =>
+            {
+                Some(())
+            }
+            _ => None,
+        })
+        .await;
+        (harness, handle, stream, turn)
+    }
+
+    /// Steer in the background: the call resolves only once the steer's fate is known.
+    fn steer_later(
+        harness: &Arc<ClaudeHarness>,
+        handle: &ThreadHandle,
+        turn: TurnId,
+        text: &str,
+    ) -> tokio::task::JoinHandle<Result<(), HarnessError>> {
+        let (harness, handle, text) = (harness.clone(), handle.clone(), text.to_owned());
+        tokio::spawn(async move { harness.steer_turn(&handle, turn, text).await })
+    }
+
+    async fn settled_steer(
+        task: tokio::task::JoinHandle<Result<(), HarnessError>>,
+    ) -> Result<(), HarnessError> {
+        tokio::time::timeout(Duration::from_secs(10), task)
+            .await
+            .expect("the steer settled")
+            .unwrap()
+    }
+
+    /// `(turn, text)` of every steer `UserMessage` among `events`.
+    fn steer_items(events: &[AgentEvent]) -> Vec<(TurnId, String)> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                AgentEvent::ItemCompleted { turn, item, .. }
+                    if item.harness_item_id.contains(":steer:") =>
+                {
+                    match &item.payload {
+                        ItemPayload::UserMessage { text } => Some((*turn, text.clone())),
+                        _ => None,
+                    }
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Wait until the child has been written `count` user lines (the prompt, then each steer).
+    async fn user_lines_written(record: &Arc<Mutex<ScriptRecord>>, count: usize) {
+        for _ in 0..500 {
+            if written(record)
+                .iter()
+                .filter(|line| line["type"] == "user")
+                .count()
+                >= count
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("{count} user lines were never written");
+    }
+
+    /// The position among the written lines of the first control request of `subtype`, or of
+    /// the first control response.
+    fn written_at(record: &Arc<Mutex<ScriptRecord>>, wanted: &str) -> usize {
+        written(record)
+            .iter()
+            .position(|line| match wanted {
+                "control_response" => line["type"] == "control_response",
+                subtype => {
+                    line["type"] == "control_request" && line["request"]["subtype"] == subtype
+                }
+            })
+            .unwrap_or_else(|| panic!("no {wanted} written"))
+    }
+
+    #[tokio::test]
+    #[traced_test]
+    async fn a_steer_taken_in_resolves_and_lands_in_its_turn() {
+        let (child, record) = scripted(
+            handshake_steps("sonnet"),
+            vec![
+                prompt_taken_in(),
+                Step::OnStdin(
+                    user(),
+                    vec![
+                        Action::Lifecycle("queued"),
+                        Action::Lifecycle("started"),
+                        rest_of_prompt_turn(),
+                    ],
+                ),
+            ],
+        );
+        let (harness, handle, mut stream, turn) =
+            steerable_turn(child, ClaudeLaunchOptions::default()).await;
+        harness
+            .steer_turn(&handle, turn, "also say KIWI".into())
+            .await
+            .unwrap();
+        let events = until_completed(&mut stream).await;
+        assert_eq!(
+            steer_items(&events),
+            vec![(turn, "also say KIWI".to_owned())]
+        );
+        assert_eq!(completion(&events), (turn, TurnStatusKind::Completed, None));
+        // The steer line: the text, as typed, with its own uuid.
+        let steer = written(&record)
+            .into_iter()
+            .filter(|line| line["type"] == "user")
+            .nth(1)
+            .unwrap();
+        assert_eq!(steer["message"]["content"][0]["text"], "also say KIWI");
+        assert!(uuid::Uuid::parse_str(steer["uuid"].as_str().unwrap()).is_ok());
+        logs_assert(lines_with(1, &[r#"action="steer_written""#]));
+        logs_assert(lines_with(1, &[r#"action="steer_settled""#, "ok=true"]));
+        logs_assert(no_line_with("also say KIWI"));
+        harness.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_steer_that_misses_its_turn_resolves_as_the_next_one() {
+        let (child, _) = scripted(
+            handshake_steps("sonnet"),
+            vec![
+                prompt_taken_in(),
+                Step::OnStdin(
+                    user(),
+                    vec![
+                        Action::Lifecycle("queued"),
+                        rest_of_prompt_turn(),
+                        Action::Lifecycle("started"),
+                        text_turn(),
+                    ],
+                ),
+            ],
+        );
+        let (harness, handle, mut stream, turn) =
+            steerable_turn(child, ClaudeLaunchOptions::default()).await;
+        harness
+            .steer_turn(&handle, turn, "also say KIWI".into())
+            .await
+            .unwrap();
+        let first = until_completed(&mut stream).await;
+        assert_eq!(completion(&first).0, turn);
+        assert!(steer_items(&first).is_empty());
+        let next = until_completed(&mut stream).await;
+        let (next_turn, status, _) = completion(&next);
+        assert_ne!(next_turn, turn);
+        assert_eq!(status, TurnStatusKind::Completed);
+        assert_eq!(
+            steer_items(&next),
+            vec![(next_turn, "also say KIWI".to_owned())]
+        );
+        harness.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_steer_is_refused_unless_it_names_the_acknowledged_active_turn() {
+        // The prompt is written but never taken in: no `init` comes.
+        let (child, record) = scripted(
+            handshake_steps("sonnet"),
+            vec![Step::OnStdin(user(), Vec::new())],
+        );
+        let (harness, _) = harness(vec![child]);
+        let (options, _updates) = open_options(ThreadId::new(), None, "sonnet");
+        let handle = harness.open_thread(options).await.unwrap();
+        let refused = |result: Result<(), HarnessError>, wanted: &str| match result {
+            Err(HarnessError::Protocol(message)) => assert!(message.contains(wanted), "{message}"),
+            other => panic!("expected a refusal naming {wanted:?}, got {other:?}"),
+        };
+        let stale = TurnId::new();
+        refused(
+            harness.steer_turn(&handle, stale, "x".into()).await,
+            "no active turn",
+        );
+        let turn = harness
+            .start_turn(&handle, text("pong?"), overrides())
+            .await
+            .unwrap();
+        refused(
+            harness.steer_turn(&handle, turn, "x".into()).await,
+            "its prompt is not taken in yet",
+        );
+        refused(
+            harness.steer_turn(&handle, stale, "x".into()).await,
+            &format!("the active turn is {turn}"),
+        );
+        // A sub-agent thread is refused before anything reaches a child.
+        let mut route = handle.clone();
+        route.harness_thread_id = "task:toolu_1".into();
+        assert!(matches!(
+            harness.steer_turn(&route, turn, "x".into()).await,
+            Err(HarnessError::Unsupported(_))
+        ));
+        assert_eq!(
+            written(&record)
+                .iter()
+                .filter(|line| line["type"] == "user")
+                .count(),
+            1,
+            "no steer was written"
+        );
+        harness.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    #[traced_test]
+    async fn stop_withdraws_a_steer_before_its_interrupt() {
+        let (child, record) = scripted(
+            handshake_steps("sonnet"),
+            vec![
+                prompt_taken_in(),
+                Step::OnStdin(user(), vec![Action::Lifecycle("queued")]),
+                Step::OnStdin(
+                    control("cancel_async_message"),
+                    vec![Action::AnswerWithdrawal { cancelled: true }],
+                ),
+                Step::OnStdin(
+                    control("interrupt"),
+                    vec![
+                        Action::Respond(json!({"still_queued": []})),
+                        Action::EmitFixture {
+                            name: "cancel",
+                            skip_types: &["control_request"],
+                        },
+                    ],
+                ),
+            ],
+        );
+        let (harness, handle, mut stream, turn) =
+            steerable_turn(child, ClaudeLaunchOptions::default()).await;
+        let steer = steer_later(&harness, &handle, turn, "also say KIWI");
+        user_lines_written(&record, 2).await;
+        harness.interrupt(&handle).await.unwrap();
+        let error = settled_steer(steer).await.unwrap_err();
+        assert!(
+            error.to_string().contains(&format!(
+                "turn {turn} was stopped before Claude Code took the steering input"
+            )),
+            "{error}"
+        );
+        assert!(written_at(&record, "cancel_async_message") < written_at(&record, "interrupt"));
+        let events = until_completed(&mut stream).await;
+        assert!(steer_items(&events).is_empty());
+        assert_eq!(completion(&events).1, TurnStatusKind::Interrupted);
+        logs_assert(lines_with(1, &[r#"action="steer_withdrawing""#]));
+        harness.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_cancel_answer_withdraws_a_steer_before_it_is_written() {
+        let (index, _) = ask_of("tool-allowed");
+        let aborted = fixture_lines("cancel")
+            .into_iter()
+            .find(|line| line.contains(r#""type": "result""#))
+            .unwrap();
+        let (child, record) = scripted(
+            handshake_steps("sonnet"),
+            vec![
+                Step::OnStdin(
+                    user(),
+                    vec![
+                        Action::Lifecycle("queued"),
+                        Action::Lifecycle("started"),
+                        Action::EmitFixturePrefix {
+                            name: "tool-allowed",
+                            count: index + 1,
+                        },
+                    ],
+                ),
+                Step::OnStdin(user(), vec![Action::Lifecycle("queued")]),
+                Step::OnStdin(
+                    control("cancel_async_message"),
+                    vec![Action::AnswerWithdrawal { cancelled: true }],
+                ),
+                Step::OnStdin(answered(), vec![Action::Emit(vec![aborted])]),
+            ],
+        );
+        let (harness, _) = harness(vec![child]);
+        let (options, _updates) = open_options(ThreadId::new(), None, "sonnet");
+        let handle = harness.open_thread(options).await.unwrap();
+        let mut stream = harness.subscribe(&handle);
+        let turn = harness
+            .start_turn(&handle, text("touch probe.txt"), overrides())
+            .await
+            .unwrap();
+        let approval = approval_requested(&mut stream).await;
+        let steer = steer_later(&harness, &handle, turn, "also say KIWI");
+        user_lines_written(&record, 2).await;
+        harness
+            .respond_approval(approval, ApprovalDecision::Cancel)
+            .await
+            .unwrap();
+        assert!(settled_steer(steer).await.is_err());
+        assert!(
+            written_at(&record, "cancel_async_message") < written_at(&record, "control_response")
+        );
+        let events = until_completed(&mut stream).await;
+        assert!(steer_items(&events).is_empty());
+        harness.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_new_turn_is_busy_while_a_steer_may_still_start_the_next_one() {
+        let (child, record) = scripted(
+            handshake_steps("sonnet"),
+            vec![
+                prompt_taken_in(),
+                Step::OnStdin(
+                    user(),
+                    vec![Action::Lifecycle("queued"), rest_of_prompt_turn()],
+                ),
+                Step::OnStdin(
+                    control("cancel_async_message"),
+                    vec![Action::AnswerWithdrawal { cancelled: true }],
+                ),
+            ],
+        );
+        let (harness, handle, mut stream, turn) =
+            steerable_turn(child, ClaudeLaunchOptions::default()).await;
+        let steer = steer_later(&harness, &handle, turn, "also say KIWI");
+        user_lines_written(&record, 2).await;
+        // The steered turn ends; the steer, queued, has not started.
+        assert_eq!(completion(&until_completed(&mut stream).await).0, turn);
+        assert!(matches!(
+            harness.start_turn(&handle, text("next"), overrides()).await,
+            Err(HarnessError::ThreadBusy { .. })
+        ));
+        // Shutting down withdraws it first: it settles as stopped, and nothing more runs.
+        harness.shutdown().await.unwrap();
+        let error = settled_steer(steer).await.unwrap_err();
+        assert!(
+            error.to_string().contains(&format!(
+                "turn {turn} was stopped before Claude Code took the steering input"
+            )),
+            "{error}"
+        );
+        assert!(written_at(&record, "cancel_async_message") > 0);
+    }
+
+    #[tokio::test]
+    async fn a_steer_into_a_turn_being_stopped_is_refused() {
+        // Stop was pressed; the aborted turn's `result` has not come yet.
+        let (child, record) = scripted(
+            handshake_steps("sonnet"),
+            vec![
+                prompt_taken_in(),
+                Step::OnStdin(
+                    control("interrupt"),
+                    vec![Action::Respond(json!({"still_queued": []}))],
+                ),
+            ],
+        );
+        let (harness, handle, _stream, turn) =
+            steerable_turn(child, ClaudeLaunchOptions::default()).await;
+        harness.interrupt(&handle).await.unwrap();
+        let error = harness
+            .steer_turn(&handle, turn, "also say KIWI".into())
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("it is being stopped"), "{error}");
+        assert_eq!(
+            written(&record)
+                .iter()
+                .filter(|line| line["type"] == "user")
+                .count(),
+            1,
+            "written after the Stop, the steer would run as the next turn"
+        );
+        harness.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    #[traced_test]
+    async fn a_stop_interrupts_the_turn_a_pending_steer_starts() {
+        // The steered turn has ended and the CLI has committed to running the steer next: the
+        // withdrawal loses, the stop still interrupts, and the steer starts its turn while the
+        // stop drains. The CLI aborts that turn (§2); here the child just exits at EOF.
+        let (child, record) = scripted(
+            handshake_steps("sonnet"),
+            vec![
+                prompt_taken_in(),
+                Step::OnStdin(
+                    user(),
+                    vec![Action::Lifecycle("queued"), rest_of_prompt_turn()],
+                ),
+                Step::OnStdin(
+                    control("cancel_async_message"),
+                    vec![Action::AnswerWithdrawal { cancelled: false }],
+                ),
+                Step::OnStdin(
+                    control("interrupt"),
+                    vec![
+                        Action::Respond(json!({"still_queued": []})),
+                        Action::LifecycleOfUser {
+                            index: 1,
+                            state: "started",
+                        },
+                        Action::EmitFixturePrefix {
+                            name: "text-turn",
+                            count: 1,
+                        },
+                    ],
+                ),
+            ],
+        );
+        let (harness, handle, mut stream, turn) =
+            steerable_turn(child, ClaudeLaunchOptions::default()).await;
+        let steer = steer_later(&harness, &handle, turn, "also say KIWI");
+        user_lines_written(&record, 2).await;
+        assert_eq!(completion(&until_completed(&mut stream).await).0, turn);
+        harness.shutdown().await.unwrap();
+        // It reached the model, as the next turn, which the stop's interrupt was for.
+        settled_steer(steer).await.unwrap();
+        let events = until_closed(&mut stream).await;
+        let (next, status, _) = completion(&events);
+        assert_ne!(next, turn);
+        assert_eq!(status, TurnStatusKind::Interrupted);
+        assert_eq!(
+            steer_items(&events),
+            vec![(next, "also say KIWI".to_owned())]
+        );
+        assert!(!lock(&record).killed, "the interrupt stops it; no kill");
+        assert!(written_at(&record, "cancel_async_message") < written_at(&record, "interrupt"));
+        logs_assert(no_line_with(r#"action="stop_kill""#));
+    }
+
+    #[tokio::test]
+    #[traced_test]
+    async fn the_backstop_stays_quiet_while_the_child_stops() {
+        // A steer the CLI never reports, then a stop that cannot withdraw it and a child that
+        // does not exit at EOF: the drain outlasts the backstop's grace.
+        let (child, _) = scripted(
+            handshake_steps("sonnet"),
+            vec![
+                prompt_taken_in(),
+                Step::OnStdin(user(), Vec::new()),
+                Step::OnStdin(
+                    control("cancel_async_message"),
+                    vec![Action::AnswerWithdrawal { cancelled: false }],
+                ),
+                Step::OnStdin(
+                    control("interrupt"),
+                    vec![
+                        Action::Respond(json!({"still_queued": []})),
+                        rest_of_prompt_turn(),
+                    ],
+                ),
+            ],
+        );
+        let child = child.ignoring_eof();
+        let (harness, handle, _stream, turn) =
+            steerable_turn(child, ClaudeLaunchOptions::default()).await;
+        let steer = steer_later(&harness, &handle, turn, "also say KIWI");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        harness.shutdown().await.unwrap();
+        let error = settled_steer(steer).await.unwrap_err();
+        assert!(
+            error.to_string().contains("may have reached the model"),
+            "{error}"
+        );
+        logs_assert(no_line_with("steer_lifecycle_missing"));
+        logs_assert(no_line_with("claude child I/O failed"));
+    }
+
+    #[tokio::test]
+    async fn a_steer_whose_reply_is_dropped_has_an_unknown_outcome() {
+        // An aborted supervisor (a stop that overran its budget) never answers: the steer may
+        // have been taken in, so it must not read as "not sent".
+        let (child, record) = scripted(
+            handshake_steps("sonnet"),
+            vec![
+                prompt_taken_in(),
+                Step::OnStdin(user(), vec![Action::Lifecycle("queued")]),
+            ],
+        );
+        let (harness, handle, _stream, turn) =
+            steerable_turn(child, ClaudeLaunchOptions::default()).await;
+        let steer = steer_later(&harness, &handle, turn, "also say KIWI");
+        user_lines_written(&record, 2).await;
+        lock(&harness.threads)
+            .get(&handle.thread)
+            .and_then(|entry| entry.child.as_ref())
+            .expect("a live child")
+            .task
+            .abort();
+        let error = settled_steer(steer).await.unwrap_err();
+        assert!(
+            matches!(&error, HarnessError::Transport(message) if message.contains("may have reached the model")),
+            "{error}"
+        );
+    }
+
+    #[tokio::test]
+    #[traced_test]
+    async fn a_failed_stop_interrupt_still_leaves_the_steers_turn_interrupted() {
+        let (child, record) = scripted(
+            handshake_steps("sonnet"),
+            vec![
+                prompt_taken_in(),
+                Step::OnStdin(
+                    user(),
+                    vec![Action::Lifecycle("queued"), rest_of_prompt_turn()],
+                ),
+                // The withdrawal loses, stdin breaks before the stop's interrupt, and the steer
+                // starts its turn.
+                Step::OnStdin(
+                    control("cancel_async_message"),
+                    vec![
+                        Action::AnswerWithdrawal { cancelled: false },
+                        Action::BreakStdin,
+                        Action::LifecycleOfUser {
+                            index: 1,
+                            state: "started",
+                        },
+                        Action::EmitFixturePrefix {
+                            name: "text-turn",
+                            count: 1,
+                        },
+                    ],
+                ),
+            ],
+        );
+        let (harness, handle, mut stream, turn) =
+            steerable_turn(child, ClaudeLaunchOptions::default()).await;
+        let steer = steer_later(&harness, &handle, turn, "also say KIWI");
+        user_lines_written(&record, 2).await;
+        assert_eq!(completion(&until_completed(&mut stream).await).0, turn);
+        harness.shutdown().await.unwrap();
+        settled_steer(steer).await.unwrap();
+        let (next, status, _) = completion(&until_closed(&mut stream).await);
+        assert_ne!(next, turn);
+        assert_eq!(status, TurnStatusKind::Interrupted);
+        logs_assert(lines_with(1, &["could not interrupt for a pending steer"]));
+    }
+
+    #[tokio::test]
+    #[traced_test]
+    async fn the_backstop_withdraws_a_steer_the_cli_never_reports() {
+        let (child, _) = scripted(
+            handshake_steps("sonnet"),
+            vec![
+                prompt_taken_in(),
+                Step::OnStdin(user(), Vec::new()),
+                Step::OnStdin(
+                    control("cancel_async_message"),
+                    vec![Action::AnswerWithdrawal { cancelled: true }],
+                ),
+            ],
+        );
+        let (harness, handle, _stream, turn) =
+            steerable_turn(child, ClaudeLaunchOptions::default()).await;
+        let error = tokio::time::timeout(
+            Duration::from_secs(10),
+            harness.steer_turn(&handle, turn, "also say KIWI".into()),
+        )
+        .await
+        .expect("the backstop answered")
+        .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("did not report the steering input; it was withdrawn"),
+            "{error}"
+        );
+        logs_assert(lines_with(
+            1,
+            &[" WARN ", r#"action="steer_lifecycle_missing""#],
+        ));
+        harness.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    #[traced_test]
+    async fn a_child_exit_with_no_turn_running_answers_a_pending_steer() {
+        let (child, _) = scripted(
+            handshake_steps("sonnet"),
+            vec![
+                prompt_taken_in(),
+                Step::OnStdin(
+                    user(),
+                    vec![
+                        Action::Lifecycle("queued"),
+                        rest_of_prompt_turn(),
+                        Action::Exit {
+                            code: 1,
+                            stderr: Vec::new(),
+                        },
+                    ],
+                ),
+            ],
+        );
+        let (harness, handle, _stream, turn) =
+            steerable_turn(child, ClaudeLaunchOptions::default()).await;
+        let error = tokio::time::timeout(
+            Duration::from_secs(10),
+            harness.steer_turn(&handle, turn, "also say KIWI".into()),
+        )
+        .await
+        .expect("the exit answered the steer")
+        .unwrap_err();
+        assert!(
+            matches!(&error, HarnessError::Transport(message) if message.contains("may have reached the model")),
+            "{error}"
+        );
+        // The mapper settled it at exit, not the supervisor's last-resort answer.
+        logs_assert(lines_with(
+            1,
+            &[r#"action="steer_outcome_unknown""#, r#"why="child_exited""#],
+        ));
+        logs_assert(no_line_with("no mapper record"));
+        harness.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    #[traced_test]
+    async fn a_child_is_not_reaped_while_a_steer_is_unsettled() {
+        let (child, record) = scripted(
+            handshake_steps("sonnet"),
+            vec![
+                prompt_taken_in(),
+                Step::OnStdin(
+                    user(),
+                    vec![Action::Lifecycle("queued"), rest_of_prompt_turn()],
+                ),
+                Step::OnStdin(
+                    control("cancel_async_message"),
+                    vec![Action::AnswerWithdrawal { cancelled: true }],
+                ),
+            ],
+        );
+        let launch = ClaudeLaunchOptions {
+            idle_timeout: Some(Duration::from_millis(20)),
+            ..ClaudeLaunchOptions::default()
+        };
+        let (harness, handle, mut stream, turn) = steerable_turn(child, launch).await;
+        let steer = steer_later(&harness, &handle, turn, "also say KIWI");
+        user_lines_written(&record, 2).await;
+        until_completed(&mut stream).await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(!lock(&record).stdin_closed, "not reaped");
+        logs_assert(a_line_with(&[r#"action="idle""#, r#"reason="steers""#]));
+        harness.shutdown().await.unwrap();
+        assert!(settled_steer(steer).await.is_err());
     }
 }

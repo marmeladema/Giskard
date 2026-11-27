@@ -423,8 +423,16 @@ deduplicated away), since the server reads no handle.
   frames, so the table is emptied at that `init` and nothing is tracked after it. Recorded in
   `lifecycle-prompt` and `lifecycle-interrupted`. The frame and `cancel_async_message` are
   `@internal` in the CLI's schema; the plan for steering on top of them is
-  `specs/claude-code-harness-plan/turn-steering-plan.md`. The mapper already maps a steer's
-  lifecycle (that plan's §4.3–§4.5; nothing writes a steer until `steer_turn` lands): at
+  `specs/claude-code-harness-plan/turn-steering-plan.md`. `steer_turn` writes a steer into the
+  acknowledged active user turn and resolves once its fate is known (that plan's §4); it is not
+  advertised yet (`turn_steering` is false until the browser change of its step 4). The
+  supervisor refuses a steer into a turn being stopped, withdraws unstarted steers
+  (`cancel_async_message`) before every interrupt, a `Cancel` answer and a stop (which, with a
+  steer pending and no turn running, still interrupts: the CLI aborts the turn the steer starts),
+  withdraws one the CLI never reports after
+  `NOTIFICATION_GRACE` (not while stopping),
+  answers every steer at child exit at the latest, refuses a new prompt (`ThreadBusy`) and
+  never reaps while a steer is unsettled. The mapper maps a steer's lifecycle: at
   `started` its `UserMessage` (`user:<turn_id>:steer:<command_uuid>`) goes on the turn it was
   written into while that turn runs, else on the next turn, which the mapper opens for it; it
   settles each steer once (`MapperOutput::SteerSettled`), and a definite failure needs positive

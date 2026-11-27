@@ -154,6 +154,8 @@ struct SteerState {
     interrupted: bool,
     /// The turn its `UserMessage` was emitted on (or, late, the one it settled against).
     received_turn: Option<TurnId>,
+    /// A lifecycle frame arrived for it (the CLI writes `queued` on the write).
+    seen: bool,
 }
 
 /// Why the adapter withdraws a steer (`note_steer_withdrawing`): it picks the failure's wording.
@@ -749,6 +751,7 @@ impl ClaudeMapper {
     pub fn note_interrupt_sent(&mut self) {
         // A steer not yet started that the CLI then runs as the next turn meets this interrupt
         // there (§4.5 of the turn-steering plan): that turn ends interrupted, not failed.
+        let mut steers = 0;
         for steer in self
             .session
             .commands
@@ -756,9 +759,19 @@ impl ClaudeMapper {
             .filter_map(|entry| (!entry.started).then_some(entry.steer.as_mut()).flatten())
         {
             steer.interrupted = true;
+            steers += 1;
         }
         match self.turn.as_mut() {
             Some(turn) => turn.interrupt_sent = true,
+            // Between a turn's `result` and the `started` of a steer it missed: the interrupt is
+            // for that steer's next turn.
+            None if steers > 0 => debug!(
+                thread_id = %self.thread,
+                harness_thread_id = %self.harness_thread_id,
+                steers,
+                action = "note_interrupt_sent",
+                "interrupt noted for steers that may still start the next turn"
+            ),
             None => warn!(
                 thread_id = %self.thread,
                 harness_thread_id = %self.harness_thread_id,
@@ -3961,18 +3974,60 @@ impl ClaudeMapper {
                 listed_turn: None,
                 interrupted: false,
                 received_turn: None,
+                seen: false,
             }),
         };
         self.session.commands.insert(command_uuid, entry);
     }
 
-    /// The steers written but not yet taken in nor settled, which a Stop withdraws.
+    /// Why a steer for `expected` cannot be written now, if it cannot (§4.2 of the
+    /// turn-steering plan): the active turn must be that turn, a user turn the adapter started,
+    /// whose prompt the CLI has taken in.
+    pub fn steer_refusal(&self, expected: TurnId) -> Option<String> {
+        let Some(turn) = self.turn.as_ref() else {
+            return Some(format!("cannot steer turn {expected}: no active turn"));
+        };
+        let why = if turn.id != expected {
+            return Some(format!(
+                "cannot steer turn {expected}: the active turn is {}",
+                turn.id
+            ));
+        } else if turn.kind != TurnKind::User {
+            "it is a compaction"
+        } else if turn.external {
+            "Claude Code started it on its own"
+        } else if !turn.prompt_acknowledged {
+            "its prompt is not taken in yet"
+        } else if turn.interrupt_sent {
+            // Written after the Stop's withdrawals, it would run as the next turn.
+            "it is being stopped"
+        } else {
+            return None;
+        };
+        Some(format!("cannot steer turn {expected}: {why}"))
+    }
+
+    /// Whether a lifecycle frame has arrived for this steer; `true` once it is no longer tracked.
+    pub fn steer_lifecycle_seen(&self, command_uuid: &str) -> bool {
+        self.session
+            .commands
+            .get(command_uuid)
+            .and_then(|entry| entry.steer.as_ref())
+            .is_none_or(|steer| steer.seen)
+    }
+
+    /// The steers written but not yet taken in nor settled, and not already being withdrawn,
+    /// which a Stop withdraws. A refused withdrawal clears that, so a later Stop sends another.
     pub fn unstarted_steers(&self) -> Vec<String> {
         self.session
             .commands
             .iter()
             .filter(|(_, entry)| {
-                !entry.started && entry.steer.as_ref().is_some_and(|steer| !steer.settled)
+                !entry.started
+                    && entry
+                        .steer
+                        .as_ref()
+                        .is_some_and(|steer| !steer.settled && steer.withdrawing.is_none())
             })
             .map(|(uuid, _)| uuid.clone())
             .collect()
@@ -3988,14 +4043,16 @@ impl ClaudeMapper {
 
     /// The adapter is writing `cancel_async_message` for this steer.
     pub fn note_steer_withdrawing(&mut self, command_uuid: &str, reason: WithdrawReason) {
+        // The first withdrawal's reason stands: a Stop's is not rewritten by a later backstop.
         if let Some(steer) = self.steer_mut(command_uuid) {
-            steer.withdrawing = Some(reason);
+            steer.withdrawing.get_or_insert(reason);
         }
     }
 
-    /// The CLI's answer to a withdrawal. A confirmed one settles the steer as withdrawn once its
-    /// `cancelled` frame has come (it precedes the answer); a refused one leaves the lifecycle to
-    /// decide: the steer was taken in, or is about to be.
+    /// The CLI's answer to a withdrawal. A confirmed one settles the steer as withdrawn at once,
+    /// whether its `cancelled` frame came first (as the CLI orders them), comes later (then
+    /// untracked) or never comes; a refused one leaves the lifecycle to decide: the steer was
+    /// taken in, or is about to be.
     pub fn note_steer_withdrawal_answer(
         &mut self,
         command_uuid: &str,
@@ -4018,13 +4075,15 @@ impl ClaudeMapper {
             steer.withdrawing = None;
             return out;
         }
+        // The confirmation is positive evidence on its own: the `cancelled` frame usually comes
+        // first, but a steer must not wait on it, or the thread stays busy.
         steer.withdrawn = true;
-        let ready = steer.cancelled_unstarted && !steer.settled;
         let reason = steer.withdrawing.unwrap_or(WithdrawReason::Stop);
-        if ready {
-            self.settle_steer(command_uuid, SteerOutcome::Withdrawn(reason), &mut out);
-            self.remove_if_done(command_uuid);
+        self.settle_steer(command_uuid, SteerOutcome::Withdrawn(reason), &mut out);
+        if let Some(entry) = self.session.commands.get_mut(command_uuid) {
+            entry.terminated = true;
         }
+        self.remove_if_done(command_uuid);
         out
     }
 
@@ -4046,6 +4105,9 @@ impl ClaudeMapper {
             return;
         };
         let steered = entry.turn;
+        if let Some(steer) = entry.steer.as_mut() {
+            steer.seen = true;
+        }
         match state {
             CommandLifecycleState::Queued => debug!(
                 thread_id = %self.thread,
@@ -10300,17 +10362,18 @@ mod tests {
             )]
         );
         assert!(mapper.session.commands.is_empty());
-        // The answer first.
+        // The answer first: it settles the steer on its own, and the late frame settles nothing
+        // a second time.
         let (mut mapper, _) = steered_mapper();
         mapper.note_steer_withdrawing("s-1", WithdrawReason::Backstop);
-        assert!(settled(&mapper.note_steer_withdrawal_answer("s-1", true)).is_empty());
         assert_eq!(
-            settled(&mapper.map_line(&steer_line("s-1", "cancelled"))),
+            settled(&mapper.note_steer_withdrawal_answer("s-1", true)),
             vec![(
                 "s-1".to_owned(),
                 SteerOutcome::Withdrawn(WithdrawReason::Backstop)
             )]
         );
+        assert!(settled(&mapper.map_line(&steer_line("s-1", "cancelled"))).is_empty());
         assert!(mapper.session.commands.is_empty());
     }
 
@@ -10417,18 +10480,33 @@ mod tests {
     }
 
     #[test]
-    fn a_confirmed_withdrawal_stays_withdrawn_when_the_child_exits_first() {
+    fn a_confirmed_withdrawal_settles_without_its_cancelled_frame() {
+        // The CLI confirmed the withdrawal but no `cancelled` frame ever comes: the steer must not
+        // wait on it, or the thread stays busy until the child exits.
         let (mut mapper, _) = steered_mapper();
         mapper.note_steer_withdrawing("s-1", WithdrawReason::Stop);
-        // The answer came, but the child exited before its `cancelled` frame was mapped.
-        assert!(settled(&mapper.note_steer_withdrawal_answer("s-1", true)).is_empty());
         assert_eq!(
-            settled(&mapper.child_exited("signal: 9")),
+            settled(&mapper.note_steer_withdrawal_answer("s-1", true)),
             vec![(
                 "s-1".to_owned(),
                 SteerOutcome::Withdrawn(WithdrawReason::Stop)
             )]
         );
+        assert!(!mapper.has_unsettled_steers());
+        assert!(settled(&mapper.child_exited("signal: 9")).is_empty());
+    }
+
+    #[test]
+    fn a_withdrawal_in_flight_is_not_sent_again() {
+        let (mut mapper, _) = steered_mapper();
+        mapper.note_steer_withdrawing("s-1", WithdrawReason::Backstop);
+        assert!(
+            mapper.unstarted_steers().is_empty(),
+            "its withdrawal is unanswered"
+        );
+        // Refused: a later Stop may withdraw it again.
+        mapper.note_steer_withdrawal_answer("s-1", false);
+        assert_eq!(mapper.unstarted_steers(), vec!["s-1".to_owned()]);
     }
 
     #[test]
