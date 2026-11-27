@@ -19,6 +19,7 @@ use claude_codes::{
     ToolResultMeta, ToolUseBlock, UsageInfo,
 };
 use giskard_core::approval::{ApprovalDecision, ApprovalKind, ApprovalMetadata, ApprovalRequest};
+use giskard_core::error::HarnessError;
 use giskard_core::event::AgentEvent;
 use giskard_core::ids::{ApprovalId, ItemId, ServerRequestId, ThreadId, TurnId};
 use giskard_core::item::{
@@ -105,6 +106,8 @@ pub enum CommandKind {
     Prompt,
     /// The `/compact` line of a compaction turn.
     Compact,
+    /// Text written into a running turn (`steer_turn`).
+    Steer,
 }
 
 impl CommandKind {
@@ -112,17 +115,103 @@ impl CommandKind {
         match self {
             CommandKind::Prompt => "prompt",
             CommandKind::Compact => "compact",
+            CommandKind::Steer => "steer",
         }
     }
 }
 
 /// One stdin message the CLI may still report on (`SessionState::commands`).
 struct CommandEntry {
-    /// The turn the adapter opened for it.
+    /// The turn the adapter opened for it; for a steer, the turn it was written into.
     turn: TurnId,
     kind: CommandKind,
     /// Its `started` arrived: the CLI took it into a turn.
     started: bool,
+    /// A terminal lifecycle state arrived (`completed`, `cancelled`, `discarded`, `refused`).
+    terminated: bool,
+    /// A steer's own state; `None` for a prompt or `/compact`.
+    steer: Option<SteerState>,
+}
+
+/// What the mapper knows of one steer until it is settled and accounted for.
+struct SteerState {
+    /// The text the adapter wrote, which its `UserMessage` says.
+    text: String,
+    /// `MapperOutput::SteerSettled` was emitted for it.
+    settled: bool,
+    /// Its `UserMessage` was emitted.
+    emitted: bool,
+    /// The adapter is withdrawing it (`note_steer_withdrawing`), and why.
+    withdrawing: Option<WithdrawReason>,
+    /// The CLI confirmed the withdrawal (`{"cancelled": true}`).
+    withdrawn: bool,
+    /// `cancelled` arrived with no `started` and no confirmed withdrawal: the next `result`
+    /// decides whether a turn took it in.
+    cancelled_unstarted: bool,
+    /// The turn whose `result` listed it in `user_message_uuids`.
+    listed_turn: Option<TurnId>,
+    /// The adapter sent an interrupt while it had not started: a turn it starts is interrupted.
+    interrupted: bool,
+    /// The turn its `UserMessage` was emitted on (or, late, the one it settled against).
+    received_turn: Option<TurnId>,
+}
+
+/// Why the adapter withdraws a steer (`note_steer_withdrawing`): it picks the failure's wording.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WithdrawReason {
+    /// Before the user's Stop, the stop sequence's interrupt, or a `Cancel` answer to an ask.
+    Stop,
+    /// No lifecycle frame came for it (the supervisor's backstop).
+    Backstop,
+}
+
+/// How a steer ended, for the `steer_turn` waiting on it (`MapperOutput::SteerSettled`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SteerOutcome {
+    /// Taken into the turn it was written for.
+    TakenIn { turn: TurnId },
+    /// Run in a later turn: the next one the CLI started for it, or one already running.
+    NextTurn { turn: TurnId },
+    /// Withdrawn by the adapter, and the CLI confirmed it: it will not reach the model.
+    Withdrawn(WithdrawReason),
+    /// The CLI dropped it (`discarded`, `refused`, or `cancelled` with no turn taking it in).
+    Dropped { state: String },
+    /// The child exited, or tracking stopped, before its fate was known.
+    Unknown,
+}
+
+impl SteerOutcome {
+    /// The result `steer_turn` returns: `Err` only for a steer that will not reach the model,
+    /// and for the unknown outcome, whose message says so.
+    pub fn into_result(self, steered_turn: TurnId) -> Result<(), HarnessError> {
+        match self {
+            SteerOutcome::TakenIn { .. } | SteerOutcome::NextTurn { .. } => Ok(()),
+            SteerOutcome::Withdrawn(WithdrawReason::Stop) => Err(HarnessError::Protocol(format!(
+                "turn {steered_turn} was stopped before Claude Code took the steering input"
+            ))),
+            SteerOutcome::Withdrawn(WithdrawReason::Backstop) => Err(HarnessError::Protocol(
+                "Claude Code did not report the steering input; it was withdrawn".into(),
+            )),
+            SteerOutcome::Dropped { state } => Err(HarnessError::Protocol(format!(
+                "Claude Code dropped the steering input ({state})"
+            ))),
+            SteerOutcome::Unknown => Err(HarnessError::Transport(
+                "Claude Code exited before reporting the steering input; it may have reached the \
+                 model"
+                    .into(),
+            )),
+        }
+    }
+
+    fn as_str(&self) -> &'static str {
+        match self {
+            SteerOutcome::TakenIn { .. } => "taken_in",
+            SteerOutcome::NextTurn { .. } => "next_turn",
+            SteerOutcome::Withdrawn(_) => "withdrawn",
+            SteerOutcome::Dropped { .. } => "dropped",
+            SteerOutcome::Unknown => "unknown",
+        }
+    }
 }
 
 /// What the adapter must do with one mapped frame.
@@ -131,6 +220,13 @@ struct CommandEntry {
 #[derive(Debug, Clone)]
 pub enum MapperOutput {
     Event(AgentEvent),
+    /// A steer's fate is known: the supervisor answers the `steer_turn` waiting on it.
+    SteerSettled {
+        command_uuid: String,
+        /// The turn the steer was written into, which an error message names.
+        steered_turn: TurnId,
+        outcome: SteerOutcome,
+    },
     /// A control_response the adapter must write, needing no user: a denied `ExitPlanMode`.
     Reply(Value),
     /// A control_response to a request the adapter sent; it correlates the waiter itself.
@@ -301,6 +397,8 @@ struct SessionState {
     commands: HashMap<String, CommandEntry>,
     /// Whether the latest `system/init` advertised `msg_lifecycle_v1`; `None` before any `init`.
     lifecycle_supported: Option<bool>,
+    /// The primary turn that completed last, where a steer consumed after its turn ended lands.
+    last_completed_turn: Option<TurnId>,
 }
 
 /// A resumed sub-agent run waiting for its first frame (`SessionState::pending_resumes`).
@@ -649,6 +747,16 @@ impl ClaudeMapper {
 
     /// The adapter sent `interrupt`; the next error-shaped result is `Interrupted`, not `Failed`.
     pub fn note_interrupt_sent(&mut self) {
+        // A steer not yet started that the CLI then runs as the next turn meets this interrupt
+        // there (§4.5 of the turn-steering plan): that turn ends interrupted, not failed.
+        for steer in self
+            .session
+            .commands
+            .values_mut()
+            .filter_map(|entry| (!entry.started).then_some(entry.steer.as_mut()).flatten())
+        {
+            steer.interrupted = true;
+        }
         match self.turn.as_mut() {
             Some(turn) => turn.interrupt_sent = true,
             None => warn!(
@@ -810,6 +918,8 @@ impl ClaudeMapper {
     /// turn there is nothing to complete.
     pub fn child_exited(&mut self, exit: &str) -> Vec<MapperOutput> {
         let mut out = Vec::new();
+        // A steer still unsettled when no further frame can come: its fate is unknown.
+        self.settle_unknown_steers("child_exited", &mut out);
         // No lifecycle frame comes from a process that has gone.
         if !self.session.commands.is_empty() {
             debug!(
@@ -1067,7 +1177,7 @@ impl ClaudeMapper {
                 });
             }
             Frame::TaskNotification(task) => self.on_task_notification(task, &mut out),
-            Frame::CommandLifecycle(message) => self.on_command_lifecycle(message),
+            Frame::CommandLifecycle(message) => self.on_command_lifecycle(message, &mut out),
             frame @ (Frame::SessionTitleChanged(_) | Frame::Ignored { .. }) => {
                 let (frame_type, subtype) = frame.kind();
                 debug!(
@@ -1103,6 +1213,7 @@ impl ClaudeMapper {
         self.session.lifecycle_supported = Some(lifecycle_supported);
         if !lifecycle_supported && !self.session.commands.is_empty() {
             // No frame will ever end these entries: a CLI without the capability sends none.
+            self.settle_unknown_steers("lifecycle_unsupported", out);
             debug!(
                 thread_id = %self.thread,
                 harness_thread_id = %self.harness_thread_id,
@@ -1910,6 +2021,7 @@ impl ClaudeMapper {
             }
         }
         let status = result_status(&result, turn.interrupt_sent);
+        self.reconcile_steers_at_result(turn_id, &result.user_message_uuids, out);
         self.emit_usage(&Route::Primary, out);
         self.finish_turn(status, origin, out);
     }
@@ -1990,6 +2102,7 @@ impl ClaudeMapper {
         let Some(turn) = self.turn.take() else {
             return;
         };
+        self.session.last_completed_turn = Some(turn.id);
         info!(
             thread_id = %self.thread,
             harness_thread_id = %self.harness_thread_id,
@@ -3689,18 +3802,29 @@ impl ClaudeMapper {
             turn: turn.id,
             kind,
             started: false,
+            terminated: false,
+            steer: None,
         };
         self.session.commands.insert(command_uuid, entry);
     }
 
     /// `command_lifecycle`: the fate of a line the adapter stamped. Observed and cross-checked
     /// only; the prompt is still acknowledged at the turn's `system/init`.
-    fn on_command_lifecycle(&mut self, message: CommandLifecycleMessage) {
+    fn on_command_lifecycle(&mut self, message: CommandLifecycleMessage, out: &mut Out) {
         let CommandLifecycleMessage {
             command_uuid,
             state,
             ..
         } = message;
+        if self
+            .session
+            .commands
+            .get(&command_uuid)
+            .is_some_and(|entry| entry.steer.is_some())
+        {
+            self.on_steer_lifecycle(command_uuid, state, out);
+            return;
+        }
         let active_turn = self.turn.as_ref().map(|turn| turn.id);
         let Some(entry) = self.session.commands.get_mut(&command_uuid) else {
             debug!(
@@ -3813,6 +3937,441 @@ impl ClaudeMapper {
         };
         if terminal {
             self.session.commands.remove(&command_uuid);
+        }
+    }
+
+    // ---- steers ---------------------------------------------------------------------------------
+
+    /// A steer the adapter is writing into `turn`: tracked under `command_uuid` until its
+    /// lifecycle settles it (`MapperOutput::SteerSettled`) and, if a turn took it in, its
+    /// `UserMessage` is emitted.
+    pub fn note_steer(&mut self, command_uuid: String, turn: TurnId, text: String) {
+        let entry = CommandEntry {
+            turn,
+            kind: CommandKind::Steer,
+            started: false,
+            terminated: false,
+            steer: Some(SteerState {
+                text,
+                settled: false,
+                emitted: false,
+                withdrawing: None,
+                withdrawn: false,
+                cancelled_unstarted: false,
+                listed_turn: None,
+                interrupted: false,
+                received_turn: None,
+            }),
+        };
+        self.session.commands.insert(command_uuid, entry);
+    }
+
+    /// The steers written but not yet taken in nor settled, which a Stop withdraws.
+    pub fn unstarted_steers(&self) -> Vec<String> {
+        self.session
+            .commands
+            .iter()
+            .filter(|(_, entry)| {
+                !entry.started && entry.steer.as_ref().is_some_and(|steer| !steer.settled)
+            })
+            .map(|(uuid, _)| uuid.clone())
+            .collect()
+    }
+
+    /// Whether a steer still waits for its fate: the thread is busy meanwhile.
+    pub fn has_unsettled_steers(&self) -> bool {
+        self.session
+            .commands
+            .values()
+            .any(|entry| entry.steer.as_ref().is_some_and(|steer| !steer.settled))
+    }
+
+    /// The adapter is writing `cancel_async_message` for this steer.
+    pub fn note_steer_withdrawing(&mut self, command_uuid: &str, reason: WithdrawReason) {
+        if let Some(steer) = self.steer_mut(command_uuid) {
+            steer.withdrawing = Some(reason);
+        }
+    }
+
+    /// The CLI's answer to a withdrawal. A confirmed one settles the steer as withdrawn once its
+    /// `cancelled` frame has come (it precedes the answer); a refused one leaves the lifecycle to
+    /// decide: the steer was taken in, or is about to be.
+    pub fn note_steer_withdrawal_answer(
+        &mut self,
+        command_uuid: &str,
+        cancelled: bool,
+    ) -> Vec<MapperOutput> {
+        let mut out = Vec::new();
+        info!(
+            thread_id = %self.thread,
+            harness_thread_id = %self.harness_thread_id,
+            command_uuid = %command_uuid,
+            cancelled,
+            action = "steer_withdrawn",
+            "Claude Code answered the withdrawal of a steer"
+        );
+        let Some(steer) = self.steer_mut(command_uuid) else {
+            return out;
+        };
+        if !cancelled {
+            // Refused: the steer was taken in, or is about to be. It is no longer being withdrawn.
+            steer.withdrawing = None;
+            return out;
+        }
+        steer.withdrawn = true;
+        let ready = steer.cancelled_unstarted && !steer.settled;
+        let reason = steer.withdrawing.unwrap_or(WithdrawReason::Stop);
+        if ready {
+            self.settle_steer(command_uuid, SteerOutcome::Withdrawn(reason), &mut out);
+            self.remove_if_done(command_uuid);
+        }
+        out
+    }
+
+    fn steer_mut(&mut self, command_uuid: &str) -> Option<&mut SteerState> {
+        self.session
+            .commands
+            .get_mut(command_uuid)
+            .and_then(|entry| entry.steer.as_mut())
+    }
+
+    /// A steer's `command_lifecycle` frame (§4.3 of the turn-steering plan).
+    fn on_steer_lifecycle(
+        &mut self,
+        command_uuid: String,
+        state: CommandLifecycleState,
+        out: &mut Out,
+    ) {
+        let Some(entry) = self.session.commands.get_mut(&command_uuid) else {
+            return;
+        };
+        let steered = entry.turn;
+        match state {
+            CommandLifecycleState::Queued => debug!(
+                thread_id = %self.thread,
+                turn_id = %steered,
+                command_uuid = %command_uuid,
+                action = "steer_queued",
+                "Claude Code queued the steering input"
+            ),
+            CommandLifecycleState::Started => {
+                entry.started = true;
+                self.take_in_steer(&command_uuid, None, out);
+            }
+            CommandLifecycleState::Completed => {
+                entry.terminated = true;
+                let consumed_unreported = !entry.started;
+                if consumed_unreported {
+                    // "Not a strict pairing": the turn that took it in ended, though no
+                    // `started` said so.
+                    self.take_in_steer(&command_uuid, Some("completed"), out);
+                }
+                self.remove_if_done(&command_uuid);
+            }
+            CommandLifecycleState::Cancelled => {
+                entry.terminated = true;
+                if entry.started {
+                    info!(
+                        thread_id = %self.thread,
+                        turn_id = %steered,
+                        command_uuid = %command_uuid,
+                        action = "steer_cancelled",
+                        "a steer taken in was cancelled with its aborted turn"
+                    );
+                    self.remove_if_done(&command_uuid);
+                    return;
+                }
+                let Some(steer) = entry.steer.as_mut() else {
+                    return;
+                };
+                steer.cancelled_unstarted = true;
+                if steer.withdrawn {
+                    let reason = steer.withdrawing.unwrap_or(WithdrawReason::Stop);
+                    self.settle_steer(&command_uuid, SteerOutcome::Withdrawn(reason), out);
+                    self.remove_if_done(&command_uuid);
+                }
+                // Otherwise the withdrawal's answer, or the next `result`, decides.
+            }
+            CommandLifecycleState::Discarded => {
+                entry.terminated = true;
+                self.settle_steer(
+                    &command_uuid,
+                    SteerOutcome::Dropped {
+                        state: "discarded".into(),
+                    },
+                    out,
+                );
+                self.remove_if_done(&command_uuid);
+            }
+            CommandLifecycleState::Unknown(other) if other == REFUSED_STATE => {
+                entry.terminated = true;
+                self.settle_steer(&command_uuid, SteerOutcome::Dropped { state: other }, out);
+                self.remove_if_done(&command_uuid);
+            }
+            CommandLifecycleState::Unknown(other) => warn!(
+                thread_id = %self.thread,
+                turn_id = %steered,
+                command_uuid = %command_uuid,
+                state = %other,
+                action = "steer_lifecycle",
+                "a steer lifecycle state this adapter does not know; still tracked"
+            ),
+        }
+    }
+
+    /// A turn took the steer in: emit its `UserMessage` there and settle it.
+    ///
+    /// On `started` (`late` is `None`) the turn is the active one: the steered turn itself, else a
+    /// later one, which the CLI opens for it when none runs (the next turn). Otherwise the turn
+    /// that consumed it is known only from a `completed` with no `started`, or from a `result`
+    /// listing it (`late` names which), and its position in that turn is unknown; when no turn
+    /// runs any more, it is settled without an item.
+    fn take_in_steer(&mut self, command_uuid: &str, late: Option<&'static str>, out: &mut Out) {
+        let Some(entry) = self.session.commands.get(command_uuid) else {
+            return;
+        };
+        let Some(steer) = entry.steer.as_ref() else {
+            return;
+        };
+        if steer.emitted {
+            return;
+        }
+        let steered = entry.turn;
+        let interrupted = steer.interrupted;
+        let listed = steer.listed_turn;
+        let text = steer.text.clone();
+        let active = self.turn.as_ref().map(|turn| turn.id);
+        // On `started` the active turn is where the CLI put it. A late confirmation names its
+        // turn only as the steered one or the one whose `result` listed it: any other active
+        // turn (a background task's continuation, say) is not where it went.
+        let active = match late {
+            None => active,
+            Some(_) => active.filter(|turn| *turn == steered || Some(*turn) == listed),
+        };
+        let turn = match (active, late) {
+            (Some(turn), _) => turn,
+            (None, None) => {
+                // The steer missed its turn and starts the next one: open it now, so its
+                // `UserMessage` precedes everything the turn does.
+                let turn = self.ensure_turn("command_lifecycle", out);
+                if interrupted {
+                    if let Some(state) = self.turn.as_mut() {
+                        state.interrupt_sent = true;
+                    }
+                    info!(
+                        thread_id = %self.thread,
+                        harness_thread_id = %self.harness_thread_id,
+                        turn_id = %turn,
+                        steered_turn_id = %steered,
+                        command_uuid = %command_uuid,
+                        action = "steer_after_stop",
+                        "a steer the Stop could not withdraw starts the next turn, which the \
+                         interrupt aborts"
+                    );
+                }
+                turn
+            }
+            (None, Some(late)) => {
+                // The turn that consumed it has ended. The server amends a finished turn only
+                // with a command's late completion, so a `UserMessage` would be dropped there:
+                // settle the steer, and say why it shows nowhere.
+                let turn = listed
+                    .or(self.session.last_completed_turn)
+                    .unwrap_or(steered);
+                warn!(
+                    thread_id = %self.thread,
+                    harness_thread_id = %self.harness_thread_id,
+                    turn_id = %turn,
+                    steered_turn_id = %steered,
+                    command_uuid = %command_uuid,
+                    evidence = late,
+                    action = "steer_confirmed_late",
+                    "Claude Code took the steering input in without reporting it, after its turn \
+                     ended; it is not shown in the thread"
+                );
+                if let Some(steer) = self.steer_mut(command_uuid) {
+                    steer.emitted = true;
+                    steer.received_turn = Some(turn);
+                }
+                let outcome = if turn == steered {
+                    SteerOutcome::TakenIn { turn }
+                } else {
+                    SteerOutcome::NextTurn { turn }
+                };
+                self.settle_steer(command_uuid, outcome, out);
+                return;
+            }
+        };
+        let next_turn = turn != steered;
+        if let Some(late) = late {
+            warn!(
+                thread_id = %self.thread,
+                harness_thread_id = %self.harness_thread_id,
+                turn_id = %turn,
+                steered_turn_id = %steered,
+                command_uuid = %command_uuid,
+                evidence = late,
+                action = "steer_confirmed_late",
+                "Claude Code took the steering input in without reporting it started; its \
+                 position in the turn is unknown"
+            );
+        } else {
+            info!(
+                thread_id = %self.thread,
+                harness_thread_id = %self.harness_thread_id,
+                turn_id = %turn,
+                steered_turn_id = %steered,
+                command_uuid = %command_uuid,
+                next_turn,
+                action = "steer_started",
+                "Claude Code took the steering input in"
+            );
+        }
+        let harness_item_id = format!("user:{turn}:steer:{command_uuid}");
+        self.user_message(&Route::Primary, turn, harness_item_id, text, out);
+        if let Some(steer) = self.steer_mut(command_uuid) {
+            steer.emitted = true;
+            steer.received_turn = Some(turn);
+        }
+        let outcome = if next_turn {
+            SteerOutcome::NextTurn { turn }
+        } else {
+            SteerOutcome::TakenIn { turn }
+        };
+        self.settle_steer(command_uuid, outcome, out);
+    }
+
+    /// Emit the steer's `SteerSettled`, once.
+    fn settle_steer(&mut self, command_uuid: &str, outcome: SteerOutcome, out: &mut Out) {
+        let Some(entry) = self.session.commands.get_mut(command_uuid) else {
+            return;
+        };
+        let steered_turn = entry.turn;
+        let Some(steer) = entry.steer.as_mut() else {
+            return;
+        };
+        if steer.settled {
+            return;
+        }
+        steer.settled = true;
+        if matches!(
+            outcome,
+            SteerOutcome::Withdrawn(_) | SteerOutcome::Dropped { .. }
+        ) {
+            info!(
+                thread_id = %self.thread,
+                harness_thread_id = %self.harness_thread_id,
+                turn_id = %steered_turn,
+                command_uuid = %command_uuid,
+                outcome = outcome.as_str(),
+                action = "steer_dropped",
+                "the steering input will not reach the model"
+            );
+        }
+        out.push(MapperOutput::SteerSettled {
+            command_uuid: command_uuid.to_owned(),
+            steered_turn,
+            outcome,
+        });
+    }
+
+    /// Forget a steer once it is settled and its lifecycle has ended.
+    fn remove_if_done(&mut self, command_uuid: &str) {
+        let done = self
+            .session
+            .commands
+            .get(command_uuid)
+            .is_some_and(|entry| {
+                entry.terminated && entry.steer.as_ref().is_none_or(|steer| steer.settled)
+            });
+        if done {
+            self.session.commands.remove(command_uuid);
+        }
+    }
+
+    /// At a primary `result`: which steers its turn consumed (`user_message_uuids`), so a steer
+    /// taken in without a `started` is accounted for, and a `cancelled` one is decided.
+    fn reconcile_steers_at_result(&mut self, turn: TurnId, listed: &[String], out: &mut Out) {
+        let steers: Vec<String> = self
+            .session
+            .commands
+            .iter()
+            .filter(|(_, entry)| entry.steer.is_some())
+            .map(|(uuid, _)| uuid.clone())
+            .collect();
+        for uuid in steers {
+            let in_list = listed.contains(&uuid);
+            let Some(entry) = self.session.commands.get_mut(&uuid) else {
+                continue;
+            };
+            let started = entry.started;
+            let Some(steer) = entry.steer.as_mut() else {
+                continue;
+            };
+            let received = steer.received_turn;
+            if in_list {
+                steer.listed_turn = Some(turn);
+            }
+            let (settled, cancelled_unstarted, emitted) =
+                (steer.settled, steer.cancelled_unstarted, steer.emitted);
+            if in_list && !emitted {
+                // Consumed by this turn with no `started` (or none yet): it reached the model.
+                self.take_in_steer(&uuid, Some("result"), out);
+                self.remove_if_done(&uuid);
+            } else if cancelled_unstarted && !settled {
+                // `cancelled` came and this turn did not take it in: it will not reach the model.
+                // The result proves no more than that; only the CLI's answer to a withdrawal of
+                // ours (which settles it first, when it comes before this result) says it was one.
+                self.settle_steer(
+                    &uuid,
+                    SteerOutcome::Dropped {
+                        state: "cancelled".into(),
+                    },
+                    out,
+                );
+                self.remove_if_done(&uuid);
+            } else if started && emitted && received == Some(turn) && !listed.is_empty() && !in_list
+            {
+                warn!(
+                    thread_id = %self.thread,
+                    harness_thread_id = %self.harness_thread_id,
+                    turn_id = %turn,
+                    command_uuid = %uuid,
+                    action = "steer_unconfirmed",
+                    "the result does not list a steer its turn took in"
+                );
+            }
+        }
+    }
+
+    /// No further frame can settle the unsettled steers: their fate is unknown.
+    fn settle_unknown_steers(&mut self, why: &'static str, out: &mut Out) {
+        let unsettled: Vec<String> = self
+            .session
+            .commands
+            .iter()
+            .filter(|(_, entry)| entry.steer.as_ref().is_some_and(|steer| !steer.settled))
+            .map(|(uuid, _)| uuid.clone())
+            .collect();
+        for uuid in unsettled {
+            // A withdrawal the CLI confirmed is positive evidence even without its `cancelled`.
+            let withdrawn = self
+                .steer_mut(&uuid)
+                .and_then(|steer| steer.withdrawn.then_some(steer.withdrawing))
+                .map(|reason| reason.unwrap_or(WithdrawReason::Stop));
+            if let Some(reason) = withdrawn {
+                self.settle_steer(&uuid, SteerOutcome::Withdrawn(reason), out);
+                continue;
+            }
+            warn!(
+                thread_id = %self.thread,
+                harness_thread_id = %self.harness_thread_id,
+                command_uuid = %uuid,
+                why,
+                action = "steer_outcome_unknown",
+                "a steer's fate is unknown: Claude Code may have taken it in"
+            );
+            self.settle_steer(&uuid, SteerOutcome::Unknown, out);
         }
     }
 
@@ -9167,5 +9726,810 @@ mod tests {
         mapper.note_command("c-1".into(), CommandKind::Prompt);
         mapper.child_exited("exit status: 1");
         assert!(mapper.session.commands.is_empty());
+    }
+
+    // ---- steers ---------------------------------------------------------------------------------
+
+    /// Where a steering fixture's recorder stopped the turn (wrote its withdrawals, then
+    /// `interrupt` or a `Cancel` answer): before this 1-based `.out.jsonl` line.
+    #[derive(Clone, Copy)]
+    enum StopAt {
+        Never,
+        BeforeLine(usize),
+        /// Right after the primary `message_delta` that ends the turn after its tool call.
+        AfterFinalDelta,
+    }
+
+    /// What a steering fixture run produced.
+    struct SteerRun {
+        mapper: ClaudeMapper,
+        outputs: Vec<MapperOutput>,
+        /// The turn the prompt opened.
+        prompt_turn: TurnId,
+        /// Steer uuids by their order in `.in.jsonl` (S, or S1 and S2).
+        steers: Vec<String>,
+    }
+
+    /// Drive a steering fixture as the supervisor would: the prompt's turn opens at its `queued`,
+    /// each steer is noted at its `queued` (written into the turn then active), a Stop withdraws
+    /// the unstarted steers and notes the interrupt, and the CLI's withdrawal answers are fed back.
+    fn drive_steers(name: &str, stop_at: StopAt) -> SteerRun {
+        let inputs = in_frames(name);
+        let users: Vec<&Value> = inputs.iter().filter(|f| f["type"] == "user").collect();
+        let prompt_uuid = users[0]["uuid"].as_str().unwrap().to_owned();
+        let texts: HashMap<String, String> = users
+            .iter()
+            .map(|f| {
+                let uuid = f["uuid"].as_str().unwrap().to_owned();
+                let text = f["message"]["content"][0]["text"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned();
+                (uuid, text)
+            })
+            .collect();
+        let steers: Vec<String> = users[1..]
+            .iter()
+            .map(|f| f["uuid"].as_str().unwrap().to_owned())
+            .collect();
+        let lines = out_lines(name);
+        let final_delta = lines.iter().enumerate().rev().find_map(|(index, line)| {
+            let frame: Value = serde_json::from_str(line).unwrap();
+            let reason = frame
+                .pointer("/event/delta/stop_reason")
+                .and_then(Value::as_str);
+            (frame["type"] == "stream_event"
+                && frame["event"]["type"] == "message_delta"
+                && reason.is_some_and(|reason| reason != "tool_use"))
+            .then_some(index + 1)
+        });
+        let stop_line = match stop_at {
+            StopAt::Never => None,
+            StopAt::BeforeLine(line) => Some(line),
+            StopAt::AfterFinalDelta => final_delta.map(|line| line + 1),
+        };
+        let mut mapper = new_mapper();
+        let mut outputs = Vec::new();
+        let mut prompt_turn = None;
+        let mut withdrawing: Vec<String> = Vec::new();
+        for (index, line) in lines.iter().enumerate() {
+            let number = index + 1;
+            if stop_line == Some(number) {
+                for uuid in mapper.unstarted_steers() {
+                    mapper.note_steer_withdrawing(&uuid, WithdrawReason::Stop);
+                    withdrawing.push(uuid);
+                }
+                mapper.note_interrupt_sent();
+            }
+            let frame: Value = serde_json::from_str(line).unwrap();
+            if frame["type"] == "command_lifecycle" && frame["state"] == "queued" {
+                let uuid = frame["command_uuid"].as_str().unwrap().to_owned();
+                if uuid == prompt_uuid {
+                    let turn = TurnId::new();
+                    outputs.extend(mapper.begin_turn(turn, TurnKind::User));
+                    mapper.note_prompt(texts[&uuid].clone());
+                    mapper.note_command(uuid, CommandKind::Prompt);
+                    prompt_turn = Some(turn);
+                } else if steers.contains(&uuid) {
+                    let turn = mapper
+                        .active_turn()
+                        .expect("a steer is written into a turn");
+                    mapper.note_steer(uuid.clone(), turn, texts[&uuid].clone());
+                }
+            }
+            outputs.extend(mapper.map_line(line));
+            let answer = frame
+                .pointer("/response/response/cancelled")
+                .and_then(Value::as_bool);
+            if let Some(cancelled) = answer {
+                let uuid = withdrawing.remove(0);
+                outputs.extend(mapper.note_steer_withdrawal_answer(&uuid, cancelled));
+            }
+        }
+        SteerRun {
+            mapper,
+            outputs,
+            prompt_turn: prompt_turn.expect("the prompt was queued"),
+            steers,
+        }
+    }
+
+    /// The `(turn, text)` of each steer `UserMessage`, in emission order.
+    fn steer_messages(outputs: &[MapperOutput]) -> Vec<(TurnId, String)> {
+        events(outputs)
+            .into_iter()
+            .filter_map(|event| match event {
+                AgentEvent::ItemCompleted { turn, item, .. }
+                    if item.harness_item_id.contains(":steer:") =>
+                {
+                    match &item.payload {
+                        ItemPayload::UserMessage { text } => Some((*turn, text.clone())),
+                        _ => None,
+                    }
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn settled(outputs: &[MapperOutput]) -> Vec<(String, SteerOutcome)> {
+        outputs
+            .iter()
+            .filter_map(|output| match output {
+                MapperOutput::SteerSettled {
+                    command_uuid,
+                    outcome,
+                    ..
+                } => Some((command_uuid.clone(), outcome.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// `(turn, status)` of every `TurnCompleted`, and the turns `TurnStarted` opened, in order.
+    fn turn_sequence(outputs: &[MapperOutput]) -> (Vec<TurnId>, Vec<(TurnId, TurnStatusKind)>) {
+        let mut started = Vec::new();
+        let mut completed = Vec::new();
+        for event in events(outputs) {
+            match event {
+                AgentEvent::TurnStarted { turn, .. } => started.push(*turn),
+                AgentEvent::TurnCompleted { turn, status, .. } => {
+                    completed.push((*turn, status.kind));
+                }
+                _ => {}
+            }
+        }
+        (started, completed)
+    }
+
+    /// The position of the first event matching `pred`.
+    fn position_of(outputs: &[MapperOutput], pred: impl Fn(&AgentEvent) -> bool) -> usize {
+        events(outputs)
+            .iter()
+            .position(|event| pred(event))
+            .expect("an event matching the predicate")
+    }
+
+    fn is_steer_message(event: &AgentEvent) -> bool {
+        matches!(event, AgentEvent::ItemCompleted { item, .. } if item.harness_item_id.contains(":steer:"))
+    }
+
+    fn is_command_completion(event: &AgentEvent) -> bool {
+        matches!(event, AgentEvent::ItemCompleted { item, .. }
+            if matches!(item.payload, ItemPayload::CommandExecution { .. }))
+    }
+
+    #[test]
+    #[traced_test]
+    fn a_steer_written_during_a_tool_call_lands_in_its_turn_after_the_tool() {
+        let run = drive_steers("steer-folded", StopAt::Never);
+        let turn = run.prompt_turn;
+        assert_eq!(
+            steer_messages(&run.outputs),
+            vec![(turn, "Also say the word KIWI.".to_owned())]
+        );
+        // In stream order: after the call's result, before the reply that obeys it.
+        let tool = position_of(&run.outputs, is_command_completion);
+        let steer = position_of(&run.outputs, is_steer_message);
+        let reply = position_of(&run.outputs, |event| {
+            matches!(event, AgentEvent::ItemCompleted { item, .. }
+                if matches!(item.payload, ItemPayload::AgentMessage { .. }))
+        });
+        assert!(tool < steer && steer < reply, "{tool} < {steer} < {reply}");
+        assert_eq!(
+            settled(&run.outputs),
+            vec![(run.steers[0].clone(), SteerOutcome::TakenIn { turn })]
+        );
+        assert_eq!(
+            turn_sequence(&run.outputs),
+            (vec![turn], vec![(turn, TurnStatusKind::Completed)])
+        );
+        assert!(!run.mapper.has_unsettled_steers());
+        assert!(run.mapper.session.commands.is_empty());
+        logs_assert(lines_with(
+            1,
+            &[r#"action="steer_started""#, "next_turn=false"],
+        ));
+        logs_assert(lines_with(0, &[" WARN "]));
+    }
+
+    #[test]
+    #[traced_test]
+    fn two_steers_at_one_boundary_land_in_order() {
+        let run = drive_steers("steer-folded-two", StopAt::Never);
+        let turn = run.prompt_turn;
+        assert_eq!(
+            steer_messages(&run.outputs),
+            vec![
+                (turn, "Also say the word APPLE.".to_owned()),
+                (turn, "Also say the word BANANA.".to_owned())
+            ]
+        );
+        assert_eq!(
+            settled(&run.outputs),
+            vec![
+                (run.steers[0].clone(), SteerOutcome::TakenIn { turn }),
+                (run.steers[1].clone(), SteerOutcome::TakenIn { turn })
+            ]
+        );
+        logs_assert(lines_with(0, &[" WARN "]));
+    }
+
+    #[test]
+    #[traced_test]
+    fn steers_at_two_boundaries_each_land_after_their_own_tool() {
+        let run = drive_steers("steer-two-boundaries", StopAt::Never);
+        let turn = run.prompt_turn;
+        let texts: Vec<String> = steer_messages(&run.outputs)
+            .into_iter()
+            .map(|(_, t)| t)
+            .collect();
+        assert_eq!(
+            texts,
+            ["Also say APPLE at the end.", "Also say BANANA at the end."]
+        );
+        let all = events(&run.outputs);
+        let tools: Vec<usize> = all
+            .iter()
+            .enumerate()
+            .filter(|(_, event)| is_command_completion(event))
+            .map(|(at, _)| at)
+            .collect();
+        let steers: Vec<usize> = all
+            .iter()
+            .enumerate()
+            .filter(|(_, event)| is_steer_message(event))
+            .map(|(at, _)| at)
+            .collect();
+        assert_eq!(tools.len(), 2);
+        assert!(tools[0] < steers[0] && steers[0] < tools[1] && tools[1] < steers[1]);
+        assert_eq!(
+            turn_sequence(&run.outputs).1,
+            vec![(turn, TurnStatusKind::Completed)]
+        );
+        logs_assert(lines_with(0, &[" WARN "]));
+    }
+
+    #[test]
+    #[traced_test]
+    fn a_steer_written_while_an_ask_waits_lands_after_the_tool() {
+        let run = drive_steers("steer-during-ask", StopAt::Never);
+        let turn = run.prompt_turn;
+        assert_eq!(steer_messages(&run.outputs).len(), 1);
+        assert_eq!(steer_messages(&run.outputs)[0].0, turn);
+        let tool = position_of(&run.outputs, is_command_completion);
+        assert!(tool < position_of(&run.outputs, is_steer_message));
+        assert_eq!(
+            settled(&run.outputs),
+            vec![(run.steers[0].clone(), SteerOutcome::TakenIn { turn })]
+        );
+        logs_assert(lines_with(0, &[" WARN "]));
+    }
+
+    #[test]
+    #[traced_test]
+    fn a_steer_written_while_a_sub_agent_runs_lands_on_the_primary_turn() {
+        let run = drive_steers("steer-subagent", StopAt::Never);
+        let turn = run.prompt_turn;
+        let primary = run.mapper.thread;
+        let steer_threads: Vec<ThreadId> = events(&run.outputs)
+            .into_iter()
+            .filter_map(|event| match event {
+                AgentEvent::ItemCompleted { thread, item, .. }
+                    if item.harness_item_id.contains(":steer:") =>
+                {
+                    Some(*thread)
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            steer_threads,
+            vec![primary],
+            "never on the sub-agent's thread"
+        );
+        assert_eq!(
+            settled(&run.outputs),
+            vec![(run.steers[0].clone(), SteerOutcome::TakenIn { turn })]
+        );
+        logs_assert(lines_with(0, &[" WARN "]));
+    }
+
+    #[test]
+    #[traced_test]
+    fn a_steer_that_misses_its_turn_opens_the_next_one() {
+        let run = drive_steers("steer-next-turn", StopAt::Never);
+        let first = run.prompt_turn;
+        let (started, completed) = turn_sequence(&run.outputs);
+        assert_eq!(started.len(), 2);
+        let next = started[1];
+        assert_eq!(
+            completed,
+            vec![
+                (first, TurnStatusKind::Completed),
+                (next, TurnStatusKind::Completed)
+            ]
+        );
+        assert_eq!(
+            steer_messages(&run.outputs),
+            vec![(next, "Also say the word KIWI.".to_owned())]
+        );
+        // The next turn opens with the steer, before anything it does.
+        let opened = position_of(
+            &run.outputs,
+            |event| matches!(event, AgentEvent::TurnStarted { turn, .. } if *turn == next),
+        );
+        let first_item = events(&run.outputs)
+            .iter()
+            .position(
+                |event| matches!(event, AgentEvent::ItemStarted { turn, .. } if *turn == next),
+            )
+            .unwrap();
+        assert!(opened < first_item);
+        assert!(matches!(events(&run.outputs)[first_item],
+            AgentEvent::ItemStarted { item, .. } if item.kind == ItemKind::UserMessage));
+        assert_eq!(
+            settled(&run.outputs),
+            vec![(run.steers[0].clone(), SteerOutcome::NextTurn { turn: next })]
+        );
+        logs_assert(lines_with(
+            1,
+            &[r#"action="steer_started""#, "next_turn=true"],
+        ));
+        logs_assert(lines_with(
+            1,
+            &[
+                r#"action="external_turn""#,
+                r#"frame_type="command_lifecycle""#,
+            ],
+        ));
+        logs_assert(lines_with(0, &[" WARN "]));
+    }
+
+    #[test]
+    #[traced_test]
+    fn two_steers_that_miss_their_turn_share_one_next_turn() {
+        let run = drive_steers("steer-next-turn-merged", StopAt::Never);
+        let (started, _) = turn_sequence(&run.outputs);
+        assert_eq!(started.len(), 2, "one next turn, not two");
+        let next = started[1];
+        assert_eq!(
+            steer_messages(&run.outputs),
+            vec![
+                (next, "Also say the word APPLE.".to_owned()),
+                (next, "Also say the word BANANA.".to_owned())
+            ]
+        );
+        assert_eq!(
+            settled(&run.outputs),
+            vec![
+                (run.steers[0].clone(), SteerOutcome::NextTurn { turn: next }),
+                (run.steers[1].clone(), SteerOutcome::NextTurn { turn: next })
+            ]
+        );
+        logs_assert(lines_with(0, &[" WARN "]));
+    }
+
+    #[test]
+    #[traced_test]
+    fn a_slash_steer_runs_as_the_next_turn_as_the_command() {
+        let run = drive_steers("steer-slash", StopAt::Never);
+        let (started, _) = turn_sequence(&run.outputs);
+        let next = started[1];
+        assert_eq!(
+            steer_messages(&run.outputs),
+            vec![(next, "/compact".to_owned())]
+        );
+        // The next turn is the compaction: its boundary activity lands on it.
+        assert!(events(&run.outputs).iter().any(|event| matches!(event,
+            AgentEvent::ItemCompleted { turn, item, .. } if *turn == next
+                && matches!(&item.payload, ItemPayload::Activity { title, .. } if title == "Context compacted"))));
+        assert_eq!(
+            settled(&run.outputs),
+            vec![(run.steers[0].clone(), SteerOutcome::NextTurn { turn: next })]
+        );
+        logs_assert(lines_with(0, &[" WARN "]));
+    }
+
+    #[test]
+    #[traced_test]
+    fn a_steer_withdrawn_before_a_stop_never_appears() {
+        for (name, line) in [
+            ("steer-withdrawn-interrupt", 20),
+            ("steer-withdrawn-cancel", 21),
+        ] {
+            let run = drive_steers(name, StopAt::BeforeLine(line));
+            let turn = run.prompt_turn;
+            assert!(steer_messages(&run.outputs).is_empty(), "{name}");
+            assert_eq!(
+                settled(&run.outputs),
+                vec![(
+                    run.steers[0].clone(),
+                    SteerOutcome::Withdrawn(WithdrawReason::Stop)
+                )],
+                "{name}"
+            );
+            assert_eq!(
+                turn_sequence(&run.outputs),
+                (vec![turn], vec![(turn, TurnStatusKind::Interrupted)]),
+                "{name}"
+            );
+            assert!(run.mapper.session.commands.is_empty(), "{name}");
+        }
+        logs_assert(lines_with(
+            2,
+            &[r#"action="steer_dropped""#, r#"outcome="withdrawn""#],
+        ));
+    }
+
+    #[test]
+    #[traced_test]
+    fn a_steer_taken_in_stays_when_its_turn_is_interrupted() {
+        let run = drive_steers("steer-folded-interrupted", StopAt::BeforeLine(50));
+        let turn = run.prompt_turn;
+        assert_eq!(steer_messages(&run.outputs).len(), 1);
+        assert_eq!(
+            settled(&run.outputs),
+            vec![(run.steers[0].clone(), SteerOutcome::TakenIn { turn })]
+        );
+        assert_eq!(
+            turn_sequence(&run.outputs).1,
+            vec![(turn, TurnStatusKind::Interrupted)]
+        );
+        assert!(run.mapper.session.commands.is_empty());
+        logs_assert(lines_with(1, &[r#"action="steer_cancelled""#]));
+    }
+
+    #[test]
+    #[traced_test]
+    fn a_steer_the_stop_cannot_withdraw_starts_an_interrupted_next_turn() {
+        let run = drive_steers("steer-stop-late", StopAt::AfterFinalDelta);
+        let first = run.prompt_turn;
+        let (started, completed) = turn_sequence(&run.outputs);
+        assert_eq!(started.len(), 2);
+        let next = started[1];
+        // The steered turn had finished; the steer's own turn is the one the interrupt aborts,
+        // reported as interrupted rather than failed.
+        assert_eq!(
+            completed,
+            vec![
+                (first, TurnStatusKind::Completed),
+                (next, TurnStatusKind::Interrupted)
+            ]
+        );
+        assert_eq!(
+            steer_messages(&run.outputs),
+            vec![(next, "Also say the word KIWI.".to_owned())]
+        );
+        assert_eq!(
+            settled(&run.outputs),
+            vec![(run.steers[0].clone(), SteerOutcome::NextTurn { turn: next })]
+        );
+        assert!(run.mapper.session.commands.is_empty());
+        logs_assert(lines_with(1, &[r#"action="steer_after_stop""#]));
+        logs_assert(lines_with(
+            1,
+            &[r#"action="steer_withdrawn""#, "cancelled=false"],
+        ));
+    }
+
+    // Lifecycle shapes no fixture records: the schema allows them ("not a strict pairing").
+
+    fn steer_line(command_uuid: &str, state: &str) -> String {
+        lifecycle_line(command_uuid, state)
+    }
+
+    fn steered_mapper() -> (ClaudeMapper, TurnId) {
+        let mut mapper = new_mapper();
+        let turn = TurnId::new();
+        mapper.begin_turn(turn, TurnKind::User);
+        mapper.note_steer("s-1".into(), turn, "steer text".into());
+        (mapper, turn)
+    }
+
+    #[test]
+    #[traced_test]
+    fn a_steer_completed_without_started_was_consumed() {
+        let (mut mapper, turn) = steered_mapper();
+        let outputs = mapper.map_line(&steer_line("s-1", "completed"));
+        assert_eq!(
+            steer_messages(&outputs),
+            vec![(turn, "steer text".to_owned())]
+        );
+        assert_eq!(
+            settled(&outputs),
+            vec![("s-1".to_owned(), SteerOutcome::TakenIn { turn })]
+        );
+        assert!(mapper.session.commands.is_empty());
+        logs_assert(lines_with(
+            1,
+            &[
+                " WARN ",
+                r#"action="steer_confirmed_late""#,
+                r#"evidence="completed""#,
+            ],
+        ));
+    }
+
+    #[test]
+    #[traced_test]
+    fn a_steer_cancelled_without_started_waits_for_the_result() {
+        // Listed by the result: taken into the aborted turn.
+        let (mut mapper, turn) = steered_mapper();
+        assert!(settled(&mapper.map_line(&steer_line("s-1", "cancelled"))).is_empty());
+        assert!(mapper.has_unsettled_steers());
+        let outputs = mapper.map_line(&result_line(&["s-1"]));
+        assert_eq!(
+            steer_messages(&outputs),
+            vec![(turn, "steer text".to_owned())]
+        );
+        assert_eq!(
+            settled(&outputs),
+            vec![("s-1".to_owned(), SteerOutcome::TakenIn { turn })]
+        );
+        assert!(mapper.session.commands.is_empty());
+
+        // Not listed: the CLI dropped it.
+        let (mut mapper, _) = steered_mapper();
+        mapper.map_line(&steer_line("s-1", "cancelled"));
+        let outputs = mapper.map_line(&result_line(&["other"]));
+        assert!(steer_messages(&outputs).is_empty());
+        assert_eq!(
+            settled(&outputs),
+            vec![(
+                "s-1".to_owned(),
+                SteerOutcome::Dropped {
+                    state: "cancelled".into()
+                }
+            )]
+        );
+        assert!(mapper.session.commands.is_empty());
+    }
+
+    #[test]
+    fn a_confirmed_withdrawal_settles_whichever_arrives_first() {
+        // The `cancelled` frame first, then the answer (the order the CLI uses).
+        let (mut mapper, _) = steered_mapper();
+        mapper.note_steer_withdrawing("s-1", WithdrawReason::Stop);
+        assert!(settled(&mapper.map_line(&steer_line("s-1", "cancelled"))).is_empty());
+        assert_eq!(
+            settled(&mapper.note_steer_withdrawal_answer("s-1", true)),
+            vec![(
+                "s-1".to_owned(),
+                SteerOutcome::Withdrawn(WithdrawReason::Stop)
+            )]
+        );
+        assert!(mapper.session.commands.is_empty());
+        // The answer first.
+        let (mut mapper, _) = steered_mapper();
+        mapper.note_steer_withdrawing("s-1", WithdrawReason::Backstop);
+        assert!(settled(&mapper.note_steer_withdrawal_answer("s-1", true)).is_empty());
+        assert_eq!(
+            settled(&mapper.map_line(&steer_line("s-1", "cancelled"))),
+            vec![(
+                "s-1".to_owned(),
+                SteerOutcome::Withdrawn(WithdrawReason::Backstop)
+            )]
+        );
+        assert!(mapper.session.commands.is_empty());
+    }
+
+    #[test]
+    fn a_refused_withdrawal_leaves_the_lifecycle_to_decide() {
+        let (mut mapper, turn) = steered_mapper();
+        mapper.note_steer_withdrawing("s-1", WithdrawReason::Stop);
+        assert!(settled(&mapper.note_steer_withdrawal_answer("s-1", false)).is_empty());
+        assert_eq!(
+            settled(&mapper.map_line(&steer_line("s-1", "started"))),
+            vec![("s-1".to_owned(), SteerOutcome::TakenIn { turn })]
+        );
+    }
+
+    #[test]
+    #[traced_test]
+    fn dropped_and_unknown_states() {
+        for state in ["discarded", "refused"] {
+            let (mut mapper, _) = steered_mapper();
+            assert_eq!(
+                settled(&mapper.map_line(&steer_line("s-1", state))),
+                vec![(
+                    "s-1".to_owned(),
+                    SteerOutcome::Dropped {
+                        state: state.into()
+                    }
+                )]
+            );
+            assert!(mapper.session.commands.is_empty());
+        }
+        // An unknown state may be an intermediate one: the steer stays tracked.
+        let (mut mapper, _) = steered_mapper();
+        assert!(settled(&mapper.map_line(&steer_line("s-1", "parked"))).is_empty());
+        assert!(mapper.has_unsettled_steers());
+        logs_assert(lines_with(
+            1,
+            &[" WARN ", r#"action="steer_lifecycle""#, "state=parked"],
+        ));
+    }
+
+    #[test]
+    #[traced_test]
+    fn a_child_exit_leaves_an_unsettled_steer_unknown() {
+        let (mut mapper, turn) = steered_mapper();
+        mapper.map_line(&steer_line("s-1", "queued"));
+        let outputs = mapper.child_exited("signal: 9");
+        let outcomes = settled(&outputs);
+        assert_eq!(outcomes, vec![("s-1".to_owned(), SteerOutcome::Unknown)]);
+        let error = outcomes[0].1.clone().into_result(turn).unwrap_err();
+        assert!(
+            matches!(&error, HarnessError::Transport(message) if message.contains("may have reached the model")),
+            "{error}"
+        );
+        assert!(mapper.session.commands.is_empty());
+        logs_assert(lines_with(
+            1,
+            &[" WARN ", r#"action="steer_outcome_unknown""#],
+        ));
+    }
+
+    #[test]
+    fn outcomes_read_as_the_plans_errors() {
+        let turn = TurnId::new();
+        assert!(SteerOutcome::TakenIn { turn }.into_result(turn).is_ok());
+        assert!(SteerOutcome::NextTurn { turn }.into_result(turn).is_ok());
+        let text = |outcome: SteerOutcome| outcome.into_result(turn).unwrap_err().to_string();
+        assert!(
+            text(SteerOutcome::Withdrawn(WithdrawReason::Stop)).contains(&format!(
+                "turn {turn} was stopped before Claude Code took the steering input"
+            ))
+        );
+        assert!(
+            text(SteerOutcome::Withdrawn(WithdrawReason::Backstop))
+                .contains("did not report the steering input; it was withdrawn")
+        );
+        assert!(
+            text(SteerOutcome::Dropped {
+                state: "refused".into()
+            })
+            .contains("dropped the steering input (refused)")
+        );
+    }
+
+    #[test]
+    #[traced_test]
+    fn the_next_turn_of_a_steer_a_stop_missed_counts_as_interrupted() {
+        // The aborted turn's `result` (`aborted_streaming`) reads as interrupted on its own; the
+        // carried-over interrupt is what keeps it so when the child exits before that `result`.
+        let (mut mapper, turn) = steered_mapper();
+        mapper.note_interrupt_sent();
+        mapper.map_line(&result_line(&[]));
+        assert_eq!(mapper.active_turn(), None);
+        mapper.map_line(&steer_line("s-1", "started"));
+        let next = mapper
+            .active_turn()
+            .expect("the steer opened the next turn");
+        assert_ne!(next, turn);
+        let outputs = mapper.child_exited("signal: 9");
+        assert_eq!(
+            turn_sequence(&outputs).1,
+            vec![(next, TurnStatusKind::Interrupted)]
+        );
+        logs_assert(lines_with(1, &[r#"action="steer_after_stop""#]));
+    }
+
+    #[test]
+    fn a_confirmed_withdrawal_stays_withdrawn_when_the_child_exits_first() {
+        let (mut mapper, _) = steered_mapper();
+        mapper.note_steer_withdrawing("s-1", WithdrawReason::Stop);
+        // The answer came, but the child exited before its `cancelled` frame was mapped.
+        assert!(settled(&mapper.note_steer_withdrawal_answer("s-1", true)).is_empty());
+        assert_eq!(
+            settled(&mapper.child_exited("signal: 9")),
+            vec![(
+                "s-1".to_owned(),
+                SteerOutcome::Withdrawn(WithdrawReason::Stop)
+            )]
+        );
+    }
+
+    #[test]
+    fn only_the_clis_confirmation_makes_a_cancelled_steer_withdrawn() {
+        // A withdrawal whose answer has not come when the result does: the result proves only
+        // that the CLI dropped it.
+        let (mut mapper, _) = steered_mapper();
+        mapper.note_steer_withdrawing("s-1", WithdrawReason::Backstop);
+        mapper.map_line(&steer_line("s-1", "cancelled"));
+        assert_eq!(
+            settled(&mapper.map_line(&result_line(&["other"]))),
+            vec![(
+                "s-1".to_owned(),
+                SteerOutcome::Dropped {
+                    state: "cancelled".into()
+                }
+            )]
+        );
+        // A refused withdrawal, then an unpaired `cancelled`: dropped, not withdrawn.
+        let (mut mapper, _) = steered_mapper();
+        mapper.note_steer_withdrawing("s-1", WithdrawReason::Stop);
+        assert!(settled(&mapper.note_steer_withdrawal_answer("s-1", false)).is_empty());
+        mapper.map_line(&steer_line("s-1", "cancelled"));
+        assert_eq!(
+            settled(&mapper.map_line(&result_line(&["other"]))),
+            vec![(
+                "s-1".to_owned(),
+                SteerOutcome::Dropped {
+                    state: "cancelled".into()
+                }
+            )]
+        );
+    }
+
+    #[test]
+    fn a_late_steer_is_not_put_on_an_unrelated_running_turn() {
+        // The steered turn ended; a turn the CLI started on its own (a continuation) runs when
+        // `completed` arrives with no `started`, and its result never listed the steer.
+        let (mut mapper, steered) = steered_mapper();
+        mapper.map_line(&result_line(&[]));
+        let continuation = TurnId::new();
+        mapper.begin_turn(continuation, TurnKind::User);
+        let outputs = mapper.map_line(&steer_line("s-1", "completed"));
+        assert!(
+            steer_messages(&outputs).is_empty(),
+            "not on the continuation"
+        );
+        assert_eq!(
+            settled(&outputs),
+            vec![("s-1".to_owned(), SteerOutcome::TakenIn { turn: steered })]
+        );
+    }
+
+    #[test]
+    #[traced_test]
+    fn an_unconfirmed_steer_is_checked_against_the_turn_that_received_it() {
+        // Written into one turn, run as the next; that turn's result lists another uuid only.
+        let (mut mapper, _) = steered_mapper();
+        mapper.map_line(&result_line(&[]));
+        mapper.map_line(&steer_line("s-1", "started"));
+        mapper.map_line(&result_line(&["someone-else"]));
+        logs_assert(lines_with(1, &[" WARN ", r#"action="steer_unconfirmed""#]));
+    }
+
+    #[test]
+    #[traced_test]
+    fn a_steer_confirmed_after_its_turn_ended_settles_without_an_item() {
+        let (mut mapper, turn) = steered_mapper();
+        mapper.map_line(&result_line(&[]));
+        assert_eq!(mapper.active_turn(), None);
+        let outputs = mapper.map_line(&steer_line("s-1", "completed"));
+        assert!(
+            steer_messages(&outputs).is_empty(),
+            "no item on a finished turn"
+        );
+        assert!(events(&outputs).is_empty());
+        assert_eq!(
+            settled(&outputs),
+            vec![("s-1".to_owned(), SteerOutcome::TakenIn { turn })]
+        );
+        assert!(mapper.session.commands.is_empty());
+        logs_assert(lines_with(
+            1,
+            &[
+                " WARN ",
+                r#"action="steer_confirmed_late""#,
+                "not shown in the thread",
+            ],
+        ));
+    }
+
+    #[test]
+    fn the_supervisor_sees_which_steers_are_still_open() {
+        let (mut mapper, _) = steered_mapper();
+        assert_eq!(mapper.unstarted_steers(), vec!["s-1".to_owned()]);
+        assert!(mapper.has_unsettled_steers());
+        mapper.map_line(&steer_line("s-1", "started"));
+        assert!(mapper.unstarted_steers().is_empty());
+        assert!(!mapper.has_unsettled_steers());
+        // A prompt is never a steer.
+        mapper.note_command("p-1".into(), CommandKind::Prompt);
+        assert!(mapper.unstarted_steers().is_empty());
     }
 }
