@@ -307,22 +307,24 @@ Then write the line, `note_steer(command_uuid, turn, text)`, keep the reply, and
 | `queued` | record; `debug` | record; `debug` |
 | `started` | **taken in**: `UserMessage` on that turn; settle `Ok`; `info` `steer_started` | **the next turn** (§4.5): `UserMessage` on it; settle `Ok`; `info` `steer_started` with `next_turn = true` |
 | `completed` after `started` | `debug`; remove | `debug`; remove |
-| `completed` with no `started` | **consumed**: the CLI reports no `started` but the turn that took it in ended ("not a strict pairing", §2). Settle `Ok`; emit its `UserMessage` on the active turn, with `warn` `steer_confirmed_late` (its position in the turn is unknown); then remove | settle `Ok`; emit its `UserMessage` on the turn whose `result` listed it in `user_message_uuids`, else on the turn just completed, with the same `warn`; then remove |
+| `completed` with no `started` | **consumed**: the CLI reports no `started` but the turn that took it in ended ("not a strict pairing", §2). Settle `Ok`; emit its `UserMessage` on that turn, with `warn` `steer_confirmed_late` (its position in the turn is unknown); then remove | the consuming turn is the one whose `result` listed it in `user_message_uuids`, else the turn just completed; any other turn running then (a continuation) is not it. When that turn is the one whose `result` is being read, emit the `UserMessage` there; once it has ended, settle `Ok` **without an item** (the server amends a finished turn only with a command's late completion), with `warn` `steer_confirmed_late` saying so; then remove |
 | `cancelled` after `started` | `info` (the model saw it; its turn was aborted); remove | same |
-| `cancelled` with no `started` | if the adapter's own withdrawal of it was confirmed: **not taken in**, settle `Err` (§4.4), `info` `steer_dropped`, remove. Otherwise keep it unsettled until the next `result` (an aborted turn's `cancelled` frames precede its `result`, §2): listed in its `user_message_uuids`, it was taken into that aborted turn, handled as `completed` with no `started`; not listed, it was not taken in, settle `Err`. A child exit first gives the unknown outcome | same |
+| `cancelled` with no `started` | if the CLI confirmed the adapter's withdrawal of it: **not taken in**, settle `Err` as withdrawn (§4.4), `info` `steer_dropped`, remove. Otherwise keep it unsettled until the next `result` (an aborted turn's `cancelled` frames precede its `result`, §2): listed in its `user_message_uuids`, it was taken into that aborted turn, handled as `completed` with no `started`; not listed, it was not taken in, settle `Err` as dropped (`cancelled`): a withdrawal whose answer has not come, or was refused, proves no more. A child exit first gives the unknown outcome, unless a withdrawal was confirmed | same |
 | `discarded`, `refused` | settle `Err` (§4.4); `info` `steer_dropped`; remove | same |
 | `Unknown(other)` | `warn`, keep waiting | same |
 
 An entry is removed only once its steer is settled and, if it was taken in, its `UserMessage`
-emitted: a terminal state never drops an entry the adapter has not yet accounted for. The table
+emitted or, for one confirmed only after its turn ended, settled without one: a terminal state
+never drops an entry the adapter has not yet accounted for. The table
 also remembers, per uuid, whether a `result` listed it and whether a withdrawal was confirmed, so
 the rows above can decide.
 
 The item's `harness_item_id` is `user:<turn_id>:steer:<command_uuid>`, its text the noted text. It
 goes through `user_message` (beside `acknowledge_prompt` in `mapper.rs`), so it is an ordinary
 user item in live state and history. `answers_the_prompt` and `acknowledge_prompt` are untouched.
-At a `result`, a started steer missing from a non-empty `user_message_uuids` is `warn`
-`steer_unconfirmed` (diagnostic only).
+At the `result` of the turn that **received** a started steer (the steered one, or the next),
+the steer missing from a non-empty `user_message_uuids` is `warn` `steer_unconfirmed`
+(diagnostic only).
 
 ### 4.4 Error wording
 
@@ -363,8 +365,10 @@ lifecycle and not by the answer:
   steer **starts as the next turn, and the `interrupt` aborts that turn at once**. Nothing can
   prevent this: `cancel_queued: true` does not either. So the mapper treats it as what the user
   sees: when a steer `started` after an interrupt the adapter sent and no turn was active to
-  receive it, the next turn opens with the steer's `UserMessage`, is marked as interrupted
-  (`note_interrupt_sent` carried over), and completes `Interrupted` on its aborted `result`.
+  receive it, the next turn opens with the steer's `UserMessage` and completes `Interrupted`.
+  Its aborted `result` (`aborted_streaming`) reads as interrupted on its own; the interrupt is
+  also carried over to the turn (`note_interrupt_sent`), so a child that exits before that
+  `result` completes it `Interrupted` too, not `Failed`.
   The steer settles `Ok` (it reached the model, and its text stays in the conversation inside
   that aborted turn). `info` `steer_after_stop`.
 
@@ -474,10 +478,17 @@ as step 0's.
 ### Step 2: steer mapping (mapper)
 
 `note_steer`, §4.3, `MapperOutput::SteerSettled`, the next turn opened at a steer's `started`
-(§4.5), `MapperOutput::WithdrawSteers` for the supervisor, the `user_message_uuids` check. Mapper
-tests from the step-1 fixtures: each scenario's items land on the right turn in stream order; the
-next turn opens at `started` with the steers' `UserMessage`s; a `/` steer's next turn maps as the
-command; an unknown uuid; an `Unknown` state keeps the steer.
+(§4.5), the `user_message_uuids` reconciliation at a `result`, and what the supervisor needs in
+step 3: `unstarted_steers` (what a Stop withdraws), `note_steer_withdrawing` and
+`note_steer_withdrawal_answer`, `has_unsettled_steers` (busy), the interrupt carried over to a
+steer's next turn, and `SteerOutcome::into_result` (the §4.4 wording). Withdrawal is the
+supervisor's to start (before a Stop, a `Cancel`, or at the backstop), so the mapper emits no
+withdrawal output. Mapper tests from the step-1 fixtures: each scenario's items land on the right
+turn in stream order; the next turn opens at `started` with the steers' `UserMessage`s; a `/`
+steer's next turn maps as the command; the Stop scenarios settle as withdrawn or as an
+interrupted next turn. Synthetic tests for what no fixture records: `completed` or `cancelled`
+with no `started`, both orders of a confirmed withdrawal, a refused one, `discarded`, `refused`,
+an unknown state, and a child exit with a steer unsettled.
 
 ### Step 3: `steer_turn` end to end
 
@@ -485,7 +496,9 @@ command; an unknown uuid; an `Unknown` state keeps the steer.
 §4.6, §4.7, the façade method, the capability. Extend `fake-claude.sh` (a trigger that folds a
 pending steer before the `result`, one that starts it after; `cancel_async_message` answering and
 emitting `cancelled`). Tests: `Ok` at `started`, taken in and as the next turn; each refusal;
-`Err` on a confirmed withdrawal or `discarded`; a lost withdrawal at Stop (the
+`Err` on a confirmed withdrawal or `discarded`; a child exit with no turn running while a steer
+is unsettled (the supervisor must still call `child_exited`, which settles it); a lost withdrawal
+at Stop (the
 next turn opens with the steer and completes `Interrupted`); the backstop (withdrawn: `Err`; not
 withdrawn: unsettled, then `Ok` from `user_message_uuids` or the unknown-outcome `Err` at child
 exit); `completed` and `cancelled` with no `started`, the latter settled only at the next

@@ -368,6 +368,7 @@ fn output_kind(output: &MapperOutput) -> &'static str {
         MapperOutput::RouteOpened { .. } => "route_opened",
         MapperOutput::RouteReopened { .. } => "route_reopened",
         MapperOutput::RouteClosed { .. } => "route_closed",
+        MapperOutput::SteerSettled { .. } => "steer_settled",
     }
 }
 
@@ -1212,6 +1213,22 @@ impl Supervisor {
             ),
             MapperOutput::RouteReopened { thread } => self.reopen_route(thread),
             MapperOutput::RouteClosed { thread } => self.close_route(thread),
+            MapperOutput::SteerSettled {
+                command_uuid,
+                steered_turn,
+                outcome,
+            } => {
+                // No `steer_turn` writes a steer yet (step 3 of the turn-steering plan), so no
+                // caller waits on one.
+                debug!(
+                    thread_id = %self.thread,
+                    turn_id = %steered_turn,
+                    command_uuid = %command_uuid,
+                    outcome = ?outcome,
+                    action = "steer_settled",
+                    "a steer settled with no caller waiting"
+                );
+            }
         }
         Ok(())
     }
@@ -2912,7 +2929,12 @@ impl Supervisor {
         } else {
             lock(&self.pending).remove_owner(self.thread)
         };
-        let outputs = if self.mapper.active_turn().is_some() || self.mapper.has_routes() {
+        // A steer can wait with no turn running: the CLI has committed to running it next but
+        // has not said so. Its `steer_turn` waits for `child_exited` to settle it.
+        let outputs = if self.mapper.active_turn().is_some()
+            || self.mapper.has_routes()
+            || self.mapper.has_unsettled_steers()
+        {
             self.mapper.child_exited(&described)
         } else {
             Vec::new()

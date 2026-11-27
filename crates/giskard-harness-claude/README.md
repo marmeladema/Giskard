@@ -423,7 +423,13 @@ deduplicated away), since the server reads no handle.
   frames, so the table is emptied at that `init` and nothing is tracked after it. Recorded in
   `lifecycle-prompt` and `lifecycle-interrupted`. The frame and `cancel_async_message` are
   `@internal` in the CLI's schema; the plan for steering on top of them is
-  `specs/claude-code-harness-plan/turn-steering-plan.md`.
+  `specs/claude-code-harness-plan/turn-steering-plan.md`. The mapper already maps a steer's
+  lifecycle (that plan's §4.3–§4.5; nothing writes a steer until `steer_turn` lands): at
+  `started` its `UserMessage` (`user:<turn_id>:steer:<command_uuid>`) goes on the turn it was
+  written into while that turn runs, else on the next turn, which the mapper opens for it; it
+  settles each steer once (`MapperOutput::SteerSettled`), and a definite failure needs positive
+  evidence (a confirmed withdrawal, `discarded`, `refused`, or a `cancelled` the next `result`
+  does not list). The `steer-*` fixtures drive these tests.
 - **Interrupt** writes the `interrupt` control request and resolves on its response, within 10 s.
   The response (`interrupt_receipt_v1`) lists under `still_queued` the stamped messages the
   interrupt left queued and under `cancelled` those it withdrew; their counts are logged
