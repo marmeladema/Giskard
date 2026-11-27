@@ -1,0 +1,3 @@
+{"type": "user", "uuid": "7faf5905-aca2-4fbb-ab64-111ef7680975", "message": {"role": "user", "content": [{"type": "text", "text": "Run this exact Bash command: `touch probe.txt`, then reply DONE."}]}}
+{"type": "user", "uuid": "5ec33161-d6a9-4aa1-b4b4-1f68e46b9e7e", "message": {"role": "user", "content": [{"type": "text", "text": "Also say the word KIWI."}]}}
+{"type": "control_response", "response": {"subtype": "success", "request_id": "75ed9a9d-a96c-4553-8515-afd7899972c4", "response": {"behavior": "allow"}}}

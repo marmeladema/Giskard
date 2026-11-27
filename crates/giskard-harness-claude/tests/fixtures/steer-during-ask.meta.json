@@ -1,0 +1,32 @@
+{
+ "scenario": "steer-during-ask",
+ "argv": [
+  "claude",
+  "-p",
+  "--input-format",
+  "stream-json",
+  "--output-format",
+  "stream-json",
+  "--verbose",
+  "--permission-prompt-tool",
+  "stdio",
+  "--setting-sources",
+  "",
+  "--include-partial-messages",
+  "--forward-subagent-text",
+  "--model",
+  "haiku",
+  "--permission-mode",
+  "manual",
+  "--session-id",
+  "a57d023c-39ed-4a4e-98c7-584c3f6bbb37"
+ ],
+ "cwd": "/work/project",
+ "env_extra": [
+  "ENABLE_CLAUDEAI_MCP_SERVERS"
+ ],
+ "exit": 0,
+ "results": 1,
+ "asks": 1,
+ "elapsed_s": 10.3
+}

@@ -1,0 +1,3 @@
+{"type": "user", "uuid": "7666c864-ee31-459c-bd4e-f2c4cf50e1cf", "message": {"role": "user", "content": [{"type": "text", "text": "Run this exact Bash command: `sleep 4 && cat data.txt`. When it has finished, run the Bash command `sleep 20 && echo N`, with N replaced by the number its output gives. Then reply DONE."}]}}
+{"type": "user", "uuid": "2db8d6f8-b1e7-4527-8569-45075ab90233", "message": {"role": "user", "content": [{"type": "text", "text": "Also say the word KIWI at the very end."}]}}
+{"type": "control_request", "request_id": "9fa393ad-d79a-483a-8ac6-16e5296b102c", "request": {"subtype": "interrupt"}}

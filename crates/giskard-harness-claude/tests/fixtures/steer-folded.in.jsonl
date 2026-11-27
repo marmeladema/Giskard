@@ -1,0 +1,2 @@
+{"type": "user", "uuid": "9b635920-b01d-4834-b945-03344614bb92", "message": {"role": "user", "content": [{"type": "text", "text": "Run this exact Bash command: `sleep 6 && echo slept`, then reply DONE."}]}}
+{"type": "user", "uuid": "6fa59dd2-be6f-4309-8e4e-d3c835d80d5d", "message": {"role": "user", "content": [{"type": "text", "text": "Also say the word KIWI."}]}}

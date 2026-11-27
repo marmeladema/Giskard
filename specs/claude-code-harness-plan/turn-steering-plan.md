@@ -465,7 +465,7 @@ as step 0's.
 | `steer-subagent` | steer while a foreground `Agent` runs |
 | `steer-next-turn` | steer during a no-tool answer: it runs as the next turn |
 | `steer-next-turn-merged` | two steers during the final answer: one next turn |
-| `steer-slash` | `/cost` written during a `Bash` call: it runs as the next turn |
+| `steer-slash` | `/compact` written during a `Bash` call: it runs as the next turn, as the command (`/compact` rather than `/cost`, whose output is the recording account's usage) |
 | `steer-withdrawn-interrupt` | steer queued; withdrawal, then a plain `interrupt`: nothing after |
 | `steer-withdrawn-cancel` | steer queued during an ask; withdrawal, then deny with `interrupt: true`: nothing after |
 | `steer-folded-interrupted` | steer taken in, then `interrupt` |

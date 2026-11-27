@@ -1,0 +1,33 @@
+{
+ "scenario": "steer-subagent",
+ "argv": [
+  "claude",
+  "-p",
+  "--input-format",
+  "stream-json",
+  "--output-format",
+  "stream-json",
+  "--verbose",
+  "--permission-prompt-tool",
+  "stdio",
+  "--setting-sources",
+  "",
+  "--include-partial-messages",
+  "--forward-subagent-text",
+  "--model",
+  "haiku",
+  "--permission-mode",
+  "manual",
+  "--session-id",
+  "d99da9ae-6d9e-4aa2-9404-9be73e4708b0"
+ ],
+ "cwd": "/work/project",
+ "env_extra": [
+  "CLAUDE_CODE_DISABLE_BACKGROUND_TASKS",
+  "ENABLE_CLAUDEAI_MCP_SERVERS"
+ ],
+ "exit": 0,
+ "results": 1,
+ "asks": 0,
+ "elapsed_s": 16.1
+}

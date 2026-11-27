@@ -18,11 +18,14 @@
   "--permission-mode",
   "manual",
   "--session-id",
-  "d0b78574-49f9-4b9c-90a8-fcfc1037ce45"
+  "f9ca5b4d-a56e-4b61-a9cd-fce1855bc28a"
  ],
  "cwd": "/work/project",
+ "env_extra": [
+  "ENABLE_CLAUDEAI_MCP_SERVERS"
+ ],
  "exit": 1,
  "results": 1,
  "asks": 1,
- "elapsed_s": 9.3
+ "elapsed_s": 9.1
 }
