@@ -25,8 +25,11 @@ use tokio::task::JoinHandle;
 use tokio::time::Instant;
 use tracing::{Instrument, debug, error, info, warn};
 
+use crate::attachments::user_message_line;
 use crate::log_fields::display_opt;
-use crate::mapper::{ClaudeMapper, CommandKind, MapperOutput, RouteLookup, TurnKind};
+use crate::mapper::{
+    ClaudeMapper, CommandKind, MapperOutput, RouteLookup, SteerOutcome, TurnKind, WithdrawReason,
+};
 use crate::process::{ChildExit, ChildLogContext, ClaudeChild, LaunchMode};
 
 /// How long a background command's terminal `task_updated` may wait for the `task_notification`
@@ -122,6 +125,13 @@ pub(crate) enum ChildCommand {
         task_id: String,
         reply: oneshot::Sender<Result<(), HarnessError>>,
     },
+    /// Write steering text into the active turn `turn` (`steer_turn`). Answered once the
+    /// steer's fate is known: the reply can wait as long as the turn runs.
+    Steer {
+        turn: TurnId,
+        text: String,
+        reply: oneshot::Sender<Result<(), HarnessError>>,
+    },
     /// Run `/compact` as a compaction turn.
     Compact {
         turn: TurnId,
@@ -144,6 +154,7 @@ impl ChildCommand {
             ChildCommand::RespondServerRequest { .. } => "respond_server_request",
             ChildCommand::StopTask { .. } => "stop_task",
             ChildCommand::StopBackgroundCommand { .. } => "terminate_command",
+            ChildCommand::Steer { .. } => "steer",
             ChildCommand::Compact { .. } => "compact",
             ChildCommand::Stop { .. } => "stop",
         }
@@ -563,6 +574,10 @@ enum Waiter {
     StopTask(StopTaskWaiter),
     /// The stop sequence's own interrupt: nobody awaits the response.
     Stop,
+    /// A steer's withdrawal (`cancel_async_message`): its answer goes to the mapper.
+    Withdraw {
+        command_uuid: String,
+    },
 }
 
 /// What the answer to a `stop_task` is logged with and replied to.
@@ -596,7 +611,7 @@ impl Waiter {
                         .map(|_| ()),
                 );
             }
-            Waiter::Stop => {}
+            Waiter::Stop | Waiter::Withdraw { .. } => {}
         }
     }
 }
@@ -803,6 +818,8 @@ pub(crate) fn spawn_supervisor(parts: SupervisorParts) -> JoinHandle<()> {
             .as_ref()
             .map(|effort| effort.0.clone()),
         current_model: parts.model,
+        steer_replies: HashMap::new(),
+        steers_unreported: HashMap::new(),
     };
     // The supervisor logs for the child's whole life: it runs in the span `open_thread` ran in.
     tokio::spawn(supervisor.run().in_current_span())
@@ -911,6 +928,24 @@ struct Supervisor {
     current_model: ModelRef,
     /// The effort level the CLI holds, as the last read-back reported it.
     current_effort: Option<String>,
+    // ENTITY-AUTHORITY-EXCEPTION:
+    // Role: The `steer_turn` call waiting on each steer this child was written, by command uuid.
+    // Source of truth: Writing a steer inserts its reply.
+    // Structural reason: A steer settles from a later lifecycle frame (the mapper's
+    //   `SteerSettled`), long after its command was served.
+    // Synchronization: Owned by this supervisor task alone.
+    // Invalidation/removal: Its `SteerSettled` removes it; child exit answers the rest.
+    steer_replies: HashMap<String, oneshot::Sender<Result<(), HarnessError>>>,
+    // ENTITY-AUTHORITY-EXCEPTION:
+    // Role: When each steer was written, until its first lifecycle frame arrives, for the
+    //   backstop that withdraws a steer the CLI never reports.
+    // Source of truth: Writing a steer inserts it.
+    // Structural reason: The CLI reports `queued` on the write; silence past the grace means the
+    //   protocol changed.
+    // Synchronization: Owned by this supervisor task alone.
+    // Invalidation/removal: Pruned once the mapper has seen a frame for it, or the backstop
+    //   fires for it; the rest drop with the task.
+    steers_unreported: HashMap<String, Instant>,
 }
 
 async fn shutdown_signal(shutdown: &mut watch::Receiver<bool>) {
@@ -952,6 +987,7 @@ impl Supervisor {
             let stage_deadline = self.stage_deadline();
             let idle_deadline = self.idle_deadline();
             let notification_deadline = self.notification_deadline();
+            let steer_deadline = self.steer_backstop_deadline();
             let stopping = self.stopping();
             tokio::select! {
                 biased;
@@ -988,6 +1024,15 @@ impl Supervisor {
                     self.awaiting_notification_since = None;
                     let outputs = self.mapper.settle_background_commands();
                     if let Err(error) = self.dispatch_all(outputs).await {
+                        self.broken("write_stdin", "a stdin write failed", &error);
+                        return self.end_broken();
+                    }
+                }
+                // Not while stopping: the stop withdraws every unstarted steer itself, and stdin may
+                // already be closed.
+                () = tokio::time::sleep_until(steer_deadline.unwrap_or_else(Instant::now)),
+                    if steer_deadline.is_some() && !stopping => {
+                    if let Err(error) = self.on_steer_backstop().await {
                         self.broken("write_stdin", "a stdin write failed", &error);
                         return self.end_broken();
                     }
@@ -1116,6 +1161,16 @@ impl Supervisor {
                             Waiter::Interrupt(_) | Waiter::Stop => {
                                 self.log_interrupt_answer(&request_id, &outcome);
                             }
+                            Waiter::Withdraw { command_uuid } => {
+                                // An error answer withdrew nothing: the lifecycle decides.
+                                let cancelled = outcome.as_ref().ok().is_some_and(|answer| {
+                                    answer.get("cancelled").and_then(Value::as_bool) == Some(true)
+                                });
+                                let settled = self
+                                    .mapper
+                                    .note_steer_withdrawal_answer(command_uuid, cancelled);
+                                self.on_steer_outputs(settled);
+                            }
                             Waiter::Unit(_) | Waiter::Value(_) => {}
                         }
                         waiter.resolve(Ok(payload));
@@ -1217,18 +1272,7 @@ impl Supervisor {
                 command_uuid,
                 steered_turn,
                 outcome,
-            } => {
-                // No `steer_turn` writes a steer yet (step 3 of the turn-steering plan), so no
-                // caller waits on one.
-                debug!(
-                    thread_id = %self.thread,
-                    turn_id = %steered_turn,
-                    command_uuid = %command_uuid,
-                    outcome = ?outcome,
-                    action = "steer_settled",
-                    "a steer settled with no caller waiting"
-                );
-            }
+            } => self.on_steer_settled(&command_uuid, steered_turn, outcome),
         }
         Ok(())
     }
@@ -1479,7 +1523,13 @@ impl Supervisor {
                 self.begin_turn_setup(line, turn, model, settings, notice, reply)
                     .await
             }
+            ChildCommand::Steer { turn, text, reply } => self.steer(turn, text, reply).await,
             ChildCommand::Interrupt { reply } => {
+                // A plain interrupt leaves a queued steer to run as the next turn.
+                if let Err(error) = self.withdraw_unstarted_steers(WithdrawReason::Stop).await {
+                    let _ = reply.send(Err(error.clone()));
+                    return Err(error);
+                }
                 let request_id = new_request_id();
                 if let Err(error) = self
                     .child
@@ -1493,7 +1543,7 @@ impl Supervisor {
                     .insert(request_id.clone(), Waiter::Interrupt(reply));
                 self.interrupt_sent = true;
                 let turn = self.mapper.active_turn();
-                if turn.is_some() {
+                if turn.is_some() || self.mapper.has_unsettled_steers() {
                     self.mapper.note_interrupt_sent();
                 }
                 info!(
@@ -1568,15 +1618,212 @@ impl Supervisor {
         );
     }
 
+    // ---- steers ---------------------------------------------------------------------------------
+
+    /// Write steering text into the active turn (§4.2 of the turn-steering plan). The reply
+    /// waits for the steer's fate (`on_steer_settled`). `Err` is a stdin write failure.
+    async fn steer(
+        &mut self,
+        turn: TurnId,
+        text: String,
+        reply: oneshot::Sender<Result<(), HarnessError>>,
+    ) -> Result<(), HarnessError> {
+        if reply.is_closed() {
+            self.log_caller_gave_up(turn, "steer_turn");
+            return Ok(());
+        }
+        if let Some(reason) = self.mapper.steer_refusal(turn) {
+            debug!(
+                thread_id = %self.thread,
+                turn_id = %turn,
+                action = "steer_turn",
+                reason = %reason,
+                "refusing a steer"
+            );
+            let _ = reply.send(Err(HarnessError::Protocol(reason)));
+            return Ok(());
+        }
+        let command_uuid = uuid::Uuid::new_v4().to_string();
+        let line = match user_message_line(&text, &[], &command_uuid) {
+            Ok(line) => line,
+            Err(error) => {
+                let _ = reply.send(Err(error));
+                return Ok(());
+            }
+        };
+        if let Err(error) = self.child.write_line(&line).await {
+            let _ = reply.send(Err(error.clone()));
+            return Err(error);
+        }
+        self.mapper.note_steer(command_uuid.clone(), turn, text);
+        info!(
+            thread_id = %self.thread,
+            harness_thread_id = display_opt(self.context.harness_thread_id.as_deref()),
+            turn_id = %turn,
+            command_uuid = %command_uuid,
+            bytes = line.len(),
+            action = "steer_written",
+            "steering input written"
+        );
+        self.steers_unreported
+            .insert(command_uuid.clone(), Instant::now());
+        self.steer_replies.insert(command_uuid, reply);
+        Ok(())
+    }
+
+    /// Write `cancel_async_message` for every steer not yet taken in, before anything that would
+    /// otherwise let the CLI run it as the next turn (an interrupt, a `Cancel` answer, a stop).
+    async fn withdraw_unstarted_steers(
+        &mut self,
+        reason: WithdrawReason,
+    ) -> Result<(), HarnessError> {
+        for command_uuid in self.mapper.unstarted_steers() {
+            self.withdraw_steer(command_uuid, reason).await?;
+        }
+        Ok(())
+    }
+
+    async fn withdraw_steer(
+        &mut self,
+        command_uuid: String,
+        reason: WithdrawReason,
+    ) -> Result<(), HarnessError> {
+        self.mapper.note_steer_withdrawing(&command_uuid, reason);
+        // Being withdrawn, it no longer needs the backstop.
+        self.steers_unreported.remove(&command_uuid);
+        let request_id = new_request_id();
+        let request = json!({"subtype": "cancel_async_message", "message_uuid": command_uuid});
+        self.child
+            .write_line(&control_line(&request_id, &request))
+            .await?;
+        info!(
+            thread_id = %self.thread,
+            harness_thread_id = display_opt(self.context.harness_thread_id.as_deref()),
+            command_uuid = %command_uuid,
+            request_id = %request_id,
+            reason = ?reason,
+            action = "steer_withdrawing",
+            "withdrawing a steer not yet taken in"
+        );
+        self.waiters
+            .insert(request_id, Waiter::Withdraw { command_uuid });
+        Ok(())
+    }
+
+    /// Answer the `steer_turn` waiting on a settled steer.
+    fn on_steer_settled(
+        &mut self,
+        command_uuid: &str,
+        steered_turn: TurnId,
+        outcome: SteerOutcome,
+    ) {
+        self.steers_unreported.remove(command_uuid);
+        let Some(reply) = self.steer_replies.remove(command_uuid) else {
+            debug!(
+                thread_id = %self.thread,
+                turn_id = %steered_turn,
+                command_uuid = %command_uuid,
+                outcome = ?outcome,
+                action = "steer_settled",
+                "a steer settled with no caller waiting"
+            );
+            return;
+        };
+        let result = outcome.into_result(steered_turn);
+        info!(
+            thread_id = %self.thread,
+            harness_thread_id = display_opt(self.context.harness_thread_id.as_deref()),
+            turn_id = %steered_turn,
+            command_uuid = %command_uuid,
+            ok = result.is_ok(),
+            action = "steer_settled",
+            "steering input settled"
+        );
+        if reply.send(result).is_err() {
+            debug!(
+                thread_id = %self.thread,
+                command_uuid = %command_uuid,
+                action = "steer_settled",
+                "the steer's caller gave up before it settled"
+            );
+        }
+    }
+
+    /// The mapper's outputs from a withdrawal answer: settlements only.
+    fn on_steer_outputs(&mut self, outputs: Vec<MapperOutput>) {
+        for output in outputs {
+            if let MapperOutput::SteerSettled {
+                command_uuid,
+                steered_turn,
+                outcome,
+            } = output
+            {
+                self.on_steer_settled(&command_uuid, steered_turn, outcome);
+            }
+        }
+    }
+
+    /// When the oldest steer the CLI has not reported on reaches its grace, if any.
+    fn steer_backstop_deadline(&mut self) -> Option<Instant> {
+        let mapper = &self.mapper;
+        self.steers_unreported
+            .retain(|command_uuid, _| !mapper.steer_lifecycle_seen(command_uuid));
+        self.steers_unreported
+            .values()
+            .min()
+            .and_then(|written| written.checked_add(NOTIFICATION_GRACE))
+    }
+
+    /// The backstop (§4.6): a steer with no lifecycle frame after the grace is withdrawn; only
+    /// the CLI's confirmation settles it as failed. `Err` is a stdin write failure.
+    async fn on_steer_backstop(&mut self) -> Result<(), HarnessError> {
+        let now = Instant::now();
+        let due: Vec<String> = self
+            .steers_unreported
+            .iter()
+            .filter(|(_, written)| {
+                written
+                    .checked_add(NOTIFICATION_GRACE)
+                    .is_some_and(|deadline| deadline <= now)
+            })
+            .map(|(command_uuid, _)| command_uuid.clone())
+            .collect();
+        for command_uuid in due {
+            self.steers_unreported.remove(&command_uuid);
+            warn!(
+                thread_id = %self.thread,
+                harness_thread_id = display_opt(self.context.harness_thread_id.as_deref()),
+                command_uuid = %command_uuid,
+                grace_ms = NOTIFICATION_GRACE.as_millis() as u64,
+                action = "steer_lifecycle_missing",
+                "Claude Code reported nothing for a steer; withdrawing it"
+            );
+            self.withdraw_steer(command_uuid, WithdrawReason::Backstop)
+                .await?;
+        }
+        Ok(())
+    }
+
     /// `ThreadBusy` while a turn is active: a user message is never queued behind another.
     fn busy(&self, action: &'static str) -> Option<HarnessError> {
-        let active = self.mapper.active_turn()?;
-        debug!(
-            thread_id = %self.thread,
-            turn_id = %active,
-            action,
-            "refusing a turn while one is active"
-        );
+        if let Some(active) = self.mapper.active_turn() {
+            debug!(
+                thread_id = %self.thread,
+                turn_id = %active,
+                action,
+                "refusing a turn while one is active"
+            );
+        } else if self.mapper.has_unsettled_steers() {
+            // The CLI may be about to run a steer as the next turn: a prompt written now would be
+            // merged into it.
+            debug!(
+                thread_id = %self.thread,
+                action,
+                "refusing a turn while a steer may still start the next one"
+            );
+        } else {
+            return None;
+        }
         Some(HarnessError::ThreadBusy {
             thread: self.thread,
         })
@@ -2122,6 +2369,12 @@ impl Supervisor {
             self.mapper.note_denied(ask.thread, tool_use_id);
         }
         if matches!(decision, ApprovalDecision::Cancel) {
+            // A deny with `interrupt: true` leaves a queued steer to run as the next turn, as a
+            // plain interrupt does: withdraw it first (stdin is ordered).
+            if let Err(error) = self.withdraw_unstarted_steers(WithdrawReason::Stop).await {
+                let _ = reply.send(Err(error.clone()));
+                return Err(error);
+            }
             // The deny carries `interrupt: true`: the turn ends `aborted_tools`, which must
             // persist as `Interrupted`, and the exit after it is expected.
             self.interrupt_sent = true;
@@ -2496,6 +2749,8 @@ impl Supervisor {
             Some("control_request")
         } else if self.mapper.active_turn().is_some() {
             Some("turn")
+        } else if self.mapper.has_unsettled_steers() {
+            Some("steers")
         } else {
             None
         }
@@ -2717,6 +2972,17 @@ impl Supervisor {
             );
             self.fail_turn_setup(setup, error);
         }
+        // Neither the interrupt nor closing stdin drops a queued steer (the CLI runs it): withdraw
+        // it first, so a stopped thread runs nothing more.
+        if let Err(error) = self.withdraw_unstarted_steers(WithdrawReason::Stop).await {
+            warn!(
+                thread_id = %self.thread,
+                action = "steer_withdrawn",
+                reason,
+                error = %error,
+                "could not withdraw a steer before stopping"
+            );
+        }
         let stage = match self.mapper.active_turn() {
             Some(turn) => {
                 let started = Instant::now();
@@ -2750,7 +3016,35 @@ impl Supervisor {
                     }
                 }
             }
-            None => self.begin_draining(),
+            None => {
+                if self.mapper.has_unsettled_steers() {
+                    // A steer whose withdrawal loses may be about to start the next turn: this
+                    // interrupt aborts that turn as it starts (§2 of the turn-steering plan: in
+                    // this window it ends `aborted_streaming` before running anything). Noted
+                    // before it is written, so the turn reads as interrupted even if the write
+                    // fails and the stop's exit grace ends it.
+                    self.interrupt_sent = true;
+                    self.mapper.note_interrupt_sent();
+                    let request_id = new_request_id();
+                    match self
+                        .child
+                        .write_line(&control_line(&request_id, &json!({"subtype": "interrupt"})))
+                        .await
+                    {
+                        Ok(()) => {
+                            self.waiters.insert(request_id, Waiter::Stop);
+                        }
+                        Err(error) => warn!(
+                            thread_id = %self.thread,
+                            action = "stop_interrupt",
+                            reason,
+                            error = %error,
+                            "could not interrupt for a pending steer before stopping"
+                        ),
+                    }
+                }
+                self.begin_draining()
+            }
         };
         self.idle_since = None;
         self.phase = Phase::Stopping(Stopping {
@@ -2895,6 +3189,7 @@ impl Supervisor {
             | ChildCommand::RespondServerRequest { reply, .. }
             | ChildCommand::StopTask { reply, .. }
             | ChildCommand::StopBackgroundCommand { reply, .. }
+            | ChildCommand::Steer { reply, .. }
             | ChildCommand::Compact { reply, .. } => {
                 let _ = reply.send(Err(child_stopped()));
             }
@@ -2943,6 +3238,11 @@ impl Supervisor {
             match output {
                 MapperOutput::Event(event) => self.append(event),
                 MapperOutput::RouteClosed { thread } => self.close_route(thread),
+                MapperOutput::SteerSettled {
+                    command_uuid,
+                    steered_turn,
+                    outcome,
+                } => self.on_steer_settled(&command_uuid, steered_turn, outcome),
                 other => debug!(
                     thread_id = %self.thread,
                     action = "child_exited",
@@ -2950,6 +3250,17 @@ impl Supervisor {
                     "ignoring a mapper output produced at child exit"
                 ),
             }
+        }
+        // The mapper settles every steer it tracks at exit; a reply left over has no entry there
+        // (it never will): its fate is just as unknown.
+        for (command_uuid, reply) in std::mem::take(&mut self.steer_replies) {
+            warn!(
+                thread_id = %self.thread,
+                command_uuid = %command_uuid,
+                action = "steer_outcome_unknown",
+                "a steer's caller is answered at child exit with no mapper record of it"
+            );
+            let _ = reply.send(SteerOutcome::Unknown.into_result(TurnId::new()));
         }
         // Routes the mapper never closed (none, normally) end with the child.
         let rest: Vec<ThreadId> = self.route_logs.keys().copied().collect();
@@ -3061,6 +3372,15 @@ pub(crate) mod tests {
         RespondOnNextWrite(Value),
         /// Answer the triggering control request with this success payload after `delay`.
         RespondAfter { delay: Duration, payload: Value },
+        /// Emit a `command_lifecycle` frame in this state for the triggering `user` line's uuid.
+        Lifecycle(&'static str),
+        /// Emit a `command_lifecycle` frame in this state for the uuid of the `index`-th `user`
+        /// line written so far (0 is the first), whatever line triggered it.
+        LifecycleOfUser { index: usize, state: &'static str },
+        /// Answer the triggering `cancel_async_message` as the CLI does: when `cancelled`, the
+        /// message's `cancelled` lifecycle frame first, then `{"cancelled": true, …}`; otherwise
+        /// `{"cancelled": false}`.
+        AnswerWithdrawal { cancelled: bool },
         /// Every later stdin write fails, as for a CLI whose stdin pipe broke.
         BreakStdin,
         /// Close stdout and exit with this code and stderr.
@@ -3147,6 +3467,13 @@ pub(crate) mod tests {
         Box::new(move |value| {
             value["type"] == "control_request" && value["request"]["subtype"] == subtype
         })
+    }
+
+    /// One `command_lifecycle` stdout line, as Claude Code writes it.
+    pub(crate) fn lifecycle_frame(command_uuid: &Value, state: &str) -> String {
+        json!({"type": "command_lifecycle", "command_uuid": command_uuid, "state": state,
+               "uuid": "scripted", "session_id": "scripted"})
+        .to_string()
     }
 
     /// A stdin line that is a user message.
@@ -3250,6 +3577,39 @@ pub(crate) mod tests {
                             "subtype": "success",
                             "request_id": trigger["request_id"],
                             "response": payload,
+                        }});
+                        let _ = self.tx.send(Out::Line(line.to_string()));
+                    }
+                    Action::Lifecycle(state) => {
+                        let _ = self
+                            .tx
+                            .send(Out::Line(lifecycle_frame(&trigger["uuid"], state)));
+                    }
+                    Action::LifecycleOfUser { index, state } => {
+                        let uuid = lock(&self.record)
+                            .written
+                            .iter()
+                            .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+                            .filter(|line| line["type"] == "user")
+                            .nth(index)
+                            .map(|line| line["uuid"].clone())
+                            .unwrap_or(Value::Null);
+                        let _ = self.tx.send(Out::Line(lifecycle_frame(&uuid, state)));
+                    }
+                    Action::AnswerWithdrawal { cancelled } => {
+                        let message_uuid = &trigger["request"]["message_uuid"];
+                        let answer = if cancelled {
+                            let _ = self
+                                .tx
+                                .send(Out::Line(lifecycle_frame(message_uuid, "cancelled")));
+                            json!({"cancelled": true, "message_uuid": message_uuid})
+                        } else {
+                            json!({"cancelled": false})
+                        };
+                        let line = json!({"type": "control_response", "response": {
+                            "subtype": "success",
+                            "request_id": trigger["request_id"],
+                            "response": answer,
                         }});
                         let _ = self.tx.send(Out::Line(line.to_string()));
                     }

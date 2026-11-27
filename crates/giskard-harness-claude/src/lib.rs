@@ -46,8 +46,11 @@ pub fn capabilities() -> HarnessCapabilities {
         mcp_status: true,
         // `compact_thread` writes `/compact` as a compaction turn.
         context_compaction: true,
-        // `structured_diffs`, `mcp_reload`, `mcp_oauth_login` and `turn_steering` are false per
-        // plan §4: Claude Code offers no path behind them.
+        // `structured_diffs`, `mcp_reload` and `mcp_oauth_login` are false per plan §4: Claude Code
+        // offers no path behind them. `turn_steering` is implemented (`steer_turn`) but stays
+        // false until the browser shows a steer that runs as the next turn as that turn's prompt
+        // (step 4 of `specs/claude-code-harness-plan/turn-steering-plan.md`): advertised now, such
+        // a steer would read as failed though it ran.
         ..HarnessCapabilities::default()
     }
 }

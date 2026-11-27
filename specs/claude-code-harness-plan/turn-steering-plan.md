@@ -154,6 +154,7 @@ the turn ends first, the message starts the next turn."
 | Queued during an ask, then `cancel_async_message {S}` and the deny with `interrupt: true` | steer `cancelled`; nothing runs after |
 | Queued, then stdin closed | not dropped: the CLI finishes the turn, takes the steer in at the next boundary (`started`, `completed`) and the reply honours it; no `discarded` |
 | Taken in (`started`), then a plain `interrupt` | steer `cancelled` (taken into an aborted turn) before the `result`; nothing runs after |
+| Queued during the final answer; at the turn's `result` (no turn running, the steer not yet `started`), `cancel_async_message {S}`, an `interrupt`, then stdin closed: the adapter's stop sequence in that window | the withdrawal loses (`cancelled: false`); the steer `started`, and the `interrupt` aborts its turn at once (`aborted_streaming`, steer `cancelled`) before it runs anything (no tool call); the process exits 0.6–0.9 s after stdin closed (1.9 s with stdin left open). 6 of 6 runs |
 | Queued after a tool call, then `cancel_async_message {S}` and an `interrupt` sent at the final `message_delta` | the withdrawal loses (`cancelled: false`, the window below); the steered turn ends `completed`; the steer starts as the next turn and the `interrupt` aborts it at once (`aborted_streaming`, steer `cancelled`). The same with `cancel_queued: true` (3 of 3 each) |
 | `priority: "next"` | as with no priority |
 | `priority: "later"` | not taken in at the boundary; runs as the next turn |
@@ -291,7 +292,10 @@ Refuse with `HarnessError::Protocol` (reported as `turn_steer_failed`) unless, i
 2. it is a `TurnKind::User` turn the adapter started (not external, not a compaction) and its
    prompt is acknowledged. A steer written before the prompt is taken in could be batched with it
    and its `UserMessage` would precede the prompt's, which the browser's ordered matching
-   (`browser_reconciles_identical_delayed_initial_echo_before_steering_echo`) does not expect.
+   (`browser_reconciles_identical_delayed_initial_echo_before_steering_echo`) does not expect;
+3. the turn is not being stopped: a Stop or a `Cancel` answer has not been sent for it. Written
+   after the Stop's withdrawals, a steer would run as the next turn; the server can still route
+   one there, since its steerable-turn check does not see an interrupt in flight.
 
 No capability check: the minimum version (§1) guarantees the lifecycle. The stopping phase
 refuses as it refuses every command. Each refusal logs `debug` with `action = "steer_turn"` and
@@ -309,7 +313,7 @@ Then write the line, `note_steer(command_uuid, turn, text)`, keep the reply, and
 | `completed` after `started` | `debug`; remove | `debug`; remove |
 | `completed` with no `started` | **consumed**: the CLI reports no `started` but the turn that took it in ended ("not a strict pairing", §2). Settle `Ok`; emit its `UserMessage` on that turn, with `warn` `steer_confirmed_late` (its position in the turn is unknown); then remove | the consuming turn is the one whose `result` listed it in `user_message_uuids`, else the turn just completed; any other turn running then (a continuation) is not it. When that turn is the one whose `result` is being read, emit the `UserMessage` there; once it has ended, settle `Ok` **without an item** (the server amends a finished turn only with a command's late completion), with `warn` `steer_confirmed_late` saying so; then remove |
 | `cancelled` after `started` | `info` (the model saw it; its turn was aborted); remove | same |
-| `cancelled` with no `started` | if the CLI confirmed the adapter's withdrawal of it: **not taken in**, settle `Err` as withdrawn (§4.4), `info` `steer_dropped`, remove. Otherwise keep it unsettled until the next `result` (an aborted turn's `cancelled` frames precede its `result`, §2): listed in its `user_message_uuids`, it was taken into that aborted turn, handled as `completed` with no `started`; not listed, it was not taken in, settle `Err` as dropped (`cancelled`): a withdrawal whose answer has not come, or was refused, proves no more. A child exit first gives the unknown outcome, unless a withdrawal was confirmed | same |
+| `cancelled` with no `started` | if the CLI confirmed the adapter's withdrawal of it: **not taken in**, settle `Err` as withdrawn (§4.4), `info` `steer_dropped`, remove. A confirmed answer settles it on its own, even if this frame never comes: the steer must not wait on it, or the thread stays busy; a frame arriving after is untracked. Otherwise keep it unsettled until the next `result` (an aborted turn's `cancelled` frames precede its `result`, §2): listed in its `user_message_uuids`, it was taken into that aborted turn, handled as `completed` with no `started`; not listed, it was not taken in, settle `Err` as dropped (`cancelled`): a withdrawal whose answer has not come, or was refused, proves no more. A child exit first gives the unknown outcome, unless a withdrawal was confirmed | same |
 | `discarded`, `refused` | settle `Err` (§4.4); `info` `steer_dropped`; remove | same |
 | `Unknown(other)` | `warn`, keep waiting | same |
 
@@ -334,6 +338,7 @@ the steer missing from a non-empty `user_message_uuids` is `warn` `steer_unconfi
 | withdrawn by the backstop, confirmed by the CLI (§4.6) | `Protocol("Claude Code did not report the steering input; it was withdrawn")` |
 | `discarded` / `refused` | `Protocol("Claude Code dropped the steering input (<state>)")` |
 | child exit / stop, the steer neither started nor settled by positive evidence (only `queued`, or no frame at all) | `Err("Claude Code exited before reporting the steering input; it may have reached the model")` (§4.6) |
+| the reply dropped unanswered (a supervisor aborted when a stop overran its budget never reaches its exit handling) | the same unknown outcome, from the façade: never "child stopped", which a caller could take as "not sent" and resend |
 
 ### 4.5 The next turn, and Stop
 
@@ -350,7 +355,11 @@ Giskard did not start.
 as the next turn (§2), and so does a `Cancel` answer to an ask. So before writing `interrupt`
 (the user's Stop, `session.rs:1460`; the stop sequence, `:2665`) and before a `Cancel` answer
 (deny with `interrupt: true`, `session.rs:475`), the supervisor writes one `cancel_async_message
-{message_uuid}` per unstarted steer of the thread, each with a waiter under `CONTROL_TIMEOUT`.
+{message_uuid}` per unstarted steer of the thread whose withdrawal is not already in flight (a
+refused answer clears that, so a later Stop sends another), each with a waiter. Like the
+supervisor's
+other waiters it has no deadline of its own: an answer that never comes leaves the steer to its
+lifecycle, and the child busy (`"control_request"`) until it exits.
 stdin is ordered, so they reach the CLI first; both orders were verified. Settlement comes from
 the lifecycle frame (`cancelled` arrives before the answer); the answer is logged
 (`steer_withdrawn`, `cancelled` true/false).
@@ -372,6 +381,15 @@ lifecycle and not by the answer:
   The steer settles `Ok` (it reached the model, and its text stays in the conversation inside
   that aborted turn). `info` `steer_after_stop`.
 
+**A stop with no turn running** (an archive, delete or shutdown in the window between a turn's
+`result` and a pending steer's `started`) has no turn to interrupt, yet a withdrawal can lose
+there too. So while a steer is unsettled the stop sequence still writes `interrupt`, noting it
+first. In that window the interrupt aborts the steer's turn as it starts, before it runs anything
+(§2, 6 of 6), so nothing more is done to stop it: the stop drains and its usual exit grace
+bounds the rest. Noting the interrupt before writing it marks the steer's next turn interrupted
+even if the write fails, so a child that exits or is killed mid-turn completes it `Interrupted`,
+not `Failed`.
+
 ### 4.6 Every steer is answered
 
 The façade waits without a timeout, so the supervisor settles every reply:
@@ -385,7 +403,10 @@ The façade waits without a timeout, so the supervisor settles every reply:
   withdrawal that was not confirmed, leaves an unknown outcome;
 - **backstop**: a steer that has seen no lifecycle frame `NOTIFICATION_GRACE` (2 s,
   `session.rs:35`) after it was written means the protocol changed (the CLI emits `queued` on the
-  write). The supervisor logs `warn` `steer_lifecycle_missing` and withdraws it. Only a confirmed
+  write). The supervisor logs `warn` `steer_lifecycle_missing` and withdraws it; a steer already
+  being withdrawn is not withdrawn again, the first withdrawal's reason stands, and the backstop
+  does not run while the child stops (the stop withdraws every unstarted steer itself, and stdin
+  may be closed). Only a confirmed
   withdrawal (`{"cancelled": true}`) settles it `Err`. Otherwise its fate is unknown, so it
   stays tracked and unsettled: a later lifecycle frame settles it as usual, and so does a
   `result` whose `user_message_uuids` lists it (`Ok`, its `UserMessage` emitted on that turn
@@ -492,24 +513,24 @@ an unknown state, and a child exit with a steer unsettled.
 
 ### Step 3: `steer_turn` end to end
 
-`ChildCommand::Steer`, §4.2, the reply map, the withdrawals before every interrupt and `Cancel`,
-§4.6, §4.7, the façade method, the capability. Extend `fake-claude.sh` (a trigger that folds a
-pending steer before the `result`, one that starts it after; `cancel_async_message` answering and
-emitting `cancelled`). Tests: `Ok` at `started`, taken in and as the next turn; each refusal;
-`Err` on a confirmed withdrawal or `discarded`; a child exit with no turn running while a steer
-is unsettled (the supervisor must still call `child_exited`, which settles it); a lost withdrawal
-at Stop (the
-next turn opens with the steer and completes `Interrupted`); the backstop (withdrawn: `Err`; not
-withdrawn: unsettled, then `Ok` from `user_message_uuids` or the unknown-outcome `Err` at child
-exit); `completed` and `cancelled` with no `started`, the latter settled only at the next
-`result` (listed or not) or by a confirmed withdrawal; child exit with a steer only `queued`
-(unknown outcome); a stop with it queued (withdrawn and confirmed: dropped); withdrawals
-written before `interrupt` and before a `Cancel` answer (ScriptedChild asserts line order);
-`ThreadBusy` from `start_turn` while a steer is unsettled; no reap meanwhile. Log assertions for
-`steer_written`, `steer_started`, `steer_dropped`, `steer_withdrawn`, `steer_after_stop`,
-`steer_lifecycle_missing`, `steer_confirmed_late`, `steer_outcome_unknown`.
+`ChildCommand::Steer`, §4.2, the reply map, the withdrawals before every interrupt, a `Cancel`
+answer and the stop sequence, §4.6, §4.7, the façade method. The capability stays false until step
+4: advertised before the browser handles a steer that runs as the next turn, such a steer would read
+as failed though it ran. Tests drive the in-process scripted child, which gains two actions (a
+lifecycle frame for the triggering line's uuid; a withdrawal answered as the CLI answers it,
+`cancelled` first): `Ok` at `started`, taken in and as the next turn; each refusal (no active turn,
+another turn, a prompt not yet taken in, a turn being stopped, a sub-agent thread) with nothing
+written; a confirmed withdrawal before an interrupt and before a `Cancel` answer, written first
+(line order); `ThreadBusy` from `start_turn` while a steer is unsettled, and a stop withdrawing it;
+the backstop (withdrawn: `Err`); a child exit with no turn running while a steer is unsettled,
+settled by the mapper (the supervisor must still call `child_exited`); a stop with no turn running
+whose withdrawal loses, the stop still interrupting and the steer's next turn `Interrupted`, also
+when that interrupt's write fails; the backstop quiet while the child stops; no reap meanwhile. The
+mapper's own outcomes (a lost withdrawal at Stop, unpaired frames, the backstop's unconfirmed case)
+are step 2's tests. Log assertions for `steer_written`, `steer_settled`, `steer_withdrawing`,
+`steer_lifecycle_missing`, `steer_outcome_unknown`; the text never logged.
 
-### Step 4: browser, a steer that runs as the next turn
+### Step 4: browser, a steer that runs as the next turn, and the capability
 
 Today `turn_completed` fails a pending steer (`app.js:5411`, `failPendingSteer`). Instead it keeps
 it pending, marked as waiting for the next turn; the first `user_message` of the next turn with
@@ -518,11 +539,14 @@ the same text confirms the row as that turn's prompt (`addItem`, beside the stee
 `turn_completed` without a match. Codex is unaffected: a Codex steer that loses the completion race
 fails with that error. `tests/ui.rs` source assertions (as
 `browser_reconciles_pending_steering_without_clearing_the_active_turn`), and an e2e case through
-`tests/e2e/run.sh` with the replay harness: a scripted steer confirmed in the next turn.
+`tests/e2e/run.sh` with the replay harness: a scripted steer confirmed in the next turn. Then
+`capabilities().turn_steering = true` (§4.8), with `lib.rs`'s test asserting it.
 
 ### Step 5: server-level test
 
-A `giskard-server` test driving a Claude thread through `fake-claude.sh`: `SteerInput` on the
+`tests/fake-claude.sh` learns to answer a steer: a trigger that takes a pending steer in before
+the `result`, one that starts it after, and `cancel_async_message` answered with `cancelled`.
+Then a `giskard-server` test driving a Claude thread through it: `SteerInput` on the
 running turn yields a same-turn `user_message` in the live snapshot and the persisted turn; a
 steer that runs as the next turn yields an external turn whose persisted items carry the steer's
 `user_message`; a steer withdrawn by Stop yields a `turn_steer_failed` error and nothing after.
