@@ -21,7 +21,10 @@
 #   a later `stop_task` emits the `killed` update and the notification of `background-stop` for
 #   that task before its `{}` answer; any other user message
 #   replays the `text-turn` frames (`FAKE_CLAUDE_EXIT_MID_TURN=<n>`: only the first n, then exit 3).
+#   A user message carrying a `uuid` gets `command_lifecycle` `queued` and `started` before its
+#   frames and `completed` after its turn's `result`, as Claude Code 2.1.330 reports them.
 #   EOF exits 0 (`FAKE_CLAUDE_IGNORE_EOF=1`: sleeps 30 s instead).
+# - `initialize` reports `claude_code_version` 2.1.332, or `FAKE_CLAUDE_VERSION` (`none`: no field).
 
 fixtures="$(dirname "$0")/fixtures"
 model=""
@@ -66,6 +69,8 @@ launch_mode="$mode"
 ask_line=$(grep -n '"type": "control_request"' "$fixtures/tool-allowed.out.jsonl" | cut -d: -f1)
 effort="null"
 asked=""
+# What `initialize` reports as `claude_code_version`; `none` leaves the field out.
+version="${FAKE_CLAUDE_VERSION:-2.1.332}"
 # The `background-complete` task still running, if one was started.
 background=""
 
@@ -88,12 +93,28 @@ field() {
     printf '%s\n' "$line" | sed -n 's/.*"'"$1"'":"\([^"]*\)".*/\1/p'
 }
 
+# One `command_lifecycle` frame for a stamped user message: lifecycle <uuid> <state>.
+lifecycle() {
+    if [ -n "$1" ]; then
+        printf '{"type":"command_lifecycle","command_uuid":"%s","state":"%s","uuid":"fake-%s","session_id":"fake"}\n' "$1" "$2" "$2"
+    fi
+}
+# The stamped user message whose turn waits for an ask's answer before it completes.
+asked_uuid=""
+
 while IFS= read -r line; do
     request_id=$(printf '%s\n' "$line" | sed -n 's/.*"request_id":"\([^"]*\)".*/\1/p')
     case "$line" in
         *'"subtype":"initialize"'*)
+            # The recording (2.1.286) predates `claude_code_version`; the adapter requires it.
+            if [ "$version" = "none" ]; then
+                version_field=""
+            else
+                version_field='"claude_code_version": "'"$version"'", '
+            fi
             sed -n '1s/"request_id": "[^"]*"/"request_id": "'"$request_id"'"/p' \
-                "$fixtures/initialize.out.jsonl"
+                "$fixtures/initialize.out.jsonl" \
+                | sed 's/"response": {"commands"/"response": {'"$version_field"'"commands"/'
             ;;
         *'"subtype":"get_settings"'*)
             respond "$request_id" '{"applied":{"model":"'"$model"'","effort":'"$effort"'},"effective":{},"sources":[]}'
@@ -143,9 +164,14 @@ while IFS= read -r line; do
             if [ -n "$asked" ]; then
                 asked=""
                 sed -n "$((ask_line + 1)),\$p" "$fixtures/tool-allowed.out.jsonl"
+                lifecycle "$asked_uuid" completed
+                asked_uuid=""
             fi
             ;;
         *'"type":"user"'*)
+            command_uuid=$(field uuid)
+            lifecycle "$command_uuid" queued
+            lifecycle "$command_uuid" started
             case "$line" in
                 *background*)
                     background=1
@@ -155,10 +181,12 @@ while IFS= read -r line; do
                     sed -n "1,${result_line}p" "$fixtures/background-complete.out.jsonl" \
                         | grep -v -e '"type": "control_request"' -e '"type": "control_response"' \
                             -e '"isReplay": true'
+                    lifecycle "$command_uuid" completed
                     continue
                     ;;
                 *touch*)
                     asked=1
+                    asked_uuid="$command_uuid"
                     sed -n "1,${ask_line}p" "$fixtures/tool-allowed.out.jsonl"
                     continue
                     ;;
@@ -170,6 +198,7 @@ while IFS= read -r line; do
                 exit 3
             fi
             sed '/"type": "control_response"/d' "$fixtures/text-turn.out.jsonl"
+            lifecycle "$command_uuid" completed
             ;;
     esac
 done

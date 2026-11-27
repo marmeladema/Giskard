@@ -1,0 +1,28 @@
+{
+ "scenario": "lifecycle-interrupted",
+ "argv": [
+  "claude",
+  "-p",
+  "--input-format",
+  "stream-json",
+  "--output-format",
+  "stream-json",
+  "--verbose",
+  "--permission-prompt-tool",
+  "stdio",
+  "--setting-sources",
+  "",
+  "--include-partial-messages",
+  "--model",
+  "haiku",
+  "--permission-mode",
+  "manual",
+  "--session-id",
+  "d0b78574-49f9-4b9c-90a8-fcfc1037ce45"
+ ],
+ "cwd": "/work/project",
+ "exit": 1,
+ "results": 1,
+ "asks": 1,
+ "elapsed_s": 9.3
+}

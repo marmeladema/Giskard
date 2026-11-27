@@ -23,10 +23,15 @@ const TEXT_APPLICATION_TYPES: &[&str] = &[
 
 /// Build the stdin line for one user message: attachment blocks first, then the text block.
 ///
+/// `command_uuid` is the message's top-level `uuid`. The CLI reports the message's fate under it
+/// in `command_lifecycle` frames (`queued`, `started`, then one terminal state) and lists it in
+/// the consuming turn's `user_message_uuids`; a message without one gets no lifecycle frames.
+///
 /// Nothing is truncated: a message whose encoded line exceeds the CLI's cap is refused by size.
 pub(crate) fn user_message_line(
     text: &str,
     attachments: &[UserAttachment],
+    command_uuid: &str,
 ) -> Result<String, HarnessError> {
     if text.is_empty() && attachments.is_empty() {
         return Err(HarnessError::Protocol("empty user message".into()));
@@ -41,6 +46,7 @@ pub(crate) fn user_message_line(
     }
     let message = json!({
         "type": "user",
+        "uuid": command_uuid,
         "message": {"role": "user", "content": content},
     });
     let line = serde_json::to_string(&message)
@@ -125,8 +131,18 @@ mod tests {
         }
     }
 
+    const UUID: &str = "6f1c2b9e-0d4a-4c8e-9b1f-3a7d5e2c8f40";
+
+    fn line(text: &str, attachments: &[UserAttachment]) -> Result<String, HarnessError> {
+        user_message_line(text, attachments, UUID)
+    }
+
     fn content(line: &str) -> Vec<Value> {
         let value: Value = serde_json::from_str(line).unwrap();
+        assert_eq!(
+            value["uuid"], UUID,
+            "every user line carries its command uuid"
+        );
         assert_eq!(value["type"], "user");
         assert_eq!(value["message"]["role"], "user");
         value["message"]["content"].as_array().unwrap().clone()
@@ -135,12 +151,12 @@ mod tests {
     #[test]
     fn attachments() {
         // A text-only message is one text block.
-        let blocks = content(&user_message_line("ping", &[]).unwrap());
+        let blocks = content(&line("ping", &[]).unwrap());
         assert_eq!(blocks, vec![json!({"type": "text", "text": "ping"})]);
 
         // An image precedes the text.
         let png = attachment("shot.png", "image/png", b"\x89PNG\r\n");
-        let blocks = content(&user_message_line("look", std::slice::from_ref(&png)).unwrap());
+        let blocks = content(&line("look", std::slice::from_ref(&png)).unwrap());
         assert_eq!(blocks.len(), 2);
         assert_eq!(blocks[0]["type"], "image");
         assert_eq!(blocks[0]["source"]["type"], "base64");
@@ -150,27 +166,27 @@ mod tests {
 
         // A PDF is a base64 document.
         let pdf = attachment("doc.pdf", "application/pdf", b"%PDF-1.7");
-        let blocks = content(&user_message_line("read", &[pdf]).unwrap());
+        let blocks = content(&line("read", &[pdf]).unwrap());
         assert_eq!(blocks[0]["type"], "document");
         assert_eq!(blocks[0]["source"]["media_type"], "application/pdf");
 
         // Text is decoded into a text-source document.
         let notes = attachment("notes.txt", "text/plain", "héllo".as_bytes());
-        let blocks = content(&user_message_line("", &[notes]).unwrap());
+        let blocks = content(&line("", &[notes]).unwrap());
         assert_eq!(blocks.len(), 1, "an empty text sends the attachment alone");
         assert_eq!(
             blocks[0],
             json!({"type": "document", "source": {"type": "text", "media_type": "text/plain", "data": "héllo"}})
         );
         let json_file = attachment("a.json", "application/json", b"{}");
-        let blocks = content(&user_message_line("x", &[json_file]).unwrap());
+        let blocks = content(&line("x", &[json_file]).unwrap());
         assert_eq!(blocks[0]["source"]["data"], "{}");
 
         // Wrapped base64 is unwrapped.
         let mut wrapped = attachment("shot.png", "image/png", &[7u8; 120]);
         let unwrapped = wrapped.data_base64.clone();
         wrapped.data_base64 = format!("{}\n{}\r\n", &unwrapped[..60], &unwrapped[60..]);
-        let blocks = content(&user_message_line("x", &[wrapped]).unwrap());
+        let blocks = content(&line("x", &[wrapped]).unwrap());
         assert_eq!(blocks[0]["source"]["data"], unwrapped);
 
         // An unsupported type is refused by name.
@@ -179,7 +195,7 @@ mod tests {
             "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             b"PK",
         );
-        let error = user_message_line("x", &[xlsx]).unwrap_err();
+        let error = line("x", &[xlsx]).unwrap_err();
         assert!(
             matches!(&error, HarnessError::Unsupported(message) if message.contains("sheet.xlsx")),
             "{error}"
@@ -189,18 +205,18 @@ mod tests {
         let mut broken = attachment("b.png", "image/png", b"x");
         broken.data_base64 = "@@@".into();
         assert!(matches!(
-            user_message_line("x", &[broken]),
+            line("x", &[broken]),
             Err(HarnessError::Protocol(message)) if message.contains("b.png")
         ));
         let latin1 = attachment("l.txt", "text/plain", &[0xe9, 0xff]);
         assert!(matches!(
-            user_message_line("x", &[latin1]),
+            line("x", &[latin1]),
             Err(HarnessError::Unsupported(message)) if message.contains("l.txt")
         ));
 
         // A message over the cap is refused by size, never truncated.
         let big = attachment("big.pdf", "application/pdf", &vec![0u8; 8 * 1024 * 1024]);
-        let error = user_message_line("x", &[big]).unwrap_err();
+        let error = line("x", &[big]).unwrap_err();
         assert!(
             matches!(&error, HarnessError::Protocol(message) if message.contains("bytes encoded") && message.contains("10 MiB")),
             "{error}"
@@ -208,7 +224,7 @@ mod tests {
 
         // Nothing at all is not a message.
         assert!(matches!(
-            user_message_line("", &[]),
+            line("", &[]),
             Err(HarnessError::Protocol(message)) if message == "empty user message"
         ));
     }

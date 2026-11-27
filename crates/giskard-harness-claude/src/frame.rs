@@ -10,10 +10,10 @@
 
 use claude_codes::io::{AssistantMessage, ResultMessage, UserMessage};
 use claude_codes::{
-    ApiRetryMessage, CompactBoundaryMessage, ControlCancelRequest, InitMessage,
-    PermissionDeniedMessage, RateLimitEvent, SessionTitleChangedMessage, StatusMessage,
-    StreamEventMessage, TaskNotificationMessage, TaskStartedMessage, TaskUpdatedMessage,
-    ToolPermissionRequest, UsageInfo,
+    ApiRetryMessage, CommandLifecycleMessage, CompactBoundaryMessage, ControlCancelRequest,
+    InitMessage, PermissionDeniedMessage, RateLimitEvent, SessionTitleChangedMessage,
+    StatusMessage, StreamEventMessage, TaskNotificationMessage, TaskStartedMessage,
+    TaskUpdatedMessage, ToolPermissionRequest, UsageInfo,
 };
 use serde::de::DeserializeOwned;
 use serde_json::Value;
@@ -75,6 +75,9 @@ pub enum Frame {
     ControlCancelRequest {
         request_id: String,
     },
+    /// The fate of a stdin message the adapter stamped with a `uuid`: `queued`, `started`, then
+    /// one terminal state. Never sent for a message without one.
+    CommandLifecycle(CommandLifecycleMessage),
     Unknown {
         r#type: String,
         subtype: Option<String>,
@@ -137,6 +140,9 @@ impl Frame {
             "autocompact_state" => Self::parse_autocompact_state(&value),
             "control_request" => Self::parse_control_request(value),
             "control_response" => Self::parse_control_response(value),
+            "command_lifecycle" => {
+                typed(value, "command_lifecycle", None).map(Frame::CommandLifecycle)
+            }
             "control_cancel_request" => {
                 typed::<ControlCancelRequest>(value, "control_cancel_request", None).map(|cancel| {
                     Frame::ControlCancelRequest {
@@ -186,6 +192,7 @@ impl Frame {
             Frame::ControlRequest { subtype, .. } => ("control_request", Some(subtype)),
             Frame::ControlResponse { .. } => ("control_response", None),
             Frame::ControlCancelRequest { .. } => ("control_cancel_request", None),
+            Frame::CommandLifecycle(_) => ("command_lifecycle", None),
             Frame::Unknown { r#type, subtype } => (r#type, subtype.as_deref()),
         }
     }
@@ -487,6 +494,7 @@ pub(crate) fn redact_serde_error(error: &serde_json::Error) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use claude_codes::CommandLifecycleState;
 
     const FIXTURES: &[&str] = &[
         "accept-for-session",
@@ -497,6 +505,8 @@ mod tests {
         "delegation",
         "delegation-interrupted",
         "initialize",
+        "lifecycle-interrupted",
+        "lifecycle-prompt",
         "plan-exit-denied",
         "resume-missing",
         "subagent-message-running",
@@ -674,6 +684,34 @@ mod tests {
         assert!(matches!(
             Frame::parse(r#"{"type":"control_cancel_request"}"#),
             Err(FrameError::Untyped { r#type, .. }) if r#type == "control_cancel_request"
+        ));
+    }
+
+    #[test]
+    fn a_command_lifecycle_frame_names_its_command_and_state() {
+        for (state, expected) in [
+            ("queued", CommandLifecycleState::Queued),
+            ("started", CommandLifecycleState::Started),
+            ("completed", CommandLifecycleState::Completed),
+            ("cancelled", CommandLifecycleState::Cancelled),
+            ("discarded", CommandLifecycleState::Discarded),
+            // 2.1.330 has a sixth state the crate's enum predates.
+            ("refused", CommandLifecycleState::Unknown("refused".into())),
+        ] {
+            let line = format!(
+                r#"{{"type":"command_lifecycle","command_uuid":"c-1","state":"{state}","uuid":"u","session_id":"s"}}"#
+            );
+            let frame = Frame::parse(&line).unwrap();
+            assert!(
+                matches!(&frame, Frame::CommandLifecycle(message)
+                    if message.command_uuid == "c-1" && message.state == expected),
+                "{state}: {frame:?}"
+            );
+            assert_eq!(frame.kind(), ("command_lifecycle", None));
+        }
+        assert!(matches!(
+            Frame::parse(r#"{"type":"command_lifecycle","state":"queued","uuid":"u","session_id":"s"}"#),
+            Err(FrameError::Untyped { r#type, .. }) if r#type == "command_lifecycle"
         ));
     }
 

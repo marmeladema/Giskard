@@ -1,0 +1,28 @@
+{
+ "scenario": "lifecycle-prompt",
+ "argv": [
+  "claude",
+  "-p",
+  "--input-format",
+  "stream-json",
+  "--output-format",
+  "stream-json",
+  "--verbose",
+  "--permission-prompt-tool",
+  "stdio",
+  "--setting-sources",
+  "",
+  "--include-partial-messages",
+  "--model",
+  "haiku",
+  "--permission-mode",
+  "manual",
+  "--session-id",
+  "8f66855b-aabd-4aab-ad65-232a2b17ce04"
+ ],
+ "cwd": "/work/project",
+ "exit": 0,
+ "results": 2,
+ "asks": 0,
+ "elapsed_s": 8.1
+}

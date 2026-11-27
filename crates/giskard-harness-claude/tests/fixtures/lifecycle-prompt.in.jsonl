@@ -1,0 +1,2 @@
+{"type": "user", "uuid": "11e6479f-0e91-4264-b9fc-e5ab0cedb4ca", "message": {"role": "user", "content": [{"type": "text", "text": "Reply with exactly one word: pong"}]}}
+{"type": "user", "uuid": "c40462f4-0425-4936-9e91-c1c601910033", "message": {"role": "user", "content": [{"type": "text", "text": "/compact"}]}}

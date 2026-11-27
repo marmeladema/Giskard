@@ -27,7 +27,7 @@ mod session;
 pub use catalog::ANTHROPIC_PROVIDER_ID;
 pub use frame::{BlockStart, Delta, Frame, FrameError, StreamEvent, StreamEventKind};
 pub use harness::ClaudeHarness;
-pub use mapper::{ClaudeMapper, MapperOutput, Route, TurnKind};
+pub use mapper::{ClaudeMapper, CommandKind, MapperOutput, Route, TurnKind};
 pub use process::{ClaudeLaunchOptions, DEFAULT_IDLE_TIMEOUT};
 
 use giskard_harness::HarnessCapabilities;

@@ -119,6 +119,7 @@ routes*). A child idle for `idle_shutdown_secs` is stopped and its thread respaw
 | `ItemId` | minted on first sight of a native key: a `tool_use` block's `id`, or `(message.id, block index)` for a text or thinking block; reused for the item's start, deltas and completion within the turn |
 | `Item.harness_item_id` | the tool-use id, `<message_id>:<index>`, `compact_boundary:<uuid>`, `user:<uuid>:<index>` for a user-frame activity or a sub-agent's delegated prompt, `user:<turn_id>:sent` for a primary turn's prompt, `task_started:<task_id>` for the activity announcing a forked skill's sub-agent, `task_started:<task_id>:<run_id>` for a resumed run's row, `task_prompt:<task_id>` for a backgrounded sub-agent's delegated prompt, `task_prompt:<run_id>` for a resumed run's message, or `task_updated:<task_id>` for a backgrounded sub-agent's outcome (`task_updated:<task_id>:<run_id>` for a resumed run's) |
 | `ApprovalId`, `ServerRequestId` | the `control_request`'s `request_id`, a UUID the CLI mints and the reply must carry; the trait's instance-wide uniqueness across children rests on the CLI minting UUIDs |
+| command uuid | a fresh v4 UUID the adapter mints for every stdin `user` line it writes (a turn's prompt, `/compact`) and sends as the line's top-level `uuid`; the CLI names it as `command_uuid` in that line's `command_lifecycle` frames and lists it in the consuming turn's `user_message_uuids`. Never an item id; it lives in the mapper's command table until the line's terminal lifecycle state (*Process control*, **Command lifecycle**) |
 
 `assistant` frames arrive **one content block per frame**, each repeating the whole message
 envelope with the same `message.id`. The mapper numbers the blocks of one message across its frames,
@@ -158,6 +159,9 @@ Asks and other control traffic:
 | any other `control_request` | `ServerRequestReceived { method: "claude/<subtype>", params: request }` plus `PendingServerRequest { subtype, input: null }` |
 | `control_cancel_request` | `MapperOutput::CancelRequest { request_id }`, logged at `info` (`action = "control_cancel_request"`); the adapter looks the ask up |
 | `control_response` | `MapperOutput::ControlResponse { request_id, payload }` for the adapter's own waiter |
+
+`command_lifecycle` produces no event: it is tracked and cross-checked (*Process control*,
+**Command lifecycle**).
 
 Session-level frames: `system/init` stores the model and emits a `Notice` once per non-`none`
 `apiKeySource` (usage is billed to that credential); a `system/init` or `system/status` whose
@@ -287,7 +291,8 @@ session flag and `--permission-mode manual`; later opens launch standard childre
 standard child still sends `set_permission_mode default` in its handshake (a failure there is
 logged and ignored).
 
-No `--add-dir` or `--replay-user-messages` (see *Process control*). The child's working directory is
+No `--add-dir` or `--replay-user-messages` (see *Process control*): what the replay echo was for,
+the CLI now reports per line in `command_lifecycle`. The child's working directory is
 `OpenThreadOptions.workspace_root`. The declaration's environment overlay is applied **over** the
 inherited environment, never in place of it, so an `ANTHROPIC_API_KEY`, `ANTHROPIC_BASE_URL` or
 other `ANTHROPIC_*` variable in Giskard's own environment reaches every child (plan §7); the
@@ -303,7 +308,14 @@ Nothing reaches stdout at spawn: the CLI's first frame answers the first message
 handshake is a sequence of control requests:
 
 1. `initialize`, under a 30 s timeout. Its `models` replace the catalog snapshot. A child that exits
-   instead, times out (killed), or refuses fails the open.
+   instead, times out (killed), or refuses fails the open. So does one whose
+   `claude_code_version` is older than `MIN_CLAUDE_CODE_VERSION` (2.1.330), or absent (only
+   releases older than that omit it): the child is reaped before anything else is written, and
+   the open fails `Unsupported` naming the version found and the one required
+   (`claude_version` at `warn`). The model probe applies the same check. The minimum is a
+   deliberate floor, not feature detection: the command lifecycle, `cancel_async_message` and
+   the interrupt receipt the adapter relies on were verified on 2.1.330 and 2.1.332, and an
+   older CLI is refused rather than half-supported.
 2. `set_permission_mode {"mode": "default"}`, under 10 s (see *Launch mode*). The CLI echoes
    `default`, and after a change emits `system/status`; the mapper expects `default` from the
    start, so that frame is not drift.
@@ -389,7 +401,34 @@ deduplicated away), since the server reads no handle.
     none of which is an answer.
   - Per-prompt `init` re-emission is observed behaviour, not documented. That is what the backstop
     is for.
+- **Command lifecycle.** Every stdin `user` line (a turn's prompt, `/compact`) carries a fresh
+  command uuid as its top-level `uuid`, so the CLI reports its fate in `command_lifecycle`
+  frames: `queued` and `started` on the write, then one terminal state, `completed` (after the
+  turn's `result` for a line that opened its turn), `cancelled` (after an interrupted turn's
+  `result`), `discarded` (the session ended with it queued) or `refused` (2.1.330 added it;
+  `claude-codes` 2.1.333 reads it as `Unknown("refused")`). A line without a `uuid` gets none,
+  and no opt-in field (`requeue_if_interrupted_within_ms`, `priority`) is sent. The mapper's
+  command table joins each frame to the turn the adapter opened for the line (`note_command`,
+  right after `begin_turn`); a terminal state removes the entry, an unknown state is logged at
+  `warn` and kept (it may be an intermediate one), and `child_exited` clears the table. A frame
+  naming no tracked uuid is `debug` (`lifecycle_untracked`). The lifecycle decides nothing yet:
+  the prompt is still acknowledged at its turn's `system/init`. It is cross-checked, at `warn`:
+  a prompt acknowledged before its `started` arrived while the latest `init` advertised
+  `msg_lifecycle_v1` (`prompt_lifecycle_missing`; on 2.1.330 `started` precedes `init` by
+  ~0.1 s, and by seconds for `/compact`, whose `init` comes once compaction is done), a
+  `started` for a turn no longer active (`command_started`), and a `result` whose non-empty
+  `user_message_uuids` lacks the uuid of the line that opened its turn (`result_uuid_mismatch`;
+  a turn the CLI started itself that consumed client messages is `debug`,
+  `result_foreign_uuids`). A CLI whose `init` lacks `msg_lifecycle_v1` sends no lifecycle
+  frames, so the table is emptied at that `init` and nothing is tracked after it. Recorded in
+  `lifecycle-prompt` and `lifecycle-interrupted`. The frame and `cancel_async_message` are
+  `@internal` in the CLI's schema; the plan for steering on top of them is
+  `specs/claude-code-harness-plan/turn-steering-plan.md`.
 - **Interrupt** writes the `interrupt` control request and resolves on its response, within 10 s.
+  The response (`interrupt_receipt_v1`) lists under `still_queued` the stamped messages the
+  interrupt left queued and under `cancelled` those it withdrew; their counts are logged
+  (`interrupt answered`), for the stop sequence's interrupt too. No `cancel_queued` is sent: it
+  would also drop a queued background-task notification.
   With no active turn the CLI answers at once and nothing else happens to the parent: the
   interrupt is noted on no turn. A background sub-agent still running then may be killed by it
   (`delegation-interrupted`, 2.1.286: interrupted after the delegating turn's `result`, the task
@@ -970,4 +1009,6 @@ An entry that does not parse is skipped with a `warn` naming its index; each ser
   the `tool-allowed` ask on a message containing `touch` and the rest once answered, replays a
   background command's turn on a message containing `background` and its `killed` pair on
   `stop_task`, and with
-  `FAKE_CLAUDE_REFUSE_BYPASS=1` refuses a bypass launch with the root sentence.
+  `FAKE_CLAUDE_REFUSE_BYPASS=1` refuses a bypass launch with the root sentence. A user line
+  carrying a `uuid` gets `command_lifecycle` `queued` and `started` before its frames and
+  `completed` after its turn's `result`.
